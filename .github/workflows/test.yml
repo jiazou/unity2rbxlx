@@ -204,14 +204,27 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     needs: fast
     timeout-minutes: 25
+    env:
+      # Path to the populated SimpleFPS Unity project on the self-hosted
+      # runner. test_projects/* in this repo are gitlinks with no
+      # .gitmodules, so CI cannot populate them; we point at a locally
+      # cloned Unity project instead. Override by setting a runner-level
+      # env var or repo variable if the path ever changes.
+      UNITY_SIMPLEFPS_DIR: /Users/jiazou/workspace/unity-3d-simplefps
     defaults:
       run:
         working-directory: converter
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: recursive
-          lfs: true
+          submodules: false
+
+      - name: Verify SimpleFPS source exists
+        run: |
+          if [ ! -d "$UNITY_SIMPLEFPS_DIR/Assets" ]; then
+            echo "::error::SimpleFPS Unity project not found at $UNITY_SIMPLEFPS_DIR"
+            exit 1
+          fi
 
       - name: Install dependencies into shared venv
         run: |
@@ -224,7 +237,7 @@ jobs:
 
       - name: Convert SimpleFPS
         run: |
-          "$HOME/.unity2rbxlx-venv/bin/python" u2r.py convert "../test_projects/SimpleFPS" \
+          "$HOME/.unity2rbxlx-venv/bin/python" u2r.py convert "$UNITY_SIMPLEFPS_DIR" \
             -o "./output/SimpleFPS" \
             --scene all \
             --no-upload \
