@@ -235,24 +235,25 @@ jobs:
           "$VENV/bin/python" -m pip install --upgrade pip
           "$VENV/bin/python" -m pip install -e ".[dev]"
 
-      - name: Convert SimpleFPS (main scene only)
+      - name: Convert SimpleFPS
         run: |
-          # Single-scene mode so the converter emits converted_place.rbxlx.
-          # --scene all writes per-scene files (main.rbxlx, menu.rbxlx) with
-          # no unified output, which is not what the smoke test wants.
           "$HOME/.unity2rbxlx-venv/bin/python" u2r.py convert "$UNITY_SIMPLEFPS_DIR" \
             -o "./output/SimpleFPS" \
-            --scene main.unity \
+            --scene all \
             --no-upload \
             --no-ai \
             --no-resolve
 
       - name: Run smoke test
         run: |
-          RBXLX="./output/SimpleFPS/converted_place.rbxlx"
+          # --scene all writes per-scene rbxlx files (main.rbxlx is the
+          # gameplay scene — 944 parts / 51 scripts). There is no unified
+          # converted_place.rbxlx in multi-scene mode.
+          RBXLX="./output/SimpleFPS/main.rbxlx"
           if [ ! -f "$RBXLX" ]; then
-            # Fallback for --scene all output naming, just in case.
-            RBXLX="./output/SimpleFPS/main.rbxlx"
+            echo "::error::Expected rbxlx not found: $RBXLX"
+            ls -la ./output/SimpleFPS/ || true
+            exit 1
           fi
           echo "smoke-testing $RBXLX"
           "$HOME/.unity2rbxlx-venv/bin/python" u2r.py smoke-test "$RBXLX" \
