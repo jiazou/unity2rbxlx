@@ -284,7 +284,10 @@ jobs:
           # --scene all writes per-scene rbxlx files (main.rbxlx is the
           # gameplay scene — 944 parts / 51 scripts). There is no unified
           # converted_place.rbxlx in multi-scene mode.
-          RBXLX="./output/SimpleFPS/main.rbxlx"
+          # Absolute paths: Studio launched from a non-interactive shell
+          # won't reliably resolve relative rbxlx paths (it silently falls
+          # back to Start Page and F5 becomes a no-op).
+          RBXLX="$PWD/output/SimpleFPS/main.rbxlx"
           if [ ! -f "$RBXLX" ]; then
             echo "::error::Expected rbxlx not found: $RBXLX"
             ls -la ./output/SimpleFPS/ || true
@@ -292,7 +295,7 @@ jobs:
           fi
           echo "smoke-testing $RBXLX"
           "$HOME/.unity2rbxlx-venv/bin/python" u2r.py smoke-test "$RBXLX" \
-            --output-dir ./smoke_output/SimpleFPS
+            --output-dir "$PWD/smoke_output/SimpleFPS"
 
       - name: Upload smoke test artifacts
         if: always()
