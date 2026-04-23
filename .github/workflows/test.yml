@@ -54,7 +54,12 @@ jobs:
       # Only SimpleFPS has a .gitmodules mapping; the other 8 gitlinks under
       # test_projects/ are dormant. Tests auto-skip unpopulated projects via
       # converter/tests/_project_paths.is_populated().
-      - name: Init SimpleFPS submodule
+      - name: Init SimpleFPS submodule (skip LFS smudge)
+        # The upstream repo's LFS quota is exhausted so binary assets cannot
+        # be pulled; GIT_LFS_SKIP_SMUDGE=1 leaves LFS pointer files in place
+        # and the converter detects + skips them (per converter/CLAUDE.md).
+        env:
+          GIT_LFS_SKIP_SMUDGE: "1"
         run: git submodule update --init --recursive test_projects/SimpleFPS
         working-directory: ${{ github.workspace }}
 
@@ -103,7 +108,11 @@ jobs:
         with:
           submodules: false
 
-      - name: Init ${{ matrix.project }} submodule
+      - name: Init ${{ matrix.project }} submodule (skip LFS smudge)
+        # Upstream Unity repos often hit LFS quota; skip smudging so the
+        # pointer files stay in place — the converter detects and skips them.
+        env:
+          GIT_LFS_SKIP_SMUDGE: "1"
         run: git submodule update --init --recursive "test_projects/${{ matrix.project }}"
         working-directory: ${{ github.workspace }}
 
@@ -174,7 +183,12 @@ jobs:
       # u2r.py eval auto-discovers populated projects under test_projects/
       # via _project_paths.is_populated(), so initing only SimpleFPS limits
       # the eval run to that project until more submodules are wired up.
-      - name: Init SimpleFPS submodule
+      - name: Init SimpleFPS submodule (skip LFS smudge)
+        # The upstream repo's LFS quota is exhausted so binary assets cannot
+        # be pulled; GIT_LFS_SKIP_SMUDGE=1 leaves LFS pointer files in place
+        # and the converter detects + skips them (per converter/CLAUDE.md).
+        env:
+          GIT_LFS_SKIP_SMUDGE: "1"
         run: git submodule update --init --recursive test_projects/SimpleFPS
         working-directory: ${{ github.workspace }}
 
