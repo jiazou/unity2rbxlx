@@ -66,7 +66,11 @@ def _process_mono_properties(
         return
 
     for key, value in props.items():
-        if key in _MONO_INTERNAL_PROPS or key.startswith("m_"):
+        # Skip only known engine-internal keys. Unity projects commonly
+        # serialize ``[SerializeField] private T m_foo`` fields that
+        # appear in YAML verbatim as ``m_foo``; a blanket m_-prefix
+        # filter would miss the common case this extractor exists for.
+        if key in _MONO_INTERNAL_PROPS:
             continue
         if not _is_object_ref(value):
             continue

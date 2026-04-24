@@ -160,3 +160,98 @@ class TestScopedContext:
     def test_empty_when_no_deps(self):
         ctx = _build_scoped_context("Solo", {"Solo": set()}, {"Solo": "class Solo {}"}, {})
         assert ctx == ""
+
+
+class TestCodexFix1CommentStripping:
+    """Codex P1 #3: comments + string literals must not create phantom refs."""
+
+    def test_comment_not_treated_as_class_declaration(self):
+        src = "// public class FakeClass {}\npublic class Real {}"
+        assert _extract_class_names(src) == {"Real"}
+
+    def test_string_not_treated_as_class_declaration(self):
+        src = '"public class InString {}";\npublic class Real {}'
+        assert _extract_class_names(src) == {"Real"}
+
+    def test_block_comment_class_suppressed(self):
+        src = "/* public class Hidden {} */\npublic class Visible {}"
+        assert _extract_class_names(src) == {"Visible"}
+
+    def test_comment_reference_not_counted(self):
+        """// Player at line start must NOT pull Player into refs."""
+        src = 'public class Door { void f() { /* TODO: wire up Player */ } }'
+        all_names = {"Player", "Door"}
+        refs = _extract_references(src, all_names)
+        assert "Player" not in refs
+
+    def test_string_literal_reference_not_counted(self):
+        src = 'public class Logger { void f() { Debug.Log("Player not found"); } }'
+        all_names = {"Player", "Logger"}
+        refs = _extract_references(src, all_names)
+        assert "Player" not in refs
+
+    def test_real_reference_still_counted(self):
+        """After stripping, genuine references must still land."""
+        src = 'public class Door { Player p; void Open() { p.unlock(); } }'
+        all_names = {"Player", "Door"}
+        refs = _extract_references(src, all_names)
+        assert refs == {"Player"}
+
+
+class TestCodexFix5SerializedFieldContext:
+    """Codex P1 #5: _build_serialized_field_context must render entries
+    that match the owning script's path.
+    """
+
+    def test_renders_entries_for_matching_path(self, tmp_path):
+        from converter.code_transpiler import _build_serialized_field_context
+
+        project_root = tmp_path
+        script_path = tmp_path / "Assets" / "Player.cs"
+        script_path.parent.mkdir(parents=True)
+        script_path.write_text("")
+
+        refs = {
+            "Assets/Player.cs": {
+                "riflePrefab": "Rifle",
+                "shootSound": "audio:/abs/path/shoot.ogg",
+            },
+            "Assets/Other.cs": {"unrelated": "X"},
+        }
+        ctx = _build_serialized_field_context(script_path, project_root, refs)
+        assert "riflePrefab -> Rifle" in ctx
+        assert "shootSound -> audio:" in ctx
+        assert "unrelated" not in ctx
+        assert "ReplicatedStorage.Templates" in ctx
+
+    def test_empty_when_no_match(self, tmp_path):
+        from converter.code_transpiler import _build_serialized_field_context
+
+        script_path = tmp_path / "Assets" / "Ghost.cs"
+        script_path.parent.mkdir(parents=True)
+        script_path.write_text("")
+        refs = {"Assets/Other.cs": {"field": "X"}}
+        assert _build_serialized_field_context(script_path, tmp_path, refs) == ""
+
+    def test_empty_when_refs_empty(self, tmp_path):
+        from converter.code_transpiler import _build_serialized_field_context
+
+        assert _build_serialized_field_context(tmp_path / "a.cs", tmp_path, {}) == ""
+
+
+class TestCodexFix2DuplicateStems:
+    """Codex P1 #2: two scripts sharing a class name or basename must
+    BOTH get their own entry in the dependency map (not silently
+    dropped to one).
+    """
+
+    def test_duplicate_class_name_disambiguates(self):
+        from converter.code_transpiler import _build_dependency_graph
+        # Two Utils-named classes in different files. Both must appear
+        # in the graph after disambiguation.
+        sources = {
+            "Utils": "public class Utils { void A() {} }",
+            "Utils__abcdef": "public class Utils { void B() {} }",
+        }
+        graph, _ = _build_dependency_graph(sources)
+        assert set(graph.keys()) == {"Utils", "Utils__abcdef"}

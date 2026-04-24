@@ -789,3 +789,64 @@ Deferred to follow-ups:
   `--upload` conversion to validate that Door.luau now uses
   `require(Player).hasKey()` instead of GetAttribute. Manual
   spot-check in PR 4 validation or wait for eval-diff run.
+
+### PR 4 — Codex review follow-ups (2026-04-24)
+
+Codex flagged 5 P1 findings. GATE was FAIL. Every one was a real
+correctness gap between the PR's advertised behaviour and the
+code that landed.
+
+- **Fix #1 (Codex P1) — low-confidence Luau leaked to later
+  prompts.** `transpile_scripts()` Phase 2 was publishing every
+  AI result into `transpiled_luau` regardless of confidence, but
+  Phase 3 replaces sub-0.1 results with stubs. Dependents in
+  later levels would then build against methods that never
+  actually landed on disk. Guarded the cache writes with
+  `if luau and confidence >= 0.1:`.
+- **Fix #2 (Codex P1) — duplicate stems silently dropped.** Two
+  scripts sharing a class name (or basename) would clobber the
+  first, so the second never got its own AI pass. Disambiguated
+  via a short path-based SHA suffix so both survive; graph +
+  topological sort still include both.
+- **Fix #3 (Codex P1) — regex-scanned comments & strings
+  polluted the dep graph.** `// Player` or `"Player not found"`
+  inside a log line was creating phantom references. Added
+  `_strip_comments_and_strings` (handles `//`, `/* */`,
+  verbatim strings, regular strings, char literals) and now run
+  both `_extract_class_names` and `_extract_references` on the
+  cleaned text.
+- **Fix #4 (Codex P1) — `m_` prefix over-filter dropped valid
+  fields.** `serialized_field_extractor` was skipping every key
+  that started with `m_`, which misses the common Unity idiom
+  `[SerializeField] private T m_foo`. Restricted the filter to
+  the explicit `_MONO_INTERNAL_PROPS` set only (matches how
+  source's own extractor distinguishes engine-internal from
+  user-private fields). SimpleFPS doesn't use this pattern so
+  field counts stayed at 18, but projects that do (e.g. most
+  asset-store code) now have their refs captured.
+- **Fix #5 (Codex P1) — serialized_field_refs never reached the
+  transpiler.** The headline 4.9 benefit — the AI prompt seeing
+  `riflePrefab -> Rifle` and generating a
+  `ReplicatedStorage.Templates:WaitForChild("Rifle")` call —
+  wasn't wired up. Added `transpile_scripts(serialized_field_refs=...)`
+  parameter, a `_build_serialized_field_context()` helper that
+  renders the per-script subset, and threaded
+  `ctx.serialized_field_refs` through `Pipeline.transpile_scripts`
+  into it. Each script's scoped prompt now carries its
+  inspector-assigned field map alongside the dep Luau.
+
+Tests (+11 new):
+- `TestCodexFix1CommentStripping` (6): // comment / string
+  literal / block comment / mixed cases can't leak refs.
+- `TestCodexFix2DuplicateStems` (1): two Utils-named scripts
+  both land in the graph after disambiguation.
+- `TestCodexFix4MPrefixFields` (1): `m_bulletPrefab` captured,
+  `m_GameObject` still skipped.
+- `TestCodexFix5SerializedFieldContext` (3): rendering matches
+  the owning script's path, unrelated entries filtered, empty
+  refs return "".
+
+Verification: fast suite 663 passed (+11 new Codex-fix tests);
+SimpleFPS smoke unchanged (944 parts / 36 scripts / 50/51
+materials / same 8-script 18-field serialized_field_refs,
+because SimpleFPS uses unprefixed public fields not `m_foo`).

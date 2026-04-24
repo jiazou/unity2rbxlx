@@ -1108,6 +1108,7 @@ class Pipeline:
             script_infos=script_infos,
             use_ai=_config.USE_AI_TRANSPILATION,
             api_key=_config.ANTHROPIC_API_KEY,
+            serialized_field_refs=self.ctx.serialized_field_refs or None,
         )
         self.ctx.transpiled_scripts = self.state.transpilation_result.total_transpiled
         log.info(

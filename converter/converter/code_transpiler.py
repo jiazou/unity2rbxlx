@@ -88,6 +88,7 @@ def transpile_scripts(
     use_ai: bool = True,
     api_key: str = "",
     max_concurrent: int = 10,
+    serialized_field_refs: dict[str, dict[str, str]] | None = None,
 ) -> TranspilationResult:
     """Transpile a list of C# scripts to Luau.
 
@@ -97,6 +98,11 @@ def transpile_scripts(
         use_ai: Whether to attempt AI transpilation for low-confidence scripts.
         api_key: Anthropic API key (required if use_ai is True).
         max_concurrent: Max concurrent API calls for AI transpilation.
+        serialized_field_refs: Phase 4.9 output — ``{relative_cs_path:
+            {field_name: prefab_or_audio_ref}}``. When provided, each
+            script's prompt gets the relevant subset appended so the AI
+            can emit real ``ReplicatedStorage.Templates:WaitForChild(...)``
+            calls for inspector-assigned prefab fields instead of ``nil``.
 
     Returns:
         TranspilationResult with all transpiled scripts and summary counts.
@@ -105,6 +111,7 @@ def transpile_scripts(
 
     # Build project context for AI transpilation
     project_context = _build_project_context(script_infos)
+    serialized_field_refs = serialized_field_refs or {}
 
     # Phase 1: Classify scripts and read source
     pending_scripts: list[tuple[Any, str, str]] = []  # (info, csharp_source, script_type)
@@ -142,17 +149,24 @@ def transpile_scripts(
     # no dep on each other, so concurrent execution is preserved.
     ai_results: dict[str, tuple[str, float, list[str]]] = {}  # class_name → (luau, confidence, warnings)
 
-    # Map every pending script to its file stem (class name or filename
-    # sans extension) so the dep-graph code has a stable key. Info lookup
-    # lets us recover the original (info, source, script_type) triple.
+    # Map every pending script to a unique stem so the dep-graph code has
+    # a stable key. Prefer the class name (keeps cross-reference matching
+    # idiomatic); when two scripts share one, disambiguate by appending a
+    # short path-based suffix so the second script still gets its own AI
+    # pass — silently dropping duplicates would regress to the pre-PR-4
+    # behaviour for legitimate cases like two Utils.cs in different dirs.
     file_sources: dict[str, str] = {}
     info_by_stem: dict[str, tuple[Any, str, str]] = {}
     for info, csharp_source, script_type in pending_scripts:
-        stem = info.class_name or info.path.stem
+        base_stem = info.class_name or info.path.stem
+        stem = base_stem
         if stem in file_sources:
-            # Duplicate class/filename — keep the first. Warn via result.
-            log.debug("Duplicate stem %r; keeping first occurrence", stem)
-            continue
+            suffix = hashlib.sha1(str(info.path).encode()).hexdigest()[:6]
+            stem = f"{base_stem}__{suffix}"
+            log.debug(
+                "Duplicate stem %r; disambiguated as %r (path=%s)",
+                base_stem, stem, info.path,
+            )
         file_sources[stem] = csharp_source
         info_by_stem[stem] = (info, csharp_source, script_type)
 
@@ -169,10 +183,11 @@ def transpile_scripts(
                 return stem, None
             info, csharp_source, script_type = triple
             scoped = _build_scoped_context(stem, dep_graph, file_sources, transpiled_luau)
-            context = (
-                f"{project_context}\n\n{scoped}"
-                if scoped else project_context
+            field_ctx = _build_serialized_field_context(
+                info.path, unity_project_path, serialized_field_refs,
             )
+            context_parts = [project_context, scoped, field_ctx]
+            context = "\n\n".join(p for p in context_parts if p)
             try:
                 if backend == "claude_cli":
                     luau, confidence, warnings = _claude_cli_transpile(
@@ -218,7 +233,13 @@ def transpile_scripts(
                         info = info_by_stem[stem][0]
                         luau, confidence, warnings = outcome
                         ai_results[info.class_name or str(info.path)] = outcome
-                        transpiled_luau[stem] = luau
+                        # Only feed high-enough-confidence Luau into the
+                        # dep-context cache; Phase 3 replaces anything
+                        # under 0.1 with a stub, so publishing it here
+                        # would give later dependents a prompt grounded
+                        # in methods that never actually land on disk.
+                        if luau and confidence >= 0.1:
+                            transpiled_luau[stem] = luau
                         result.total_ai += 1
                         log.info("  %s: transpiled via Anthropic API (confidence %.2f)",
                                  info.path.name, confidence)
@@ -230,7 +251,8 @@ def transpile_scripts(
                     info = info_by_stem[stem_out][0]
                     luau, confidence, warnings = outcome
                     ai_results[info.class_name or str(info.path)] = outcome
-                    transpiled_luau[stem_out] = luau
+                    if luau and confidence >= 0.1:
+                        transpiled_luau[stem_out] = luau
                     result.total_ai += 1
                     log.info("  %s: transpiled via %s (confidence %.2f)",
                              info.path.name, backend, confidence)
@@ -307,14 +329,46 @@ def transpile_scripts(
 # ---------------------------------------------------------------------------
 
 
+# ``/* ... */`` and ``// ...`` comments, plus ``"..."`` / ``'...'`` string
+# literals, must be stripped before pattern-matching on C# source —
+# otherwise "// Player" or "class Foo // note" injects phantom refs into
+# the dependency graph. Handles escapes; collapses the literal to an
+# empty replacement so character offsets don't get wildly shifted for
+# downstream error reporting (none yet, but future-proof).
+_CSHARP_COMMENT_OR_STRING = re.compile(
+    r"""
+    //[^\n]*            # line comment
+    | /\*.*?\*/         # block comment (non-greedy)
+    | @"(?:[^"]|"")*"   # verbatim string
+    | "(?:\\.|[^"\\])*" # regular string
+    | '(?:\\.|[^'\\])*' # char literal
+    """,
+    re.DOTALL | re.VERBOSE,
+)
+
+
+def _strip_comments_and_strings(source: str) -> str:
+    """Remove C# comments + string/char literals from ``source``.
+
+    Each match collapses to a single space to keep word boundaries
+    intact for the subsequent regex scans.
+    """
+    return _CSHARP_COMMENT_OR_STRING.sub(" ", source)
+
+
 def _extract_class_names(source: str) -> set[str]:
-    """Return the class/struct/enum/interface names defined in a C# file."""
+    """Return the class/struct/enum/interface names defined in a C# file.
+
+    Comments and string literals are stripped first so ``// class Foo``
+    or ``"class Bar"`` don't register as real type declarations.
+    """
+    clean = _strip_comments_and_strings(source)
     names: set[str] = set()
     for match in re.finditer(
         r"(?:public\s+|internal\s+|private\s+)?"
         r"(?:abstract\s+|static\s+|sealed\s+|partial\s+)*"
         r"(?:class|struct|enum|interface)\s+(\w+)",
-        source,
+        clean,
     ):
         names.add(match.group(1))
     return names
@@ -322,14 +376,15 @@ def _extract_class_names(source: str) -> set[str]:
 
 def _extract_references(source: str, all_class_names: set[str]) -> set[str]:
     """Names from ``all_class_names`` that appear in ``source`` and aren't
-    declared there. Word-boundary match — no string-literal filtering yet
-    (good enough for dependency routing; false positives only mean the AI
-    gets more context than strictly needed).
+    declared there. Comments + string literals are stripped first so
+    references inside ``// TODO: Player``, log messages like
+    ``"Player not found"``, etc. don't pollute the graph.
     """
     defined = _extract_class_names(source)
+    clean = _strip_comments_and_strings(source)
     refs: set[str] = set()
     for name in all_class_names - defined:
-        if re.search(rf"\b{re.escape(name)}\b", source):
+        if re.search(rf"\b{re.escape(name)}\b", clean):
             refs.add(name)
     return refs
 
@@ -453,6 +508,39 @@ def _build_scoped_context(
             )
 
     return "\n\n".join(parts)
+
+
+def _build_serialized_field_context(
+    script_path: Path,
+    unity_project_path: str | Path,
+    serialized_field_refs: dict[str, dict[str, str]],
+) -> str:
+    """Render the 4.9 serialized-field-refs for ``script_path`` as a
+    prompt section. Returns empty string when no refs are available.
+
+    ``serialized_field_refs`` is keyed on paths relative to
+    ``unity_project_path`` (see ``serialize_for_context``), so we
+    recompute the relative key here to look it up.
+    """
+    if not serialized_field_refs:
+        return ""
+    try:
+        rel = script_path.resolve().relative_to(Path(unity_project_path).resolve())
+    except (ValueError, OSError):
+        rel = script_path
+    fields = serialized_field_refs.get(str(rel)) or serialized_field_refs.get(
+        str(script_path)
+    )
+    if not fields:
+        return ""
+    lines = [
+        "--- Inspector-assigned serialized fields on this MonoBehaviour ---",
+        "(Use ReplicatedStorage.Templates:WaitForChild(name) for prefab refs,",
+        " and the audio asset path directly for audio refs.)",
+    ]
+    for field_name, target in sorted(fields.items()):
+        lines.append(f"  {field_name} -> {target}")
+    return "\n".join(lines)
 
 
 def _build_project_context(script_infos: list[Any]) -> str:

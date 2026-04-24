@@ -205,3 +205,29 @@ class TestSerializeForContext:
         refs = {Path("/tmp/abs/path.cs"): {"field": "X"}}
         out = serialize_for_context(refs)
         assert out == {"/tmp/abs/path.cs": {"field": "X"}}
+
+
+class TestCodexFix4MPrefixFields:
+    """Codex P1 #4: don't drop [SerializeField] private m_foo fields."""
+
+    def test_m_prefixed_user_field_captured(self, tmp_path):
+        """Private serialized fields like ``m_prefab`` / ``m_shootSound``
+        are legitimate inspector-assigned refs. They must land in the
+        output, not be silently filtered as engine-internal.
+        """
+        script_path = tmp_path / "Weapon.cs"
+        prefab_path = tmp_path / "Bullet.prefab"
+        script_path.write_text("")
+        prefab_path.write_text("")
+        guid_index = _StubGuidIndex({
+            "wep_guid": script_path,
+            "pfb_guid": prefab_path,
+        })
+        props = {
+            "m_Script": {"guid": "wep_guid"},
+            "m_bulletPrefab": {"guid": "pfb_guid"},  # user field
+            "m_GameObject": {"guid": "something"},    # engine-internal, must skip
+        }
+        result: dict = {}
+        _process_mono_properties(props, guid_index, result)
+        assert result == {script_path: {"m_bulletPrefab": "Bullet"}}
