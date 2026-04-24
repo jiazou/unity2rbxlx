@@ -850,3 +850,46 @@ Verification: fast suite 663 passed (+11 new Codex-fix tests);
 SimpleFPS smoke unchanged (944 parts / 36 scripts / 50/51
 materials / same 8-script 18-field serialized_field_refs,
 because SimpleFPS uses unprefixed public fields not `m_foo`).
+
+### Cross-script shared-state gap — prompt iteration insufficient (2026-04-24)
+
+Validation of PR 4's dependency-aware context on SimpleFPS showed
+the AI transpiler still emits `character:GetAttribute("hasKey")`
+on the Door side even though:
+
+1. Its scoped prompt includes Player.luau's exported
+   `_G.Player.hasKey = function() return gotKey end`.
+2. Door.cs's C# source literally says
+   `other.GetComponent<Player>().hasKey` — an unambiguous property
+   accessor, no attribute hint anywhere.
+3. PR 4's "cross-script shared state" prompt rule explicitly said
+   to use `require(module).method()` over `GetAttribute`.
+
+A second prompt iteration with prescriptive language + concrete
+WRONG/RIGHT examples was tried and **also failed** — Door.luau
+emerged identical. The AI is picking the Roblox-idiomatic
+attribute-access pattern regardless of prompt wording or source
+structure. Prompt-rule wordsmithing is not sufficient to close
+this gap.
+
+**The fix belongs in a post-transpile linter, not the prompt.**
+Walk every generated `.luau`, find `:GetAttribute("X")` calls with
+no matching `:SetAttribute("X")` anywhere in the corpus AND a
+matching exported getter (`Module.hasX = function() ... end` or
+`_G.Module.hasX = ...`). Then either:
+  (a) auto-rewrite the reader to `require(Module).hasX()` (strict,
+      requires confidence in the detection)
+  (b) emit an UNCONVERTED.md warning so human review catches it
+
+Option (b) is safer for a first-landing; option (a) becomes
+feasible once we have a real test corpus for regression.
+
+**Plan:** new follow-up PR (not in Phase 4's six-PR sequence),
+scoped to shared-state consistency linter. Deferred until after
+PR 5 lands.
+
+**What the prompt rule still does:** worth keeping in the PR 4
+form because it DID influence Player.luau's writer side — the
+post-PR4 Player now exports `_G.Player.hasKey` + sets the init
+attribute, which is half the bridge. Just not enough for Door to
+pick up on its own.
