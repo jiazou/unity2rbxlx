@@ -136,64 +136,104 @@ def transpile_scripts(
         script_type = _classify_script_type(csharp_source, info)
         pending_scripts.append((info, csharp_source, script_type))
 
-    # Phase 2: AI transpilation (concurrent for API, serial for CLI)
+    # Phase 2: AI transpilation — dependency-aware, processed in level order
+    # so each script's prompt can include the already-transpiled Luau of
+    # its direct dependencies (Phase 4.3.1). Within a level scripts have
+    # no dep on each other, so concurrent execution is preserved.
     ai_results: dict[str, tuple[str, float, list[str]]] = {}  # class_name → (luau, confidence, warnings)
+
+    # Map every pending script to its file stem (class name or filename
+    # sans extension) so the dep-graph code has a stable key. Info lookup
+    # lets us recover the original (info, source, script_type) triple.
+    file_sources: dict[str, str] = {}
+    info_by_stem: dict[str, tuple[Any, str, str]] = {}
+    for info, csharp_source, script_type in pending_scripts:
+        stem = info.class_name or info.path.stem
+        if stem in file_sources:
+            # Duplicate class/filename — keep the first. Warn via result.
+            log.debug("Duplicate stem %r; keeping first occurrence", stem)
+            continue
+        file_sources[stem] = csharp_source
+        info_by_stem[stem] = (info, csharp_source, script_type)
+
+    dep_graph, _class_map = _build_dependency_graph(file_sources)
+    dep_levels = _compute_dependency_levels(dep_graph)
+    transpiled_luau: dict[str, str] = {}  # stem → luau, grows across levels
 
     if use_ai and pending_scripts:
         backend = _find_transpiler() if not api_key else "anthropic_api"
 
-        if backend == "anthropic_api" and api_key and len(pending_scripts) > 1:
-            # Concurrent API calls for better throughput
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-            futures = {}
-            with ThreadPoolExecutor(max_workers=min(max_concurrent, len(pending_scripts))) as executor:
-                for info, csharp_source, script_type in pending_scripts:
-                    future = executor.submit(
-                        _ai_transpile,
+        def _transpile_one(stem: str) -> tuple[str, tuple[str, float, list[str]] | None]:
+            triple = info_by_stem.get(stem)
+            if triple is None:
+                return stem, None
+            info, csharp_source, script_type = triple
+            scoped = _build_scoped_context(stem, dep_graph, file_sources, transpiled_luau)
+            context = (
+                f"{project_context}\n\n{scoped}"
+                if scoped else project_context
+            )
+            try:
+                if backend == "claude_cli":
+                    luau, confidence, warnings = _claude_cli_transpile(
+                        csharp_source,
+                        class_name=info.class_name,
+                        script_type=script_type,
+                        project_context=context,
+                    )
+                elif backend == "anthropic_api" and api_key:
+                    luau, confidence, warnings = _ai_transpile(
                         csharp_source, api_key, ANTHROPIC_MODEL,
                         class_name=info.class_name,
                         script_type=script_type,
-                        project_context=project_context,
+                        project_context=context,
                     )
-                    futures[future] = info
-                for future in as_completed(futures):
-                    info = futures[future]
-                    try:
-                        luau, confidence, warnings = future.result()
-                        ai_results[info.class_name or str(info.path)] = (luau, confidence, warnings)
+                else:
+                    return stem, None
+                return stem, (luau, confidence, warnings)
+            except Exception as exc:
+                log.warning("AI transpilation failed for %s: %s",
+                            info.path.name, exc)
+                return stem, None
+
+        can_parallelize = backend == "anthropic_api" and api_key and len(pending_scripts) > 1
+        for level_idx, level_stems in enumerate(dep_levels):
+            if not level_stems:
+                continue
+            log.info("[transpile] Level %d/%d: %d scripts",
+                     level_idx + 1, len(dep_levels), len(level_stems))
+            if can_parallelize and len(level_stems) > 1:
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                with ThreadPoolExecutor(
+                    max_workers=min(max_concurrent, len(level_stems)),
+                ) as executor:
+                    futures = {
+                        executor.submit(_transpile_one, stem): stem
+                        for stem in level_stems
+                    }
+                    for future in as_completed(futures):
+                        stem, outcome = future.result()
+                        if outcome is None:
+                            continue
+                        info = info_by_stem[stem][0]
+                        luau, confidence, warnings = outcome
+                        ai_results[info.class_name or str(info.path)] = outcome
+                        transpiled_luau[stem] = luau
                         result.total_ai += 1
                         log.info("  %s: transpiled via Anthropic API (confidence %.2f)",
                                  info.path.name, confidence)
-                    except Exception as exc:
-                        log.warning("AI transpilation failed for %s: %s",
-                                    info.path.name, exc)
-        else:
-            # Serial transpilation (CLI or single script)
-            for info, csharp_source, script_type in pending_scripts:
-                try:
-                    if backend == "claude_cli":
-                        luau, confidence, warnings = _claude_cli_transpile(
-                            csharp_source,
-                            class_name=info.class_name,
-                            script_type=script_type,
-                            project_context=project_context,
-                        )
-                    elif backend == "anthropic_api" and api_key:
-                        luau, confidence, warnings = _ai_transpile(
-                            csharp_source, api_key, ANTHROPIC_MODEL,
-                            class_name=info.class_name,
-                            script_type=script_type,
-                            project_context=project_context,
-                        )
-                    else:
+            else:
+                for stem in level_stems:
+                    stem_out, outcome = _transpile_one(stem)
+                    if outcome is None:
                         continue
-                    ai_results[info.class_name or str(info.path)] = (luau, confidence, warnings)
+                    info = info_by_stem[stem_out][0]
+                    luau, confidence, warnings = outcome
+                    ai_results[info.class_name or str(info.path)] = outcome
+                    transpiled_luau[stem_out] = luau
                     result.total_ai += 1
                     log.info("  %s: transpiled via %s (confidence %.2f)",
                              info.path.name, backend, confidence)
-                except Exception as exc:
-                    log.warning("AI transpilation failed for %s: %s, falling back to rule-based",
-                                info.path.name, exc)
 
     # Phase 3: Assemble results, falling back to rule-based where AI didn't produce output
     for info, csharp_source, script_type in pending_scripts:
@@ -249,6 +289,170 @@ def transpile_scripts(
         result.total_failed,
     )
     return result
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.3.1 — dependency-aware context
+#
+# The old flow fed every script the same flat "project classes" list. That left
+# the AI blind to sibling scripts' exports, so cross-script state guesses
+# (Door reading ``character:GetAttribute("hasKey")`` while Player keeps a
+# module-local ``gotKey``) silently split into two channels that nothing
+# bridged. See TODO.md "Cross-script shared-state transpilation gap".
+#
+# These helpers build a C#-level dependency graph from the pending script
+# sources, topologically sort it (alphabetical tie-break for determinism),
+# and produce a per-script scoped context that includes every direct
+# dependency's already-transpiled Luau plus 1-hop transitive signatures.
+# ---------------------------------------------------------------------------
+
+
+def _extract_class_names(source: str) -> set[str]:
+    """Return the class/struct/enum/interface names defined in a C# file."""
+    names: set[str] = set()
+    for match in re.finditer(
+        r"(?:public\s+|internal\s+|private\s+)?"
+        r"(?:abstract\s+|static\s+|sealed\s+|partial\s+)*"
+        r"(?:class|struct|enum|interface)\s+(\w+)",
+        source,
+    ):
+        names.add(match.group(1))
+    return names
+
+
+def _extract_references(source: str, all_class_names: set[str]) -> set[str]:
+    """Names from ``all_class_names`` that appear in ``source`` and aren't
+    declared there. Word-boundary match — no string-literal filtering yet
+    (good enough for dependency routing; false positives only mean the AI
+    gets more context than strictly needed).
+    """
+    defined = _extract_class_names(source)
+    refs: set[str] = set()
+    for name in all_class_names - defined:
+        if re.search(rf"\b{re.escape(name)}\b", source):
+            refs.add(name)
+    return refs
+
+
+def _build_dependency_graph(
+    file_sources: dict[str, str],
+) -> tuple[dict[str, set[str]], dict[str, str]]:
+    """Build ``stem -> {stems it depends on}`` + ``class_name -> stem``.
+
+    ``file_sources`` maps file stem (class name / filename-without-ext) to
+    the raw C# source. Self-references are filtered.
+    """
+    class_to_stem: dict[str, str] = {}
+    for stem, source in file_sources.items():
+        for name in _extract_class_names(source):
+            class_to_stem[name] = stem
+
+    all_class_names = set(class_to_stem.keys())
+    graph: dict[str, set[str]] = {stem: set() for stem in file_sources}
+    for stem, source in file_sources.items():
+        for ref_class in _extract_references(source, all_class_names):
+            dep_stem = class_to_stem[ref_class]
+            if dep_stem != stem:
+                graph[stem].add(dep_stem)
+    return graph, class_to_stem
+
+
+def _topological_sort(graph: dict[str, set[str]]) -> list[str]:
+    """Return nodes in dependency order — deps first, cycles broken
+    arbitrarily. Deterministic: iteration order + ``sorted()`` mean the
+    same input always produces the same output.
+    """
+    visited: set[str] = set()
+    on_stack: set[str] = set()
+    order: list[str] = []
+
+    def _visit(node: str) -> None:
+        if node in visited or node in on_stack:
+            return
+        on_stack.add(node)
+        for dep in sorted(graph.get(node, set())):
+            _visit(dep)
+        on_stack.discard(node)
+        visited.add(node)
+        order.append(node)
+
+    for node in sorted(graph):
+        _visit(node)
+    return order
+
+
+def _compute_dependency_levels(
+    graph: dict[str, set[str]],
+) -> list[list[str]]:
+    """Group stems into levels where all of a node's deps land in earlier
+    levels. Scripts in the same level have no dep on each other, so they
+    can run concurrently without starving the dependency-aware prompt.
+    """
+    order = _topological_sort(graph)
+    level_of: dict[str, int] = {}
+    for stem in order:
+        deps = graph.get(stem, set())
+        if not deps:
+            level_of[stem] = 0
+        else:
+            level_of[stem] = max(
+                (level_of[d] for d in deps if d in level_of), default=-1,
+            ) + 1
+
+    levels: dict[int, list[str]] = {}
+    for stem, lvl in level_of.items():
+        levels.setdefault(lvl, []).append(stem)
+    # Sort within level for deterministic ordering; level 0 first.
+    return [sorted(levels[k]) for k in sorted(levels)]
+
+
+def _build_scoped_context(
+    stem: str,
+    graph: dict[str, set[str]],
+    file_sources: dict[str, str],
+    transpiled_luau: dict[str, str],
+) -> str:
+    """Scoped prompt context: direct deps' Luau + 1-hop transitive sigs.
+
+    Direct deps get their already-transpiled Luau inline (so the AI can
+    see method signatures and call them with ``require()``). Transitive
+    deps get a class/method summary only — full source would blow the
+    context window on projects with hundreds of scripts.
+    """
+    direct = graph.get(stem, set())
+    transitive: set[str] = set()
+    for dep in direct:
+        transitive |= graph.get(dep, set())
+    transitive -= direct
+    transitive.discard(stem)
+
+    parts: list[str] = []
+    for dep in sorted(direct):
+        if dep in transpiled_luau:
+            parts.append(
+                f"--- Already-transpiled dependency: {dep}.luau ---\n"
+                f"```luau\n{transpiled_luau[dep]}\n```"
+            )
+        elif dep in file_sources:
+            parts.append(
+                f"--- Dependency (not yet transpiled): {dep}.cs ---\n"
+                f"```csharp\n{file_sources[dep]}\n```"
+            )
+
+    for dep in sorted(transitive):
+        source = file_sources.get(dep)
+        if not source:
+            continue
+        classes = re.findall(r"(?:public\s+)?(?:abstract\s+)?(?:static\s+)?class\s+(\w+)", source)
+        methods = re.findall(r"public\s+(?:static\s+)?[\w<>\[\]]+\s+(\w+)\s*\(", source)
+        if classes or methods:
+            class_str = ", ".join(dict.fromkeys(classes)) if classes else dep
+            method_str = ", ".join(dict.fromkeys(methods)) if methods else "none"
+            parts.append(
+                f"--- Transitive ref: {dep} (classes: {class_str}; public methods: {method_str}) ---"
+            )
+
+    return "\n\n".join(parts)
 
 
 def _build_project_context(script_infos: list[Any]) -> str:
@@ -1049,6 +1253,31 @@ Events & Communication:
 - `StartCoroutine(Func())` → `task.spawn(Func)`
 - `yield return new WaitForSeconds(n)` → `task.wait(n)`
 - `yield return null` → `task.wait()`
+
+Cross-script shared state (CRITICAL — avoids silent split-state bugs):
+- When a dependency you see in the provided context exports a getter
+  (e.g. `Player.hasKey = function() return gotKey end`), call it via
+  `require(script.Parent.Player).hasKey()` — do NOT guess
+  `character:GetAttribute("hasKey")`. Attribute reads with no matching
+  writer elsewhere in the project produce silent nil/false values that
+  never update.
+- Only use `:GetAttribute`/`:SetAttribute` for state the CURRENT script
+  owns and writes on the same instance. Cross-script queries go through
+  a ModuleScript method.
+- If you must expose shared boolean state via attributes, write it on
+  BOTH the owning-script side (every assignment site) AND the consumer
+  side. Never one without the other.
+
+Unconverted methods (when a C# method has no faithful Luau translation):
+- Emit a stub Luau function with `-- UNCONVERTED: <short reason>` as the
+  body. Do NOT silently drop methods. Reasons: reflection, unsafe code,
+  editor-only APIs, or genuinely no Roblox equivalent.
+- Example: `function MyClass:TakeScreenshot()\n  -- UNCONVERTED: Application.CaptureScreenshot has no Roblox equivalent\nend`
+
+Property metamethods (C# auto-properties with side-effect getters/setters):
+- When the C# property does non-trivial work in `get`/`set`, emit
+  `__index`/`__newindex` metamethods on the backing table — NOT plain
+  field aliases. Plain aliases lose the side effect at call time.
 
 Networking (for multiplayer Unity games):
 - `[Command]` methods → `RemoteEvent:FireServer()`

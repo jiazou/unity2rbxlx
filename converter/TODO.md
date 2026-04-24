@@ -697,3 +697,95 @@ bug even when the AI gets it wrong.
 Action: address in PR 4 via 4.3.1 dependency-aware prompt +
 explicit shared-state rule. The linter is a nice add but not
 load-bearing if the prompt fix lands.
+
+### PR 4 — 4.3 code_transpiler + 4.9 serialized_field_extractor
+
+Audit shrank scope from the plan's ~330-line estimate to ~130 by
+dropping 4.3.2 C# pattern warnings (diagnostics only; AI handles
+LINQ / networking / async fine) and leaving 4.3.4 LocalScript
+classification as-is (dest's default-to-Script semantically
+matches its bootstrap architecture). 4.3.5 inline-policy was
+already implicit in the prompt.
+
+- **4.3.1 Dependency-aware context (the PR 3 shared-state fix).**
+  Ported `_extract_class_names`, `_extract_references`,
+  `_build_dependency_graph`, `_topological_sort` (alphabetical
+  tie-break for determinism), `_compute_dependency_levels`, and
+  `_build_scoped_context` into `code_transpiler.py`. Refactored
+  `transpile_scripts()` to process pending scripts in dependency
+  order, accumulating a `transpiled_luau: dict[stem, str]` as it
+  goes. Each script's AI prompt now receives its direct deps'
+  already-transpiled Luau inline (or the raw C# when a dep hasn't
+  been processed yet), plus 1-hop transitive class+method
+  signatures. Scripts at the same topological level run
+  concurrently via `ThreadPoolExecutor` so the API backend keeps
+  its parallelism.
+- **4.3.3 Prompt rules.** Added three sections to the AI system
+  prompt:
+    * "Cross-script shared state" — explicit rule: when a
+      dependency exports a getter, call it via
+      `require(module).method()` rather than guessing
+      `character:GetAttribute`. Attribute reads with no matching
+      writer produce silent nil values. This is the Door/Player
+      bug's direct fix.
+    * "Unconverted methods" — emit a stub Luau function with a
+      `-- UNCONVERTED: <reason>` body, never silently drop.
+      Sets up PR 6's 4.4 diagnostics pass.
+    * "Property metamethods" — use `__index`/`__newindex` when a
+      C# property has a non-trivial getter/setter, rather than
+      plain aliases.
+- **4.9 serialized_field_extractor.** New module
+  `converter/converter/serialized_field_extractor.py` (~130 loc)
+  walks scene + prefab MonoBehaviour components, resolves each
+  `m_Script` GUID to its `.cs`, and collects non-internal fields
+  whose values reference a `.prefab` or audio asset. Output:
+  `{cs_path: {field: prefab_name_or_audio_ref}}`. Feeds the AI
+  transpiler (it can now see `Player.riflePrefab → Rifle`) and
+  PR 5's `generate_prefab_packages` (which needs the list of
+  prefabs actually referenced by scripts).
+- **Pipeline wiring.** New `ConversionContext.serialized_field_refs`
+  dict persisted into `conversion_context.json`. Call site lives
+  at the tail of `extract_assets`; eagerly parses the prefab
+  library when lazy-loading hasn't happened yet so the first
+  extraction sees prefab MonoBehaviours (not just scene ones).
+
+Tests (31 new):
+- `tests/test_transpiler_dependency.py` — 13 cases covering
+  class-name extraction (modifiers, multiple decls, interfaces),
+  reference word-boundary matching, dependency graph
+  (Player→Door example), deterministic topo sort, cycle handling,
+  dependency levels (diamond + linear), scoped context (Luau
+  wins over C# when available).
+- `tests/test_serialized_field_extractor.py` — 14 cases covering
+  object-ref validity, mono-property processing (prefab ref,
+  audio ref, internal-prop skip, first-binding-wins, non-.cs
+  scripts), full extraction across scene + prefab library,
+  missing prefab_library and guid_index, path-relative
+  serialization.
+
+Verification:
+- Fast suite 652 passed (+31 new), 2 skipped, 25 deselected.
+- SimpleFPS convert (`--no-upload --no-ai --no-resolve`) produces
+  same 944 parts / 36 scripts / 50/51 materials / 7 anim scripts
+  as PR 3 baseline. `conversion_context.json` now carries 8
+  scripts of serialized_field_refs (18 fields total), e.g.
+  `Assets/Scripts/Player.cs: riflePrefab -> Rifle`,
+  `Assets/Scripts/HostilePlane.cs: shootSound -> audio:…`,
+  `Assets/Scripts/Mine.cs: explosion -> Explosion`.
+- Dependency-aware context: `[transpile_scripts] Built
+  dependency map: 9 scripts with 11 cross-references` during
+  rule-based path. AI path validation deferred to the next full
+  `--upload` run.
+
+Deferred to follow-ups:
+- 4.3.2 C# pattern warnings — skipped this PR; AI path handles
+  them fine. Revisit when pre-flight diagnostics become a UX
+  pain point.
+- 4.3.4 `_classify_script_type` harmonization — dest's
+  default-to-Script semantically fits. Revisit if a project
+  ships cross-classified scripts that need source's
+  default-to-ModuleScript behavior.
+- The shared-state prompt rule's efficacy — needs a full
+  `--upload` conversion to validate that Door.luau now uses
+  `require(Player).hasKey()` instead of GetAttribute. Manual
+  spot-check in PR 4 validation or wait for eval-diff run.
