@@ -28,16 +28,27 @@ if [ ! -f "$ALLOWLIST_FILE" ]; then
   exit 2
 fi
 
+# Verify $BASE is reachable. If checkout fetch-depth is too small or the base
+# ref was never fetched, fail loudly here — silently passing the gate when
+# the diff can't be computed is exactly the failure mode we don't want.
+if ! (cd "$REPO_ROOT" && git rev-parse --verify --quiet "$BASE" >/dev/null); then
+  echo "ERROR: base ref '$BASE' not reachable locally." >&2
+  echo "Fetch it before running the gate, e.g.:" >&2
+  echo "  git fetch origin '${BASE#origin/}' --depth=200" >&2
+  exit 2
+fi
+
 # Build the allowed-files set (paths only, strip the | reason).
 allowed_paths=$(grep -v '^\s*#' "$ALLOWLIST_FILE" | grep -v '^\s*$' | awk -F' \\| ' '{print $1}' | sed 's/[[:space:]]*$//')
 
 # Get the diff. Only added lines (start with `+`, not `+++`).
 # Restrict to .py files in core/, converter/, unity/, roblox/ under converter/.
+# No `|| true` here — if git diff itself errors, we want the gate to fail.
 diff_output=$(cd "$REPO_ROOT" && git diff "$BASE"...HEAD --unified=0 -- \
   ':(glob)converter/core/**/*.py' \
   ':(glob)converter/converter/**/*.py' \
   ':(glob)converter/unity/**/*.py' \
-  ':(glob)converter/roblox/**/*.py' 2>/dev/null || true)
+  ':(glob)converter/roblox/**/*.py')
 
 if [ -z "$diff_output" ]; then
   echo "no-any-gate: no relevant Python changes in diff."
@@ -74,8 +85,9 @@ violations=$(echo "$diff_output" | awk '
     if (line ~ /^[ \t]*from[ \t]+typing[ \t]+import/) next
     if (line ~ /^[ \t]*import[ \t]+typing/) next
 
-    # Match Any with word boundary on both sides, in annotation contexts.
-    if (match(line, /(:[ \t]*|->[ \t]*|\[[ \t]*|,[ \t]*|\|[ \t]*)Any([ \t]*[],|)>:]|[ \t]*$)/)) {
+    # Match Any (or typing.Any) with annotation-context delimiter on the
+    # left side and a permitted token on the right.
+    if (match(line, /(:[ \t]*|->[ \t]*|\[[ \t]*|,[ \t]*|\|[ \t]*)(typing\.)?Any([ \t]*[],|)>:]|[ \t]*$)/)) {
       print file ": " line
     }
   }

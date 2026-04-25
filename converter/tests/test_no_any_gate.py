@@ -224,6 +224,39 @@ def test_bonus_list_any_fails(tmp_path: Path) -> None:
     assert "list[Any]" in (result.stderr + result.stdout)
 
 
+# ---------- Bonus: `typing.Any` is flagged (regression for codex P1) ----------
+
+def test_bonus_typing_dot_any_fails(tmp_path: Path) -> None:
+    """Don't let `typing.Any` slip past the bare-token regex."""
+    repo = _make_repo_with_baseline(tmp_path)
+    _commit_change(repo, "feat-typing-any", {
+        "converter/converter/new_module.py": (
+            "import typing\n"
+            "def f(scene: typing.Any) -> None:\n"
+            "    pass\n"
+        ),
+    })
+    result = _run_gate(repo)
+    assert result.returncode == 1
+    assert "typing.Any" in (result.stderr + result.stdout)
+
+
+# ---------- Bonus: missing base ref fails loudly (regression for codex P1) ----------
+
+def test_bonus_missing_base_ref_fails_loudly(tmp_path: Path) -> None:
+    """If the base ref isn't reachable, the gate must fail with a clear error,
+    not silently exit 0 because git diff returned nothing."""
+    repo = _make_repo_with_baseline(tmp_path)
+    _commit_change(repo, "feat-needs-base", {
+        "converter/converter/new_module.py": (
+            "def process(name: str) -> str:\n    return name\n"
+        ),
+    })
+    result = _run_gate(repo, base="origin/never-fetched")
+    assert result.returncode == 2
+    assert "not reachable" in (result.stderr + result.stdout)
+
+
 # ---------- Bonus: `Any` as a word inside identifiers is not flagged ----------
 
 def test_bonus_word_in_identifier_not_flagged(tmp_path: Path) -> None:

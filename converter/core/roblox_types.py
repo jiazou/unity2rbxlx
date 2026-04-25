@@ -12,8 +12,10 @@ ScriptType = Literal["Script", "LocalScript", "ModuleScript"]
 
 # Roblox Attribute values support a known finite scalar set. Anything richer
 # (Vector3, Color3, etc.) is stored on its dedicated typed field, not here.
-# The rbxlx writer's _encode_attributes serializer matches this exact set.
-RbxAttrValue = str | int | float | bool | None
+# The rbxlx writer's _encode_attributes serializer matches this exact set —
+# do not add None here without extending the encoder, or the serializer will
+# count an entry in the length prefix and emit no payload.
+RbxAttrValue = str | int | float | bool
 
 
 @dataclass
