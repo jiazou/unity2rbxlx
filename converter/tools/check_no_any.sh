@@ -76,6 +76,19 @@ violations=$(echo "$diff_output" | awk '
   }
   /^\+/ && !/^\+\+\+/ {
     line=substr($0, 2)
+
+    # Stringized-annotation check (PEP 563 / `from __future__ import annotations`):
+    # `x: "Any"` and `x: 'typing.Any'` are real annotations to Python but are
+    # erased by the string-stripping pass below. Catch them on the original
+    # line BEFORE stripping. Narrow false-positive risk: strings whose
+    # content directly contains `:"Any"` or `:'Any'` (with optional whitespace
+    # between `:` and the quote) would also flag — rare in practice and a
+    # rephrase resolves it.
+    if (match(line, /(:[ \t]*|->[ \t]*|\[[ \t]*|,[ \t]*|\|[ \t]*)["\x27](typing\.)?Any["\x27]/)) {
+      print file ": " line "  [forbidden: stringized Any annotation]"
+      next
+    }
+
     # Strip single-line string literals (both quote styles) so that string
     # content matching the annotation regex does not false-positive. Does
     # not handle triple-quoted multiline docstrings; a line inside one that

@@ -386,6 +386,49 @@ def test_bonus_unrelated_typing_import_alias_passes(tmp_path: Path) -> None:
     assert result.returncode == 0, f"unexpected fail: {result.stdout}\n{result.stderr}"
 
 
+# ---------- Bonus: stringized annotations are blocked (codex round 5 P1) ----------
+
+def test_bonus_stringized_any_annotation_fails(tmp_path: Path) -> None:
+    """`x: "Any"` is a real annotation under PEP 563. Block it."""
+    repo = _make_repo_with_baseline(tmp_path)
+    _commit_change(repo, "feat-stringized-any", {
+        "converter/converter/new_module.py": (
+            'from __future__ import annotations\n'
+            'def f(x: "Any") -> None:\n'
+            '    pass\n'
+        ),
+    })
+    result = _run_gate(repo)
+    assert result.returncode == 1
+    assert "stringized Any annotation" in (result.stderr + result.stdout)
+
+
+def test_bonus_stringized_typing_any_fails(tmp_path: Path) -> None:
+    """`x: 'typing.Any'` should also be blocked."""
+    repo = _make_repo_with_baseline(tmp_path)
+    _commit_change(repo, "feat-stringized-typing-any", {
+        "converter/converter/new_module.py": (
+            'from __future__ import annotations\n'
+            "def f(x: 'typing.Any') -> None:\n"
+            '    pass\n'
+        ),
+    })
+    result = _run_gate(repo)
+    assert result.returncode == 1
+    assert "stringized" in (result.stderr + result.stdout)
+
+
+def test_bonus_stringized_any_in_field_fails(tmp_path: Path) -> None:
+    repo = _make_repo_with_baseline(tmp_path)
+    _commit_change(repo, "feat-stringized-field", {
+        "converter/converter/new_module.py": (
+            'value: "Any" = None\n'
+        ),
+    })
+    result = _run_gate(repo)
+    assert result.returncode == 1
+
+
 # ---------- Bonus: missing base ref fails loudly (regression for codex P1) ----------
 
 def test_bonus_missing_base_ref_fails_loudly(tmp_path: Path) -> None:
