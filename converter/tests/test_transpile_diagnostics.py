@@ -266,3 +266,108 @@ class TestCodexFix3CollisionHooksExempt:
         """
         # All exempt → no warnings even with empty Luau.
         assert check_method_completeness(cs, "local x = 1") == []
+
+
+class TestCodexFix1FollowupCallSites:
+    """Codex fix #1 regressed: loosened regex now matches method CALLS
+    inside property getters / statement RHS as declarations (found via
+    SimpleFPS smoke — ``return GetComponent<X>();`` in a property body
+    flagged GetComponent as a missing method). Filter by scanning the
+    preceding ``return type`` region for statement-starter keywords.
+    """
+
+    def test_return_getcomponent_in_property_not_captured(self):
+        """Classic Unity property-getter pattern that tripped the first
+        Codex-fix-#1 attempt.
+        """
+        cs = """
+        public class C {
+            private AudioSource source {
+                get { return GetComponent<AudioSource>(); }
+            }
+            public void Real() {}
+        }
+        """
+        luau = "function C:Real() end\n"
+        warnings = check_method_completeness(cs, luau)
+        names = [w.split("'")[1] for w in warnings]
+        assert "GetComponent" not in names
+        assert "Real" not in names  # Real IS in Luau
+
+    def test_new_constructor_call_not_captured(self):
+        """``x = new Widget(a, b)`` isn't a method declaration."""
+        cs = """
+        public class C {
+            public void Build() { var w = new Widget(1, 2); }
+        }
+        """
+        luau = "function C:Build() end\n"
+        warnings = check_method_completeness(cs, luau)
+        names = [w.split("'")[1] for w in warnings]
+        assert "Widget" not in names
+
+    def test_throw_new_exception_not_captured(self):
+        cs = """
+        public class C {
+            public void Guard() { if (x) throw new InvalidOperationException(); }
+        }
+        """
+        luau = "function C:Guard() end\n"
+        warnings = check_method_completeness(cs, luau)
+        names = [w.split("'")[1] for w in warnings]
+        assert "InvalidOperationException" not in names
+
+    def test_real_method_still_captured(self):
+        """Make sure the filter doesn't over-apply — a legitimate method
+        after a ``return`` (e.g. the same keyword in another scope) still
+        lands.
+        """
+        cs = """
+        public class C {
+            public void One() { return; }
+            public IEnumerator Two() { yield return null; }
+            public void Three() {}
+        }
+        """
+        # Luau has One + Three, missing Two — Two SHOULD be flagged.
+        luau = "function C:One() end\nfunction C:Three() end\n"
+        names = [w.split("'")[1]
+                 for w in check_method_completeness(cs, luau)]
+        # Two should be missing; One and Three not.
+        assert "Two" in names
+        assert "One" not in names
+        assert "Three" not in names
+
+
+class TestCaseInsensitiveLuauMatch:
+    """The AI transpiler camelCases PascalCase C# methods (Luau
+    convention). The diagnostic must not flag ``Shoot``/``TakeDamage``
+    as missing when the Luau defines them as ``shoot``/``takeDamage``.
+    """
+
+    def test_pascal_to_camel_matches(self):
+        cs = """
+        public class P {
+            public void Shoot() {}
+            public void TakeDamage() {}
+            public void GetItem() {}
+        }
+        """
+        luau = """
+        local function shoot() end
+        local function takeDamage() end
+        local function getItem() end
+        """
+        assert check_method_completeness(cs, luau) == []
+
+    def test_camel_to_pascal_still_matches(self):
+        """Works the other way too (defensive)."""
+        cs = "public class P { public void foo() {} }"
+        luau = "function P:Foo() end"
+        assert check_method_completeness(cs, luau) == []
+
+    def test_unconverted_comment_case_insensitive(self):
+        """Case-insensitivity extends to UNCONVERTED comment matches."""
+        cs = "public class P { public void DoThing() {} }"
+        luau = "-- UNCONVERTED: doThing has no Roblox equivalent\n"
+        assert check_method_completeness(cs, luau) == []

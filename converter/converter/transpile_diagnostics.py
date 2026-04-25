@@ -63,6 +63,17 @@ _CSHARP_KEYWORD_NAMES: frozenset[str] = frozenset({
 })
 
 
+# Statement-starter keywords that mean "what follows is an expression,
+# not a declaration." If one of these appears in the text between the
+# matched statement boundary and the captured method name, the match
+# is almost certainly a method CALL in RHS (e.g. ``return
+# GetComponent<X>();`` inside a property body) rather than a
+# definition. Filter those out.
+_CALL_SITE_PRECEDING_KEYWORDS = re.compile(
+    r"\b(?:return|throw|yield|await|new)\b"
+)
+
+
 # Luau function definition forms — both `function`-keyword declarations
 # and assignment-style exports. The repo's transpiled scripts use both:
 #   function Class:Method(...)
@@ -151,18 +162,34 @@ def check_method_completeness(
             continue
         if name in _LIFECYCLE_EXEMPT:
             continue
+        # Filter method CALLS misread as declarations. In
+        # ``return GetComponent<X>();`` the regex sees ``return`` as
+        # return-type and ``GetComponent`` as the method name.
+        # Scanning the text between the statement boundary and the
+        # captured name for statement-starter keywords catches this.
+        pre = clean_cs[match.start():match.start(1)]
+        if _CALL_SITE_PRECEDING_KEYWORDS.search(pre):
+            continue
         csharp_methods.add(name)
     if not csharp_methods:
         return []
 
+    # Collect Luau function names case-insensitively. The AI transpiler
+    # routinely applies Luau conventions (camelCase) to methods that
+    # were PascalCase in C# — ``Shoot`` becomes ``shoot``. That's a
+    # naming transform, not a drop. Matching case-insensitively avoids
+    # flooding the report with "missing" methods that are actually
+    # present under their camelCase sibling.
     luau_functions: set[str] = set()
     for pat in _LUAU_FUNC_FORMS:
         for match in pat.finditer(luau_source):
-            luau_functions.add(match.group(1))
+            luau_functions.add(match.group(1).lower())
 
     # Methods that the AI explicitly marked as unconverted via comment.
     # Accept both `-- UNCONVERTED: foo` and `-- TODO: foo` idioms.
-    commented: set[str] = set()
+    # Match case-insensitively so the AI's camelCase comment refs line
+    # up with PascalCase C# method names.
+    commented_ci: set[str] = set()
     for line in luau_source.splitlines():
         stripped = line.strip()
         if not stripped.startswith("--"):
@@ -170,11 +197,15 @@ def check_method_completeness(
         upper = stripped.upper()
         if "UNCONVERTED" not in upper and "TODO" not in upper:
             continue
+        lower_line = stripped.lower()
         for method in csharp_methods:
-            if method in stripped:
-                commented.add(method)
+            if method.lower() in lower_line:
+                commented_ci.add(method.lower())
 
-    missing = sorted(csharp_methods - luau_functions - commented)
+    missing = sorted(
+        m for m in csharp_methods
+        if m.lower() not in luau_functions and m.lower() not in commented_ci
+    )
     return [
         f"[{source_name}] C# method '{m}' missing from Luau output "
         f"(neither a function definition nor an UNCONVERTED / TODO comment)"

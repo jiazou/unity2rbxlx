@@ -1086,3 +1086,39 @@ Tests (+12 new):
 Verification: fast suite 705 passed (+12); SimpleFPS smoke
 unchanged (944 parts / 36 scripts / 50/51 materials / 0
 method_completeness_warnings as expected for `--no-ai`).
+
+### PR 6 — post-Codex, post-AI-smoke follow-ups (2026-04-25)
+
+Validated PR 6's diagnostic by running a partial convert on
+output/SimpleFPS_full (AI transpile cache hit, 10s). Initial
+pass surfaced **37 method_completeness_warnings** across 14
+scripts — but inspection showed all 37 were false positives or
+case-mismatch noise. Two additional fixes:
+
+- **Call-site filter.** The loosened regex from Codex fix #1
+  matched `return GetComponent<X>()` inside property getters as
+  declarations (`return`=return-type, `GetComponent`=name). Added
+  `_CALL_SITE_PRECEDING_KEYWORDS` regex that scans the text
+  between the matched statement boundary and the captured name
+  for `return`/`throw`/`yield`/`await`/`new` — if any appears,
+  drop the match (it's an expression, not a declaration).
+  Dropped 8 false positives including all 6 `GetComponent` hits
+  + 1 `GameObject` + 1 other.
+- **Case-insensitive Luau match.** AI transpiler routinely applies
+  Luau camelCase conventions to PascalCase C# methods — `Shoot`
+  becomes `shoot`, `TakeDamage` becomes `takeDamage`. Matching
+  case-insensitively (both on function-definition recognition
+  AND `-- UNCONVERTED` comment names) cuts the remaining 28
+  naming-convention false positives.
+
+Final verification: 33 tests pass in
+`tests/test_transpile_diagnostics.py` (+7 new: call-site filter
+covers return/new/throw cases, real methods past `return` still
+captured, case-insensitive match covers camelCase + reversal +
+UNCONVERTED comments). SimpleFPS full AI-convert report surfaces
+**exactly 1 method_completeness_warning** — `HudControl.cs:
+PauseMenu`, a real signal where the AI renamed the method to
+`pauseMenuHandler` to avoid clashing with a local variable of
+the same name. Human-actionable, not noise.
+
+Signal-to-noise went from 0/37 → 1/1.
