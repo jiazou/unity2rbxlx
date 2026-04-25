@@ -30,36 +30,83 @@ _CSHARP_COMMENT_OR_STRING = re.compile(
     re.DOTALL | re.VERBOSE,
 )
 
-# C# method: any access modifier + return type + identifier + ``(``.
-# The outer-most capture group is the method name.
+# C# method declaration. Must come right after a statement boundary
+# (start-of-source, ``;``, ``{``, or ``}``) so we don't match identifiers
+# inside expressions. Modifiers are optional — default-private methods
+# inside a class (``void Helper()``, ``IEnumerator Run()``) qualify too.
+# Method-level generics (``TOut Map<TIn>(...)``) are recognized via the
+# trailing ``<...>`` after the captured name. The outer-most capture
+# group is the method name.
 _CSHARP_METHOD_RE = re.compile(
-    r"(?:public|private|protected|internal|static|override|virtual|abstract|async|sealed"
-    r"|new|partial)\s+"
-    r"(?:(?:public|private|protected|internal|static|override|virtual|abstract|async|sealed"
-    r"|new|partial)\s+)*"
-    r"[\w<>\[\],\s]+?\s+(\w+)\s*\(",
+    r"(?:^|[;{}])\s*"
+    r"(?:\[[^\]]*\]\s*)*"
+    r"(?:(?:public|private|protected|internal|static|override|virtual"
+    r"|abstract|async|sealed|new|partial|extern|unsafe|readonly|volatile)\s+)*"
+    r"(?:[\w]+(?:<[^()<>]*>)?(?:\[\])?\??)\s+"
+    r"(\w+)"
+    r"\s*(?:<[\w,\s]*>)?"
+    r"\s*\(",
     re.MULTILINE,
 )
 
-# Luau function definition forms we recognize:
+
+# C# keywords that look method-shaped but aren't (control flow,
+# language constructs). When the regex captures one of these as a
+# "method name", drop it.
+_CSHARP_KEYWORD_NAMES: frozenset[str] = frozenset({
+    "if", "for", "while", "return", "using", "switch", "do", "catch",
+    "else", "foreach", "lock", "try", "throw", "yield", "new",
+    "ref", "out", "in", "is", "as", "case", "break", "continue",
+    "goto", "default", "fixed", "checked", "unchecked", "where",
+    "typeof", "sizeof", "stackalloc", "delegate", "operator",
+    "void", "var",
+})
+
+
+# Luau function definition forms — both `function`-keyword declarations
+# and assignment-style exports. The repo's transpiled scripts use both:
 #   function Class:Method(...)
 #   function Class.Method(...)
 #   function name(...)
 #   local function name(...)
-_LUAU_FUNC_RE = re.compile(
-    r"function\s+(?:\w+[.:])?([\w]+)\s*\(",
-    re.MULTILINE,
+#   Class.method = function(...)
+#   Class:method = function(...)
+#   _G.Class.method = function(...)
+#   bare `name = function(...)` at module top
+_LUAU_FUNC_FORMS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bfunction\s+(?:[\w.]+[.:])?(\w+)\s*\(", re.MULTILINE),
+    re.compile(r"(?:^|[;{}\s])(?:[\w.]+\.)?(\w+)\s*=\s*function\s*\(", re.MULTILINE),
 )
 
 
-# Unity lifecycle hooks that the transpiler intentionally lowers into
-# top-level code / Heartbeat connections rather than named functions.
-# Exempt them from missing-method warnings so we don't flood the report.
+# Unity lifecycle hooks + event-style hooks that the transpiler
+# idiomatically lowers into top-level code, RunService connections,
+# or part.Touched / part.MouseClick:Connect listeners — never named
+# Luau functions. Exempt so check_method_completeness doesn't yell
+# at correctly-converted scripts.
+#
+# See ``api_mappings.LIFECYCLE_MAP`` for the complete set the
+# transpiler rewrites; the entries below are the ones that survive
+# the regex (i.e. use a method-style C# declaration).
 _LIFECYCLE_EXEMPT: frozenset[str] = frozenset({
+    # Frame / start hooks (top-level / RunService.Heartbeat)
     "Awake", "Start", "Update", "FixedUpdate", "LateUpdate",
     "OnEnable", "OnDisable", "OnDestroy", "OnApplicationQuit",
     "OnValidate", "OnDrawGizmos", "OnDrawGizmosSelected",
     "Reset", "OnGUI", "Main",
+    # Collider hooks → part.Touched / TouchEnded
+    "OnCollisionEnter", "OnCollisionStay", "OnCollisionExit",
+    "OnTriggerEnter", "OnTriggerStay", "OnTriggerExit",
+    "OnCollisionEnter2D", "OnCollisionStay2D", "OnCollisionExit2D",
+    "OnTriggerEnter2D", "OnTriggerStay2D", "OnTriggerExit2D",
+    # Mouse hooks → ClickDetector / MouseButton1Click
+    "OnMouseDown", "OnMouseUp", "OnMouseEnter", "OnMouseExit",
+    "OnMouseOver", "OnMouseDrag", "OnMouseUpAsButton",
+    # Application / focus
+    "OnApplicationFocus", "OnApplicationPause",
+    # Particle / animator events
+    "OnParticleCollision", "OnParticleTrigger",
+    "OnAnimatorIK", "OnAnimatorMove",
 })
 
 
@@ -96,6 +143,12 @@ def check_method_completeness(
     csharp_methods: set[str] = set()
     for match in _CSHARP_METHOD_RE.finditer(clean_cs):
         name = match.group(1)
+        # Drop control-flow keywords the regex incidentally captures
+        # (``if (cond)`` looks like ``<type> if(...)`` to the engine
+        # without context). Drop ``void`` / ``var`` / etc. too —
+        # those are return-type tokens, never method names.
+        if name in _CSHARP_KEYWORD_NAMES:
+            continue
         if name in _LIFECYCLE_EXEMPT:
             continue
         csharp_methods.add(name)
@@ -103,8 +156,9 @@ def check_method_completeness(
         return []
 
     luau_functions: set[str] = set()
-    for match in _LUAU_FUNC_RE.finditer(luau_source):
-        luau_functions.add(match.group(1))
+    for pat in _LUAU_FUNC_FORMS:
+        for match in pat.finditer(luau_source):
+            luau_functions.add(match.group(1))
 
     # Methods that the AI explicitly marked as unconverted via comment.
     # Accept both `-- UNCONVERTED: foo` and `-- TODO: foo` idioms.

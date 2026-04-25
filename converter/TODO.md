@@ -1043,3 +1043,46 @@ Deferred to follow-up PRs (post-Phase-4):
 - Prefab-scoped animator controller GUID aggregation (PR 2a
   follow-up).
 - Sub-mesh identity (`mesh_file_id`) in vertex-color baking.
+
+### PR 6 — Codex review follow-ups (2026-04-25)
+
+Codex flagged 2 P1 + 1 P2 in PR 6's diagnostic. GATE was FAIL.
+All real and addressed before the PR landed.
+
+- **Fix #1 (Codex P1) — default-private + generic methods missed.**
+  The C# regex required an explicit access modifier; `void Helper()`,
+  `IEnumerator Run()`, `public TOut Map<TIn>(...)` slipped through.
+  Loosened the regex to make modifiers optional, anchored on
+  statement boundaries (`^|;|{|}`), and added a keyword filter
+  (`if`/`for`/`while`/`return`/`void`/`var`/etc.) so control-flow
+  statements don't get captured as methods. Generic method-name
+  parameters (`Map<TIn, TOut>(...)`) now recognized via the trailing
+  `<...>` pattern after the captured name.
+- **Fix #2 (Codex P1) — assignment-style Luau exports false-positived.**
+  The Luau regex only saw `function Foo:Bar()` / `function Foo.Bar()`.
+  Repo emits `_G.Player.hasKey = function() ... end` (assignment form,
+  used by Player.luau under PR 4's dep-aware context). The diagnostic
+  was claiming `hasKey` missing even when correctly emitted. Added a
+  second regex capturing `(?:[\w.]+\.)?(\w+)\s*=\s*function\s*\(`,
+  unioned with the existing `function`-keyword forms.
+- **Fix #3 (Codex P2) — collision/trigger/mouse hooks not exempt.**
+  Unity callbacks `OnCollisionEnter`/`OnCollisionStay`/`OnCollisionExit`,
+  `OnTriggerEnter`/`OnTriggerStay`/`OnTriggerExit` (1D + 2D variants),
+  `OnMouseDown`/`OnMouseUp`/`OnMouseEnter`/`OnMouseExit`/`OnMouseOver`/
+  `OnMouseDrag`/`OnMouseUpAsButton`, plus particle/animator events
+  (`OnParticleCollision`, `OnAnimatorIK`, etc.) get rewritten to
+  `part.Touched:Connect(...)` / `MouseClick:Connect(...)` —
+  no named function survives. All added to `_LIFECYCLE_EXEMPT`.
+
+Tests (+12 new):
+- `TestCodexFix1NoModifierMethods`: default-private void/IEnumerator
+  capture, generic method capture, void/var keyword filtering,
+  control-flow keyword filtering.
+- `TestCodexFix2AssignmentLuauForms`: dotted, _G-prefixed, bare,
+  and function-keyword forms all recognized as definitions.
+- `TestCodexFix3CollisionHooksExempt`: 1D/2D collision + trigger
+  + mouse + on-application hooks all silent.
+
+Verification: fast suite 705 passed (+12); SimpleFPS smoke
+unchanged (944 parts / 36 scripts / 50/51 materials / 0
+method_completeness_warnings as expected for `--no-ai`).

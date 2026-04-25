@@ -130,3 +130,139 @@ class TestCheckMethodCompleteness:
         luau = "-- nothing"
         w = check_method_completeness(cs, luau, source_name="MyScript.cs")
         assert "[MyScript.cs]" in w[0]
+
+
+class TestCodexFix1NoModifierMethods:
+    """P1: regex used to require an access modifier; default-private +
+    generic methods slipped through. Loosened regex catches them.
+    """
+
+    def test_default_private_method_captured(self):
+        cs = "public class Foo { void Helper() {} public void Used() {} }"
+        # Luau has Used; Helper is missing.
+        luau = "function Foo:Used() end\n"
+        warnings = check_method_completeness(cs, luau)
+        names = [w.split("'")[1] for w in warnings]
+        assert "Helper" in names
+
+    def test_ienumerator_return_type_captured(self):
+        """``IEnumerator Run()`` is a default-private coroutine — caught."""
+        cs = """
+        public class C {
+            IEnumerator Run() { yield return null; }
+            public void Other() {}
+        }
+        """
+        luau = "function C:Other() end\n"
+        names = [w.split("'")[1] for w in check_method_completeness(cs, luau)]
+        assert "Run" in names
+
+    def test_generic_method_captured(self):
+        cs = "public class C { public TOut Map<TIn, TOut>(TIn x) { return default; } }"
+        luau = ""  # No Luau functions.
+        # Need a non-empty luau (early-return check). Add a stub line.
+        names = [w.split("'")[1]
+                 for w in check_method_completeness(cs, luau or "local x = 1")]
+        assert "Map" in names
+
+    def test_void_var_keywords_not_method_names(self):
+        """``void`` and ``var`` are return-type tokens, not methods."""
+        cs = "public class C { void DoIt() { var x = 1; } }"
+        luau = "function C:DoIt() end\n"
+        # 'var' or 'void' MUST NOT appear as missing-method warnings.
+        warnings = check_method_completeness(cs, luau)
+        for w in warnings:
+            method = w.split("'")[1]
+            assert method not in {"void", "var"}
+
+    def test_control_flow_keywords_skipped(self):
+        cs = """
+        public class C {
+            public void Loop() {
+                if (true) { foo(); }
+                while (true) { bar(); }
+                for (int i = 0; i < 10; i++) {}
+            }
+        }
+        """
+        luau = "function C:Loop() end\n"
+        warnings = check_method_completeness(cs, luau)
+        # No false positives from `if(`, `while(`, `for(`.
+        names = {w.split("'")[1] for w in warnings}
+        assert names.isdisjoint({"if", "while", "for"})
+
+
+class TestCodexFix2AssignmentLuauForms:
+    """P1: the diagnostic must accept ``Class.method = function() end``
+    and ``_G.X.method = function()`` as valid method definitions —
+    that's how Player.luau (and the dep-aware exports) emit getters.
+    """
+
+    def test_dotted_assignment_form(self):
+        cs = "public class Player { public bool hasKey() { return false; } }"
+        luau = "Player.hasKey = function() return gotKey end\n"
+        assert check_method_completeness(cs, luau) == []
+
+    def test_global_dotted_assignment_form(self):
+        cs = "public class Player { public bool hasKey() { return false; } }"
+        luau = "_G.Player.hasKey = function() return gotKey end\n"
+        assert check_method_completeness(cs, luau) == []
+
+    def test_bare_assignment_form(self):
+        """Bare ``name = function()`` at module top counts."""
+        cs = "public class Foo { public void Bar() {} }"
+        luau = "Bar = function() end\n"
+        assert check_method_completeness(cs, luau) == []
+
+    def test_function_keyword_form_still_works(self):
+        cs = "public class Foo { public void Bar() {} }"
+        luau = "function Foo:Bar() end\n"
+        assert check_method_completeness(cs, luau) == []
+
+
+class TestCodexFix3CollisionHooksExempt:
+    """P2: Unity collision/trigger/mouse hooks lower into Touched
+    or ClickDetector connections — no named Luau function — so they
+    must be in the exempt set.
+    """
+
+    def test_collision_hook_exempt(self):
+        cs = """
+        public class C {
+            void OnCollisionEnter(Collision c) {}
+            void OnCollisionExit(Collision c) {}
+            void OnTriggerEnter(Collider c) {}
+            public void Real() {}
+        }
+        """
+        luau = "function C:Real() end\nworkspace.Touched:Connect(function() end)\n"
+        # No collision-hook-related warnings.
+        warnings = check_method_completeness(cs, luau)
+        for w in warnings:
+            method = w.split("'")[1]
+            assert "Collision" not in method
+            assert "Trigger" not in method
+
+    def test_mouse_hook_exempt(self):
+        cs = """
+        public class C {
+            void OnMouseDown() {}
+            void OnMouseUpAsButton() {}
+            public void Real() {}
+        }
+        """
+        luau = "function C:Real() end\n"
+        warnings = check_method_completeness(cs, luau)
+        for w in warnings:
+            method = w.split("'")[1]
+            assert "Mouse" not in method
+
+    def test_2d_collider_hooks_exempt(self):
+        cs = """
+        public class C {
+            void OnCollisionEnter2D(Collision2D c) {}
+            void OnTriggerExit2D(Collider2D c) {}
+        }
+        """
+        # All exempt → no warnings even with empty Luau.
+        assert check_method_completeness(cs, "local x = 1") == []
