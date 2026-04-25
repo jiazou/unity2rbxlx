@@ -1,0 +1,242 @@
+"""Tests for tools/check_no_any.sh.
+
+The gate runs against a `git diff <base>...HEAD` and fails when added lines
+introduce `Any` annotations in non-allowlisted files. These tests build
+self-contained git repositories in tmp dirs so the gate's diff logic can be
+exercised without polluting the real working tree.
+"""
+
+import os
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+GATE_SCRIPT = REPO_ROOT / "converter" / "tools" / "check_no_any.sh"
+ALLOWLIST_FILE = REPO_ROOT / "converter" / "tools" / "no-any-allowlist.txt"
+
+
+def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _make_repo_with_baseline(tmp_path: Path) -> Path:
+    """Create a fresh git repo with the gate's tools/ vendored in and a baseline commit."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "--initial-branch=main")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "Test")
+
+    # Vendor the gate script + allowlist so the gate can find them relative
+    # to the repo root (the script resolves SCRIPT_DIR/../.. = repo root).
+    tools = repo / "converter" / "tools"
+    tools.mkdir(parents=True)
+    shutil.copy2(GATE_SCRIPT, tools / "check_no_any.sh")
+    shutil.copy2(ALLOWLIST_FILE, tools / "no-any-allowlist.txt")
+    os.chmod(tools / "check_no_any.sh", 0o755)
+
+    # Seed with an empty Python file in each gated directory so future diffs
+    # against this baseline have somewhere to land.
+    for d in ("converter/core", "converter/converter", "converter/unity", "converter/roblox"):
+        (repo / d).mkdir(parents=True, exist_ok=True)
+        (repo / d / "__init__.py").write_text("")
+        (repo / d / "seed.py").write_text("# seed\n")
+
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "baseline")
+    return repo
+
+
+def _run_gate(repo: Path, base: str = "main") -> subprocess.CompletedProcess[str]:
+    """Run the gate from a feature branch in the repo, comparing against base."""
+    return subprocess.run(
+        ["bash", "converter/tools/check_no_any.sh", base],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _commit_change(repo: Path, branch: str, files: dict[str, str]) -> None:
+    """Create a feature branch off main, write files, and commit."""
+    _git(repo, "checkout", "-q", "-b", branch)
+    for relpath, content in files.items():
+        target = repo / relpath
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", f"changes for {branch}")
+
+
+# ---------- T1: allowlist file is well-formed ----------
+
+def test_t1_allowlist_parses() -> None:
+    """Every non-comment line in the allowlist matches `<path> | <reason>`
+    and the path resolves to an existing file."""
+    text = ALLOWLIST_FILE.read_text()
+    for lineno, raw in enumerate(text.splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        assert " | " in line, f"L{lineno}: expected ' | ' separator, got: {raw!r}"
+        path, reason = line.split(" | ", 1)
+        path = path.strip()
+        reason = reason.strip()
+        assert path, f"L{lineno}: empty path"
+        assert reason, f"L{lineno}: empty reason"
+        full = REPO_ROOT / path
+        assert full.is_file(), f"L{lineno}: allowlisted file does not exist: {path}"
+
+
+# ---------- T2: clean diff passes ----------
+
+def test_t2_clean_diff_passes(tmp_path: Path) -> None:
+    repo = _make_repo_with_baseline(tmp_path)
+    _commit_change(repo, "feat-clean", {
+        "converter/converter/new_module.py": (
+            "def process(name: str, count: int) -> bool:\n"
+            "    return count > 0\n"
+        ),
+    })
+    result = _run_gate(repo)
+    assert result.returncode == 0, f"unexpected fail: {result.stdout}\n{result.stderr}"
+
+
+# ---------- T3: `: Any` in non-allowlisted file fails ----------
+
+def test_t3_param_any_fails(tmp_path: Path) -> None:
+    repo = _make_repo_with_baseline(tmp_path)
+    _commit_change(repo, "feat-any-param", {
+        "converter/converter/new_module.py": (
+            "from typing import Any\n"
+            "def process(scene: Any) -> None:\n"
+            "    pass\n"
+        ),
+    })
+    result = _run_gate(repo)
+    assert result.returncode == 1
+    assert "scene: Any" in result.stderr or "scene: Any" in result.stdout
+
+
+# ---------- T4: `dict[str, Any]` field fails (the conversion_context.py:73 pattern) ----------
+
+def test_t4_dict_any_field_fails(tmp_path: Path) -> None:
+    repo = _make_repo_with_baseline(tmp_path)
+    _commit_change(repo, "feat-dict-any", {
+        "converter/core/new_ctx.py": (
+            "from typing import Any\n"
+            "from dataclasses import dataclass, field\n"
+            "@dataclass\n"
+            "class Ctx:\n"
+            "    storage_plan: dict[str, Any] = field(default_factory=dict)\n"
+        ),
+    })
+    result = _run_gate(repo)
+    assert result.returncode == 1
+    assert "dict[str, Any]" in (result.stderr + result.stdout)
+
+
+# ---------- T5: `-> Any` return annotation fails ----------
+
+def test_t5_return_any_fails(tmp_path: Path) -> None:
+    repo = _make_repo_with_baseline(tmp_path)
+    _commit_change(repo, "feat-ret-any", {
+        "converter/converter/new_module.py": (
+            "from typing import Any\n"
+            "def fetch() -> Any:\n"
+            "    return None\n"
+        ),
+    })
+    result = _run_gate(repo)
+    assert result.returncode == 1
+    assert "-> Any" in (result.stderr + result.stdout)
+
+
+# ---------- T6: `: Any` in allowlisted boundary file passes ----------
+
+def test_t6_any_in_allowlisted_file_passes(tmp_path: Path) -> None:
+    repo = _make_repo_with_baseline(tmp_path)
+    _commit_change(repo, "feat-boundary", {
+        "converter/unity/yaml_parser.py": (
+            "from typing import Any\n"
+            "def ref_file_id(ref: Any) -> str | None:\n"
+            "    return None\n"
+        ),
+    })
+    result = _run_gate(repo)
+    assert result.returncode == 0, f"unexpected fail: {result.stdout}\n{result.stderr}"
+
+
+# ---------- T7: `from typing import Any` import line is not flagged ----------
+
+def test_t7_import_line_not_flagged(tmp_path: Path) -> None:
+    repo = _make_repo_with_baseline(tmp_path)
+    _commit_change(repo, "feat-just-import", {
+        "converter/converter/new_module.py": (
+            "from typing import Any  # noqa: F401\n"
+            "def process(name: str) -> str:\n"
+            "    return name\n"
+        ),
+    })
+    result = _run_gate(repo)
+    assert result.returncode == 0, f"unexpected fail: {result.stdout}\n{result.stderr}"
+
+
+# ---------- T8: `Any` inside a comment is not flagged ----------
+
+def test_t8_comment_not_flagged(tmp_path: Path) -> None:
+    repo = _make_repo_with_baseline(tmp_path)
+    _commit_change(repo, "feat-comment", {
+        "converter/converter/new_module.py": (
+            "def process(name: str) -> str:\n"
+            "    # WARNING: do not use Any here\n"
+            "    return name\n"
+        ),
+    })
+    result = _run_gate(repo)
+    assert result.returncode == 0, f"unexpected fail: {result.stdout}\n{result.stderr}"
+
+
+# ---------- Bonus: list[Any] is flagged ----------
+
+def test_bonus_list_any_fails(tmp_path: Path) -> None:
+    """The exact smuggling pattern from the audit: `parsed_scenes: list[Any]`."""
+    repo = _make_repo_with_baseline(tmp_path)
+    _commit_change(repo, "feat-list-any", {
+        "converter/converter/new_module.py": (
+            "from typing import Any\n"
+            "def f(parsed_scenes: list[Any]) -> None:\n"
+            "    pass\n"
+        ),
+    })
+    result = _run_gate(repo)
+    assert result.returncode == 1
+    assert "list[Any]" in (result.stderr + result.stdout)
+
+
+# ---------- Bonus: `Any` as a word inside identifiers is not flagged ----------
+
+def test_bonus_word_in_identifier_not_flagged(tmp_path: Path) -> None:
+    repo = _make_repo_with_baseline(tmp_path)
+    _commit_change(repo, "feat-identifier", {
+        "converter/converter/new_module.py": (
+            "def has_anything(values: list[str]) -> bool:\n"
+            "    return bool(values)\n"
+        ),
+    })
+    result = _run_gate(repo)
+    assert result.returncode == 0, f"unexpected fail: {result.stdout}\n{result.stderr}"
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
