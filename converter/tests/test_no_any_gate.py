@@ -358,8 +358,10 @@ def test_bonus_any_aliased_via_from_import_fails(tmp_path: Path) -> None:
     assert "aliasing Any" in (result.stderr + result.stdout)
 
 
-def test_bonus_typing_module_aliased_fails(tmp_path: Path) -> None:
-    """`import typing as t` enables `t.Any`; block the alias on the import line."""
+def test_bonus_aliased_typing_any_in_annotation_fails(tmp_path: Path) -> None:
+    """`import typing as t` is allowed (typing has many legitimate names),
+    but `t.Any` at the use site is caught via the broadened module-prefix
+    pattern in the main annotation regex."""
     repo = _make_repo_with_baseline(tmp_path)
     _commit_change(repo, "feat-typing-alias", {
         "converter/converter/new_module.py": (
@@ -370,26 +372,26 @@ def test_bonus_typing_module_aliased_fails(tmp_path: Path) -> None:
     })
     result = _run_gate(repo)
     assert result.returncode == 1
-    assert "aliasing the typing module" in (result.stderr + result.stdout)
+    assert "t.Any" in (result.stderr + result.stdout)
 
 
-def test_bonus_typing_alias_in_comma_import_fails(tmp_path: Path) -> None:
-    """`import os, typing as t` is a typing alias too; comma-list form."""
+def test_bonus_typing_alias_used_for_non_any_passes(tmp_path: Path) -> None:
+    """`import typing as t` with `t.Self` (or any non-Any usage) must pass."""
     repo = _make_repo_with_baseline(tmp_path)
-    _commit_change(repo, "feat-comma-typing-alias", {
+    _commit_change(repo, "feat-typing-alias-self", {
         "converter/converter/new_module.py": (
-            "import os, typing as t\n"
-            "def f(x: t.Any) -> None:\n"
-            "    pass\n"
+            "import typing as t\n"
+            "class Foo:\n"
+            "    def clone(self) -> t.Self:\n"
+            "        return self\n"
         ),
     })
     result = _run_gate(repo)
-    assert result.returncode == 1
-    assert "aliasing the typing module" in (result.stderr + result.stdout)
+    assert result.returncode == 0, f"unexpected fail: {result.stdout}\n{result.stderr}"
 
 
 def test_bonus_unrelated_typing_import_alias_passes(tmp_path: Path) -> None:
-    """Aliasing a non-Any name (e.g. TypeVar) should not be blocked."""
+    """Aliasing a non-Any name (e.g. TypeVar) must not be blocked."""
     repo = _make_repo_with_baseline(tmp_path)
     _commit_change(repo, "feat-typevar-alias", {
         "converter/converter/new_module.py": (
@@ -401,47 +403,30 @@ def test_bonus_unrelated_typing_import_alias_passes(tmp_path: Path) -> None:
     assert result.returncode == 0, f"unexpected fail: {result.stdout}\n{result.stderr}"
 
 
-# ---------- Bonus: stringized annotations are blocked (codex round 5 P1) ----------
+# ---------- Bonus: dict/list literals containing "Any" are not flagged ----------
 
-def test_bonus_stringized_any_annotation_fails(tmp_path: Path) -> None:
-    """`x: "Any"` is a real annotation under PEP 563. Block it."""
+def test_bonus_list_literal_with_any_string_passes(tmp_path: Path) -> None:
+    """`labels = ["Any"]` is a list literal, not an annotation."""
     repo = _make_repo_with_baseline(tmp_path)
-    _commit_change(repo, "feat-stringized-any", {
+    _commit_change(repo, "feat-list-literal", {
         "converter/converter/new_module.py": (
-            'from __future__ import annotations\n'
-            'def f(x: "Any") -> None:\n'
-            '    pass\n'
+            'labels = ["Any", "Specific"]\n'
         ),
     })
     result = _run_gate(repo)
-    assert result.returncode == 1
-    assert "stringized Any annotation" in (result.stderr + result.stdout)
+    assert result.returncode == 0, f"unexpected fail: {result.stdout}\n{result.stderr}"
 
 
-def test_bonus_stringized_typing_any_fails(tmp_path: Path) -> None:
-    """`x: 'typing.Any'` should also be blocked."""
+def test_bonus_dict_literal_with_any_string_passes(tmp_path: Path) -> None:
+    """`opts = {"mode": "Any"}` is a dict literal, not an annotation."""
     repo = _make_repo_with_baseline(tmp_path)
-    _commit_change(repo, "feat-stringized-typing-any", {
+    _commit_change(repo, "feat-dict-literal", {
         "converter/converter/new_module.py": (
-            'from __future__ import annotations\n'
-            "def f(x: 'typing.Any') -> None:\n"
-            '    pass\n'
+            'opts = {"mode": "Any", "level": 1}\n'
         ),
     })
     result = _run_gate(repo)
-    assert result.returncode == 1
-    assert "stringized" in (result.stderr + result.stdout)
-
-
-def test_bonus_stringized_any_in_field_fails(tmp_path: Path) -> None:
-    repo = _make_repo_with_baseline(tmp_path)
-    _commit_change(repo, "feat-stringized-field", {
-        "converter/converter/new_module.py": (
-            'value: "Any" = None\n'
-        ),
-    })
-    result = _run_gate(repo)
-    assert result.returncode == 1
+    assert result.returncode == 0, f"unexpected fail: {result.stdout}\n{result.stderr}"
 
 
 # ---------- Bonus: missing base ref fails loudly (regression for codex P1) ----------

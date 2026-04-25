@@ -77,17 +77,13 @@ violations=$(echo "$diff_output" | awk '
   /^\+/ && !/^\+\+\+/ {
     line=substr($0, 2)
 
-    # Stringized-annotation check (PEP 563 / `from __future__ import annotations`):
-    # `x: "Any"` and `x: 'typing.Any'` are real annotations to Python but are
-    # erased by the string-stripping pass below. Catch them on the original
-    # line BEFORE stripping. Narrow false-positive risk: strings whose
-    # content directly contains `:"Any"` or `:'Any'` (with optional whitespace
-    # between `:` and the quote) would also flag — rare in practice and a
-    # rephrase resolves it.
-    if (match(line, /(:[ \t]*|->[ \t]*|\[[ \t]*|,[ \t]*|\|[ \t]*)["\x27](typing\.)?Any["\x27]/)) {
-      print file ": " line "  [forbidden: stringized Any annotation]"
-      next
-    }
+    # KNOWN LIMITATION (documented, not enforced):
+    # Under PEP 563 / `from __future__ import annotations`, real annotations
+    # can be written as strings: `x: "Any"`, `x: 'typing.Any'`. A regex check
+    # for these collides with ordinary list/dict literals like `["Any"]` or
+    # `{"mode": "Any"}` — both have a delimiter+quoted-Any+quote pattern.
+    # Distinguishing the two requires real AST analysis, out of scope for
+    # this grep gate. Reviewers should catch stringized Any in code review.
 
     # Strip single-line string literals (both quote styles) so that string
     # content matching the annotation regex does not false-positive. Does
@@ -116,22 +112,18 @@ violations=$(echo "$diff_output" | awk '
       print file ": " line "  [forbidden: aliasing Any]"
       next
     }
-    # `typing as <NAME>` covers:
-    #   import typing as t
-    #   import os, typing as t        (comma-list import)
-    #   x; import typing as t         (multi-statement)
-    # Outside an import, `typing as ...` is essentially never valid Python,
-    # so a bare-anywhere check is safe after string+comment stripping.
-    if (match(line, /(^|[^a-zA-Z0-9_])typing[ \t]+as[ \t]+[a-zA-Z_]/)) {
-      print file ": " line "  [forbidden: aliasing the typing module]"
-      next
-    }
+    # Note: we do NOT block `import typing as t` outright — typing exports
+    # plenty of legitimate names (Self, TypeAlias, TypeVar, ...) and a
+    # refactor that uses an alias for those should not fail the gate.
+    # The annotation regex below catches `t.Any` (or `whatever.Any`) at the
+    # actual use site via the optional module-prefix `[a-zA-Z_]\w*\.`, so
+    # the bypass is closed without false-positives on the import line.
 
-    # Match Any (or typing.Any) with annotation-context delimiter on the
+    # Match Any (or <module>.Any) with annotation-context delimiter on the
     # left side and a non-identifier char (or EOL) on the right side, so we
     # also catch `value: Any = ...`, `value: typing.Any = ...`, `int | Any =`,
-    # etc., not just `Any]` / `Any,` / `Any)` / `Any:` / `Any|` / `Any$`.
-    if (match(line, /(:[ \t]*|->[ \t]*|\[[ \t]*|,[ \t]*|\|[ \t]*)(typing\.)?Any([^a-zA-Z0-9_]|$)/)) {
+    # `value: t.Any = None` (any single-identifier alias of typing), etc.
+    if (match(line, /(:[ \t]*|->[ \t]*|\[[ \t]*|,[ \t]*|\|[ \t]*)([a-zA-Z_][a-zA-Z0-9_]*\.)?Any([^a-zA-Z0-9_]|$)/)) {
       print file ": " line
     }
   }
