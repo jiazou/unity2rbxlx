@@ -116,7 +116,13 @@ violations=$(echo "$diff_output" | awk '
       print file ": " line "  [forbidden: aliasing Any]"
       next
     }
-    if (match(line, /(^|;)[ \t]*import[ \t]+typing[ \t]+as[ \t]+[a-zA-Z_]/)) {
+    # `typing as <NAME>` covers:
+    #   import typing as t
+    #   import os, typing as t        (comma-list import)
+    #   x; import typing as t         (multi-statement)
+    # Outside an import, `typing as ...` is essentially never valid Python,
+    # so a bare-anywhere check is safe after string+comment stripping.
+    if (match(line, /(^|[^a-zA-Z0-9_])typing[ \t]+as[ \t]+[a-zA-Z_]/)) {
       print file ": " line "  [forbidden: aliasing the typing module]"
       next
     }

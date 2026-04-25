@@ -373,6 +373,21 @@ def test_bonus_typing_module_aliased_fails(tmp_path: Path) -> None:
     assert "aliasing the typing module" in (result.stderr + result.stdout)
 
 
+def test_bonus_typing_alias_in_comma_import_fails(tmp_path: Path) -> None:
+    """`import os, typing as t` is a typing alias too; comma-list form."""
+    repo = _make_repo_with_baseline(tmp_path)
+    _commit_change(repo, "feat-comma-typing-alias", {
+        "converter/converter/new_module.py": (
+            "import os, typing as t\n"
+            "def f(x: t.Any) -> None:\n"
+            "    pass\n"
+        ),
+    })
+    result = _run_gate(repo)
+    assert result.returncode == 1
+    assert "aliasing the typing module" in (result.stderr + result.stdout)
+
+
 def test_bonus_unrelated_typing_import_alias_passes(tmp_path: Path) -> None:
     """Aliasing a non-Any name (e.g. TypeVar) should not be blocked."""
     repo = _make_repo_with_baseline(tmp_path)
