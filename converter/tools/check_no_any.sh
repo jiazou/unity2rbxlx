@@ -86,8 +86,10 @@ violations=$(echo "$diff_output" | awk '
     if (line ~ /^[ \t]*import[ \t]+typing/) next
 
     # Match Any (or typing.Any) with annotation-context delimiter on the
-    # left side and a permitted token on the right.
-    if (match(line, /(:[ \t]*|->[ \t]*|\[[ \t]*|,[ \t]*|\|[ \t]*)(typing\.)?Any([ \t]*[],|)>:]|[ \t]*$)/)) {
+    # left side and a non-identifier char (or EOL) on the right side, so we
+    # also catch `value: Any = ...`, `value: typing.Any = ...`, `int | Any =`,
+    # etc., not just `Any]` / `Any,` / `Any)` / `Any:` / `Any|` / `Any$`.
+    if (match(line, /(:[ \t]*|->[ \t]*|\[[ \t]*|,[ \t]*|\|[ \t]*)(typing\.)?Any([^a-zA-Z0-9_]|$)/)) {
       print file ": " line
     }
   }

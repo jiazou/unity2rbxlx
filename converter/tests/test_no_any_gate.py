@@ -241,6 +241,50 @@ def test_bonus_typing_dot_any_fails(tmp_path: Path) -> None:
     assert "typing.Any" in (result.stderr + result.stdout)
 
 
+# ---------- Bonus: `x: Any = ...` is flagged (regression for codex round 2 P1) ----------
+
+def test_bonus_any_with_assignment_fails(tmp_path: Path) -> None:
+    """Class field / module variable annotations followed by `=` must fail.
+    Earlier regex required the right-of-Any to be `]`, `,`, `|`, etc., so
+    `value: Any = None` slipped through. Now using a non-identifier-char
+    boundary on the right side."""
+    repo = _make_repo_with_baseline(tmp_path)
+    _commit_change(repo, "feat-any-assign", {
+        "converter/converter/new_module.py": (
+            "from typing import Any\n"
+            "value: Any = None\n"
+        ),
+    })
+    result = _run_gate(repo)
+    assert result.returncode == 1
+    assert "value: Any" in (result.stderr + result.stdout)
+
+
+def test_bonus_typing_any_with_assignment_fails(tmp_path: Path) -> None:
+    repo = _make_repo_with_baseline(tmp_path)
+    _commit_change(repo, "feat-typing-any-assign", {
+        "converter/converter/new_module.py": (
+            "import typing\n"
+            "value: typing.Any = None\n"
+        ),
+    })
+    result = _run_gate(repo)
+    assert result.returncode == 1
+
+
+def test_bonus_union_with_any_and_assignment_fails(tmp_path: Path) -> None:
+    """`int | Any = 0` was passing under the prior regex."""
+    repo = _make_repo_with_baseline(tmp_path)
+    _commit_change(repo, "feat-union-any-assign", {
+        "converter/converter/new_module.py": (
+            "from typing import Any\n"
+            "value: int | Any = 0\n"
+        ),
+    })
+    result = _run_gate(repo)
+    assert result.returncode == 1
+
+
 # ---------- Bonus: missing base ref fails loudly (regression for codex P1) ----------
 
 def test_bonus_missing_base_ref_fails_loudly(tmp_path: Path) -> None:
