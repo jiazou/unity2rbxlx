@@ -965,3 +965,81 @@ Deferred follow-ups:
   `--no-upload` means no real asset IDs.
 - Per-prefab variant-chain preservation in templates — currently
   emits the flattened resolved form.
+
+### PR 6 — 4.4 transpile diagnostics (FINAL Phase 4 PR)
+
+Audit shrank scope to ~80 lines code by reusing existing
+infrastructure: dest already runs ``luau-analyze`` syntax gating
+in ``code_transpiler``'s reprompt loop; PR 4 already added the
+UNCONVERTED-stub prompt rule. Only real gaps were
+(a) the method-completeness diagnostic itself, (b) the validate
+CLI's non-recursive glob.
+
+- **`converter/converter/transpile_diagnostics.py`** (~130 lines).
+  Exports `check_method_completeness(csharp, luau, source_name)`
+  returning a list of warnings for C# methods missing from the
+  Luau output. Pure function. Strips C# comments + string literals
+  before regex-extracting method names so ``// public void Foo()``
+  or ``"public void Bar()"`` in a log string don't register as
+  real declarations. Honors ``-- UNCONVERTED`` and ``-- TODO``
+  comments as intentional drops. Lifecycle hooks (Awake, Start,
+  Update, …) are exempt because the transpiler idiomatically
+  lowers them into top-level code or `RunService` connections.
+- **`code_transpiler.py` Phase-3 hook**. After AI transpile
+  produces the Luau and warnings, call the diagnostic. Append
+  any missing-method warnings onto the script's `warnings` list.
+  Gated on `strategy == "ai"` — rule-based stubs don't round-trip
+  C# methods meaningfully.
+- **`convert_interactive.py` validate** now uses `rglob` instead
+  of flat `glob`. Covers `scripts/animations/`,
+  `scripts/animation_data/`, `scripts/packages/`,
+  `scripts/scriptable_objects/` — every Luau-emitting subdir
+  added between PR 1 and PR 5.
+- **`report_generator.py`** gains
+  `ScriptSummary.method_completeness_warnings: list[str]`.
+  Pipeline's `_build_conversion_report` populates it via a new
+  `_collect_method_warnings()` helper that walks
+  `transpilation_result.scripts` looking for the
+  "missing from Luau output" pattern.
+
+Explicitly NOT done (plan mandate "DO NOT"):
+- `luau_validator.py` resurrection
+- `ValidationIssue`/`ValidationResult` dataclasses
+- E001-E030 structured error codes
+
+Tests (+14 in `tests/test_transpile_diagnostics.py`):
+- Strip-comments helper handles line, block, string forms
+- Lifecycle exemption (Awake/Start/Update/etc. silent)
+- Missing methods reported with source name embedded
+- Function-form recognition: `Class:Method`, `Class.Method`,
+  `local function`, plain `function`
+- `-- UNCONVERTED` and `-- TODO` comments count as intentional
+  drops
+- Comments and string literals in C# don't register as methods
+- Multiple missing methods sorted alphabetically (deterministic)
+- Empty inputs short-circuit safely
+- Source-name embedded in every warning
+
+Verification:
+- Fast suite 693 passed (+14 new), 2 skipped, 25 deselected.
+- SimpleFPS smoke (`--no-upload --no-ai --no-resolve`):
+  944 parts / 36 scripts / 50/51 materials / 7 anim scripts /
+  7 prefab templates / 0 method_completeness_warnings (no AI ran
+  in this smoke; rule-based path doesn't trigger the diagnostic).
+- `convert_interactive.py validate /tmp/phase4_pr6_smoke`:
+  44 files scanned (top-level scripts + animations/ subdir
+  + packages/PrefabSpawner.luau), 0 syntax errors.
+
+This closes Phase 4. All six plan PRs landed. ~3000 net lines
+across the merge sequence.
+
+Deferred to follow-up PRs (post-Phase-4):
+- Cross-script shared-state linter (see prompt-iteration-failed
+  section above) — finds `:GetAttribute("X")` calls with no
+  matching `:SetAttribute("X")` in the corpus when a dependency
+  exports a getter, then either rewrites or warns.
+- Standalone `.rbxm` file output per prefab (Toolbox convenience).
+- Full SurfaceAppearance round-trip through templates.
+- Prefab-scoped animator controller GUID aggregation (PR 2a
+  follow-up).
+- Sub-mesh identity (`mesh_file_id`) in vertex-color baking.
