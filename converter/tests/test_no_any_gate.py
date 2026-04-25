@@ -285,6 +285,62 @@ def test_bonus_union_with_any_and_assignment_fails(tmp_path: Path) -> None:
     assert result.returncode == 1
 
 
+# ---------- Bonus: multi-statement import bypass (regression for codex round 3 P3) ----------
+
+def test_bonus_multistatement_import_bypass_fails(tmp_path: Path) -> None:
+    """`import typing; value: typing.Any = None` must not bypass the gate.
+    Older versions had `next` clauses that skipped any line starting with
+    a typing import, letting the rest of the multi-statement line through."""
+    repo = _make_repo_with_baseline(tmp_path)
+    _commit_change(repo, "feat-multistmt", {
+        "converter/converter/new_module.py": (
+            "import typing; value: typing.Any = None\n"
+        ),
+    })
+    result = _run_gate(repo)
+    assert result.returncode == 1
+    assert "typing.Any" in (result.stderr + result.stdout)
+
+
+def test_bonus_multistatement_from_import_bypass_fails(tmp_path: Path) -> None:
+    repo = _make_repo_with_baseline(tmp_path)
+    _commit_change(repo, "feat-from-multistmt", {
+        "converter/converter/new_module.py": (
+            "from typing import Any; x: Any = None\n"
+        ),
+    })
+    result = _run_gate(repo)
+    assert result.returncode == 1
+
+
+# ---------- Bonus: string literals containing `Any` are not flagged (codex round 3 P2) ----------
+
+def test_bonus_string_literal_with_any_not_flagged(tmp_path: Path) -> None:
+    """Strings like `message = "expected ': Any' here"` must not false-positive."""
+    repo = _make_repo_with_baseline(tmp_path)
+    _commit_change(repo, "feat-string-any", {
+        "converter/converter/new_module.py": (
+            'def f() -> None:\n'
+            '    message = "expected \': Any\' here"\n'
+            '    print(message)\n'
+        ),
+    })
+    result = _run_gate(repo)
+    assert result.returncode == 0, f"unexpected fail: {result.stdout}\n{result.stderr}"
+
+
+def test_bonus_double_quoted_string_with_any_annotation_pattern_not_flagged(tmp_path: Path) -> None:
+    repo = _make_repo_with_baseline(tmp_path)
+    _commit_change(repo, "feat-double-string-any", {
+        "converter/converter/new_module.py": (
+            'def f() -> str:\n'
+            '    return "x: Any"\n'
+        ),
+    })
+    result = _run_gate(repo)
+    assert result.returncode == 0, f"unexpected fail: {result.stdout}\n{result.stderr}"
+
+
 # ---------- Bonus: missing base ref fails loudly (regression for codex P1) ----------
 
 def test_bonus_missing_base_ref_fails_loudly(tmp_path: Path) -> None:

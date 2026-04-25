@@ -76,14 +76,23 @@ violations=$(echo "$diff_output" | awk '
   }
   /^\+/ && !/^\+\+\+/ {
     line=substr($0, 2)
-    # Strip comments (everything from the first # not inside a string).
-    # Approximate: drop from the first # to end of line. Loses Any inside
-    # f-strings with #, but those are rare and not annotations anyway.
+    # Strip single-line string literals (both quote styles) so that string
+    # content matching the annotation regex does not false-positive. Does
+    # not handle triple-quoted multiline docstrings; a line inside one that
+    # mentions an annotation-shaped fragment can still false-positive.
+    # Treated as a known limitation; rephrase or split if hit.
+    gsub(/"[^"]*"/, "", line)
+    gsub(/\x27[^\x27]*\x27/, "", line)
+    # Strip comments (everything from the first # to end of line).
     sub(/[ \t]*#.*$/, "", line)
 
-    # Skip pure import lines.
-    if (line ~ /^[ \t]*from[ \t]+typing[ \t]+import/) next
-    if (line ~ /^[ \t]*import[ \t]+typing/) next
+    # Note: bare `from typing import Any` and `import typing` are NOT skipped
+    # by an explicit clause. The annotation regex below requires `:`, `->`,
+    # `[`, `,`, or `|` immediately before `Any`, none of which appear on a
+    # plain import line. An older version of this script had explicit `next`
+    # clauses for those imports; they enabled a `import typing; v: typing.Any
+    # = ...` bypass via Python multi-statement lines. Removing them closes
+    # that hole without false-positives on imports.
 
     # Match Any (or typing.Any) with annotation-context delimiter on the
     # left side and a non-identifier char (or EOL) on the right side, so we
