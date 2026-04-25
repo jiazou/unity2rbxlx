@@ -5,10 +5,15 @@ roblox_types.py -- Data models for Roblox output.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Literal
 
 
 ScriptType = Literal["Script", "LocalScript", "ModuleScript"]
+
+# Roblox Attribute values support a known finite scalar set. Anything richer
+# (Vector3, Color3, etc.) is stored on its dedicated typed field, not here.
+# The rbxlx writer's _encode_attributes serializer matches this exact set.
+RbxAttrValue = str | int | float | bool | None
 
 
 @dataclass
@@ -110,7 +115,7 @@ class RbxPart:
     decals: list[RbxDecal] = field(default_factory=list)
     children: list[RbxPart] = field(default_factory=list)
     scripts: list[RbxScript] = field(default_factory=list)
-    attributes: dict[str, Any] = field(default_factory=dict)
+    attributes: dict[str, RbxAttrValue] = field(default_factory=dict)
     # CustomPhysicalProperties: (density, friction, elasticity, frictionWeight, elasticityWeight)
     custom_physical_properties: tuple[float, float, float, float, float] | None = None
     # CollisionFidelity: 0=Default, 1=Hull, 2=Box, 3=PreciseConvexDecomposition
@@ -145,7 +150,7 @@ class RbxUIElement:
     layout_cell_size: tuple[int, int] = (100, 100)  # For UIGridLayout
     layout_h_alignment: str = "Left"  # Left, Center, Right
     layout_v_alignment: str = "Top"  # Top, Center, Bottom
-    attributes: dict[str, Any] = field(default_factory=dict)
+    attributes: dict[str, RbxAttrValue] = field(default_factory=dict)
     on_click_handlers: list[dict[str, str]] = field(default_factory=list)  # [{method: str, target_name: str}]
 
 
@@ -155,7 +160,7 @@ class RbxScreenGui:
     name: str = "ScreenGui"
     elements: list[RbxUIElement] = field(default_factory=list)
     reset_on_spawn: bool = False
-    attributes: dict[str, Any] = field(default_factory=dict)
+    attributes: dict[str, RbxAttrValue] = field(default_factory=dict)
 
 
 @dataclass
@@ -193,7 +198,7 @@ class RbxParticleEmitter:
     shape_style: str = "Cylinder"  # Cylinder, Sphere, Block, Disc
     shape_in_out: str = "Outward"  # Outward, Inward, InAndOut
     # Attributes for features without direct Roblox equivalents
-    attributes: dict[str, Any] = field(default_factory=dict)
+    attributes: dict[str, RbxAttrValue] = field(default_factory=dict)
 
 
 @dataclass
@@ -321,7 +326,7 @@ class RbxPostProcessing:
     atmosphere_glare: float = 0.0
     atmosphere_haze: float = 0.0
     # Extra attributes for effects without direct Roblox equivalent
-    attributes: dict[str, Any] = field(default_factory=dict)
+    attributes: dict[str, RbxAttrValue] = field(default_factory=dict)
 
 
 @dataclass
