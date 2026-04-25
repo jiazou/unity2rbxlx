@@ -341,6 +341,51 @@ def test_bonus_double_quoted_string_with_any_annotation_pattern_not_flagged(tmp_
     assert result.returncode == 0, f"unexpected fail: {result.stdout}\n{result.stderr}"
 
 
+# ---------- Bonus: aliased Any imports are blocked (codex round 4 P2) ----------
+
+def test_bonus_any_aliased_via_from_import_fails(tmp_path: Path) -> None:
+    """`from typing import Any as Dyn` is a bypass; block it."""
+    repo = _make_repo_with_baseline(tmp_path)
+    _commit_change(repo, "feat-any-alias", {
+        "converter/converter/new_module.py": (
+            "from typing import Any as Dyn\n"
+            "def f(x: Dyn) -> None:\n"
+            "    pass\n"
+        ),
+    })
+    result = _run_gate(repo)
+    assert result.returncode == 1
+    assert "aliasing Any" in (result.stderr + result.stdout)
+
+
+def test_bonus_typing_module_aliased_fails(tmp_path: Path) -> None:
+    """`import typing as t` enables `t.Any`; block the alias on the import line."""
+    repo = _make_repo_with_baseline(tmp_path)
+    _commit_change(repo, "feat-typing-alias", {
+        "converter/converter/new_module.py": (
+            "import typing as t\n"
+            "def f(x: t.Any) -> None:\n"
+            "    pass\n"
+        ),
+    })
+    result = _run_gate(repo)
+    assert result.returncode == 1
+    assert "aliasing the typing module" in (result.stderr + result.stdout)
+
+
+def test_bonus_unrelated_typing_import_alias_passes(tmp_path: Path) -> None:
+    """Aliasing a non-Any name (e.g. TypeVar) should not be blocked."""
+    repo = _make_repo_with_baseline(tmp_path)
+    _commit_change(repo, "feat-typevar-alias", {
+        "converter/converter/new_module.py": (
+            "from typing import TypeVar as TV\n"
+            "T = TV(\"T\")\n"
+        ),
+    })
+    result = _run_gate(repo)
+    assert result.returncode == 0, f"unexpected fail: {result.stdout}\n{result.stderr}"
+
+
 # ---------- Bonus: missing base ref fails loudly (regression for codex P1) ----------
 
 def test_bonus_missing_base_ref_fails_loudly(tmp_path: Path) -> None:

@@ -94,6 +94,20 @@ violations=$(echo "$diff_output" | awk '
     # = ...` bypass via Python multi-statement lines. Removing them closes
     # that hole without false-positives on imports.
 
+    # Block alias-bypass patterns: `Any as <NAME>` or `import typing as <NAME>`.
+    # Renaming Any (or the typing module) is the obvious way to slip a typed
+    # escape hatch past a literal-token grep. Documented limitation: type
+    # alias via assignment (`Dyn = Any; def f(x: Dyn)`) would still slip
+    # through; that requires real AST analysis and is left for follow-up.
+    if (match(line, /(^|[^a-zA-Z0-9_])Any[ \t]+as[ \t]+[a-zA-Z_]/)) {
+      print file ": " line "  [forbidden: aliasing Any]"
+      next
+    }
+    if (match(line, /(^|;)[ \t]*import[ \t]+typing[ \t]+as[ \t]+[a-zA-Z_]/)) {
+      print file ": " line "  [forbidden: aliasing the typing module]"
+      next
+    }
+
     # Match Any (or typing.Any) with annotation-context delimiter on the
     # left side and a non-identifier char (or EOL) on the right side, so we
     # also catch `value: Any = ...`, `value: typing.Any = ...`, `int | Any =`,
