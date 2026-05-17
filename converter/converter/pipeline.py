@@ -3241,9 +3241,22 @@ script.Disabled = true
         plan_lookup = self._load_storage_plan_for_rehydration()
         luau_files = sorted(scripts_dir.rglob("*.luau"))
         from_plan = 0
+        rehydrated = 0
         for luau_path in luau_files:
-            source = luau_path.read_text(encoding="utf-8")
             name = luau_path.stem
+
+            # Skip retired skeletal-animation artifacts. An output dir from a
+            # pre-retirement run may still hold AnimationData_* /
+            # AnimBootstrap_* / *_StateMachine / character_animator files;
+            # rehydrating them would resurrect the retired feature. The
+            # working Anim_* inline-tween scripts are kept.
+            if (name.startswith("AnimationData_")
+                    or name.startswith("AnimBootstrap_")
+                    or name.endswith("_StateMachine")
+                    or name == "character_animator"):
+                continue
+
+            source = luau_path.read_text(encoding="utf-8")
 
             if name in plan_lookup:
                 script_type, parent_path = plan_lookup[name]
@@ -3265,10 +3278,11 @@ script.Disabled = true
             if parent_path and hasattr(script, "parent_path"):
                 script.parent_path = parent_path
             self.state.rbx_place.scripts.append(script)
+            rehydrated += 1
 
         log.info(
             "[write_output] Rehydrated %d scripts from disk (%d via plan, %d via heuristic)",
-            len(luau_files), from_plan, len(luau_files) - from_plan,
+            rehydrated, from_plan, rehydrated - from_plan,
         )
 
     def _load_storage_plan_for_rehydration(self) -> dict[str, tuple[str, str | None]]:

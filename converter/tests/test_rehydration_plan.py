@@ -588,3 +588,30 @@ def test_rehydration_round_trip_nested_dirs_preserves_layout(tmp_path):
         "animations/DoorOpen.luau",
         "scriptable_objects/Config.luau",
     ]
+
+
+def test_rehydration_skips_retired_animation_artifacts(tmp_path):
+    """A pre-retirement output dir may still hold AnimationData_* /
+    AnimBootstrap_* / *_StateMachine skeletal-animation artifacts.
+    Rehydration must skip them (the feature is retired) while keeping the
+    working Anim_* inline-tween scripts and ordinary scripts."""
+    pipeline = _make_pipeline(tmp_path)
+    scripts_dir = pipeline.output_dir / "scripts"
+    (scripts_dir / "animation_data").mkdir(parents=True)
+    (scripts_dir / "animations").mkdir(parents=True)
+    (scripts_dir / "animation_data" / "AnimationData_Hero.luau").write_text("return {}\n")
+    (scripts_dir / "animations" / "AnimBootstrap_Hero.luau").write_text("-- bootstrap\n")
+    (scripts_dir / "animations" / "Anim_HeroCtrl_StateMachine.luau").write_text("-- sm\n")
+    (scripts_dir / "animations" / "Anim_Door_open.luau").write_text("-- tween\n")
+    (scripts_dir / "GameManager.luau").write_text('print("hi")\n')
+
+    pipeline._rehydrate_scripts_from_disk(scripts_dir)
+
+    names = {s.name for s in pipeline.state.rbx_place.scripts}
+    # Retired skeletal-animation artifacts are not rehydrated.
+    assert "AnimationData_Hero" not in names
+    assert "AnimBootstrap_Hero" not in names
+    assert "Anim_HeroCtrl_StateMachine" not in names
+    # The working transform-tween script and ordinary scripts survive.
+    assert "Anim_Door_open" in names
+    assert "GameManager" in names
