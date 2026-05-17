@@ -1610,9 +1610,11 @@ def export_controller_json(
 
     The character_animator.luau expects this format for state machine evaluation.
 
-    When ``clip_name_by_guid`` is provided, BlendTree entries resolve their
-    ``clip_guid`` → ``clip_name`` so the runtime can look clips up by name.
-    Without it, entries missing a name are dropped (they'd be unreachable).
+    When ``clip_name_by_guid`` is provided, each state's ``motion`` and the
+    BlendTree entries resolve their ``clip_guid`` → clip display name so the
+    runtime can look clips up by the same key the keyframes dict uses.
+    Without it, ``motion`` falls back to the state name and BlendTree entries
+    missing a name are dropped (they'd be unreachable).
     """
     clip_name_by_guid = clip_name_by_guid or {}
     states = []
@@ -1635,9 +1637,15 @@ def export_controller_json(
                 "hasExitTime": trans.has_exit_time,
                 "exitTime": trans.exit_time,
             })
+        # ``motion`` is the key the runtime uses to look a state's clip up
+        # in the keyframes dict. That dict is keyed by clip *display name*
+        # (see convert_animations: keyframes = {humanoid_display[id(clip)]:
+        # ...}), so ``motion`` must resolve to the same display name — NOT
+        # the state name, which collides with the keyframes key only by
+        # accident. Fall back to the state name for states with no clip.
         state_entry: dict[str, Any] = {
             "name": state.name,
-            "motion": state.name,  # Use state name as motion key
+            "motion": clip_name_by_guid.get(state.clip_guid, state.name),
             "speed": state.speed,
             "transitions": transitions,
         }
