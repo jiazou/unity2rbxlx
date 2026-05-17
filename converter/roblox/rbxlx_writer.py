@@ -819,9 +819,11 @@ def _make_script(parent_xml: ET.Element, script: RbxScript) -> None:
     item, props = _make_item(parent_xml, script_class, name)
     disabled = getattr(script, "disabled", False)
     _add_bool(props, "Disabled", disabled)
-    # LinkedSource (empty = no external source)
-    linked = ET.SubElement(props, "Content", name="LinkedSource")
-    ET.SubElement(linked, "null")
+    # LinkedSource is a deprecated external-source pointer; emitting it
+    # (even as null) makes Studio prompt the LinkedSource Migrator dialog
+    # on every place load offering to "convert" the scripts to embedded
+    # form. The Source property below is already embedded, so the prompt
+    # is noise. Omit LinkedSource entirely.
     # RunContext for Script class (Legacy=0, Server=1, Client=2)
     # Use Server (1) explicitly — Legacy (0) scripts in ServerScriptService
     # are silently dropped when Studio loads rbxlx files from disk.
