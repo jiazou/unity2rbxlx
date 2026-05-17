@@ -1526,8 +1526,13 @@ Navigation:
 - `NavMeshAgent.speed/stoppingDistance` → store as attributes, use in movement logic
 
 Animation:
-- `Animator.SetBool/SetFloat/SetInteger/SetTrigger` → `humanoid:SetAttribute("ParamName", value)`
-- `Animator.Play("StateName")` → `animTrack:Play()`
+- Skeletal/character animation is NOT supported (Roblox has no automated
+  skinned-mesh pipeline) — there is no animation runtime.
+- `Animator.*` calls (`SetBool`/`SetFloat`/`SetInteger`/`SetTrigger`/
+  `ResetTrigger`/`Play`/`CrossFade`) become `SetAttribute("ParamName", value)`
+  on the host: the parameter is recorded but drives no skeleton — an inert
+  degradation, not real animation. Never emit AnimationTrack playback or
+  Animator/AnimationController runtime code.
 
 Audio:
 - `AudioSource.Play()` → `sound:Play()`

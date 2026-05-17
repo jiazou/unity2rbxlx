@@ -223,3 +223,24 @@ class TestSlowMarkExcludesScriptTranspilation:
             "unfiltered collection. The previous assertion is meaningless "
             "without this. Maybe the test was renamed?"
         )
+
+
+class TestAnimationSectionRetired:
+    """Skeletal/character animation was retired — Roblox has no automated
+    skinned-mesh pipeline, so there is no animation runtime. The prompt's
+    Animation section must not teach the AI to emit animation-runtime code.
+    Regression guard: the prompt used to instruct
+    ``Animator.Play("StateName")`` -> ``animTrack:Play()``.
+    """
+
+    def test_prompt_does_not_teach_animationtrack_playback(self) -> None:
+        assert "animTrack:Play()" not in _AI_SYSTEM_PROMPT, (
+            "AI prompt still teaches AnimationTrack playback; skeletal "
+            "animation is retired — Animator.* must degrade to SetAttribute."
+        )
+
+    def test_prompt_marks_skeletal_animation_unsupported(self) -> None:
+        assert "Skeletal/character animation is NOT supported" in _AI_SYSTEM_PROMPT, (
+            "AI prompt's Animation section must state skeletal animation "
+            "is unsupported so the AI does not invent runtime calls."
+        )
