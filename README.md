@@ -187,7 +187,7 @@ test_projects/                    # Git submodules of sample Unity projects
 
 ## Limitations
 
-- Skeletal animation supported for R15-mappable rigs (Motor6D + `animator_runtime.luau`); both text-YAML and binary `.anim` / `.controller` are parsed (binary requires the optional `UnityPy` dependency). See `converter/docs/UNSUPPORTED.md` for the full list.
+- Skeletal / character animation is **not supported** — a Unity `SkinnedMeshRenderer` converts to a single rigid `MeshPart`, and Roblox has no automated/headless path to a skinned `MeshPart` that deforms via `Bone` instances. Humanoid clips and `AnimatorController` state machines are surfaced to `UNCONVERTED.md`. Transform / property animation (non-humanoid clips) IS supported via inline TweenService scripts. See `converter/docs/UNSUPPORTED.md` for the full list.
 - Custom shaders are approximated with Roblox materials
 - Git LFS pointer files are detected and skipped (run `git lfs pull` first)
 - VFX Graph is not converted (no node-graph primitive on Roblox); particle sub-emitters are auto-converted via `sub_emitter_runtime.luau` when `_HasSubEmitters` is detected

@@ -83,11 +83,11 @@ support see also `CLAUDE.md` § Supported Features.
 
 | Feature | Notes |
 |---|---|
-| Property animations | TweenService scripts |
-| Skeletal animation (R15-mappable) | Motor6D bone chain via `character_animator.luau` |
-| Animator state machine | Unified state machine script with parameter-driven transitions |
-| 1D blend trees | Linear interpolation between thresholds |
-| TransformAnimator (CFrame/Size curves) | Inline TweenService Scripts (per `inline-over-runtime-wrappers.md`) |
+| Transform / property animations | Inline TweenService scripts (CFrame / Size / position / rotation / scale curves) |
+
+Skeletal / character animation is **not supported** — see
+[Skeletal / character animation](#skeletal--character-animation-not-supported)
+below.
 
 ### Terrain
 
@@ -107,7 +107,7 @@ support see also `CLAUDE.md` § Supported Features.
 | Client/Server/Module classification | Auto-detected from API usage |
 | Cross-script dependency injection | `require()` calls auto-inserted in topological order |
 | RemoteEvent auto-creation | From script analysis |
-| Runtime modules auto-injected | animator, nav mesh, event system, event dispatch, physics bridge, cinemachine, object pool, pickup, sub-emitter |
+| Runtime modules auto-injected | nav mesh, event system, event dispatch, physics bridge, cinemachine, object pool, pickup, sub-emitter |
 
 ---
 
@@ -210,23 +210,37 @@ For FBX, the converter falls back to dominant-color extraction:
 - Better than default gray for environment meshes (roads, buildings) but loses
   per-vertex variation.
 
-### Animation completeness
+### Skeletal / character animation (NOT SUPPORTED)
 
-The animator runtime handles common cases but several Unity features are
-unimplemented:
+**Unity `SkinnedMeshRenderer` and skeletal/character animation cannot be
+converted.** This is a hard limitation, not a converter gap:
+
+- A Unity skinned mesh converts to a **single rigid `MeshPart`**. It does not
+  deform.
+- Roblox has **no automated or headless path** to a skinned `MeshPart` that
+  deforms via `Bone` instances. Skinned-mesh import is **Studio-3D-Importer
+  only** — it requires a human in Roblox Studio's 3D Importer UI and cannot be
+  driven by an automated converter.
+
+Because the converter is fully automated, the entire skeletal-animation
+feature is out of scope. The following are **all unsupported** and surfaced to
+the per-run `UNCONVERTED.md` when encountered:
 
 | Feature | Status |
 |---|---|
-| Simple state transitions | Implemented |
-| 1D blend trees | Implemented |
-| 2D blend trees (freeform) | Logged to `UNCONVERTED.md`; first-leaf clip used as fallback |
+| Humanoid / skeletal `.anim` clips | Not supported — surfaced to `UNCONVERTED.md` |
+| `AnimatorController` state machines | Not supported |
+| 1D / 2D blend trees | Not supported |
 | Animation layers | Not supported (Roblox has no per-bone masking) |
 | Avatar masks | Not supported |
 | Root motion extraction | Not supported |
 | Inverse kinematics | Not supported |
-| Binary `.controller` / `.anim` | Surfaced to `UNCONVERTED.md`; needs UnityPy or binary YAML parser |
-| Imperative `Animator.*` from a `LocalScript` | Not supported — the `CharacterAnimator` runtime and its dispatch registry are server-side, so transpiled `SetTrigger`/`Play`/`CrossFade` calls from a `LocalScript` do not reach it. **TODO (revisit):** server-side was a PR2 scoping decision, not a settled design — reassess whether the character-animation runtime should live on the server, the client, or be replicated across both. |
-| Weighted keyframe blending (tween backend) | `KeyframeTrack:AdjustWeight` is a no-op stub; overlaying multiple keyframe tracks on one rig is not blended |
+| Imperative `Animator.*` calls (`SetTrigger` / `Play` / `CrossFade` …) | No animation runtime — degrade to harmless `:SetAttribute`/`:GetAttribute` on the host so transpiled code stays valid Luau, but they have no animation effect |
+
+**What IS supported:** transform / property animation. A clip that only drives
+arbitrary transform children (a spinning platform, a bobbing door — no
+humanoid bones) converts to an inline TweenService script. This path is
+unaffected by the skeletal-animation limitation.
 
 ---
 

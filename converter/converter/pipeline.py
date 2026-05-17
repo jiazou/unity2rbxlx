@@ -1584,7 +1584,10 @@ class Pipeline:
         )
 
     def convert_animations(self) -> None:
-        """Route Unity animations to character_animator or inline TweenService.
+        """Route Unity animations to inline TweenService scripts.
+
+        Transform-only clips become inline TweenService Scripts; humanoid/
+        skeletal clips are unsupported and surfaced to UNCONVERTED.md.
 
         When a parsed scene is available, pass it so the converter can
         filter controllers to those actually referenced and scene-scope
@@ -2276,22 +2279,6 @@ return table.concat(allData, "\\n")'''
                 ))
             log.info("[write_output] Wrote %d animation scripts",
                      len(self.state.animation_result.generated_scripts))
-
-        # Write animation data ModuleScripts to ReplicatedStorage.
-        if self.state.animation_result and self.state.animation_result.animation_data_modules:
-            anim_data_dir = scripts_dir / "animation_data"
-            anim_data_dir.mkdir(parents=True, exist_ok=True)
-            for module_name, module_source in self.state.animation_result.animation_data_modules:
-                out_path = anim_data_dir / f"{module_name}.luau"
-                out_path.write_text(module_source, encoding="utf-8")
-                self.state.rbx_place.scripts.append(RbxScript(
-                    name=module_name,
-                    source=module_source,
-                    script_type="ModuleScript",
-                    source_path=f"animation_data/{module_name}.luau",
-                ))
-            log.info("[write_output] Wrote %d animation data modules",
-                     len(self.state.animation_result.animation_data_modules))
 
         # Attach ScriptableObject ModuleScripts on the fresh-transpile path.
         # Rehydration already picks them up from disk; dedupe by name. Names
@@ -3254,9 +3241,22 @@ script.Disabled = true
         plan_lookup = self._load_storage_plan_for_rehydration()
         luau_files = sorted(scripts_dir.rglob("*.luau"))
         from_plan = 0
+        rehydrated = 0
         for luau_path in luau_files:
-            source = luau_path.read_text(encoding="utf-8")
             name = luau_path.stem
+
+            # Skip retired skeletal-animation artifacts. An output dir from a
+            # pre-retirement run may still hold AnimationData_* /
+            # AnimBootstrap_* / character_animator files; rehydrating them
+            # would resurrect the retired feature. These are converter-internal
+            # names that cannot collide with a user clip's Anim_* inline-tween
+            # script (Anim_<ctrl>_<clip>), which is kept.
+            if (name.startswith("AnimationData_")
+                    or name.startswith("AnimBootstrap_")
+                    or name == "character_animator"):
+                continue
+
+            source = luau_path.read_text(encoding="utf-8")
 
             if name in plan_lookup:
                 script_type, parent_path = plan_lookup[name]
@@ -3278,10 +3278,11 @@ script.Disabled = true
             if parent_path and hasattr(script, "parent_path"):
                 script.parent_path = parent_path
             self.state.rbx_place.scripts.append(script)
+            rehydrated += 1
 
         log.info(
             "[write_output] Rehydrated %d scripts from disk (%d via plan, %d via heuristic)",
-            len(luau_files), from_plan, len(luau_files) - from_plan,
+            rehydrated, from_plan, rehydrated - from_plan,
         )
 
     def _load_storage_plan_for_rehydration(self) -> dict[str, tuple[str, str | None]]:
@@ -3751,7 +3752,6 @@ script.Disabled = true
         """Inject runtime library ModuleScripts when relevant features are detected.
 
         Scans the place's scripts and parts for features that need runtime support:
-        - HasAnimator attribute → inject character_animator.luau
         - NavMeshAgent attributes → inject nav_mesh_runtime.luau
         - Canvas/ScreenGui elements → inject event_system.luau
         - CharacterController attributes → inject physics_bridge.luau
@@ -3760,7 +3760,6 @@ script.Disabled = true
         injected = 0
 
         # Detect features from parts (recursively check all children)
-        has_animator = False
         has_navmesh = False
         has_character_controller = False
         has_cinemachine = False
@@ -3768,11 +3767,9 @@ script.Disabled = true
         # has_pickups removed — scripts propagated automatically now
 
         def _scan_parts(parts):
-            nonlocal has_animator, has_navmesh, has_character_controller, has_cinemachine, has_sub_emitters
+            nonlocal has_navmesh, has_character_controller, has_cinemachine, has_sub_emitters
             for part in parts:
                 attrs = getattr(part, "attributes", {})
-                if attrs.get("HasAnimator"):
-                    has_animator = True
                 if attrs.get("_HasNavMeshAgent"):
                     has_navmesh = True
                 if attrs.get("_HasCharacterController"):
@@ -3795,8 +3792,6 @@ script.Disabled = true
 
         # Inject runtime modules as ModuleScripts in ReplicatedStorage
         modules_to_inject = []
-        if has_animator:
-            modules_to_inject.append(("CharacterAnimator", "character_animator.luau"))
         if has_navmesh:
             modules_to_inject.append(("NavAgent", "nav_mesh_runtime.luau"))
         if has_ui:

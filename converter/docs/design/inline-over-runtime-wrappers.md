@@ -62,16 +62,21 @@ the output still says `Time.deltaTime` and `Input.GetKey(...)` and requires a
 ## What this policy does NOT cover
 
 The `converter/runtime/` directory is not empty after this policy. It still
-holds five legitimate runtime modules that are auto-injected into converted
-games:
+holds several legitimate runtime modules that are auto-injected into
+converted games:
 
- - `character_animator.luau` — Unity Animator Controller runtime (state
-   machines, parameters, transitions, blend trees).
  - `nav_mesh_runtime.luau` — NavMeshAgent → `PathfindingService` runtime.
  - `event_system.luau` — `UnityEvent` wiring.
  - `physics_bridge.luau` — physics constraints that Roblox doesn't expose as
    a single call.
  - `cinemachine_runtime.luau` — Cinemachine virtual camera state.
+
+> The `character_animator.luau` skeletal-animation runtime was retired in
+> 2026-05. Skeletal/character animation cannot be converted automatically —
+> a Unity `SkinnedMeshRenderer` becomes a single rigid `MeshPart` and Roblox
+> has no automated/headless path to a skinned `MeshPart` that deforms via
+> `Bone` instances. Humanoid clips are surfaced to `UNCONVERTED.md`. See
+> `docs/UNSUPPORTED.md`.
 
 These are kept because they implement **genuinely stateful runtime behavior
 that cannot be inlined into each script**. A state machine is a per-entity
@@ -132,9 +137,10 @@ The nine wrappers that were removed under this policy:
    `animation_converter.py`'s TweenService output; deleted. Its
    curve-based CFrame/Size animation is handled inline by generated
    TweenService scripts.
- - `converter/runtime/animator_bridge.luau` — unique features (blend
-   trees, getters, `Play()`, Any-state transitions, lazy track loading,
-   `Destroy()`) merged into `character_animator.luau`; deleted.
+ - `converter/runtime/animator_bridge.luau` — was an Animator state-machine
+   runtime; deleted. Skeletal/character animation is unsupported (see
+   `docs/UNSUPPORTED.md`); the `character_animator.luau` successor runtime
+   was likewise retired in 2026-05.
 
 And the orphaned scanner:
 
