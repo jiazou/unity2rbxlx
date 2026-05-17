@@ -222,17 +222,28 @@ API_CALL_MAP: dict[str, str] = {
     "AudioSource.isPlaying": ".IsPlaying",
     # -- Animation --
     # Animator.StringToHash handled by validator (extracts string argument directly)
+    #
+    # Scalar parameters stay on the rig's attributes — the CharacterAnimator
+    # runtime reads initial values and connects GetAttributeChangedSignal per
+    # parameter at Register time, so a plain :SetAttribute on the rig host
+    # propagates into the state machine with no extra wiring.
     "Animator.SetBool": ":SetAttribute",
     "Animator.SetFloat": ":SetAttribute",
     "Animator.SetInteger": ":SetAttribute",
     "Animator.GetBool": ":GetAttribute",
     "Animator.GetFloat": ":GetAttribute",
     "Animator.GetInteger": ":GetAttribute",
-    "Animator.SetTrigger": "AnimationTrack:Play()",
-    "Animator.ResetTrigger": ":SetAttribute(name, false)",
-    "Animator.Play": "AnimationTrack:Play()",
-    "Animator.CrossFade": "AnimationTrack:Play()",
-    "Animator.CrossFadeInFixedTime": "AnimationTrack:Play()",
+    # Imperative ops route to the CharacterAnimator module-level registry via
+    # the animatorDispatch helper (UTILITY_FUNCTIONS) — the rig host resolves
+    # to its CharacterAnimator instance. Calls that arrive before the
+    # per-controller bootstrap runs are queued and drained on Register.
+    # SERVER-SIDE ONLY: a transpiled call from a LocalScript will not reach
+    # the server-bound instance (see docs/UNSUPPORTED.md).
+    "Animator.SetTrigger": "animatorDispatch(host, 'SetTrigger', name)",
+    "Animator.ResetTrigger": "animatorDispatch(host, 'ResetTrigger', name)",
+    "Animator.Play": "animatorDispatch(host, 'Play', stateName)",
+    "Animator.CrossFade": "animatorDispatch(host, 'CrossFade', stateName, duration)",
+    "Animator.CrossFadeInFixedTime": "animatorDispatch(host, 'CrossFadeInFixedTime', stateName, duration)",
     "Animation.Play": "AnimationTrack:Play()",
     # -- Camera --
     "Camera.main": "workspace.CurrentCamera",
@@ -1053,5 +1064,19 @@ local function getSwipe(): string?
 \tlocal s = _lastSwipe
 \t_lastSwipe = nil
 \treturn s
+end""",
+    # Routes a transpiled imperative Animator.* call (SetTrigger / Play /
+    # CrossFade / ...) to the CharacterAnimator module-level registry. The
+    # rig host resolves to its CharacterAnimator instance; calls arriving
+    # before the per-controller bootstrap registers the host are queued by
+    # CharacterAnimator.Dispatch and drained on Register.
+    # SERVER-SIDE ONLY — a call from a LocalScript will not reach the
+    # server-bound instance (see docs/UNSUPPORTED.md).
+    "animatorDispatch": """\
+local function animatorDispatch(host: Instance?, op: string, ...)
+\tif not host then return end
+\tlocal CharacterAnimator = game:GetService("ReplicatedStorage"):FindFirstChild("CharacterAnimator")
+\tif not CharacterAnimator then return end
+\trequire(CharacterAnimator).Dispatch(host, op, ...)
 end""",
 }

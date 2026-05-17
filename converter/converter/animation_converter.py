@@ -1610,9 +1610,11 @@ def export_controller_json(
 
     The character_animator.luau expects this format for state machine evaluation.
 
-    When ``clip_name_by_guid`` is provided, BlendTree entries resolve their
-    ``clip_guid`` → ``clip_name`` so the runtime can look clips up by name.
-    Without it, entries missing a name are dropped (they'd be unreachable).
+    When ``clip_name_by_guid`` is provided, each state's ``motion`` and the
+    BlendTree entries resolve their ``clip_guid`` → clip display name so the
+    runtime can look clips up by the same key the keyframes dict uses.
+    Without it, ``motion`` falls back to the state name and BlendTree entries
+    missing a name are dropped (they'd be unreachable).
     """
     clip_name_by_guid = clip_name_by_guid or {}
     states = []
@@ -1635,9 +1637,15 @@ def export_controller_json(
                 "hasExitTime": trans.has_exit_time,
                 "exitTime": trans.exit_time,
             })
+        # ``motion`` is the key the runtime uses to look a state's clip up
+        # in the keyframes dict. That dict is keyed by clip *display name*
+        # (see convert_animations: keyframes = {humanoid_display[id(clip)]:
+        # ...}), so ``motion`` must resolve to the same display name — NOT
+        # the state name, which collides with the keyframes key only by
+        # accident. Fall back to the state name for states with no clip.
         state_entry: dict[str, Any] = {
             "name": state.name,
-            "motion": state.name,  # Use state name as motion key
+            "motion": clip_name_by_guid.get(state.clip_guid, state.name),
             "speed": state.speed,
             "transitions": transitions,
         }
@@ -1771,8 +1779,107 @@ def export_clip_keyframes(clip: AnimClip) -> dict[str, Any]:
 
     return {
         "duration": round(clip.duration, 3),
+        # The KeyframeTrack adapter defaults its ``Looped`` field from this
+        # flag; the runtime still overrides it per-state from the controller
+        # graph, but a track played outside a state (blend-tree leaf) honours
+        # the clip's own loop setting.
+        "loop": bool(clip.loop),
         "bones": bones,
     }
+
+
+def generate_controller_bootstrap(
+    module_name: str,
+    rig_name: str,
+    *,
+    prefab_scoped: bool = False,
+) -> str:
+    """Generate the per-controller bootstrap Script.
+
+    The bootstrap is the glue that makes the CharacterAnimator path actually
+    run for a rig (PR2 of the character-animation plan): it ``require``s the
+    CharacterAnimator runtime + the controller's ``AnimationData_*`` module,
+    finds the rig, instantiates ``CharacterAnimator.new(controllerData, rig)``,
+    registers it (``CharacterAnimator.Register``) so transpiled imperative
+    ``Animator.*`` calls resolve to it, loads the keyframe data, and ticks
+    ``:Update(dt)`` on ``RunService.Heartbeat``.
+
+    Args:
+        module_name: name of the ``AnimationData_*`` ModuleScript that holds
+            the exported controller graph + bone keyframes.
+        rig_name: name of the Roblox model/part that carries the rig — the
+            Animator host's GameObject name.
+        prefab_scoped: when True the bootstrap lives under a cloned
+            ``ReplicatedStorage.Templates.<Prefab>`` and binds to
+            ``script.Parent`` (this clone), falling back to a workspace
+            search for scene-baked instances. Mirrors the exact pattern
+            ``generate_tween_script`` uses so multi-instance prefabs each
+            drive their own clone instead of all racing onto whichever copy
+            ``workspace:FindFirstChild`` returns first.
+
+    Returns:
+        Luau source for a server Script.
+    """
+    lines: list[str] = []
+    lines.append(f"-- Auto-generated CharacterAnimator bootstrap for {module_name}")
+    lines.append("-- Wires the exported Unity AnimatorController to the")
+    lines.append("-- CharacterAnimator tween-backend runtime (PR2 of the")
+    lines.append("-- character-animation plan; see docs/design/character-animation.md).")
+    lines.append("--")
+    lines.append("-- SERVER-SIDE ONLY: transpiled Animator.* calls from a")
+    lines.append("-- LocalScript will not reach this server-bound instance")
+    lines.append("-- (see docs/UNSUPPORTED.md).")
+    lines.append("")
+    lines.append('local ReplicatedStorage = game:GetService("ReplicatedStorage")')
+    lines.append('local RunService = game:GetService("RunService")')
+    lines.append("")
+    lines.append('local CharacterAnimatorModule = ReplicatedStorage:FindFirstChild("CharacterAnimator")')
+    lines.append(f'local AnimationDataModule = ReplicatedStorage:FindFirstChild("{module_name}")')
+    lines.append("if not CharacterAnimatorModule or not AnimationDataModule then")
+    lines.append("    -- Runtime module or animation data missing; nothing to drive.")
+    lines.append("    return")
+    lines.append("end")
+    lines.append("local CharacterAnimator = require(CharacterAnimatorModule)")
+    lines.append("local animationData = require(AnimationDataModule)")
+    lines.append("")
+    if prefab_scoped:
+        lines.append("-- Prefab-scoped: prefer script.Parent (this clone), fall")
+        lines.append("-- back to a workspace search when running from a global container.")
+        lines.append("local rig")
+        lines.append("if script.Parent and (script.Parent:IsA('Model') or script.Parent:IsA('BasePart')) then")
+        if rig_name:
+            lines.append(f'    rig = script.Parent:FindFirstChild("{rig_name}", true) or script.Parent')
+        else:
+            lines.append("    rig = script.Parent")
+        lines.append("else")
+        if rig_name:
+            lines.append(f'    rig = workspace:FindFirstChild("{rig_name}", true)')
+        else:
+            lines.append("    rig = nil")
+        lines.append("end")
+    else:
+        if rig_name:
+            lines.append(f'local rig = workspace:FindFirstChild("{rig_name}", true)')
+        else:
+            lines.append("local rig = nil")
+    lines.append("if not rig then")
+    lines.append("    -- Rig not found; bootstrap will not run.")
+    lines.append("    return")
+    lines.append("end")
+    lines.append("")
+    lines.append("local instance = CharacterAnimator.new(animationData.controller, rig)")
+    lines.append("if animationData.keyframes then")
+    lines.append("    instance:LoadKeyframes(animationData.keyframes)")
+    lines.append("end")
+    lines.append("-- Register so transpiled imperative Animator.* calls resolve to")
+    lines.append("-- this instance (and drain any calls queued before this ran).")
+    lines.append("CharacterAnimator.Register(rig, instance)")
+    lines.append("")
+    lines.append("RunService.Heartbeat:Connect(function(dt)")
+    lines.append("    instance:Update(dt)")
+    lines.append("end)")
+    lines.append("")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -2177,6 +2284,27 @@ def convert_animations(
                     f"return data\n"
                 )
                 result.animation_data_modules.append((module_name, module_source))
+
+                # Per-controller bootstrap Script (PR2): requires the
+                # CharacterAnimator runtime + this AnimationData_* module,
+                # finds the rig, instantiates + registers the runtime, and
+                # ticks :Update(dt) on Heartbeat. Emitted as a generated
+                # Script so the pipeline parents it like other animation
+                # scripts; prefab-scoped emissions get the same
+                # script.Parent-first binding as the tween scripts and are
+                # recorded in script_scopes so the pipeline reparents them
+                # under ReplicatedStorage.Templates.<Prefab>.
+                bootstrap_name = f"AnimBootstrap_{prefix}{ctrl_key}"
+                bootstrap_source = generate_controller_bootstrap(
+                    module_name,
+                    ctrl.name,
+                    prefab_scoped=scope_is_prefab,
+                )
+                result.generated_scripts.append(
+                    (bootstrap_name, bootstrap_source)
+                )
+                if scope_is_prefab:
+                    result.script_scopes[bootstrap_name] = scope
 
     # Scene-scoped runs: UNCONVERTED entries were collected during
     # project-wide discovery, before the scene filter got applied.
