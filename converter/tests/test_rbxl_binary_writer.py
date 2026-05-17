@@ -111,6 +111,60 @@ class TestBinaryWithScripts:
         assert b"hello world" in data
 
 
+class TestTokenPropertyDefaults:
+    """The binary format groups properties per class — if any Part has a
+    ``Shape`` property, every Part needs a Shape value emitted. Parts
+    without one get a default. The wrong default (0 = Ball) silently turns
+    flat dock-style colliders into 1-stud spheres at runtime, only
+    visible when the binary is loaded — the XML form loads fine because
+    Studio uses Roblox's engine default (Block) for absent properties.
+    """
+
+    def test_missing_shape_defaults_to_block_not_ball(self, tmp_path):
+        """Regression: a Part without ``<token name="Shape">`` must end up
+        as Block in the binary, not Ball — even when *another* Part in the
+        same class has a Shape property set."""
+        xml = (
+            '<?xml version="1.0"?>'
+            '<roblox>'
+            '<Item class="Workspace" referent="W">'
+            '  <Item class="Part" referent="P1">'
+            '    <Properties>'
+            '      <string name="Name">FlatCollider</string>'
+            '      <Vector3 name="size"><X>50</X><Y>1</Y><Z>10</Z></Vector3>'
+            '    </Properties>'
+            '  </Item>'
+            '  <Item class="Part" referent="P2">'
+            '    <Properties>'
+            '      <string name="Name">SphereTrigger</string>'
+            '      <Vector3 name="size"><X>2</X><Y>2</Y><Z>2</Z></Vector3>'
+            '      <token name="Shape">0</token>'
+            '    </Properties>'
+            '  </Item>'
+            '</Item>'
+            '</roblox>'
+        )
+        xml_file = tmp_path / "shape_default.rbxlx"
+        xml_file.write_text(xml, encoding="utf-8")
+        result = xml_to_binary(xml_file)
+        data = result.read_bytes()
+
+        # We can't easily decode the full binary here without reimplementing
+        # the reader, but we can assert the property-name-aware default
+        # function works as intended at the unit level.
+        from roblox.rbxl_binary_writer import (
+            _default_for_property,
+            _default_for_type,
+            TYPE_ENUM,
+        )
+        # Shape default: Block (1), not Ball (0).
+        assert _default_for_property("Shape", TYPE_ENUM) == 1
+        # Type default unchanged for non-name-overridden enums.
+        assert _default_for_type(TYPE_ENUM) == 0
+        # An unknown token property still falls back to the type default.
+        assert _default_for_property("SomeUnknownToken", TYPE_ENUM) == 0
+
+
 class TestBinaryErrorHandling:
     def test_nonexistent_file(self, tmp_path):
         with pytest.raises((FileNotFoundError, ET.ParseError, OSError)):

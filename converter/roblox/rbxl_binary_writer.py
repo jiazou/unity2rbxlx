@@ -412,6 +412,48 @@ def _default_for_type(type_id: int) -> object:
     return defaults.get(type_id, "")
 
 
+# Property-name-aware token defaults. The Roblox binary format groups properties
+# by class, so every instance of a class must emit a value for every property
+# any instance in that class set. When the XML omits a property we have to
+# substitute Roblox's actual default — and for ``Token`` (Enum) properties the
+# default is NOT always ``0``. Substituting ``0`` for ``Part.Shape`` makes the
+# part a ``Ball`` instead of a ``Block``, which silently collapses dock-style
+# colliders to 1-stud spheres and is the kind of bug that only surfaces when
+# the binary file gets opened in Studio (the XML rbxlx loads fine because
+# Studio's XML parser uses the engine default when the property is absent).
+#
+# Keep this map keyed by the **XML property name** as emitted by
+# ``rbxlx_writer.py``. Values are the integer Enum member that matches the
+# property's runtime default on a freshly-constructed instance.
+_TOKEN_DEFAULTS_BY_NAME: dict[str, int] = {
+    # BasePart shape defaults to Block (1), not Ball (0).
+    "Shape": 1,
+    # BasePart surface defaults are Smooth (10) on all six faces, except for
+    # the deprecated BottomSurface which is Inlet (3) historically. Modern
+    # Studio uses Smooth for all six, and we never emit non-Smooth surfaces
+    # so this normalises the missing-property case.
+    "TopSurface": 10,
+    "BottomSurface": 10,
+    "FrontSurface": 10,
+    "BackSurface": 10,
+    "LeftSurface": 10,
+    "RightSurface": 10,
+}
+
+
+def _default_for_property(prop_name: str, type_id: int) -> object:
+    """Return Roblox's default value for *prop_name* on a fresh instance.
+
+    Falls back to :func:`_default_for_type` when we don't have a
+    property-specific override. Token defaults must be name-aware (see
+    ``_TOKEN_DEFAULTS_BY_NAME``); other types are well-served by the
+    type-only default table.
+    """
+    if type_id == TYPE_ENUM and prop_name in _TOKEN_DEFAULTS_BY_NAME:
+        return _TOKEN_DEFAULTS_BY_NAME[prop_name]
+    return _default_for_type(type_id)
+
+
 def _serialise_prop_values(type_id: int, values: list[object]) -> bytes:
     """Serialise an array of property values for one PROP chunk."""
     n = len(values)
@@ -715,7 +757,7 @@ def xml_to_binary(xml_path: str | Path, binary_path: str | Path | None = None) -
                 if prop_name in inst.properties:
                     values.append(inst.properties[prop_name][1])
                 else:
-                    values.append(_default_for_type(type_id))
+                    values.append(_default_for_property(prop_name, type_id))
             output += _build_prop(idx, prop_name, type_id, values)
 
     # PRNT chunk.
