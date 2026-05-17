@@ -225,6 +225,8 @@ unimplemented:
 | Root motion extraction | Not supported |
 | Inverse kinematics | Not supported |
 | Binary `.controller` / `.anim` | Surfaced to `UNCONVERTED.md`; needs UnityPy or binary YAML parser |
+| Imperative `Animator.*` from a `LocalScript` | Not supported — the `CharacterAnimator` instance and its dispatch registry are server-side; transpiled `SetTrigger`/`Play`/`CrossFade` calls originating from a `LocalScript` will not reach it |
+| Weighted keyframe blending (tween backend) | `KeyframeTrack:AdjustWeight` is a no-op stub; overlaying multiple keyframe tracks on one rig is not blended |
 
 ---
 

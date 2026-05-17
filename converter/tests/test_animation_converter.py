@@ -38,6 +38,7 @@ from converter.animation_converter import (
     convert_animations,
     export_controller_json,
     export_clip_keyframes,
+    generate_controller_bootstrap,
     _quat_to_euler_degrees,
 )
 
@@ -1657,6 +1658,32 @@ class TestAnimationDataExport:
         assert frames[1]["cf"]["x"] == 1.0
         # Z should be negated (Unity -> Roblox)
         assert frames[1]["cf"]["z"] == -3.0
+
+    def test_export_clip_keyframes_carries_loop_flag(self):
+        """PR2: the exported keyframe data carries the clip loop flag so
+        KeyframeTrack can default its Looped field."""
+        looping = AnimClip(
+            name="walk", duration=1.0, loop=True, sample_rate=30,
+            curves=[AnimCurve(
+                property_type="position", path="Hips",
+                keyframes=[
+                    AnimKeyframe(time=0.0, value=(0.0, 0.0, 0.0)),
+                    AnimKeyframe(time=1.0, value=(1.0, 0.0, 0.0)),
+                ],
+            )],
+        )
+        once = AnimClip(
+            name="jump", duration=1.0, loop=False, sample_rate=30,
+            curves=[AnimCurve(
+                property_type="position", path="Hips",
+                keyframes=[
+                    AnimKeyframe(time=0.0, value=(0.0, 0.0, 0.0)),
+                    AnimKeyframe(time=1.0, value=(1.0, 0.0, 0.0)),
+                ],
+            )],
+        )
+        assert export_clip_keyframes(looping)["loop"] is True
+        assert export_clip_keyframes(once)["loop"] is False
 
     def test_export_clip_keyframes_merges_curves_by_time(self):
         """A bone with separate position and rotation curves whose
@@ -3825,3 +3852,188 @@ class TestPhase59PrefabScopedTweenScripts:
         assert variant.referenced_animator_controller_guids == merged_refs
         # Base controller is no longer referenced.
         assert "c" * 32 not in variant.referenced_animator_controller_guids
+
+
+# ===========================================================================
+# PR2 (character-animation plan): tween backend end-to-end
+# ===========================================================================
+
+
+def _build_humanoid_controller_project(tmp_path: Path) -> tuple[Path, str]:
+    """Write a minimal Unity project with one humanoid clip + controller.
+
+    The clip touches the ``Hips`` bone so it routes through
+    character_animator (animation_data module + bootstrap), not inline
+    TweenService. Returns (project_root, controller_guid).
+    """
+    assets = tmp_path / "Assets"
+    assets.mkdir(exist_ok=True)
+    clip_guid = "c" * 32
+    ctrl_guid = "d" * 32
+
+    (assets / "Walk.anim").write_text(textwrap.dedent("""\
+        %YAML 1.1
+        %TAG !u! tag:unity3d.com,2011:
+        --- !u!74 &7400000
+        AnimationClip:
+          m_Name: Walk
+          m_SampleRate: 30
+          m_AnimationClipSettings:
+            m_StartTime: 0
+            m_StopTime: 1.0
+            m_LoopTime: 1
+          m_PositionCurves:
+          - curve:
+              m_Curve:
+              - time: 0
+                value: {x: 0, y: 0, z: 0}
+              - time: 1
+                value: {x: 1, y: 0, z: 0}
+            path: Hips
+          m_RotationCurves: []
+          m_EulerCurves: []
+          m_ScaleCurves: []
+        """))
+    (assets / "Walk.anim.meta").write_text(
+        f"fileFormatVersion: 2\nguid: {clip_guid}\n"
+    )
+
+    (assets / "Hero.controller").write_text(textwrap.dedent(f"""\
+        %YAML 1.1
+        %TAG !u! tag:unity3d.com,2011:
+        --- !u!91 &9100000
+        AnimatorController:
+          m_Name: Hero
+          m_AnimatorParameters:
+          - m_Name: Speed
+            m_Type: 1
+            m_DefaultFloat: 0
+          m_AnimatorLayers:
+          - m_Name: Base Layer
+            m_StateMachine: {{fileID: 200}}
+        --- !u!1107 &200
+        AnimatorStateMachine:
+          m_ChildStates:
+          - m_State: {{fileID: 301}}
+          m_DefaultState: {{fileID: 301}}
+        --- !u!1102 &301
+        AnimatorState:
+          m_Name: Walk
+          m_Motion:
+            fileID: 7400000
+            guid: {clip_guid}
+            type: 2
+        """))
+    (assets / "Hero.controller.meta").write_text(
+        f"fileFormatVersion: 2\nguid: {ctrl_guid}\n"
+    )
+    return tmp_path, ctrl_guid
+
+
+class TestControllerBootstrapCodegen:
+    """PR2 item 4/6: per-controller bootstrap Script generation + scoping."""
+
+    def test_bootstrap_requires_runtime_and_data_module(self) -> None:
+        src = generate_controller_bootstrap("AnimationData_Hero", "Hero")
+        assert 'FindFirstChild("CharacterAnimator")' in src
+        assert 'FindFirstChild("AnimationData_Hero")' in src
+        assert "require(CharacterAnimatorModule)" in src
+        assert "require(AnimationDataModule)" in src
+
+    def test_bootstrap_instantiates_registers_and_ticks(self) -> None:
+        src = generate_controller_bootstrap("AnimationData_Hero", "Hero")
+        assert "CharacterAnimator.new(animationData.controller, rig)" in src
+        assert "CharacterAnimator.Register(rig, instance)" in src
+        assert "instance:LoadKeyframes(animationData.keyframes)" in src
+        assert "RunService.Heartbeat:Connect" in src
+        assert "instance:Update(dt)" in src
+
+    def test_bootstrap_scene_scoped_uses_workspace_search(self) -> None:
+        src = generate_controller_bootstrap(
+            "AnimationData_Hero", "Hero", prefab_scoped=False,
+        )
+        assert 'workspace:FindFirstChild("Hero", true)' in src
+        assert "script.Parent" not in src
+
+    def test_bootstrap_prefab_scoped_prefers_script_parent(self) -> None:
+        """Mirror generate_tween_script's prefab binding: script.Parent
+        first, workspace fallback after — and in that order."""
+        src = generate_controller_bootstrap(
+            "AnimationData_Hero", "Hero", prefab_scoped=True,
+        )
+        assert "script.Parent" in src
+        assert "workspace:FindFirstChild" in src
+        assert src.index("script.Parent") < src.index("workspace:FindFirstChild")
+
+    def test_convert_animations_emits_bootstrap_for_humanoid_controller(
+        self, tmp_path: Path,
+    ) -> None:
+        from unity.guid_resolver import build_guid_index
+
+        project, _ = _build_humanoid_controller_project(tmp_path)
+        guid_index = build_guid_index(project)
+        result = convert_animations(project, guid_index=guid_index)
+
+        # The humanoid controller emits an AnimationData_* module ...
+        module_names = [n for n, _ in result.animation_data_modules]
+        assert "AnimationData_Hero" in module_names
+        # ... and a paired bootstrap Script.
+        script_names = [n for n, _ in result.generated_scripts]
+        assert "AnimBootstrap_Hero" in script_names
+        bootstrap = next(
+            s for n, s in result.generated_scripts if n == "AnimBootstrap_Hero"
+        )
+        assert 'FindFirstChild("AnimationData_Hero")' in bootstrap
+        # Scene-scoped (no parsed_scenes) → no script_scopes entry.
+        assert "AnimBootstrap_Hero" not in result.script_scopes
+
+    def test_bootstrap_prefab_scoped_recorded_in_script_scopes(
+        self, tmp_path: Path,
+    ) -> None:
+        from core.unity_types import (
+            ParsedScene,
+            PrefabInstanceData,
+            PrefabLibrary,
+            PrefabTemplate,
+        )
+        from unity.guid_resolver import build_guid_index
+        from unity.prefab_parser import aggregate_prefab_controller_refs
+
+        project, ctrl_guid = _build_humanoid_controller_project(tmp_path)
+        prefab = PrefabTemplate(
+            prefab_path=project / "Assets" / "Hero.prefab",
+            name="Hero",
+            referenced_animator_controller_guids={ctrl_guid},
+        )
+        library = PrefabLibrary(
+            prefabs=[prefab],
+            by_name={"Hero": prefab},
+            by_guid={"hero" + "0" * 28: prefab},
+        )
+        scene = ParsedScene(
+            scene_path=project / "Assets" / "Level1.unity",
+            prefab_instances=[PrefabInstanceData(
+                file_id="500",
+                source_prefab_guid="hero" + "0" * 28,
+                source_prefab_file_id="0",
+                transform_parent_file_id="0",
+                modifications=[],
+            )],
+        )
+        aggregate_prefab_controller_refs(scene, library)
+        guid_index = build_guid_index(project)
+        result = convert_animations(
+            project,
+            guid_index=guid_index,
+            parsed_scenes=[scene],
+            prefab_library=library,
+        )
+        # Prefab-scoped bootstrap: name carries the prefab prefix and the
+        # scope is recorded so the pipeline reparents it under the template.
+        assert "AnimBootstrap_Hero_Hero" in result.script_scopes
+        assert result.script_scopes["AnimBootstrap_Hero_Hero"] == "Hero"
+        bootstrap = next(
+            s for n, s in result.generated_scripts
+            if n == "AnimBootstrap_Hero_Hero"
+        )
+        assert "script.Parent" in bootstrap
