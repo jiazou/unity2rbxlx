@@ -592,17 +592,20 @@ def test_rehydration_round_trip_nested_dirs_preserves_layout(tmp_path):
 
 def test_rehydration_skips_retired_animation_artifacts(tmp_path):
     """A pre-retirement output dir may still hold AnimationData_* /
-    AnimBootstrap_* / *_StateMachine skeletal-animation artifacts.
-    Rehydration must skip them (the feature is retired) while keeping the
-    working Anim_* inline-tween scripts and ordinary scripts."""
+    AnimBootstrap_* skeletal-animation artifacts. Rehydration must skip them
+    (the feature is retired) while keeping the working Anim_* inline-tween
+    scripts and ordinary scripts."""
     pipeline = _make_pipeline(tmp_path)
     scripts_dir = pipeline.output_dir / "scripts"
     (scripts_dir / "animation_data").mkdir(parents=True)
     (scripts_dir / "animations").mkdir(parents=True)
     (scripts_dir / "animation_data" / "AnimationData_Hero.luau").write_text("return {}\n")
     (scripts_dir / "animations" / "AnimBootstrap_Hero.luau").write_text("-- bootstrap\n")
-    (scripts_dir / "animations" / "Anim_HeroCtrl_StateMachine.luau").write_text("-- sm\n")
     (scripts_dir / "animations" / "Anim_Door_open.luau").write_text("-- tween\n")
+    # A transform clip literally named "StateMachine" produces a real
+    # Anim_*_StateMachine inline-tween script — it must NOT be pruned
+    # (regression: an over-broad endswith("_StateMachine") guard would).
+    (scripts_dir / "animations" / "Anim_Gate_StateMachine.luau").write_text("-- tween\n")
     (scripts_dir / "GameManager.luau").write_text('print("hi")\n')
 
     pipeline._rehydrate_scripts_from_disk(scripts_dir)
@@ -611,7 +614,7 @@ def test_rehydration_skips_retired_animation_artifacts(tmp_path):
     # Retired skeletal-animation artifacts are not rehydrated.
     assert "AnimationData_Hero" not in names
     assert "AnimBootstrap_Hero" not in names
-    assert "Anim_HeroCtrl_StateMachine" not in names
-    # The working transform-tween script and ordinary scripts survive.
+    # Working transform-tween scripts and ordinary scripts survive.
     assert "Anim_Door_open" in names
+    assert "Anim_Gate_StateMachine" in names
     assert "GameManager" in names

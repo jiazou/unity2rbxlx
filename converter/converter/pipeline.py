@@ -3247,12 +3247,12 @@ script.Disabled = true
 
             # Skip retired skeletal-animation artifacts. An output dir from a
             # pre-retirement run may still hold AnimationData_* /
-            # AnimBootstrap_* / *_StateMachine / character_animator files;
-            # rehydrating them would resurrect the retired feature. The
-            # working Anim_* inline-tween scripts are kept.
+            # AnimBootstrap_* / character_animator files; rehydrating them
+            # would resurrect the retired feature. These are converter-internal
+            # names that cannot collide with a user clip's Anim_* inline-tween
+            # script (Anim_<ctrl>_<clip>), which is kept.
             if (name.startswith("AnimationData_")
                     or name.startswith("AnimBootstrap_")
-                    or name.endswith("_StateMachine")
                     or name == "character_animator"):
                 continue
 
