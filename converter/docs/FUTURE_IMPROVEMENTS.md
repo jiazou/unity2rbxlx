@@ -11,47 +11,21 @@ committed to as work.
 
 ---
 
-## Animation system completion
+## Animation
 
-**Status:** Phases 0–2 and 4 landed. Animator controllers transpile to
-self-contained per-controller `Anim_*_StateMachine` scripts
-(`animation_converter.py:generate_state_machine_script` — inline
-TweenService/RunService, no runtime `require`); other clips ship as inline
-`Anim_*` TweenService scripts. Phases 3 and 5 are open.
+**Transform / property animation** is supported: a clip that drives only
+arbitrary transform children (no humanoid bones) converts to an inline
+TweenService `Anim_*` script.
 
-> **Orphan-module debt.** `runtime/animator_runtime.luau` (the
-> `AnimatorRuntime` state-machine ModuleScript and its 1D blend-tree
-> support) and the `AnimationData_*` data modules are injected into output
-> when `HasAnimator` is set, but **no generated script `require`s or
-> instantiates them** — they are dead code in every converted project. The
-> Unity `Animator.*` API is translated inline by `api_mappings.py` to
-> `:SetAttribute` / `AnimationTrack:Play()`, bypassing the module entirely.
-> Resolve by either wiring a real `require(...AnimatorRuntime)` consumer or
-> deleting the orphan module + its injection. The same overstatement is
-> stale in `CLAUDE.md` ("5 runtime Luau modules auto-injected") and
-> `docs/design/inline-over-runtime-wrappers.md`.
-
-### Phase 3 — `KeyframeSequence` export
-
-Generate `KeyframeSequence` XML nodes in the rbxlx so animations are part
-of the place file rather than referenced by external asset ID. Closest to
-self-contained output. The alternative (bulk-uploading via `cloud_api.py`
-to get asset IDs) works but adds an upload step and asset count.
-
-Trade-off: KeyframeSequence is a heavy XML structure, but it's deterministic
-and round-trips correctly.
-
-### Phase 5 — Advanced features (out of scope until needed)
-
-- **2D blend trees (freeform)** — Cartesian / directional blending with
-  Delaunay triangulation. Currently surfaced to `UNCONVERTED.md` with the
-  first leaf clip used as fallback.
-- **Animation layers + avatar masks** — Roblox has no per-bone masking;
-  would need per-bone track splitting or `AnimationTrack.Priority` games.
-- **Root motion extraction** — Separate root bone curves → apply as
-  `HumanoidRootPart` movement.
-- **Inverse kinematics** — Would require a full IK solver in Luau.
-  Out of scope.
+**Skeletal / character animation is out of scope — permanently.** A Unity
+`SkinnedMeshRenderer` converts to a single rigid `MeshPart`, and Roblox
+exposes no automated/headless path to a skinned `MeshPart` that deforms via
+`Bone` instances (skinned-mesh import is Studio-3D-Importer-only). The
+`character_animator` skeletal-animation runtime, its `AnimationData_*` data
+modules, and the per-controller bootstrap were retired in 2026-05. Humanoid
+clips, `AnimatorController` state machines, blend trees, layers, masks, root
+motion, and IK are all surfaced to `UNCONVERTED.md`. See
+`docs/UNSUPPORTED.md`.
 
 ---
 

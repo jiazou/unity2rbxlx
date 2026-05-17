@@ -14,8 +14,8 @@ One Luau module per major Unity system:
 | World/level manager | Manager module | game-specific |
 | Input/character controller | Controller module | game-specific |
 | Per-MonoBehaviour | One module each | game-specific |
-| Legacy `.anim` on non-skeletal | Auto-gen animator config | `runtime/character_animator.luau` |
-| Mecanim on skinned | Auto-gen root-motion config | `runtime/character_animator.luau` |
+| Transform-only `.anim` (non-humanoid) | Auto-gen inline `Anim_*` script | `TweenService` (inline, no runtime) |
+| Humanoid / skeletal `.anim`, Mecanim on skinned meshes | Not supported — surfaced to `UNCONVERTED.md` (see `docs/UNSUPPORTED.md`) | — |
 | ParticleSystem (burst) | Emitter `Enabled=false` + `BurstCount` | scripts call `:Emit()` |
 | NavMeshAgent | Controller module | `runtime/nav_mesh_runtime.luau` |
 | Cinemachine | Camera attributes + runtime | `runtime/cinemachine_runtime.luau` |
