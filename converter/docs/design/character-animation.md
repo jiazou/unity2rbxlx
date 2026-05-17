@@ -1,185 +1,101 @@
-# Character / Skeletal Animation
+# Character / Skeletal Animation — Closed
 
-**Status:** Planned 2026-05-17. Engineering plan reviewed (`/plan-eng-review`
-+ Codex outside voice). Not yet implemented. Supersedes the "Animation system
-completion" Phase 3-5 framing in [`../FUTURE_IMPROVEMENTS.md`](../FUTURE_IMPROVEMENTS.md).
-
----
-
-## Problem
-
-Transform animation works. Skeletal / character animation does not — and it
-is not merely *unwired*, it is *unfinished*. Three pieces exist, none complete:
-
-1. **`runtime/animator_runtime.luau`** — a full Unity Animator Controller
-   runtime (state machine, parameters, transitions, 1D blend trees, plus
-   `_playKeyframeAnimation` per-bone CFrame tweening). Injected into output
-   when `HasAnimator` is set (`pipeline.py:3799`) but **never `require`d or
-   instantiated** by any generated script. Dead code in every converted
-   project. Internally inconsistent too: `_transitionTo` plays via
-   `_lazyLoadTrack` (Roblox `AnimationTrack`, needs uploaded `Animation`
-   assets the converter never produces), while `_playKeyframeAnimation`
-   (the only real per-bone code) is defined but never called.
-
-2. **`animation_converter.py:generate_state_machine_script`** — emits a
-   self-contained per-controller Luau `Script`, but only tweens **one Part's
-   `Position`** (lines 1707-1731). Not a skeletal animator. Gated on
-   `humanoid_clips and has_transitions and len(states) >= 2`; no test project
-   currently triggers it.
-
-3. **`AnimationData_*` JSON modules** — controller graph + bone keyframes
-   (`export_controller_json` / `export_clip_keyframes`). Emitted for humanoid
-   clips, consumed by nothing.
-
-What *does* work and is **out of scope to change**: transform-only clips via
-`generate_tween_script` → inline `Anim_*` `TweenService` scripts.
+**Status:** Closed 2026-05-17. Skeletal/character animation is **not feasible**
+for an automated Unity→Roblox converter; the work was retired. This document
+records *why*, so the dead end is not re-attempted blind. For the user-facing
+limitation see [`../UNSUPPORTED.md`](../UNSUPPORTED.md) § "Skeletal / character
+animation — NOT supported".
 
 ---
 
-## Architecture
+## Outcome
 
-One state-machine runtime. A per-character **backend** fork — native vs.
-tween — chosen at conversion time. Unity's AnimatorController state machine
-(states / transitions / parameters / blend trees) has no Roblox equivalent
-and must be emulated regardless of backend; only *clip playback* differs.
+A four-PR plan to finish skeletal/character animation was scoped, started, and
+then abandoned when a platform investigation showed the goal is unreachable
+through any automated path:
 
-```
-Unity project
-   │ parse
-   ▼
-AnimatorController + .anim clips + rig (SkinnedMeshRenderer / Avatar / bone names)
-   │
-   ▼
-[detect_rig_backend]  per character ─► confidence score
-   │  native        │  tween            │ low confidence
-   │                │                   ▼
-   │                │             ask author (/convert-unity prompt)
-   ▼                ▼
-KeyframeSequence    AnimationData_* JSON
-+ Motor6D + Animator  (controller graph + bone keyframes)
-   └───────┬────────┘
-           ▼
-   generated per-controller bootstrap Script
-   require(CharacterAnimator).new(controllerData, rig); Heartbeat → :Update(dt)
-           ▼
-   CharacterAnimator  ── single state machine: states / transitions / params / blend trees
-           │  plays each active state's clip via a backend-agnostic track handle:
-           ├─ native backend → AnimationTrack:Play
-           └─ tween backend  → keyframe-tween adapter (see PR2)
-```
+- **PR1 — landed** (merged, PR #94). Renamed `animator_runtime.luau` →
+  `character_animator.luau` and retired the redundant
+  `generate_state_machine_script`. Cleanup.
+- **PR2 — landed** (merged, PR #95). Wired the `CharacterAnimator` tween
+  backend end-to-end — working code, but it animates an *invisible* skeleton
+  (see below).
+- **PR3 / PR4 — cancelled**, never started.
+- **Retirement** (PR #98). The `CharacterAnimator` runtime, the
+  `AnimationData_*` module emission, the per-controller bootstrap codegen, the
+  runtime-module injection, and the imperative-`Animator.*` dispatch were all
+  deleted. Humanoid/skeletal animation clips are now surfaced to
+  `UNCONVERTED.md`.
 
-The fork is narrow **only if** the tween backend is wrapped in a track-like
-adapter (see PR2, risk R2). Without that adapter the two backends are two
-playback models and the state machine cannot stay backend-agnostic.
+What survives and works, untouched: **transform/property animation** — doors,
+moving platforms, rotating props — via `generate_tween_script` → inline
+`Anim_*` `TweenService` scripts.
 
 ---
 
-## PR sequencing
+## Why it is not feasible
 
-Strangler-fig. Each PR ships something testable. The per-character fork —
-the user's requested end-state — lands **last**, after both backends it
-routes between actually exist.
+Two independent blockers, established from Roblox documentation and a codebase
+audit.
 
-### PR1 — Rename + retire the redundant generator
+### 1. The converted rig cannot deform
 
-- `runtime/animator_runtime.luau` → `runtime/character_animator.luau`;
-  symbol `AnimatorRuntime` → `CharacterAnimator`; injection key in
-  `pipeline.py:3796-3799`; doc references in `CLAUDE.md` and
-  `docs/design/inline-over-runtime-wrappers.md`.
-- Retire `generate_state_machine_script`; reroute its callers.
+A Unity `SkinnedMeshRenderer` is a single mesh skinned to a bone hierarchy.
+The converter turns it into:
 
-**Not a pure refactor.** `generate_state_machine_script` *does* emit for
-controllers with humanoid clips + transitions + >= 2 states — the 9 fixtures
-just never hit that branch. Removing it changes generated output for real
-projects. Treat as a behavior change: add characterization tests pinning the
-current output of that branch *before* deleting it.
+- one **rigid `MeshPart`** — the whole mesh, undeformable; and
+- a skeleton of **invisible transparent `Part`s + `Motor6D`s**
+  (`component_converter.py:convert_skinned_mesh_renderer`,
+  `rbxlx_writer.py:_make_bone_parts_and_motor6ds`)
 
-### PR2 — Tween backend, end-to-end
+which is **not bound to the mesh geometry**. Animating that skeleton — by any
+backend — moves invisible Parts; the visible character never deforms. The
+converter has no Roblox `Bone`-based skinning path and never had one.
 
-The substantive PR. Makes the `CharacterAnimator` path actually run for one
-rig. Work items:
+### 2. There is no automated way to build a skinned mesh
 
-- **Motion-key contract fix.** `export_controller_json` writes
-  `state.motion = state.name`, but keyframes are keyed by clip *display name*
-  (`animation_converter.py:1842, 2383`). `_transitionTo` calling
-  `_playKeyframeAnimation(state.motion)` would miss whenever state name !=
-  clip name. Align the contract: carry the clip key on the state.
-- **Track-like adapter.** Wrap `_playKeyframeAnimation` in a handle exposing
-  `:Stop()`, weight, and exit-time progress, so `_transitionTo`,
-  `_checkTransitions` (exit-time gating reads `currentTrack`), and blend
-  trees stay backend-agnostic.
-- **Wire `_transitionTo`** to use the tween adapter when no `AnimationTrack`
-  is available.
-- **Generated per-controller bootstrap Script** — `require`s
-  `CharacterAnimator`, instantiates with the `AnimationData_*` JSON + the
-  rig, ticks `:Update(dt)` on `Heartbeat`.
-- **Script-side integration.** Transpiled gameplay code does not call a
-  runtime instance today — `api_mappings.py:224-235` maps `Animator.SetBool`
-  → `:SetAttribute` and `SetTrigger/Play/CrossFade` → placeholder
-  `AnimationTrack:Play()`. Decide and implement how user scripts reach the
-  `CharacterAnimator` instance (attribute bridge vs. direct handle).
-- **Bootstrap placement / scoping.** Animation scripts go into a flat list;
-  prefab-scoped ones are copied onto templates (`pipeline.py:2264, 3369,
-  3561`). The bootstrap must fit the scene-baked-vs-cloned-prefab topology or
-  it will miss instances or double-drive them.
+A mesh that deforms via `Bone` instances needs skin weights baked into the
+`MeshPart` asset. As of 2026, Roblox produces those **only** through the
+interactive **Studio 3D Importer**:
 
-### PR3 — Native backend (`KeyframeSequence`)
+- Open Cloud asset upload of `.fbx`/`.glb` yields a `Model` of plain rigid
+  `MeshPart`s.
+- `AssetService:CreateMeshPartAsync` exposes only fidelity options — no rig.
+- `EditableMesh` has skinning-shaped APIs (`AddBone`, `SetVertexBoneWeights`)
+  but no documented path to a reusable skinned `MeshPart` asset.
+- The only adjacent automation (`AvatarCreationService:AutoSetupAvatarAsync`,
+  `WrapLayer.AutoSkin`) is avatar-specific, not generic mesh authoring.
 
-Larger than first scoped. No IR or `rbxlx_writer` support for
-`KeyframeSequence` / `Animation` assets exists; no animation upload / asset-id
-plumbing; scene conversion never instantiates an `Animator` (`HasAnimator` is
-only an attribute). Work: `.anim` → `KeyframeSequence` export, IR + writer
-support, `Motor6D` + `Animator` rig instantiation (`SkinnedMeshRenderer` →
-`Motor6D` conversion already exists), `Animator:LoadAnimation` →
-`AnimationTrack` wiring.
-
-### PR4 — Detector + per-character fork + author prompt
-
-Last, once both backends are real. A `detect_rig_backend` step analyzes the
-Unity rig (humanoid `Avatar`? standard / Mixamo bone names? → native; else
-tween) with a confidence score; low confidence → interactive author prompt
-via the `/convert-unity` skill. No `Avatar` / humanoid metadata parsing
-exists today — PR4 adds it. Must apply identically on the `u2r.py convert`
-and `convert_interactive.py` paths.
+A batch converter (`u2r.py`) cannot drive the Studio 3D Importer, so there is
+no automated path to a deformable skinned character. Native vs. tween playback
+was therefore moot: with a rigid mesh, neither backend produces visible
+character animation.
 
 ---
 
-## Test strategy
+## What would reopen this
 
-Contract-level coverage, not just golden projects.
+Only a Roblox platform change would — specifically, one of:
 
-- **PR1:** characterization tests pinning `generate_state_machine_script`
-  output before deletion; regression check that the 9 projects' output is
-  otherwise unchanged.
-- **PR2:** unit tests for the motion-key contract, the track adapter
-  (`:Stop()` / exit-time / weight), `_transitionTo` fallback, bootstrap
-  scoping (scene-baked vs. prefab-cloned); one non-standard-rig e2e fixture.
-- **PR3:** `KeyframeSequence` XML round-trip tests; native-rig e2e fixture
-  (candidate: Gamekit3D / Ellen — confirm it has usable `.anim` +
-  `AnimatorController` data first).
-- **PR4:** detector unit tests across rig shapes; the ambiguous → prompt
-  path; `u2r.py` vs. `convert_interactive.py` parity.
+- an Open Cloud / Luau API that imports a rigged `.fbx`/`.glb` into a skinned
+  `MeshPart` with bones and skin weights; or
+- a runtime API that binds `Bone` instances to an existing mesh's vertices
+  (e.g. `CreateMeshPartAsync` preserving an `EditableMesh` rig).
 
-Two new Unity test projects are required (non-standard rig, humanoid-mappable
-rig) — no current fixture exercises skeletal animation.
+Until then, skeletal-character animation stays unsupported. Revisit only with
+a working demo of automated skinned-`MeshPart` creation as the hard gate.
 
 ---
 
-## NOT in scope
+## Review trail
 
-- 2D blend trees, animation layers / avatar masks, root motion, IK — remain
-  in `FUTURE_IMPROVEMENTS.md` Phase 5.
-- Bulk-uploading animations as cloud assets — `KeyframeSequence` stays
-  embedded in the rbxlx unless PR3 surfaces a concrete reason.
+- `/plan-eng-review` + Codex outside voice on the original 4-PR plan.
+- Codex review of PR2 (shaped the registry/attribute design; surfaced 2 bugs
+  in the implementation).
+- Codex passes on PR3 scope, on the "skinned-MeshPart pipeline" option, and a
+  research spike on automated skinned-mesh creation — all concluding no
+  automated path exists.
+- Codex review of the retirement.
 
----
-
-## Open risks
-
-- **R1 — no skeletal test coverage exists.** Mitigated by the two new
-  fixtures; until they land, every claim about skeletal output is unverified.
-- **R2 — backend divergence.** If the tween backend is not given a real
-  track-like adapter, the "one runtime" claim collapses into two playback
-  models with different state semantics. PR2 must deliver the adapter.
-- **R3 — PR3 scope.** The native backend touches the IR, the writer, and
-  asset plumbing; it may itself need to split across more than one PR.
+The original problem statement and the abandoned 4-PR plan are preserved in
+this file's earlier git revisions for anyone investigating the platform gap.
