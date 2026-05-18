@@ -359,8 +359,16 @@ if touchPart then
 \t\t\t-- consumer of ``hasKey``/``hasRifle`` never sees the flag without
 \t\t\t-- this server-side write. Player Object attributes set server-side
 \t\t\t-- DO replicate, so the client read still works.
+\t\t\t-- Write the ``has<X>`` flag on BOTH the character Model and the
+\t\t\t-- Player Instance. Door.luau's Touched handler reads from the
+\t\t\t-- character (the touching part's Model ancestor); HUD scripts
+\t\t\t-- often only have the Player ref. Roblox replicates instance
+\t\t\t-- attributes set server-side to every client, so the client-side
+\t\t\t-- Player.luau reads keep working too.
 \t\t\tif itemName and itemName ~= "" then
-\t\t\t\tplayer:SetAttribute("has" .. itemName, true)
+\t\t\t\tlocal _flag = "has" .. itemName
+\t\t\t\tif character then character:SetAttribute(_flag, true) end
+\t\t\t\tplayer:SetAttribute(_flag, true)
 \t\t\tend
 \t\t\tif _pickupEvent then _pickupEvent:FireClient(player, itemName) end
 \t\t\tif source then source:Play() end
@@ -672,13 +680,14 @@ def _detect_pickup_setattribute_pattern(scripts: list["RbxScript"]) -> bool:
             return True
         # Direct-RemoteEvent shape: fires PickupItemEvent but doesn't
         # write the server-side has-attribute. The apply function
-        # injects the missing write. Match the EXACT dynamic-concat
-        # pattern the pack injects (``SetAttribute("has" .. itemName,
-        # true)``) — checking for any ``SetAttribute("has"...)`` would
-        # false-skip Pickups that init unrelated has-flags (e.g. an
-        # opening-state ``SetAttribute("hasKey", false)``) but never
-        # write the dynamic-concat shape that mirrors what the
-        # pack would inject.
+        # injects the missing write. ``_PICKUP_HAS_ATTR_INJECTED_RE``
+        # matches the EXACT dynamic-concat shapes the pack emits (the
+        # legacy ``SetAttribute("has" .. itemName, true)`` literal and
+        # the current ``_flag = "has" .. itemName`` local) — checking
+        # for any ``SetAttribute("has"...)`` would false-skip Pickups
+        # that init unrelated has-flags (e.g. an opening-state
+        # ``SetAttribute("hasKey", false)``) but never write the
+        # dynamic-concat shape that mirrors what the pack would inject.
         if (
             "PickupItemEvent" in src
             and "FireClient" in src
@@ -688,11 +697,20 @@ def _detect_pickup_setattribute_pattern(scripts: list["RbxScript"]) -> bool:
     return False
 
 
-# The exact server-attr write the pack injects. Matching this directly
-# (rather than ``SetAttribute("has"...)``) avoids false-skipping
-# Pickups that init unrelated has-flags before firing.
+# The server-attr write the pack injects, in both shapes it has emitted:
+#   - legacy literal: ``<recv>:SetAttribute("has" .. itemName, true)``
+#   - current ``_flag`` local: ``local _flag = "has" .. itemName`` followed
+#     by ``<recv>:SetAttribute(_flag, true)``
+# Matching the ``"has" .. itemName`` concat directly (rather than any
+# ``SetAttribute("has"...)``) avoids false-skipping Pickups that init
+# unrelated has-flags before firing. The ``_flag = "has" .. itemName``
+# assignment is the unique marker of the current rewrite/inject output;
+# without this alternative the guard never recognizes an already-converted
+# Pickup, so re-running the pack appends duplicate ``has<X>`` blocks.
 _PICKUP_HAS_ATTR_INJECTED_RE = re.compile(
     r':\s*SetAttribute\s*\(\s*"has"\s*\.\.\s*itemName\s*,\s*true\s*\)'
+    r'|'
+    r'_flag\s*=\s*"has"\s*\.\.\s*itemName'
 )
 
 
@@ -733,9 +751,11 @@ def _detect_pickup_remote_event_in_use(scripts: list["RbxScript"]) -> bool:
     description="Convert Pickup script SetAttribute calls to "
     "ReplicatedStorage.PickupItemEvent:FireClient — server-side "
     "SetAttribute does not trigger client GetAttributeChangedSignal. "
-    "Also injects a server-side ``player:SetAttribute('has'..itemName, true)`` "
-    "before FireClient so server scripts (Door, etc.) can read replicated "
-    "gameplay flags.",
+    "Also injects server-side ``character:SetAttribute('has'..itemName, true)`` "
+    "AND ``player:SetAttribute('has'..itemName, true)`` before FireClient so "
+    "server scripts can read replicated gameplay flags from whichever container "
+    "they have in scope — Door's Touched handler has the character Model; "
+    "HUD scripts may only have the Player ref.",
     detect=_detect_pickup_setattribute_pattern,
 )
 def _convert_pickup_to_remote_event(scripts: list["RbxScript"]) -> int:
@@ -759,14 +779,22 @@ def _convert_pickup_to_remote_event(scripts: list["RbxScript"]) -> int:
                 '\t\t\tlocal _pe = game:GetService("ReplicatedStorage"):FindFirstChild("PickupItemEvent")\n'
                 f'\t\t\tlocal _char = {receiver}\n'
                 '\t\t\tlocal _pl = _char and game:GetService("Players"):GetPlayerFromCharacter(_char)\n'
-                '\t\t\t-- Persist the pickup as a server-side Player attribute so server\n'
-                '\t\t\t-- scripts (e.g. Door checking ``player:GetAttribute("hasKey")``) can\n'
-                '\t\t\t-- react. ``LocalPlayer:SetAttribute`` from the client does not\n'
-                '\t\t\t-- replicate, so any server consumer of ``hasKey``/``hasRifle``\n'
-                '\t\t\t-- needs this server-side write. Object attributes set server-side\n'
-                '\t\t\t-- DO replicate, so the client read in Player.luau still works.\n'
-                '\t\t\tif _pl and itemName and itemName ~= "" then\n'
-                '\t\t\t\t_pl:SetAttribute("has" .. itemName, true)\n'
+                '\t\t\t-- Persist the pickup as a server-side attribute so server scripts\n'
+                '\t\t\t-- (e.g. Door checking ``character:GetAttribute("hasKey")``) can\n'
+                '\t\t\t-- read it. ``LocalPlayer:SetAttribute`` from the client does NOT\n'
+                '\t\t\t-- replicate, so any server consumer of ``hasKey``/``hasRifle`` needs\n'
+                '\t\t\t-- the server-side write here. Roblox replicates instance attributes\n'
+                '\t\t\t-- set server-side down to every client, so Player.luau\'s client-side\n'
+                '\t\t\t-- read still works.\n'
+                '\t\t\t--\n'
+                '\t\t\t-- Write on BOTH the character Model and the Player Instance so\n'
+                '\t\t\t-- consumers can pick whichever container is in scope. Door reads\n'
+                '\t\t\t-- the character (touching model is what its Touched handler has);\n'
+                '\t\t\t-- HUD-style scripts may only have the Player ref.\n'
+                '\t\t\tif itemName and itemName ~= "" then\n'
+                '\t\t\t\tlocal _flag = "has" .. itemName\n'
+                '\t\t\t\tif _char then _char:SetAttribute(_flag, true) end\n'
+                '\t\t\t\tif _pl then _pl:SetAttribute(_flag, true) end\n'
                 '\t\t\tend\n'
                 '\t\t\tif _pe and _pl then _pe:FireClient(_pl, itemName) end\n'
                 '\t\tend'
@@ -884,11 +912,18 @@ def _inject_has_attribute_before_fireclient(s: "RbxScript") -> int:
 
     def _inject(m: "re.Match[str]") -> str:
         player_var = m.group(2)
-        # Indent the injection to match the line containing FireClient.
-        # Walk back to find the line's leading whitespace.
+        # Set the ``has<X>`` flag on BOTH the character Model and the
+        # Player Instance. Door reads the character (touching part's
+        # Model ancestor); HUD scripts may only have the Player ref.
+        # The legacy version only wrote the Player Instance attribute,
+        # which Door never read — key-protected doors stayed locked.
         return (
             f'if {player_var} and itemName and itemName ~= "" then '
-            f'{player_var}:SetAttribute("has" .. itemName, true) end\n\t\t\t'
+            f'local _flag = "has" .. itemName; '
+            f'{player_var}:SetAttribute(_flag, true); '
+            f'local _ch = {player_var}.Character; '
+            f'if _ch then _ch:SetAttribute(_flag, true) end '
+            f'end\n\t\t\t'
             f'{m.group(0)}'
         )
 
@@ -4130,15 +4165,24 @@ def _inject_proximity_trigger_fanout(scripts: list["RbxScript"]) -> int:
         lead = m.group("lead")
         container = m.group("container")
         arg = m.group("arg")
+        var = m.group("var")
         body = m.group("body")
         rewritten_body = _rewrite_proximity_body(body, arg)
-        # Use a non-clashing function name; pin under the marker so the
-        # idempotency guard can find us on re-runs.
+        # Preserve the ``local <var> = findTriggerPart(container)`` line
+        # at the top of the new block. The captured body often still
+        # references the trigger-part local (e.g. ``triggerPart:Find
+        # FirstChildWhichIsA("Sound")``); dropping the definition would
+        # produce ``nil:Find...`` calls inside _onProximityTouched.
+        # Keep the variable around for body-level reads even though the
+        # fanout below no longer uses it to bind Touched.
         replacement = (
+            f"{lead}local {var} = findTriggerPart({container})\n"
             f"{lead}-- {_PROXIMITY_TRIGGER_MARKER}: connect Touched on every body\n"
             f"{lead}-- part so step-on triggers (mines/pickups/pressure-plates) fire,\n"
             f"{lead}-- and resolve the touching character via ancestor lookup so\n"
-            f"{lead}-- accessory-mounted touches also count.\n"
+            f"{lead}-- accessory-mounted touches also count. The {var} local is\n"
+            f"{lead}-- preserved so body-level references (e.g. nearby Sound\n"
+            f"{lead}-- lookups under the trigger part) still resolve.\n"
             f"{lead}local function _onProximityTouched({arg})\n"
             f"{rewritten_body}"
             f"{lead}end\n"

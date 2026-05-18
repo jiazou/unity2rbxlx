@@ -354,15 +354,29 @@ class TestPickupRemoteEventServerAttr:
         """
         s = self._ai_transpiled_pickup()
         packs_module._convert_pickup_to_remote_event([s])
-        assert '_pl:SetAttribute("has" .. itemName, true)' in s.source
+        assert '_pl:SetAttribute(_flag, true)' in s.source
         # Order matters: write the attribute, then fire the event.
-        attr_idx = s.source.index('_pl:SetAttribute("has" .. itemName')
+        attr_idx = s.source.index('_pl:SetAttribute(_flag, true)')
         fire_idx = s.source.index("FireClient(_pl, itemName)")
         assert attr_idx < fire_idx, (
             "server-attr write must precede FireClient so a server-side "
             "Door listener seeing a same-frame attribute read on the "
             "Touched signal observes the flag flip"
         )
+
+    def test_writes_server_side_character_attribute(self) -> None:
+        """Regression: the previous version only wrote the attribute on
+        the **Player Instance**, but ``Door.luau`` reads the attribute on
+        the **character Model** (the touching part's Model ancestor).
+        Without a write on the character, every key-protected door stays
+        locked even after a successful pickup. Pack must write both."""
+        s = self._ai_transpiled_pickup()
+        packs_module._convert_pickup_to_remote_event([s])
+        assert '_char:SetAttribute(_flag, true)' in s.source
+        # Both writes precede FireClient.
+        char_idx = s.source.index('_char:SetAttribute(_flag, true)')
+        fire_idx = s.source.index("FireClient(_pl, itemName)")
+        assert char_idx < fire_idx
 
     def test_injects_has_attr_when_unrelated_has_attribute_initialized(self) -> None:
         """Codex finding [P1] (round 7): a Pickup that initializes an
@@ -391,8 +405,12 @@ class TestPickupRemoteEventServerAttr:
         # SetAttribute("hasKey", false).
         assert packs_module._detect_pickup_setattribute_pattern([s]) is True
         packs_module._convert_pickup_to_remote_event([s])
-        # The exact dynamic-concat pattern is injected.
-        assert ':SetAttribute("has" .. itemName, true)' in s.source
+        # The pack writes the dynamic ``has``+itemName flag on the Player
+        # AND derives the character to set the flag on the model too.
+        assert '"has" .. itemName' in s.source
+        assert ':SetAttribute(_flag, true)' in s.source
+        # Character branch is present (line resolves player.Character).
+        assert 'Character' in s.source
 
     def test_injects_has_attr_into_direct_fireclient_pickups(self) -> None:
         """Codex finding [P1] (round 6): a Pickup that already uses
@@ -422,9 +440,14 @@ class TestPickupRemoteEventServerAttr:
             script_type="Script",
         )
         packs_module._convert_pickup_to_remote_event([s])
-        assert ':SetAttribute("has" .. itemName, true)' in s.source
+        # The pack writes the dynamic ``has``+itemName flag on the Player
+        # via the extracted ``_flag`` local.
+        assert ':SetAttribute(_flag, true)' in s.source
+        assert '"has" .. itemName' in s.source
+        # Character branch present so server-side Door consumers also see it.
+        assert '.Character' in s.source
         # Order: SetAttribute write must precede FireClient.
-        attr_idx = s.source.index('SetAttribute("has" .. itemName')
+        attr_idx = s.source.index(':SetAttribute(_flag, true)')
         fire_idx = s.source.index('FireClient(player, itemName)')
         assert attr_idx < fire_idx
 
@@ -436,6 +459,62 @@ class TestPickupRemoteEventServerAttr:
         s = self._ai_transpiled_pickup()
         packs_module._convert_pickup_to_remote_event([s])
         assert 'itemName and itemName ~= ""' in s.source
+
+    def test_injected_has_attr_write_is_recognized_by_guard_regex(self) -> None:
+        """``_PICKUP_HAS_ATTR_INJECTED_RE`` must match the ``_flag = "has"
+        .. itemName`` shape the rewrite emits. The guard previously only
+        recognized the legacy literal ``SetAttribute("has" .. itemName,
+        true)``, so an already-converted Pickup looked un-converted."""
+        s = self._ai_transpiled_pickup()
+        packs_module._convert_pickup_to_remote_event([s])
+        assert packs_module._PICKUP_HAS_ATTR_INJECTED_RE.search(s.source), (
+            "guard regex must recognize the pack's own injected output"
+        )
+
+    def test_rerunning_pack_does_not_duplicate_has_attr_write(self) -> None:
+        """Idempotency: once a Pickup is converted, a later ``run_packs()``
+        pass must not append another ``has<X>`` block. With the guard
+        regex matching only the legacy literal, the detector kept
+        re-firing and ``_inject_has_attribute_before_fireclient`` stacked
+        a duplicate SetAttribute write before the same FireClient on
+        every pass."""
+        s = self._ai_transpiled_pickup()
+        run_packs([s])
+        first_pass = s.source
+        flag_writes = first_pass.count("SetAttribute(_flag, true)")
+        assert flag_writes >= 1
+        # A second pass over the already-converted script is a no-op.
+        run_packs([s])
+        assert s.source == first_pass
+        assert s.source.count("SetAttribute(_flag, true)") == flag_writes
+
+    def test_rerunning_direct_fireclient_pickup_does_not_duplicate(self) -> None:
+        """Idempotency for the direct-FireClient injection path: a Pickup
+        that already fires ``PickupItemEvent`` gets one ``has<X>`` block
+        injected before FireClient. Re-running the pack must not inject a
+        second — the guard at the FireClient-injection site must see the
+        ``_flag`` write the first pass left behind."""
+        s = RbxScript(
+            name="Pickup",
+            source=(
+                'local _pe = game:GetService("ReplicatedStorage")'
+                ':FindFirstChild("PickupItemEvent")\n'
+                "triggerPart.Touched:Connect(function(otherPart)\n"
+                "    local character = otherPart:FindFirstAncestorOfClass(\"Model\")\n"
+                "    local player = game:GetService(\"Players\")"
+                ":GetPlayerFromCharacter(character)\n"
+                "    if _pe and player then _pe:FireClient(player, itemName) end\n"
+                "end)\n"
+            ),
+            script_type="Script",
+        )
+        packs_module._convert_pickup_to_remote_event([s])
+        first_pass = s.source
+        flag_writes = first_pass.count("SetAttribute(_flag, true)")
+        assert flag_writes >= 1
+        packs_module._convert_pickup_to_remote_event([s])
+        assert s.source == first_pass
+        assert s.source.count("SetAttribute(_flag, true)") == flag_writes
 
 
 class TestDoorGlobalPlayerToAttribute:
@@ -3186,6 +3265,48 @@ class TestProximityTriggerFanout:
         second = packs_module._inject_proximity_trigger_fanout([s])
         assert first == 1
         assert second == 0
+
+    def test_preserves_triggerpart_local_for_body_references(self) -> None:
+        """Regression: the captured Touched body often still references
+        ``triggerPart`` (e.g. ``triggerPart:FindFirstChildWhichIsA("Sound")``
+        for nearby Sound lookups). The pack used to drop the
+        ``local triggerPart = findTriggerPart(container)`` line entirely,
+        producing ``nil:FindFirstChildWhichIsA(...)`` runtime errors in
+        Mine.luau:125. Keep the local so body references resolve.
+        """
+        s = RbxScript(
+            name="Mine",
+            source=(
+                'local Players = game:GetService("Players")\n'
+                "local container = script.Parent\n"
+                "local triggered = false\n"
+                "local explodeTime = 1\n"
+                "local function findTriggerPart(p) return p end\n"
+                "local function Explode() end\n"
+                "\n"
+                "local triggerPart = findTriggerPart(container)\n"
+                "if triggerPart then\n"
+                "\ttriggerPart.Touched:Connect(function(otherPart)\n"
+                "\t\tif triggered then return end\n"
+                "\t\tlocal player = Players:GetPlayerFromCharacter(otherPart.Parent)\n"
+                "\t\tif player then\n"
+                "\t\t\ttriggered = true\n"
+                "\t\t\tlocal s = triggerPart:FindFirstChildWhichIsA('Sound')\n"
+                "\t\t\tif s then s:Play() end\n"
+                "\t\t\ttask.delay(explodeTime, Explode)\n"
+                "\t\tend\n"
+                "\tend)\n"
+                "end\n"
+            ),
+            script_type="Script",
+        )
+        fixes = packs_module._inject_proximity_trigger_fanout([s])
+        assert fixes == 1
+        # The trigger-part local must survive the rewrite so the body's
+        # ``triggerPart:FindFirstChildWhichIsA(...)`` reference resolves.
+        assert "local triggerPart = findTriggerPart(container)" in s.source
+        # The body content that depends on the local is preserved.
+        assert "triggerPart:FindFirstChildWhichIsA('Sound')" in s.source
 
     def test_no_op_on_unrelated_script(self) -> None:
         """Scripts without the ``findTriggerPart`` + single-part Touched
