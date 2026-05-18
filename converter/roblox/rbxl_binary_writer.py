@@ -412,45 +412,81 @@ def _default_for_type(type_id: int) -> object:
     return defaults.get(type_id, "")
 
 
-# Property-name-aware token defaults. The Roblox binary format groups properties
-# by class, so every instance of a class must emit a value for every property
-# any instance in that class set. When the XML omits a property we have to
-# substitute Roblox's actual default — and for ``Token`` (Enum) properties the
-# default is NOT always ``0``. Substituting ``0`` for ``Part.Shape`` makes the
-# part a ``Ball`` instead of a ``Block``, which silently collapses dock-style
-# colliders to 1-stud spheres and is the kind of bug that only surfaces when
-# the binary file gets opened in Studio (the XML rbxlx loads fine because
-# Studio's XML parser uses the engine default when the property is absent).
+# Class-and-property-aware token defaults. The Roblox binary format groups
+# properties by class — every instance of a class must emit a value for every
+# property any instance in that class set. Missing properties get filled with
+# a default; for ``Token`` (Enum) properties the type-default of ``0`` is
+# often WRONG. Worse, the same property name can have **different** defaults
+# on different classes (e.g. ``Part.Shape`` defaults to ``Block (1)`` but
+# ``ParticleEmitter.Shape`` defaults to ``Box (0)``), so the lookup must be
+# keyed by ``(class_name, property_name)`` — not by property name alone.
 #
-# Keep this map keyed by the **XML property name** as emitted by
-# ``rbxlx_writer.py``. Values are the integer Enum member that matches the
-# property's runtime default on a freshly-constructed instance.
-_TOKEN_DEFAULTS_BY_NAME: dict[str, int] = {
-    # BasePart shape defaults to Block (1), not Ball (0).
-    "Shape": 1,
-    # BasePart surface defaults are Smooth (10) on all six faces, except for
-    # the deprecated BottomSurface which is Inlet (3) historically. Modern
-    # Studio uses Smooth for all six, and we never emit non-Smooth surfaces
-    # so this normalises the missing-property case.
-    "TopSurface": 10,
-    "BottomSurface": 10,
-    "FrontSurface": 10,
-    "BackSurface": 10,
-    "LeftSurface": 10,
-    "RightSurface": 10,
+# Only properties whose Roblox runtime default differs from the type-default
+# (``0`` for Token) need an entry; everything else falls through to
+# :func:`_default_for_type`. Property names match the XML tag name emitted by
+# ``rbxlx_writer.py``; class names match the ``class="..."`` attribute on
+# ``<Item>`` elements.
+_TOKEN_DEFAULTS: dict[tuple[str, str], int] = {
+    # ``BasePart.Shape`` → ``Enum.PartType.Block`` (1). The deprecated bug
+    # this fix targets: a Part with no ``<token name="Shape">`` in the XML
+    # used to land as a 1-stud Ball in the binary because the type-default
+    # for Token is 0 (Ball). Note that ``ParticleEmitter.Shape`` is a
+    # ``ParticleEmitterShape`` enum that defaults to ``Box (0)`` — which
+    # already matches the type-default, so it needs no entry, but the
+    # class-keyed lookup is what prevents collision.
+    ("Part", "Shape"): 1,
+    # ``BasePart.Material`` → ``Enum.Material.Plastic`` (256).
+    # ``rbxlx_writer.py`` only emits ``Material`` when the source asset
+    # explicitly carries one (``_make_part`` checks ``part.material is not
+    # None``), so Parts that fall back must get the engine default here.
+    ("Part", "Material"): 256,
+    ("MeshPart", "Material"): 256,
+    ("SpawnLocation", "Material"): 256,
+    ("TrussPart", "Material"): 256,
+    ("WedgePart", "Material"): 256,
+    ("CornerWedgePart", "Material"): 256,
+    # ``BasePart`` surface tokens → ``Enum.SurfaceType.Smooth`` (0). This
+    # matches the value ``rbxlx_writer.py`` explicitly emits at every Part
+    # write (see ``_make_part``: ``_add_token(props, "TopSurface", 0)``).
+    # The pipeline always sets these, so the fill is mostly defensive; we
+    # still list them so a third-party XML lacking the property doesn't
+    # default to ``Glue`` or any other non-Smooth surface.
+    ("Part", "TopSurface"): 0,
+    ("Part", "BottomSurface"): 0,
+    ("Part", "FrontSurface"): 0,
+    ("Part", "BackSurface"): 0,
+    ("Part", "LeftSurface"): 0,
+    ("Part", "RightSurface"): 0,
+    ("MeshPart", "TopSurface"): 0,
+    ("MeshPart", "BottomSurface"): 0,
+    ("MeshPart", "FrontSurface"): 0,
+    ("MeshPart", "BackSurface"): 0,
+    ("MeshPart", "LeftSurface"): 0,
+    ("MeshPart", "RightSurface"): 0,
+    # Text alignment defaults to ``Center`` on every Text* GUI element.
+    # ``rbxlx_writer.py`` only emits alignment when the source UI carries
+    # a non-default value, so missing-property fill must match the engine.
+    ("TextLabel", "TextXAlignment"): 2,   # Enum.TextXAlignment.Center
+    ("TextLabel", "TextYAlignment"): 1,   # Enum.TextYAlignment.Center
+    ("TextButton", "TextXAlignment"): 2,
+    ("TextButton", "TextYAlignment"): 1,
+    ("TextBox", "TextXAlignment"): 2,
+    ("TextBox", "TextYAlignment"): 1,
 }
 
 
-def _default_for_property(prop_name: str, type_id: int) -> object:
-    """Return Roblox's default value for *prop_name* on a fresh instance.
+def _default_for_property(class_name: str, prop_name: str, type_id: int) -> object:
+    """Return Roblox's runtime default for ``ClassName.prop_name``.
 
-    Falls back to :func:`_default_for_type` when we don't have a
-    property-specific override. Token defaults must be name-aware (see
-    ``_TOKEN_DEFAULTS_BY_NAME``); other types are well-served by the
-    type-only default table.
+    For Token (Enum) properties the lookup is keyed by
+    ``(class_name, prop_name)`` because the same property name can have
+    different defaults on different classes. Everything else falls
+    through to :func:`_default_for_type`.
     """
-    if type_id == TYPE_ENUM and prop_name in _TOKEN_DEFAULTS_BY_NAME:
-        return _TOKEN_DEFAULTS_BY_NAME[prop_name]
+    if type_id == TYPE_ENUM:
+        v = _TOKEN_DEFAULTS.get((class_name, prop_name))
+        if v is not None:
+            return v
     return _default_for_type(type_id)
 
 
@@ -757,7 +793,7 @@ def xml_to_binary(xml_path: str | Path, binary_path: str | Path | None = None) -
                 if prop_name in inst.properties:
                     values.append(inst.properties[prop_name][1])
                 else:
-                    values.append(_default_for_property(prop_name, type_id))
+                    values.append(_default_for_property(class_name, prop_name, type_id))
             output += _build_prop(idx, prop_name, type_id, values)
 
     # PRNT chunk.
