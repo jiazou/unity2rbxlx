@@ -460,6 +460,62 @@ class TestPickupRemoteEventServerAttr:
         packs_module._convert_pickup_to_remote_event([s])
         assert 'itemName and itemName ~= ""' in s.source
 
+    def test_injected_has_attr_write_is_recognized_by_guard_regex(self) -> None:
+        """``_PICKUP_HAS_ATTR_INJECTED_RE`` must match the ``_flag = "has"
+        .. itemName`` shape the rewrite emits. The guard previously only
+        recognized the legacy literal ``SetAttribute("has" .. itemName,
+        true)``, so an already-converted Pickup looked un-converted."""
+        s = self._ai_transpiled_pickup()
+        packs_module._convert_pickup_to_remote_event([s])
+        assert packs_module._PICKUP_HAS_ATTR_INJECTED_RE.search(s.source), (
+            "guard regex must recognize the pack's own injected output"
+        )
+
+    def test_rerunning_pack_does_not_duplicate_has_attr_write(self) -> None:
+        """Idempotency: once a Pickup is converted, a later ``run_packs()``
+        pass must not append another ``has<X>`` block. With the guard
+        regex matching only the legacy literal, the detector kept
+        re-firing and ``_inject_has_attribute_before_fireclient`` stacked
+        a duplicate SetAttribute write before the same FireClient on
+        every pass."""
+        s = self._ai_transpiled_pickup()
+        run_packs([s])
+        first_pass = s.source
+        flag_writes = first_pass.count("SetAttribute(_flag, true)")
+        assert flag_writes >= 1
+        # A second pass over the already-converted script is a no-op.
+        run_packs([s])
+        assert s.source == first_pass
+        assert s.source.count("SetAttribute(_flag, true)") == flag_writes
+
+    def test_rerunning_direct_fireclient_pickup_does_not_duplicate(self) -> None:
+        """Idempotency for the direct-FireClient injection path: a Pickup
+        that already fires ``PickupItemEvent`` gets one ``has<X>`` block
+        injected before FireClient. Re-running the pack must not inject a
+        second — the guard at the FireClient-injection site must see the
+        ``_flag`` write the first pass left behind."""
+        s = RbxScript(
+            name="Pickup",
+            source=(
+                'local _pe = game:GetService("ReplicatedStorage")'
+                ':FindFirstChild("PickupItemEvent")\n'
+                "triggerPart.Touched:Connect(function(otherPart)\n"
+                "    local character = otherPart:FindFirstAncestorOfClass(\"Model\")\n"
+                "    local player = game:GetService(\"Players\")"
+                ":GetPlayerFromCharacter(character)\n"
+                "    if _pe and player then _pe:FireClient(player, itemName) end\n"
+                "end)\n"
+            ),
+            script_type="Script",
+        )
+        packs_module._convert_pickup_to_remote_event([s])
+        first_pass = s.source
+        flag_writes = first_pass.count("SetAttribute(_flag, true)")
+        assert flag_writes >= 1
+        packs_module._convert_pickup_to_remote_event([s])
+        assert s.source == first_pass
+        assert s.source.count("SetAttribute(_flag, true)") == flag_writes
+
 
 class TestDoorGlobalPlayerToAttribute:
     """The ``door_global_player_to_attribute`` pack catches Door scripts

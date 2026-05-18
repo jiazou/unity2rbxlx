@@ -680,13 +680,14 @@ def _detect_pickup_setattribute_pattern(scripts: list["RbxScript"]) -> bool:
             return True
         # Direct-RemoteEvent shape: fires PickupItemEvent but doesn't
         # write the server-side has-attribute. The apply function
-        # injects the missing write. Match the EXACT dynamic-concat
-        # pattern the pack injects (``SetAttribute("has" .. itemName,
-        # true)``) — checking for any ``SetAttribute("has"...)`` would
-        # false-skip Pickups that init unrelated has-flags (e.g. an
-        # opening-state ``SetAttribute("hasKey", false)``) but never
-        # write the dynamic-concat shape that mirrors what the
-        # pack would inject.
+        # injects the missing write. ``_PICKUP_HAS_ATTR_INJECTED_RE``
+        # matches the EXACT dynamic-concat shapes the pack emits (the
+        # legacy ``SetAttribute("has" .. itemName, true)`` literal and
+        # the current ``_flag = "has" .. itemName`` local) — checking
+        # for any ``SetAttribute("has"...)`` would false-skip Pickups
+        # that init unrelated has-flags (e.g. an opening-state
+        # ``SetAttribute("hasKey", false)``) but never write the
+        # dynamic-concat shape that mirrors what the pack would inject.
         if (
             "PickupItemEvent" in src
             and "FireClient" in src
@@ -696,11 +697,20 @@ def _detect_pickup_setattribute_pattern(scripts: list["RbxScript"]) -> bool:
     return False
 
 
-# The exact server-attr write the pack injects. Matching this directly
-# (rather than ``SetAttribute("has"...)``) avoids false-skipping
-# Pickups that init unrelated has-flags before firing.
+# The server-attr write the pack injects, in both shapes it has emitted:
+#   - legacy literal: ``<recv>:SetAttribute("has" .. itemName, true)``
+#   - current ``_flag`` local: ``local _flag = "has" .. itemName`` followed
+#     by ``<recv>:SetAttribute(_flag, true)``
+# Matching the ``"has" .. itemName`` concat directly (rather than any
+# ``SetAttribute("has"...)``) avoids false-skipping Pickups that init
+# unrelated has-flags before firing. The ``_flag = "has" .. itemName``
+# assignment is the unique marker of the current rewrite/inject output;
+# without this alternative the guard never recognizes an already-converted
+# Pickup, so re-running the pack appends duplicate ``has<X>`` blocks.
 _PICKUP_HAS_ATTR_INJECTED_RE = re.compile(
     r':\s*SetAttribute\s*\(\s*"has"\s*\.\.\s*itemName\s*,\s*true\s*\)'
+    r'|'
+    r'_flag\s*=\s*"has"\s*\.\.\s*itemName'
 )
 
 
