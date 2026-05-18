@@ -289,7 +289,6 @@ def convert(
     output_path.mkdir(parents=True, exist_ok=True)
 
     # Load API key: from --api-key (string or file), env var, or auto-discover
-    import os
     resolved_key = _resolve_credential(api_key, "ROBLOX_API_KEY", "apikey", project_path)
     if resolved_key:
         config.ROBLOX_API_KEY = resolved_key
@@ -471,7 +470,7 @@ def publish(
 
     from roblox.id_cache import read_ids, write_ids
     from roblox.place_publisher import (
-        publish_cached_chunks, publish_place, publish_place_file,
+        publish_cached_chunks, publish_place,
     )
     from converter.pipeline import Pipeline
     from core.conversion_context import ConversionContext

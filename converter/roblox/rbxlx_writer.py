@@ -14,7 +14,6 @@ import xml.etree.ElementTree as ET
 import xml.dom.minidom
 from pathlib import Path
 from uuid import uuid4
-from typing import Any
 
 from core.roblox_types import (
     RbxAttrValue,
@@ -1359,7 +1358,6 @@ def _pretty_xml(root: ET.Element) -> str:
     # that minidom applied to the script source text.
     # Uses a scan-based approach instead of regex to avoid issues with non-greedy
     # matching across many elements with multiline content.
-    import html
 
     result = _wrap_elements_in_cdata(result, "ProtectedString")
     result = _wrap_elements_in_cdata(result, "BinaryString")
