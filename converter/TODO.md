@@ -135,6 +135,22 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
   and surface to `UNCONVERTED.md` instead of issuing a doomed upload.
 ## Infrastructure
 
+- [ ] **P1 — `classify_storage` overwrites the agent-authored `storage_plan`.**
+  The `/convert-unity` skill's Step 4a has the agent author `conversion_plan.json`
+  with a hand-crafted `storage_plan` (per-script client/server/replicated
+  containers + historic-bug `overrides_applied`). But `Pipeline._classify_storage`
+  (`pipeline.py:3319`) runs the auto-classifier (`storage_classifier.py`) and
+  **overwrites** `conversion_plan.json`, discarding the agent's `storage_plan`.
+  Confirmed in the trash-dash Mode-2 run (2026-05-18): Step 4a authored
+  1 server / 49 shared / 1 server-module / 8 overrides; after `assemble`,
+  `classify_storage` produced 11 server / 106 shared / 0 server-modules /
+  **0 overrides_applied**. Effect: Step 4a's storage decisions never take effect,
+  even through the interactive skill. Fix: `_classify_storage` should treat an
+  existing agent-authored `storage_plan` as authoritative input (honor / merge
+  `overrides_applied`), or skip regeneration when `conversion_plan.json` already
+  carries a non-empty agent-authored `storage_plan`. This is the real plan->pipeline
+  wiring gap — broader than the `--skip-architecture-step` gate from PR #109.
+
 - [ ] **P2 — Stale "Step 4.5" terminology.** The `/convert-unity` skill
   renamed its game-logic-porting phase to 4a/4b/4c, but the old name
   "Step 4.5" still appears in `README.md`, `converter/ARCHITECTURE.md`,
