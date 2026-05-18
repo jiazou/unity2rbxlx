@@ -103,6 +103,36 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
 - [ ] **P2 — Full SurfaceAppearance round-trip through templates.** PR 5
   deferred. The smoke ran with `--no-upload` so real asset IDs never wired
   through `ReplicatedStorage.Templates`. Verify on a full upload run.
+
+- [ ] **P1 — `read_fbx` rejects FBX version >= 7500 (64-bit offsets).**
+  `fbx_binary.py:read_fbx` raises `NotImplementedError` for FBX 7500+
+  (FBX 2016 and newer — extremely common for modern Unity assets). Effect:
+  `mirror_fbx_handedness` catches the error and returns `False`, so the
+  pipeline (`pipeline.py:1122-1123`) uploads the **raw original** — no
+  handedness mirror, no bounding-box computation, no sub-mesh resolution.
+  Modern FBX silently degrade. Found in the trash-dash conversion run
+  (2026-05-18): `Cat.fbx` / `CatBase.fbx` / `Racoon.fbx` are all 7500;
+  raw upload of these heavily-rigged multi-skin character FBX is rejected
+  by Roblox Open Cloud with "Failed to parse the uploaded file".
+  Fix: extend `_read_node` / `_write_node` to handle 7500's 64-bit
+  EndOffset / NumProperties / PropertyListLen header fields. Note: even
+  with 7500 read support, complex skinned-character FBX still cannot go
+  through the Open Cloud mesh endpoint (see next item) — this fix recovers
+  handedness + bbox for *static* 7500 meshes.
+
+- [ ] **P2 — Skinned/animation-only FBX uploaded as meshes and rejected.**
+  Two sub-cases found in the trash-dash run (2026-05-18):
+  (a) Animation-only FBX (e.g. `Cat_Jump.fbx`, FBX 7400) contain a single
+  `Geometry` node with **zero vertices**. The asset extractor classifies
+  any `.fbx` as `kind="mesh"`; `mirror_fbx_handedness` finds the empty
+  Geometry node and returns `True` without checking vertex count, so the
+  empty file uploads and Roblox rejects it ("Cannot import file with no
+  mesh content"). 24 such files failed this way.
+  (b) Rigged character FBX (Skin/Cluster/Deformer nodes) cannot be ingested
+  by the Open Cloud mesh endpoint at all — consistent with the existing
+  `docs/UNSUPPORTED.md` skeletal-mesh limitation.
+  Fix: detect zero-vertex `Geometry` and skinned FBX pre-upload; skip them
+  and surface to `UNCONVERTED.md` instead of issuing a doomed upload.
 ## Infrastructure
 
 - [ ] **P2 — Three-flow byte-equivalence: u2r.py vs convert_interactive.py
