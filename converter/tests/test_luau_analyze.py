@@ -7,6 +7,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from utils import luau_analyze
@@ -83,3 +85,28 @@ class TestSyntaxErrorsForSource:
         monkeypatch.setattr(luau_analyze.subprocess, "run",
                             lambda *a, **k: _FakeCompleted())
         assert luau_analyze.syntax_errors_for_source("local x = 1") == []
+
+    def test_no_analyzer_skips_temp_file(self, monkeypatch):
+        monkeypatch.setattr(luau_analyze.shutil, "which", lambda _: None)
+
+        def fail(*a, **k):
+            raise AssertionError("temp file must not be created without analyzer")
+
+        monkeypatch.setattr(luau_analyze.tempfile, "NamedTemporaryFile", fail)
+        assert luau_analyze.syntax_errors_for_source("local x = 1") == []
+
+    def test_temp_file_cleaned_up_on_exception(self, monkeypatch):
+        # The finally block must remove the temp file even when the analyzer
+        # run raises before returning.
+        monkeypatch.setattr(luau_analyze.shutil, "which", lambda _: "/fake/luau-analyze")
+        captured = {}
+
+        def boom(path, **k):
+            captured["tmp"] = path
+            raise RuntimeError("analyzer blew up")
+
+        monkeypatch.setattr(luau_analyze, "syntax_errors_for_file", boom)
+        with pytest.raises(RuntimeError, match="analyzer blew up"):
+            luau_analyze.syntax_errors_for_source("local x = 1")
+        assert "tmp" in captured
+        assert not Path(captured["tmp"]).exists()

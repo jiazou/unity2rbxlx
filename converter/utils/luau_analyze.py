@@ -49,17 +49,26 @@ def syntax_errors_for_source(source: str, timeout: float = 10.0) -> list[str]:
     """Run ``luau-analyze`` on an in-memory Luau source string.
 
     Writes the source to a temp file, checks it, and rewrites the temp path
-    to ``"script"`` in the returned error lines for cleaner messages.
+    to ``"script"`` in the returned error lines for cleaner messages. Returns
+    an empty list (without touching the filesystem) when ``luau-analyze`` is
+    not installed. The temp file is always removed, even if the write or the
+    analyzer run raises.
     """
-    with tempfile.NamedTemporaryFile(
+    if not luau_analyze_path():
+        return []
+    # Capture tmp_path immediately after creation so the finally block can
+    # always clean up, even if f.write(source) raises.
+    f = tempfile.NamedTemporaryFile(
         mode="w", suffix=".luau", delete=False, encoding="utf-8"
-    ) as f:
-        f.write(source)
-        tmp_path = f.name
+    )
+    tmp_path = f.name
     try:
+        f.write(source)
+        f.close()
         return [
             line.replace(tmp_path, "script")
             for line in syntax_errors_for_file(tmp_path, timeout=timeout)
         ]
     finally:
+        f.close()  # idempotent if already closed
         Path(tmp_path).unlink(missing_ok=True)
