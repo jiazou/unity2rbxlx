@@ -359,8 +359,16 @@ if touchPart then
 \t\t\t-- consumer of ``hasKey``/``hasRifle`` never sees the flag without
 \t\t\t-- this server-side write. Player Object attributes set server-side
 \t\t\t-- DO replicate, so the client read still works.
+\t\t\t-- Write the ``has<X>`` flag on BOTH the character Model and the
+\t\t\t-- Player Instance. Door.luau's Touched handler reads from the
+\t\t\t-- character (the touching part's Model ancestor); HUD scripts
+\t\t\t-- often only have the Player ref. Roblox replicates instance
+\t\t\t-- attributes set server-side to every client, so the client-side
+\t\t\t-- Player.luau reads keep working too.
 \t\t\tif itemName and itemName ~= "" then
-\t\t\t\tplayer:SetAttribute("has" .. itemName, true)
+\t\t\t\tlocal _flag = "has" .. itemName
+\t\t\t\tif character then character:SetAttribute(_flag, true) end
+\t\t\t\tplayer:SetAttribute(_flag, true)
 \t\t\tend
 \t\t\tif _pickupEvent then _pickupEvent:FireClient(player, itemName) end
 \t\t\tif source then source:Play() end
@@ -4147,15 +4155,24 @@ def _inject_proximity_trigger_fanout(scripts: list["RbxScript"]) -> int:
         lead = m.group("lead")
         container = m.group("container")
         arg = m.group("arg")
+        var = m.group("var")
         body = m.group("body")
         rewritten_body = _rewrite_proximity_body(body, arg)
-        # Use a non-clashing function name; pin under the marker so the
-        # idempotency guard can find us on re-runs.
+        # Preserve the ``local <var> = findTriggerPart(container)`` line
+        # at the top of the new block. The captured body often still
+        # references the trigger-part local (e.g. ``triggerPart:Find
+        # FirstChildWhichIsA("Sound")``); dropping the definition would
+        # produce ``nil:Find...`` calls inside _onProximityTouched.
+        # Keep the variable around for body-level reads even though the
+        # fanout below no longer uses it to bind Touched.
         replacement = (
+            f"{lead}local {var} = findTriggerPart({container})\n"
             f"{lead}-- {_PROXIMITY_TRIGGER_MARKER}: connect Touched on every body\n"
             f"{lead}-- part so step-on triggers (mines/pickups/pressure-plates) fire,\n"
             f"{lead}-- and resolve the touching character via ancestor lookup so\n"
-            f"{lead}-- accessory-mounted touches also count.\n"
+            f"{lead}-- accessory-mounted touches also count. The {var} local is\n"
+            f"{lead}-- preserved so body-level references (e.g. nearby Sound\n"
+            f"{lead}-- lookups under the trigger part) still resolve.\n"
             f"{lead}local function _onProximityTouched({arg})\n"
             f"{rewritten_body}"
             f"{lead}end\n"

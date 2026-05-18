@@ -3210,6 +3210,48 @@ class TestProximityTriggerFanout:
         assert first == 1
         assert second == 0
 
+    def test_preserves_triggerpart_local_for_body_references(self) -> None:
+        """Regression: the captured Touched body often still references
+        ``triggerPart`` (e.g. ``triggerPart:FindFirstChildWhichIsA("Sound")``
+        for nearby Sound lookups). The pack used to drop the
+        ``local triggerPart = findTriggerPart(container)`` line entirely,
+        producing ``nil:FindFirstChildWhichIsA(...)`` runtime errors in
+        Mine.luau:125. Keep the local so body references resolve.
+        """
+        s = RbxScript(
+            name="Mine",
+            source=(
+                'local Players = game:GetService("Players")\n'
+                "local container = script.Parent\n"
+                "local triggered = false\n"
+                "local explodeTime = 1\n"
+                "local function findTriggerPart(p) return p end\n"
+                "local function Explode() end\n"
+                "\n"
+                "local triggerPart = findTriggerPart(container)\n"
+                "if triggerPart then\n"
+                "\ttriggerPart.Touched:Connect(function(otherPart)\n"
+                "\t\tif triggered then return end\n"
+                "\t\tlocal player = Players:GetPlayerFromCharacter(otherPart.Parent)\n"
+                "\t\tif player then\n"
+                "\t\t\ttriggered = true\n"
+                "\t\t\tlocal s = triggerPart:FindFirstChildWhichIsA('Sound')\n"
+                "\t\t\tif s then s:Play() end\n"
+                "\t\t\ttask.delay(explodeTime, Explode)\n"
+                "\t\tend\n"
+                "\tend)\n"
+                "end\n"
+            ),
+            script_type="Script",
+        )
+        fixes = packs_module._inject_proximity_trigger_fanout([s])
+        assert fixes == 1
+        # The trigger-part local must survive the rewrite so the body's
+        # ``triggerPart:FindFirstChildWhichIsA(...)`` reference resolves.
+        assert "local triggerPart = findTriggerPart(container)" in s.source
+        # The body content that depends on the local is preserved.
+        assert "triggerPart:FindFirstChildWhichIsA('Sound')" in s.source
+
     def test_no_op_on_unrelated_script(self) -> None:
         """Scripts without the ``findTriggerPart`` + single-part Touched
         pattern must not be mutated. Pickup-style code that already does
