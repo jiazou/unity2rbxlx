@@ -31,27 +31,12 @@ from core.roblox_types import (
     RbxSurfaceAppearance,
     RbxUIElement,
 )
+from roblox.materials import MATERIAL_NAME_TO_TOKEN
 
 log = logging.getLogger(__name__)
 
 # Maximum output size (Luau Execution API limit)
 _MAX_SCRIPT_BYTES = 4 * 1024 * 1024  # 4 MB
-
-# Material name -> Enum.Material member name
-_MATERIAL_MAP = {
-    "Plastic": "Plastic", "SmoothPlastic": "SmoothPlastic", "Neon": "Neon",
-    "Wood": "Wood", "WoodPlanks": "WoodPlanks", "Marble": "Marble",
-    "Basalt": "Basalt", "Slate": "Slate", "CrackedLava": "CrackedLava",
-    "Concrete": "Concrete", "Limestone": "Limestone", "Pavement": "Pavement",
-    "Granite": "Granite", "Brick": "Brick", "Pebble": "Pebble",
-    "Cobblestone": "Cobblestone", "Rock": "Rock", "Sandstone": "Sandstone",
-    "CorrodedMetal": "CorrodedMetal", "DiamondPlate": "DiamondPlate",
-    "Foil": "Foil", "Metal": "Metal", "Grass": "Grass",
-    "LeafyGrass": "LeafyGrass", "Sand": "Sand", "Fabric": "Fabric",
-    "Snow": "Snow", "Mud": "Mud", "Ground": "Ground", "Asphalt": "Asphalt",
-    "Salt": "Salt", "Ice": "Ice", "Glacier": "Glacier", "Glass": "Glass",
-    "ForceField": "ForceField",
-}
 
 
 def _f(v: float) -> str:
@@ -104,7 +89,7 @@ def _mat_enum(mat: str | int) -> str:
     if isinstance(mat, int):
         # Reverse-lookup from token value is complex; just use Plastic
         return "Enum.Material.Plastic"
-    name = _MATERIAL_MAP.get(mat, "Plastic")
+    name = mat if mat in MATERIAL_NAME_TO_TOKEN else "Plastic"
     return f"Enum.Material.{name}"
 
 
