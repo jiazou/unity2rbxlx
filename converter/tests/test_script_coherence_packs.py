@@ -354,15 +354,29 @@ class TestPickupRemoteEventServerAttr:
         """
         s = self._ai_transpiled_pickup()
         packs_module._convert_pickup_to_remote_event([s])
-        assert '_pl:SetAttribute("has" .. itemName, true)' in s.source
+        assert '_pl:SetAttribute(_flag, true)' in s.source
         # Order matters: write the attribute, then fire the event.
-        attr_idx = s.source.index('_pl:SetAttribute("has" .. itemName')
+        attr_idx = s.source.index('_pl:SetAttribute(_flag, true)')
         fire_idx = s.source.index("FireClient(_pl, itemName)")
         assert attr_idx < fire_idx, (
             "server-attr write must precede FireClient so a server-side "
             "Door listener seeing a same-frame attribute read on the "
             "Touched signal observes the flag flip"
         )
+
+    def test_writes_server_side_character_attribute(self) -> None:
+        """Regression: the previous version only wrote the attribute on
+        the **Player Instance**, but ``Door.luau`` reads the attribute on
+        the **character Model** (the touching part's Model ancestor).
+        Without a write on the character, every key-protected door stays
+        locked even after a successful pickup. Pack must write both."""
+        s = self._ai_transpiled_pickup()
+        packs_module._convert_pickup_to_remote_event([s])
+        assert '_char:SetAttribute(_flag, true)' in s.source
+        # Both writes precede FireClient.
+        char_idx = s.source.index('_char:SetAttribute(_flag, true)')
+        fire_idx = s.source.index("FireClient(_pl, itemName)")
+        assert char_idx < fire_idx
 
     def test_injects_has_attr_when_unrelated_has_attribute_initialized(self) -> None:
         """Codex finding [P1] (round 7): a Pickup that initializes an
@@ -391,8 +405,12 @@ class TestPickupRemoteEventServerAttr:
         # SetAttribute("hasKey", false).
         assert packs_module._detect_pickup_setattribute_pattern([s]) is True
         packs_module._convert_pickup_to_remote_event([s])
-        # The exact dynamic-concat pattern is injected.
-        assert ':SetAttribute("has" .. itemName, true)' in s.source
+        # The pack writes the dynamic ``has``+itemName flag on the Player
+        # AND derives the character to set the flag on the model too.
+        assert '"has" .. itemName' in s.source
+        assert ':SetAttribute(_flag, true)' in s.source
+        # Character branch is present (line resolves player.Character).
+        assert 'Character' in s.source
 
     def test_injects_has_attr_into_direct_fireclient_pickups(self) -> None:
         """Codex finding [P1] (round 6): a Pickup that already uses
@@ -422,9 +440,14 @@ class TestPickupRemoteEventServerAttr:
             script_type="Script",
         )
         packs_module._convert_pickup_to_remote_event([s])
-        assert ':SetAttribute("has" .. itemName, true)' in s.source
+        # The pack writes the dynamic ``has``+itemName flag on the Player
+        # via the extracted ``_flag`` local.
+        assert ':SetAttribute(_flag, true)' in s.source
+        assert '"has" .. itemName' in s.source
+        # Character branch present so server-side Door consumers also see it.
+        assert '.Character' in s.source
         # Order: SetAttribute write must precede FireClient.
-        attr_idx = s.source.index('SetAttribute("has" .. itemName')
+        attr_idx = s.source.index(':SetAttribute(_flag, true)')
         fire_idx = s.source.index('FireClient(player, itemName)')
         assert attr_idx < fire_idx
 

@@ -733,9 +733,11 @@ def _detect_pickup_remote_event_in_use(scripts: list["RbxScript"]) -> bool:
     description="Convert Pickup script SetAttribute calls to "
     "ReplicatedStorage.PickupItemEvent:FireClient — server-side "
     "SetAttribute does not trigger client GetAttributeChangedSignal. "
-    "Also injects a server-side ``player:SetAttribute('has'..itemName, true)`` "
-    "before FireClient so server scripts (Door, etc.) can read replicated "
-    "gameplay flags.",
+    "Also injects server-side ``character:SetAttribute('has'..itemName, true)`` "
+    "AND ``player:SetAttribute('has'..itemName, true)`` before FireClient so "
+    "server scripts can read replicated gameplay flags from whichever container "
+    "they have in scope — Door's Touched handler has the character Model; "
+    "HUD scripts may only have the Player ref.",
     detect=_detect_pickup_setattribute_pattern,
 )
 def _convert_pickup_to_remote_event(scripts: list["RbxScript"]) -> int:
@@ -759,14 +761,22 @@ def _convert_pickup_to_remote_event(scripts: list["RbxScript"]) -> int:
                 '\t\t\tlocal _pe = game:GetService("ReplicatedStorage"):FindFirstChild("PickupItemEvent")\n'
                 f'\t\t\tlocal _char = {receiver}\n'
                 '\t\t\tlocal _pl = _char and game:GetService("Players"):GetPlayerFromCharacter(_char)\n'
-                '\t\t\t-- Persist the pickup as a server-side Player attribute so server\n'
-                '\t\t\t-- scripts (e.g. Door checking ``player:GetAttribute("hasKey")``) can\n'
-                '\t\t\t-- react. ``LocalPlayer:SetAttribute`` from the client does not\n'
-                '\t\t\t-- replicate, so any server consumer of ``hasKey``/``hasRifle``\n'
-                '\t\t\t-- needs this server-side write. Object attributes set server-side\n'
-                '\t\t\t-- DO replicate, so the client read in Player.luau still works.\n'
-                '\t\t\tif _pl and itemName and itemName ~= "" then\n'
-                '\t\t\t\t_pl:SetAttribute("has" .. itemName, true)\n'
+                '\t\t\t-- Persist the pickup as a server-side attribute so server scripts\n'
+                '\t\t\t-- (e.g. Door checking ``character:GetAttribute("hasKey")``) can\n'
+                '\t\t\t-- read it. ``LocalPlayer:SetAttribute`` from the client does NOT\n'
+                '\t\t\t-- replicate, so any server consumer of ``hasKey``/``hasRifle`` needs\n'
+                '\t\t\t-- the server-side write here. Roblox replicates instance attributes\n'
+                '\t\t\t-- set server-side down to every client, so Player.luau\'s client-side\n'
+                '\t\t\t-- read still works.\n'
+                '\t\t\t--\n'
+                '\t\t\t-- Write on BOTH the character Model and the Player Instance so\n'
+                '\t\t\t-- consumers can pick whichever container is in scope. Door reads\n'
+                '\t\t\t-- the character (touching model is what its Touched handler has);\n'
+                '\t\t\t-- HUD-style scripts may only have the Player ref.\n'
+                '\t\t\tif itemName and itemName ~= "" then\n'
+                '\t\t\t\tlocal _flag = "has" .. itemName\n'
+                '\t\t\t\tif _char then _char:SetAttribute(_flag, true) end\n'
+                '\t\t\t\tif _pl then _pl:SetAttribute(_flag, true) end\n'
                 '\t\t\tend\n'
                 '\t\t\tif _pe and _pl then _pe:FireClient(_pl, itemName) end\n'
                 '\t\tend'
@@ -884,11 +894,18 @@ def _inject_has_attribute_before_fireclient(s: "RbxScript") -> int:
 
     def _inject(m: "re.Match[str]") -> str:
         player_var = m.group(2)
-        # Indent the injection to match the line containing FireClient.
-        # Walk back to find the line's leading whitespace.
+        # Set the ``has<X>`` flag on BOTH the character Model and the
+        # Player Instance. Door reads the character (touching part's
+        # Model ancestor); HUD scripts may only have the Player ref.
+        # The legacy version only wrote the Player Instance attribute,
+        # which Door never read — key-protected doors stayed locked.
         return (
             f'if {player_var} and itemName and itemName ~= "" then '
-            f'{player_var}:SetAttribute("has" .. itemName, true) end\n\t\t\t'
+            f'local _flag = "has" .. itemName; '
+            f'{player_var}:SetAttribute(_flag, true); '
+            f'local _ch = {player_var}.Character; '
+            f'if _ch then _ch:SetAttribute(_flag, true) end '
+            f'end\n\t\t\t'
             f'{m.group(0)}'
         )
 
