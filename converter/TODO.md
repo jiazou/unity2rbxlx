@@ -180,6 +180,30 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
   plan->pipeline wiring gap — broader than the `--skip-architecture-step` gate
   from PR #109.
 
+- [ ] **P1 — Storage classifier's ModuleScript path is fragile and under-tested.**
+  Container assignment splits into two unequal paths. `Script` / `LocalScript`
+  route by simple type rules (`Script` -> `ServerScriptService`, `LocalScript` ->
+  `StarterPlayerScripts`; `storage_classifier.py:338`) — robust, hard to get wrong.
+  `ModuleScript` routes by a caller-graph heuristic (`storage_classifier.py:309`)
+  that (a) **ignores the module's own client/server API surface** and infers only
+  from callers; (b) is fed a **regex-scanned** call graph (`storage_classifier.py:232`)
+  that the synthesized `or game:GetService("ServerStorage"):FindFirstChild(...)`
+  require-fallback (`script_coherence.py:69,183`) poisons into treating callers as
+  server-side; and (c) is then **not corrected** — both
+  `_fix_client_server_classification` (`script_coherence.py:423`) and
+  `_propagate_client_classification` (`script_coherence.py:392`) skip modules.
+  Every storage bug hit in the trash-dash run lives on this path. It is
+  **under-tested**: the primary test project SimpleFPS is 76% `Script` (and the
+  3+-client-API promotion guard at `script_coherence.py:136,237,281` keeps its big
+  client scripts as `LocalScript`s), so it routes *around* the buggy path;
+  `tests/test_storage_classifier.py` covers only toy module cases. trash-dash
+  (88% `ModuleScript`) is the first real module-heavy game to exercise it — and it
+  fell over. Fix direction: have the module router also inspect the module's own
+  client/server API surface (not callers only); extend the correction passes to
+  cover modules; harden the call graph against synthesized require-fallback
+  strings; add a module-heavy test project / fixtures. (Claude + Codex cross-model
+  analysis, 2026-05-19.)
+
 - [ ] **P2 — Retire genre-specific scaffolding; make the converter fully
   genre-agnostic.** `--scaffolding=fps` (`u2r.py convert`) injects FPS-genre
   scripts (client controller LocalScript, HUD ScreenGui, HUDController) and
