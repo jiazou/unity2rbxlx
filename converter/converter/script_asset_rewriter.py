@@ -82,10 +82,13 @@ def rewrite_asset_references(
     if not safe_keys:
         return 0
 
-    # Match quoted string literals in Luau source.
+    # Match quoted string literals in Luau source. The body excludes raw
+    # newlines: Luau ``"..."`` / ``'...'`` literals never span lines (long
+    # strings use ``[[...]]``). Without this, an apostrophe in a ``--``
+    # comment (``don't``, ``Roblox's``) pairs with a later one and the regex
+    # swallows everything between them — including real asset-path lines.
     string_pattern = re.compile(
-        r'("(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\')',
-        re.DOTALL,
+        r'("(?:[^"\\\n]|\\.)*"|\'(?:[^\'\\\n]|\\.)*\')',
     )
 
     total_rewrites = 0
