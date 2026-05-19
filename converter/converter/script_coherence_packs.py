@@ -1619,8 +1619,14 @@ def _fix_door_global_player_lookup(scripts: list["RbxScript"]) -> int:
 # Rewrite ``local function playerHasX(playerInstance)`` to read directly
 # from the Player-instance attribute that the pickup pack writes.
 
+# Match the ``playerHasX`` helper definition. ``\w*`` (not ``\w+``)
+# tolerates the zero-parameter shape — the AI transpiler emits both
+# ``playerHasKey(playerInstance)`` and, more recently, the bare
+# ``playerHasKey()`` form. The earlier ``\w+`` only matched the former,
+# so the pack silently no-oped on the bare shape and the door bug
+# survived (door never opens).
 _DOOR_MODULE_PLAYER_HELPER_RE = re.compile(
-    r"local function (player[Hh]as\w+)\s*\(\s*(\w+)\s*\)"
+    r"local function (?P<fn>player[Hh]as\w+)\s*\(\s*\w*\s*\)"
     r"(?P<body>.*?)"
     r"^end$",
     re.DOTALL | re.MULTILINE,
@@ -1656,33 +1662,69 @@ def _fix_door_module_player_lookup(scripts: list["RbxScript"]) -> int:
     for s in scripts:
         if s.name != "Door":
             continue
-        original = s.source
+        original = s.source or ""
+        src = original
+
+        # Step 1 — rewrite the helper body. The helper becomes a
+        # ``playerHasX(_part)`` that walks up from the touched part to
+        # the attribute the Pickup pack writes (on both the character
+        # Model and the Player instance, server-side — both replicate).
+        # Normalising every shape to a single ``_part`` parameter lets a
+        # zero-parameter caller pass the touch part directly (Step 2).
+        rewritten: dict[str, str] = {}  # fn name -> attr name
 
         def _replace(m: "re.Match[str]") -> str:
-            fn_name = m.group(1)
-            arg_name = m.group(2)
+            fn_name = m.group("fn")
             body = m.group("body")
             # Skip helpers that don't reference the module/PlayerScripts
             # path — they're already correct.
             if "getPlayerMod" not in body and "PlayerScripts" not in body:
                 return m.group(0)
             # Derive attribute name from the function name:
-            # ``playerHasKey`` → ``hasKey``. Falls back to ``hasKey`` if
-            # the pattern doesn't yield a clean suffix.
-            suffix = fn_name[len("playerHas"):]
+            # ``playerHasKey`` → ``hasKey``. ``len("playerHas")`` == 9
+            # covers both the ``playerHas`` and ``playerhas`` spellings.
+            suffix = fn_name[9:]
             attr = ("has" + suffix) if suffix else "hasKey"
+            rewritten[fn_name] = attr
             return (
-                f"local function {fn_name}({arg_name})\n"
-                f"    -- Pickup pack writes ``Player:SetAttribute({attr!r}, true)``\n"
-                f"    -- server-side on the Player instance — replicates to all\n"
-                f"    -- scripts. Door runs server-side, so this is the only\n"
-                f"    -- check that reflects state set by the client's pickup.\n"
-                f"    return {arg_name} ~= nil and {arg_name}:GetAttribute({attr!r}) == true\n"
+                f"local function {fn_name}(_part)\n"
+                f"    -- Pickup (a server Script) writes ``{attr}`` server-side\n"
+                f"    -- on the touching player's character Model AND Player\n"
+                f"    -- instance — both replicate. Door runs server-side; walk\n"
+                f"    -- up from the touched part to find that authoritative flag.\n"
+                f"    local _n = _part\n"
+                f"    while _n do\n"
+                f"        if _n:GetAttribute({attr!r}) == true then return true end\n"
+                f"        _n = _n.Parent\n"
+                f"    end\n"
+                f"    return false\n"
                 f"end"
             )
 
-        s.source = _DOOR_MODULE_PLAYER_HELPER_RE.sub(_replace, s.source)
-        if s.source != original:
+        src = _DOOR_MODULE_PLAYER_HELPER_RE.sub(_replace, src)
+
+        # Step 2 — empty-paren call sites (``playerHasKey()``) have no
+        # part to read from. Thread the enclosing handler's first
+        # parameter (the touched part) into each. Calls that already
+        # pass an argument are left alone — the walk-up body handles a
+        # part, character, or Player instance equally.
+        for fn_name in rewritten:
+            empty_call = re.compile(r"\b" + re.escape(fn_name) + r"\s*\(\s*\)")
+
+            def _thread_arg(cm: "re.Match[str]", _fn: str = fn_name) -> str:
+                preceding = src[: cm.start()]
+                enclosing = None
+                for fm in re.finditer(
+                    r"function\s*[\w.:]*\s*\(\s*([A-Za-z_]\w*)", preceding
+                ):
+                    enclosing = fm
+                arg = enclosing.group(1) if enclosing else "_part"
+                return f"{_fn}({arg})"
+
+            src = empty_call.sub(_thread_arg, src)
+
+        if src != original:
+            s.source = src
             fixes += 1
             log.info(
                 "  Rewrote Door module-Player gameplay-flag lookups in '%s'", s.name,
@@ -4353,5 +4395,116 @@ def _inject_template_clone_visibility(scripts: list["RbxScript"]) -> int:
             log.info(
                 "  Inserted template-clone visibility fixup(s) in '%s'",
                 s.name,
+            )
+    return fixes
+
+
+# ---------------------------------------------------------------------------
+# Pack: fps_camera_pitch_inversion
+# ---------------------------------------------------------------------------
+#
+# Unity's ``Input.GetAxis("Mouse Y")`` is positive-UP; Roblox's
+# ``UserInputService:GetMouseDelta().Y`` is positive-DOWN. A correct FPS
+# pitch combines two sign decisions with OPPOSITE polarity:
+#   - the mouse-delta accumulation: ``pitch = pitch +/- d.Y * k``
+#   - the camera application:        ``CFrame.Angles(+/- pitch, ...)``
+# Correct vertical look needs these two signs to disagree (e.g. the
+# canonical ``pitch = pitch - d.Y`` paired with ``CFrame.Angles(pitch)``,
+# which the transpiler prompt teaches).
+#
+# The AI transpiler sometimes emits AGREEING signs — observed shape:
+# ``pitch = pitch - d.Y`` together with ``CFrame.Angles(math.rad(-pitch))``
+# — which inverts vertical look (pushing the mouse forward tilts the view
+# down). Yaw is unaffected because it has no second negation.
+#
+# Fix: when the two signs agree, flip the MOUSE-delta line's sign. The
+# camera ``-pitch`` form is left intact on purpose — recoil kicks
+# (``pitch = pitch - 2``) and asymmetric pitch clamps are authored
+# against that convention, so flipping the camera term would break them.
+
+# Matches the mouse-delta pitch accumulation: ``<pv> = <pv> +/- <x>.Y``.
+# An optional ``math.clamp(`` wrapper is tolerated so the inline-clamp
+# shape (``pv = math.clamp(pv - d.Y * k, lo, hi)``) is handled too. The
+# match deliberately stops at ``.Y`` so any trailing ``* SENSITIVITY``
+# survives untouched.
+_PITCH_ACCUM_RE = re.compile(
+    r'^(?P<lead>[ \t]*)(?P<pv>[A-Za-z_]\w*)\s*=\s*'
+    r'(?P<wrap>math\.clamp\(\s*)?'
+    r'(?P=pv)\s*(?P<sign>[+-])\s*(?P<delta>[A-Za-z_]\w*\s*\.\s*Y)\b',
+    re.MULTILINE,
+)
+
+
+def _camera_pitch_sign_is_negated(src: str, pv: str) -> bool | None:
+    """Return True if the camera applies ``-<pv>`` inside a
+    ``CFrame.Angles`` call, False if it applies ``+<pv>``, None if no
+    such application is found.
+    """
+    m = re.search(
+        r'CFrame\.Angles\s*\(\s*(?:math\.rad\s*\(\s*)?(?P<cs>-?)\s*'
+        + re.escape(pv) + r'\b',
+        src,
+    )
+    if m is None:
+        return None
+    return m.group('cs') == '-'
+
+
+def _pitch_vars_to_flip(src: str) -> set[str]:
+    """Pitch vars whose mouse-delta sign AGREES with the camera
+    application sign — the inverted combination."""
+    out: set[str] = set()
+    for m in _PITCH_ACCUM_RE.finditer(src):
+        pv = m.group('pv')
+        negated = _camera_pitch_sign_is_negated(src, pv)
+        if negated is None:
+            continue
+        mouse_is_negative = m.group('sign') == '-'
+        if mouse_is_negative == negated:
+            out.add(pv)
+    return out
+
+
+def _detect_fps_camera_pitch_inversion(scripts: list["RbxScript"]) -> bool:
+    for s in scripts:
+        if _pitch_vars_to_flip(s.source or ""):
+            return True
+    return False
+
+
+@patch_pack(
+    name="fps_camera_pitch_inversion",
+    description="Flip the mouse-delta pitch accumulation sign when an "
+    "FPS controller pairs it with a same-sign camera CFrame.Angles "
+    "application. Roblox GetMouseDelta().Y is positive-down (vs Unity's "
+    "positive-up Mouse Y axis); a same-sign pairing inverts vertical "
+    "look so pushing the mouse forward tilts the view down.",
+    detect=_detect_fps_camera_pitch_inversion,
+)
+def _fix_fps_camera_pitch_inversion(scripts: list["RbxScript"]) -> int:
+    fixes = 0
+    for s in scripts:
+        src = s.source or ""
+        to_flip = _pitch_vars_to_flip(src)
+        if not to_flip:
+            continue
+
+        def _flip(m: "re.Match[str]") -> str:
+            pv = m.group('pv')
+            if pv not in to_flip:
+                return m.group(0)
+            new_sign = '+' if m.group('sign') == '-' else '-'
+            return (
+                f"{m.group('lead')}{pv} = "
+                f"{m.group('wrap') or ''}{pv} {new_sign} {m.group('delta')}"
+            )
+
+        new_src = _PITCH_ACCUM_RE.sub(_flip, src)
+        if new_src != src:
+            s.source = new_src
+            fixes += 1
+            log.info(
+                "  Fixed inverted FPS camera pitch in '%s' (vars: %s)",
+                s.name, sorted(to_flip),
             )
     return fixes
