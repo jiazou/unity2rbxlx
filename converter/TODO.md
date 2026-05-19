@@ -147,21 +147,30 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
   map to `ScreenGui.Enabled`, and why it is dropped. Likely related to the
   `classify_storage` / Step-4a-plan-not-honored P1 above.
 
-- [ ] **P1 — `classify_storage` overwrites the agent-authored `storage_plan`.**
-  The `/convert-unity` skill's Step 4a has the agent author `conversion_plan.json`
-  with a hand-crafted `storage_plan` (per-script client/server/replicated
-  containers + historic-bug `overrides_applied`). But `Pipeline._classify_storage`
-  (`pipeline.py:3319`) runs the auto-classifier (`storage_classifier.py`) and
-  **overwrites** `conversion_plan.json`, discarding the agent's `storage_plan`.
-  Confirmed in the trash-dash Mode-2 run (2026-05-18): Step 4a authored
+- [ ] **P1 — Phase 4a.5 agent-override ingestion is unimplemented.**
+  `storage_classifier.py` ("Phase 4a.5") is correctly meant to run during Step 4a
+  — that is not the bug. The `/convert-unity` skill
+  (`references/phase-4a-storage-classification.md`) designs 4a.5 as: the classifier
+  emits a *proposed* `storage_plan` -> the agent reviews it -> the agent overrides
+  by editing `storage_plan` in `conversion_plan.json` -> 4b/downstream use the
+  overridden plan. `StoragePlan.overrides_applied` (`storage_classifier.py:113`) is
+  the field reserved for this. But the override half is never built:
+  - `classify_storage()` (`storage_classifier.py:119`) has no `existing_plan` /
+    `overrides` parameter — it builds a fresh `StoragePlan()` from scratch every call.
+  - `overrides_applied` is a declared field with a hopeful comment; nothing
+    populates it.
+  - `_classify_storage()` (`pipeline.py:3335`) calls the classifier with only
+    `scripts` + `dependency_map`, then unconditionally rewrites `conversion_plan.json`
+    (`pipeline.py:3356`) — and re-runs on every `write_output`.
+  So an agent-edited `storage_plan` is silently discarded by the next `assemble`.
+  Confirmed in the trash-dash Mode-2 run (2026-05-19): Step 4a authored
   1 server / 49 shared / 1 server-module / 8 overrides; after `assemble`,
-  `classify_storage` produced 11 server / 106 shared / 0 server-modules /
-  **0 overrides_applied**. Effect: Step 4a's storage decisions never take effect,
-  even through the interactive skill. Fix: `_classify_storage` should treat an
-  existing agent-authored `storage_plan` as authoritative input (honor / merge
-  `overrides_applied`), or skip regeneration when `conversion_plan.json` already
-  carries a non-empty agent-authored `storage_plan`. This is the real plan->pipeline
-  wiring gap — broader than the `--skip-architecture-step` gate from PR #109.
+  `overrides_applied` was 0. Fix (the stub is already there): give
+  `classify_storage()` an optional `existing_plan` arg that honors agent-set
+  containers and populates `overrides_applied`; have `_classify_storage()` read the
+  existing `conversion_plan.json` `storage_plan` and pass it in instead of
+  regenerating blind. This is the real plan->pipeline wiring gap — broader than the
+  `--skip-architecture-step` gate from PR #109.
 
 - [ ] **P2 — Stale "Step 4.5" terminology.** The `/convert-unity` skill
   renamed its game-logic-porting phase to 4a/4b/4c, but the old name
