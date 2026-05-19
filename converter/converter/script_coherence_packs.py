@@ -3617,6 +3617,31 @@ def _build_local_literal_table(source: str) -> dict[str, str]:
     return out
 
 
+def _is_boolean_state_var(source: str, var: str) -> bool:
+    """True iff every assignment to ``var`` (its ``local`` initializer and
+    every reassignment) has a boolean-literal RHS (``true`` / ``false``).
+
+    The shim's backing-var accessor is hardcoded to boolean semantics
+    (``c:GetAttribute(name) == true``) and the mirror writes the RHS into
+    a Roblox attribute — which can only hold value types, never
+    Instances. So a bare-identifier accessor (e.g. ``return character``)
+    may be lifted into the attribute-backed shim ONLY when the backing
+    var is genuinely boolean state. ``return character`` resolves to a
+    character Model — mirroring it emits ``SetAttribute(name, <Instance>)``,
+    which throws ``Instance is not a supported attribute type`` at runtime.
+    """
+    assign_re = re.compile(
+        r'^[ \t]*(?:local\s+)?' + re.escape(var) + r'\s*=\s*(?P<rhs>[^\n;]+?)\s*$',
+        re.MULTILINE,
+    )
+    saw_assignment = False
+    for m in assign_re.finditer(source):
+        saw_assignment = True
+        if m.group("rhs").strip() not in ("true", "false"):
+            return False
+    return saw_assignment
+
+
 def _classify_api(target_src: str, exporter_var: str) -> list[_ApiMethod]:
     """Parse the exporter's `function <Var>.<m>() return <expr> end`
     definitions. Returns one entry per parameterless single-line accessor
@@ -3646,8 +3671,15 @@ def _classify_api(target_src: str, exporter_var: str) -> list[_ApiMethod]:
             referenced = literal_locals.get(expr)
             if referenced is not None:
                 out.append(_ApiMethod(method, expr, None, referenced))
-            else:
+            elif _is_boolean_state_var(target_src, expr):
                 out.append(_ApiMethod(method, expr, expr, None))
+            else:
+                # Bare identifier holding non-boolean runtime state
+                # (e.g. `return character` -> a character Model). A
+                # Roblox attribute cannot carry it, so it is NOT a
+                # shimmable backing var; fall through to unknown-shape
+                # handling (the shim emits `return nil` with a warning).
+                out.append(_ApiMethod(method, expr, None, None))
         else:
             # Unknown shape; emit nothing for now. Future work could
             # support `return Var.field` or simple table reads.
@@ -4101,10 +4133,18 @@ _PROXIMITY_TRIGGER_MARKER = "_AutoProximityTriggerFanout"
 #       <var>.Touched:Connect(function(<arg>)
 #           ...body...
 #       end)
+#       ...rest (e.g. a sibling <var>.TouchEnded:Connect block)...
 #   end
 #
-# The body content is captured non-greedily up to the closing ``end)``
-# of the Connect call, followed by the closing ``end`` of the ``if``.
+# ``body`` is captured non-greedily and stops at the ``.Touched``
+# connect's OWN ``end)``. ``rest`` then captures everything else inside
+# the ``if`` block — crucially any sibling handler like
+# ``<var>.TouchEnded:Connect(...)`` — up to the ``if``'s closing ``end``
+# (at the same indent as the ``local`` line). Earlier the regex required
+# the ``if``-``end`` immediately after the ``.Touched`` ``end)``; when a
+# door also bound ``.TouchEnded`` the non-greedy ``body`` over-captured,
+# swallowing the first ``end)`` and producing a stray ``)`` in the
+# rewritten ``local function`` — invalid Luau.
 _PROXIMITY_TRIGGER_RE = re.compile(
     r'(?P<lead>^[ \t]*)local\s+(?P<var>[a-zA-Z_]\w*)\s*=\s*findTriggerPart\s*\(\s*'
     r'(?P<container>[a-zA-Z_]\w*)\s*\)\s*\n'
@@ -4113,7 +4153,8 @@ _PROXIMITY_TRIGGER_RE = re.compile(
     r'function\s*\(\s*(?P<arg>[a-zA-Z_]\w*)\s*\)\s*\n'
     r'(?P<body>(?:.*?\n)*?)'
     r'(?P=connect_indent)end\s*\)\s*\n'
-    r'[ \t]*end\b',
+    r'(?P<rest>(?:.*?\n)*?)'
+    r'(?P=lead)end\b',
     re.MULTILINE,
 )
 
@@ -4174,33 +4215,40 @@ def _inject_proximity_trigger_fanout(scripts: list["RbxScript"]) -> int:
         arg = m.group("arg")
         var = m.group("var")
         body = m.group("body")
+        rest = m.group("rest")
         rewritten_body = _rewrite_proximity_body(body, arg)
         # Preserve the ``local <var> = findTriggerPart(container)`` line
         # at the top of the new block. The captured body often still
         # references the trigger-part local (e.g. ``triggerPart:Find
         # FirstChildWhichIsA("Sound")``); dropping the definition would
         # produce ``nil:Find...`` calls inside _onProximityTouched.
-        # Keep the variable around for body-level reads even though the
-        # fanout below no longer uses it to bind Touched.
+        #
+        # ``rest`` carries any sibling handlers found inside the same
+        # ``if <var> then`` block (notably a ``<var>.TouchEnded:Connect``
+        # binding on doors). It is re-emitted verbatim inside the
+        # rebuilt ``if <var> then`` so those handlers — and the ``if``
+        # guard they depend on — survive the rewrite.
         replacement = (
             f"{lead}local {var} = findTriggerPart({container})\n"
             f"{lead}-- {_PROXIMITY_TRIGGER_MARKER}: connect Touched on every body\n"
             f"{lead}-- part so step-on triggers (mines/pickups/pressure-plates) fire,\n"
             f"{lead}-- and resolve the touching character via ancestor lookup so\n"
-            f"{lead}-- accessory-mounted touches also count. The {var} local is\n"
-            f"{lead}-- preserved so body-level references (e.g. nearby Sound\n"
-            f"{lead}-- lookups under the trigger part) still resolve.\n"
+            f"{lead}-- accessory-mounted touches also count. The {var} local and\n"
+            f"{lead}-- any sibling handlers (e.g. TouchEnded) are preserved.\n"
             f"{lead}local function _onProximityTouched({arg})\n"
             f"{rewritten_body}"
             f"{lead}end\n"
-            f"{lead}if {container}:IsA(\"BasePart\") then\n"
-            f"{lead}\t{container}.Touched:Connect(_onProximityTouched)\n"
-            f"{lead}elseif {container}:IsA(\"Model\") then\n"
-            f"{lead}\tfor _, _d in ipairs({container}:GetDescendants()) do\n"
-            f"{lead}\t\tif _d:IsA(\"BasePart\") then\n"
-            f"{lead}\t\t\t_d.Touched:Connect(_onProximityTouched)\n"
+            f"{lead}if {var} then\n"
+            f"{lead}\tif {container}:IsA(\"BasePart\") then\n"
+            f"{lead}\t\t{container}.Touched:Connect(_onProximityTouched)\n"
+            f"{lead}\telseif {container}:IsA(\"Model\") then\n"
+            f"{lead}\t\tfor _, _d in ipairs({container}:GetDescendants()) do\n"
+            f"{lead}\t\t\tif _d:IsA(\"BasePart\") then\n"
+            f"{lead}\t\t\t\t_d.Touched:Connect(_onProximityTouched)\n"
+            f"{lead}\t\t\tend\n"
             f"{lead}\t\tend\n"
             f"{lead}\tend\n"
+            f"{rest}"
             f"{lead}end"
         )
         s.source = src[: m.start()] + replacement + src[m.end():]

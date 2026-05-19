@@ -3102,6 +3102,55 @@ class TestLocalScriptApiShim:
         assert fixes == 0
         assert len(scripts) == original_count
 
+    def test_instance_returning_accessor_not_mirrored(self) -> None:
+        """Regression: a bare-identifier accessor whose backing var holds
+        a non-boolean runtime value — ``function Player.getInstance()
+        return character end`` — must NOT be treated as boolean state.
+        The shim mirror used to emit ``character:SetAttribute(
+        "getInstance", char)``, and a Roblox attribute cannot hold an
+        Instance, so it threw ``Instance is not a supported attribute
+        type`` at runtime. The genuine boolean accessor (``hasKey``)
+        must still be mirrored.
+        """
+        exporter = RbxScript(
+            name="Player",
+            source=(
+                "local Player = {}\n"
+                "local gotKey = false\n"
+                "local character\n"
+                "function Player.hasKey() return gotKey end\n"
+                "function Player.getInstance() return character end\n"
+                "local function onCharacter(char)\n"
+                "    character = char\n"
+                "    gotKey = true\n"
+                "end\n"
+            ),
+            script_type="LocalScript",
+        )
+        scripts = [exporter, self._consumer_shape_a()]
+        packs_module._inject_localscript_api_shim(scripts)
+
+        # The Instance-typed accessor must not produce an attribute mirror.
+        assert 'SetAttribute("getInstance"' not in exporter.source
+        # The genuine boolean accessor still mirrors.
+        assert 'SetAttribute("hasKey"' in exporter.source
+        # The shim module must not pretend getInstance is boolean state;
+        # it falls through to the unknown-shape `return nil` handling.
+        shim = next((s for s in scripts if s.name == "PlayerShared"), None)
+        assert shim is not None
+        assert 'function PlayerShared.getInstance() return nil end' in shim.source
+        assert 'GetAttribute("getInstance")' not in shim.source
+
+    def test_is_boolean_state_var_classification(self) -> None:
+        src = (
+            "local gotKey = false\n"
+            "local character\n"
+            "gotKey = true\n"
+            "character = workspace\n"
+        )
+        assert packs_module._is_boolean_state_var(src, "gotKey") is True
+        assert packs_module._is_boolean_state_var(src, "character") is False
+
 
 class TestTemplateCloneVisibility:
     """The ``template_clone_visibility`` pack adds a visibility + weld
@@ -3345,6 +3394,75 @@ class TestProximityTriggerFanout:
         fixes = packs_module._inject_proximity_trigger_fanout([s])
         assert fixes == 0
         assert s.source == original
+
+    def test_door_with_touchended_sibling_handler(self) -> None:
+        """Regression: a Door binds both ``.Touched`` and ``.TouchEnded``
+        inside one ``if triggerPart then`` block. The body regex used to
+        over-capture — unable to stop at the Touched handler's own
+        ``end)`` (the ``if``-``end`` didn't follow it), it swallowed the
+        first ``end)`` and the TouchEnded binding, leaving a stray ``)``
+        in the rewritten ``local function`` and breaking every door
+        (`Door:99: Expected identifier ... got ')'`).
+
+        The fix must: produce a ``_onProximityTouched`` that closes with
+        a bare ``end``, preserve the ``.TouchEnded`` handler verbatim,
+        and keep the result valid Luau.
+        """
+        s = RbxScript(
+            name="Door",
+            source=(
+                'local Players = game:GetService("Players")\n'
+                "local container = script.Parent\n"
+                "local function findTriggerPart(p) return p end\n"
+                "local function isPlayerPart(o) return true end\n"
+                "local function playerHasKey() return true end\n"
+                "local function toggleDoor(open) end\n"
+                "\n"
+                "local triggerPart = findTriggerPart(container)\n"
+                "if triggerPart then\n"
+                "    triggerPart.Touched:Connect(function(other)\n"
+                "        if isPlayerPart(other) then\n"
+                "            if playerHasKey() then toggleDoor(true) end\n"
+                "        end\n"
+                "    end)\n"
+                "    triggerPart.TouchEnded:Connect(function(other)\n"
+                "        if isPlayerPart(other) then\n"
+                "            if playerHasKey() then toggleDoor(false) end\n"
+                "        end\n"
+                "    end)\n"
+                "end\n"
+            ),
+            script_type="Script",
+        )
+        fixes = packs_module._inject_proximity_trigger_fanout([s])
+        assert fixes == 1
+        # The named handler closes with a bare `end` — no stray `)`.
+        assert "local function _onProximityTouched(other)" in s.source
+        # The _onProximityTouched body (between its declaration and the
+        # rebuilt `if triggerPart then`) must not carry a stray `end)`.
+        handler_body = s.source.split("_onProximityTouched(other)", 1)[1].split(
+            "if triggerPart then", 1
+        )[0]
+        assert "end)" not in handler_body, (
+            "_onProximityTouched body must not carry a stray end)"
+        )
+        # The sibling TouchEnded handler is preserved verbatim.
+        assert "triggerPart.TouchEnded:Connect(function(other)" in s.source
+        assert "toggleDoor(false)" in s.source
+        # The fanout is emitted.
+        assert 'container:IsA("BasePart")' in s.source
+        # Sanity: balanced block keywords. Each `if`/`for`/`while`/
+        # `function` opens one `end`; `elseif` reuses its `if`'s `end`,
+        # so it is subtracted from the `then` tally.
+        import re as _re
+        opens = (
+            len(_re.findall(r'\bthen\b', s.source))
+            - len(_re.findall(r'\belseif\b', s.source))
+            + len(_re.findall(r'\bdo\b', s.source))
+            + len(_re.findall(r'\bfunction\b', s.source))
+        )
+        closes = len(_re.findall(r'\bend\b', s.source))
+        assert opens == closes, f"unbalanced blocks: {opens} opens vs {closes} ends"
 
     # TODO: re-add a test for the BasePart-fallback intermediate-statement
     # shape once the regex can be widened without triggering catastrophic
