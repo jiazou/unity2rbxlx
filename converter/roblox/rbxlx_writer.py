@@ -14,7 +14,6 @@ import xml.etree.ElementTree as ET
 import xml.dom.minidom
 from pathlib import Path
 from uuid import uuid4
-from typing import Any
 
 from core.roblox_types import (
     RbxAttrValue,
@@ -39,7 +38,7 @@ from core.roblox_types import (
     RbxUIElement,
     RbxVideoFrame,
 )
-from core.coordinate_system import quaternion_to_rotation_matrix
+from roblox.materials import MATERIAL_NAME_TO_TOKEN, DEFAULT_MATERIAL_TOKEN
 
 log = logging.getLogger(__name__)
 
@@ -56,27 +55,6 @@ def _ref_id() -> str:
 # Maps Unity fileID → Roblox referent for constraint Part1 resolution.
 # Populated during _make_part, consumed during _make_constraint.
 _unity_fid_to_referent: dict[str, str] = {}
-
-
-def _quat_to_rotation_matrix(
-    qx: float, qy: float, qz: float, qw: float
-) -> tuple[float, float, float, float, float, float, float, float, float]:
-    """Convert a quaternion (x, y, z, w) to a 3x3 rotation matrix.
-
-    Returns the nine elements (R00, R01, R02, R10, R11, R12, R20, R21, R22)
-    suitable for embedding in an RBXLX ``<CoordinateFrame>`` element.
-    """
-    mat = quaternion_to_rotation_matrix(qx, qy, qz, qw)
-    # quaternion_to_rotation_matrix returns a 3x3 list-of-lists or flat tuple.
-    # Normalise to a flat 9-float tuple.
-    if isinstance(mat, (list, tuple)) and isinstance(mat[0], (list, tuple)):
-        return (
-            float(mat[0][0]), float(mat[0][1]), float(mat[0][2]),
-            float(mat[1][0]), float(mat[1][1]), float(mat[1][2]),
-            float(mat[2][0]), float(mat[2][1]), float(mat[2][2]),
-        )
-    # Already flat
-    return tuple(float(v) for v in mat[:9])  # type: ignore[return-value]
 
 
 # ---------------------------------------------------------------------------
@@ -103,12 +81,6 @@ def _add_float(parent: ET.Element, name: str, value: float) -> ET.Element:
 
 def _add_int(parent: ET.Element, name: str, value: int) -> ET.Element:
     elem = ET.SubElement(parent, "int", name=name)
-    elem.text = str(value)
-    return elem
-
-
-def _add_double(parent: ET.Element, name: str, value: float) -> ET.Element:
-    elem = ET.SubElement(parent, "double", name=name)
     elem.text = str(value)
     return elem
 
@@ -173,13 +145,6 @@ def _add_content(parent: ET.Element, name: str, url: str) -> ET.Element:
     elem = ET.SubElement(parent, "Content", name=name)
     sub = ET.SubElement(elem, "url")
     sub.text = url
-    return elem
-
-
-def _add_binary_string(parent: ET.Element, name: str, b64_data: str) -> ET.Element:
-    """Add a BinaryString property (base64-encoded, wrapped in CDATA by _pretty_xml)."""
-    elem = ET.SubElement(parent, "BinaryString", name=name)
-    elem.text = b64_data
     return elem
 
 
@@ -256,8 +221,6 @@ def _make_light(parent_xml: ET.Element, light: RbxLight) -> None:
         _add_color3(props, "Color", *light.color[:3])
     if hasattr(light, "range"):
         _add_float(props, "Range", light.range)
-    if hasattr(light, "enabled"):
-        _add_bool(props, "Enabled", light.enabled)
     if hasattr(light, "angle") and light_class == "SpotLight":
         _add_float(props, "Angle", light.angle)
     if hasattr(light, "shadows"):
@@ -913,27 +876,13 @@ def _make_part(parent_xml: ET.Element, part: RbxPart) -> None:
             _add_color3uint8(props, "Color3uint8", r, g, b)
 
         # Material (must be token ID, not string name)
-        _MATERIAL_TOKENS = {
-            "Plastic": 256, "SmoothPlastic": 272, "Neon": 288,
-            "Wood": 512, "WoodPlanks": 528, "Marble": 784, "Basalt": 788,
-            "Slate": 800, "CrackedLava": 804, "Concrete": 816,
-            "Limestone": 820, "Pavement": 836, "Granite": 832,
-            "Brick": 848, "Pebble": 864, "Cobblestone": 880,
-            "Rock": 896, "Sandstone": 912, "CorrodedMetal": 1040,
-            "DiamondPlate": 1056, "Foil": 1072, "Metal": 1088,
-            "Grass": 1280, "LeafyGrass": 1284, "Sand": 1296,
-            "Fabric": 1312, "Snow": 1328, "Mud": 1344,
-            "Ground": 1360, "Asphalt": 1376, "Salt": 1392,
-            "Ice": 1536, "Glacier": 1552, "Glass": 1568,
-            "ForceField": 1584, "Air": 1792, "Water": 2048,
-        }
         if hasattr(part, "material") and part.material is not None:
             if isinstance(part.material, int):
                 _add_token(props, "Material", part.material)
-            elif isinstance(part.material, str) and part.material in _MATERIAL_TOKENS:
-                _add_token(props, "Material", _MATERIAL_TOKENS[part.material])
+            elif isinstance(part.material, str) and part.material in MATERIAL_NAME_TO_TOKEN:
+                _add_token(props, "Material", MATERIAL_NAME_TO_TOKEN[part.material])
             else:
-                _add_token(props, "Material", 256)  # Default to Plastic
+                _add_token(props, "Material", DEFAULT_MATERIAL_TOKEN)  # Plastic
 
         # Transparency
         if hasattr(part, "transparency") and part.transparency:
@@ -1359,7 +1308,6 @@ def _pretty_xml(root: ET.Element) -> str:
     # that minidom applied to the script source text.
     # Uses a scan-based approach instead of regex to avoid issues with non-greedy
     # matching across many elements with multiline content.
-    import html
 
     result = _wrap_elements_in_cdata(result, "ProtectedString")
     result = _wrap_elements_in_cdata(result, "BinaryString")

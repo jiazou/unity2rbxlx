@@ -4,18 +4,13 @@ test_prefab_variants.py -- Tests for prefab variant chain resolution.
 
 from __future__ import annotations
 
-import copy
-import textwrap
 from pathlib import Path
-from typing import Any
 
-import pytest
 
 from core.unity_types import (
     PrefabComponent,
     PrefabNode,
     PrefabTemplate,
-    PrefabLibrary,
 )
 from unity.prefab_parser import (
     _parse_single_prefab,
@@ -269,6 +264,25 @@ class TestSetNestedProperty:
         props = {"m_Mesh": {"fileID": 0, "guid": "old"}}
         _set_nested_property(props, "m_Mesh", None, {"fileID": 123, "guid": "new"})
         assert props["m_Mesh"]["guid"] == "new"
+
+    def test_null_objectref_falls_back_to_value(self):
+        """A null-reference objectReference (all-zeros guid) must NOT be stored
+        as the property value — the scalar value is used instead.
+
+        Regression for the all-zeros-GUID bug: the old inline
+        ``obj_ref.get("guid")`` treated Unity's null-reference sentinel
+        ("0"*32) as a real reference. Routing through ``ref_guid`` fixes it.
+        """
+        props = {}
+        null_ref = {"fileID": 0, "guid": "0" * 32, "type": 2}
+        _set_nested_property(props, "m_SomeField", "fallback", null_ref)
+        assert props["m_SomeField"] == "fallback"
+
+    def test_real_objectref_is_stored(self):
+        props = {}
+        real_ref = {"fileID": 11400000, "guid": "a" * 32, "type": 2}
+        _set_nested_property(props, "m_SomeField", "fallback", real_ref)
+        assert props["m_SomeField"] == real_ref
 
 
 # ---------------------------------------------------------------------------
