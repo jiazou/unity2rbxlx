@@ -135,6 +135,18 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
   and surface to `UNCONVERTED.md` instead of issuing a doomed upload.
 ## Infrastructure
 
+- [ ] **P1 — Converter doesn't wire ScreenGui enable/disable into the state
+  machine.** Trash-dash Mode-2 (2026-05-19): all 4 converted ScreenGuis
+  (`Loadout`, `Game`, `GameOver`, `Leaderboard`) ship with `Enabled=true`,
+  so they render stacked at once — an opaque white wall over the menu.
+  In Unity the `GameManager` state machine shows/hides canvases per state
+  (Loadout / Game / GameOver). The converter neither (a) sets non-initial
+  canvases `Enabled=false` at build time, nor (b) emits state-machine code
+  that toggles `ScreenGui.Enabled` on state transitions. Explore: where
+  Unity `Canvas`/`GameObject.SetActive` and per-state canvas wiring should
+  map to `ScreenGui.Enabled`, and why it is dropped. Likely related to the
+  `classify_storage` / Step-4a-plan-not-honored P1 above.
+
 - [ ] **P1 — `classify_storage` overwrites the agent-authored `storage_plan`.**
   The `/convert-unity` skill's Step 4a has the agent author `conversion_plan.json`
   with a hand-crafted `storage_plan` (per-script client/server/replicated
