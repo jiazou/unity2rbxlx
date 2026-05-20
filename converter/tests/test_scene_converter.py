@@ -1525,3 +1525,250 @@ class TestMainCameraRig:
 
         assert part is not None
         assert "_MainCameraRig" not in part.attributes
+
+
+class TestTriggerVsMeshSizeAuthority:
+    """When a GameObject carries a visible mesh AND a trigger collider, the
+    Part Size and Transparency must come from the mesh, not the trigger.
+    The trigger's intended volume is recorded as ``_Trigger*`` attributes so
+    scripts can still do OverlapParams-style proximity detection.
+
+    Concrete case this guards against: SimpleFPS landmines had MeshFilter +
+    BoxCollider (~0.32 x 0.10 x 0.35 m) on the same GameObject as a
+    SphereCollider trigger with radius 2 m. The earlier policy grew the
+    Part Size to the 4 m sphere bounding box and forced Transparency=1,
+    producing a 14.28-stud invisible cube instead of a small visible mine.
+    """
+
+    @staticmethod
+    def _fake_comp(component_type, properties):
+        c = type("FakeComp", (), {})()
+        c.component_type = component_type
+        c.properties = properties
+        return c
+
+    @staticmethod
+    def _fake_node(components, name="Mine", mesh_guid=""):
+        n = type("FakeNode", (), {})()
+        n.name = name
+        n.components = list(components)
+        n.mesh_guid = mesh_guid
+        return n
+
+    def test_visible_mesh_plus_trigger_keeps_mesh_size(self):
+        from converter.scene_converter import _process_components
+        from core.roblox_types import RbxPart
+
+        # ~SimpleFPS Mine geometry: 0.32 x 0.10 x 0.35 m mesh -> studs.
+        # ``part.size`` is pre-populated by the mesh-sizing path before
+        # ``_process_components`` runs in production; mirror that here.
+        mesh_size = (1.153, 0.348, 1.250)
+        part = RbxPart(name="Mine")
+        part.size = mesh_size
+
+        comps = [
+            self._fake_comp("MeshFilter", {}),
+            self._fake_comp("MeshRenderer", {}),
+            self._fake_comp("BoxCollider",
+                            {"m_Size": {"x": 0.323, "y": 0.098, "z": 0.350},
+                             "m_IsTrigger": 0}),
+            self._fake_comp("SphereCollider",
+                            {"m_Radius": 2.0, "m_IsTrigger": 1}),
+        ]
+        node = self._fake_node(comps, mesh_guid="abcd"*8)
+
+        _process_components(node, part)
+
+        # The mesh wins for visible Size — the trigger sphere's ~14-stud
+        # bounding box must NOT have grown the Part.
+        assert part.size[0] < 5.0, f"Part Size X clobbered by trigger: {part.size}"
+        assert part.size[1] < 5.0, f"Part Size Y clobbered by trigger: {part.size}"
+        assert part.size[2] < 5.0, f"Part Size Z clobbered by trigger: {part.size}"
+        # The trigger still imposes detection semantics on the visible Part:
+        # CanQuery on, CanCollide off (trigger dominates per the existing
+        # ``node_has_trigger`` policy).
+        assert part.can_query is True
+        assert part.can_collide is False
+        # Trigger does NOT hide the visible mesh.
+        assert part.transparency != 1.0, "Trigger forced Transparency=1 over a visible mesh"
+        # Trigger volume preserved as attributes for OverlapParams-based
+        # script detection.
+        assert part.attributes is not None
+        assert part.attributes.get("_TriggerShape") == "Sphere"
+        # 2 m radius -> 4 m diameter -> ~14.28 studs on each axis.
+        for axis in ("_TriggerSizeX", "_TriggerSizeY", "_TriggerSizeZ"):
+            assert part.attributes.get(axis, 0) > 10.0, (
+                f"{axis} not recorded ({part.attributes.get(axis)})"
+            )
+        # And the trigger is also emitted as a transparent CHILD Part so
+        # ``Touched``-based detection still fires at the original radius
+        # (without it, Touched on the small visible mesh only fires on
+        # direct contact — breaks Unity's "walk near the door" pattern).
+        trigger_children = [c for c in part.children if c.name == "TriggerZone"]
+        assert len(trigger_children) == 1, (
+            f"expected 1 TriggerZone child, got {len(trigger_children)}"
+        )
+        tz = trigger_children[0]
+        assert tz.transparency == 1.0
+        assert tz.can_collide is False
+        assert tz.can_query is True
+        assert tz.can_touch is True
+        # Sized to the trigger sphere (~14.28 studs).
+        assert tz.size[0] > 10.0 and tz.size[1] > 10.0 and tz.size[2] > 10.0, (
+            f"TriggerZone size {tz.size} too small — expected ~14.28 stud sphere"
+        )
+        # Ball shape for SphereCollider.
+        assert tz.shape == 0
+
+    def test_trigger_alone_still_sizes_part(self):
+        """Backward compatibility: when the trigger is the ONLY sized
+        component on the node (no mesh, no non-trigger collider), it
+        must still drive Part Size and Transparency=1 — the existing
+        proximity-zone-on-a-marker-GameObject pattern keeps working."""
+        from converter.scene_converter import _process_components
+        from core.roblox_types import RbxPart
+
+        part = RbxPart(name="ProximityZone")
+        # Default Part size — pre-loop nothing else set it.
+        part.size = (0.05, 0.05, 0.05)
+
+        comps = [
+            self._fake_comp("SphereCollider",
+                            {"m_Radius": 2.0, "m_IsTrigger": 1}),
+        ]
+        node = self._fake_node(comps, name="ProximityZone")
+
+        _process_components(node, part)
+
+        # Trigger sized the part — 4 m diameter ~= 14.28 studs.
+        assert max(part.size) > 10.0, f"Trigger-only didn't size: {part.size}"
+        assert part.transparency == 1.0
+        assert part.can_query is True
+        assert part.can_collide is False
+        # When the trigger owns size, the volume is the Part itself —
+        # no need to also stash it on attributes.
+        attrs = part.attributes or {}
+        assert "_TriggerSizeX" not in attrs
+
+
+class TestPrefabInstanceScaleNotDoubled:
+    """A PrefabInstance must size its Part to the effective instance scale,
+    not ``prefab_root.scale × instance_scale`` (which double-counts the
+    prefab's localScale).
+
+    Unity ``m_LocalScale.*`` modifications on a ``PrefabInstance`` REPLACE
+    the prefab root's localScale on that instance — they don't compose
+    multiplicatively. So when ``template.root.scale = (S, S, S)`` and the
+    scene either omits any override (instance inherits S) or sets
+    ``m_LocalScale.x = S`` (override matches), the effective instance
+    scale is ``S``, not ``S × S``.
+
+    Concrete case: SimpleFPS Mine — prefab root localScale 2.5 + an
+    ``m_LocalScale.x = 2.4999995`` PrefabInstance override produced a Part
+    sized to ``2.5 × 2.5 = 6.25 × mesh_AABB × STUDS_PER_METER`` = ~7.21
+    studs, instead of the expected ~2.88 studs.
+    """
+
+    def _build_template(self, root_scale, mesh_size_meters):
+        """Build a minimal prefab template with a root mesh node."""
+        from converter.scene_converter import RbxPart  # noqa: F401 — module import
+        # Lightweight fake matching the surface used by _convert_prefab_node:
+        # template has .root with .scale, .position, .rotation, .name,
+        # .mesh_guid, .mesh_file_id, .children, .components; template has .name.
+        root = type("FakeNode", (), {})()
+        root.name = "FakeMesh"
+        root.scale = root_scale
+        root.position = (0.0, 0.0, 0.0)
+        root.rotation = (0.0, 0.0, 0.0, 1.0)
+        root.mesh_guid = "deadbeef" * 4
+        root.mesh_file_id = "0"
+        root.children = []
+        root.components = []
+        template = type("FakeTemplate", (), {})()
+        template.name = "Mine"
+        template.root = root
+        return template
+
+    def test_instance_with_override_matching_template_keeps_single_scale(self, tmp_path, monkeypatch):
+        """Prefab template root scale 2.5 + instance override ``m_LocalScale.x = 2.5``:
+        the resulting Part size must be ``~2.5 × mesh_aabb × STUDS_PER_METER``,
+        NOT ``~6.25 × mesh_aabb × STUDS_PER_METER``.
+        """
+        from converter import scene_converter as sc
+        from converter.scene_converter import SceneConversionContext
+        from core.unity_types import GuidIndex, GuidEntry
+
+        mesh_asset = tmp_path / "embedded_mine.prefab"
+        mesh_asset.write_text("dummy")
+        mesh_guid = "deadbeef" * 4
+        prefab_guid = "feedface" * 4
+        guid_index = GuidIndex(project_root=tmp_path)
+        guid_index.guid_to_entry[mesh_guid] = GuidEntry(
+            guid=mesh_guid,
+            asset_path=mesh_asset.resolve(),
+            relative_path=mesh_asset.relative_to(tmp_path),
+            kind="prefab",
+        )
+        # The PrefabInstance resolver also calls ``guid_index.resolve`` on
+        # the prefab source. Point that at the same on-disk file so the
+        # resolver can find a template by stem.
+        guid_index.guid_to_entry[prefab_guid] = GuidEntry(
+            guid=prefab_guid,
+            asset_path=mesh_asset.resolve(),
+            relative_path=mesh_asset.relative_to(tmp_path),
+            kind="prefab",
+        )
+
+        # Stub the embedded-AABB reader so we don't need a real Unity YAML.
+        monkeypatch.setattr(
+            sc, "_read_embedded_mesh_aabb",
+            lambda asset_path, mesh_file_id: (0.32, 0.10, 0.35),
+        )
+
+        template = self._build_template(
+            root_scale=(2.5, 2.5, 2.5),
+            mesh_size_meters=(0.32, 0.10, 0.35),
+        )
+        prefab_lib = type("FakeLib", (), {})()
+        prefab_lib.by_name = {mesh_asset.stem: template}
+
+        # Build a PrefabInstance with an m_LocalScale.x = 2.5 override.
+        pi = type("FakePI", (), {})()
+        pi.source_prefab_guid = prefab_guid
+        pi.transform_parent_file_id = ""
+        pi.removed_components = []
+        pi.modifications = [
+            {"propertyPath": "m_RootOrder",
+             "target": {"fileID": "1"}, "value": "0"},
+            {"propertyPath": "m_LocalPosition.x",
+             "target": {"fileID": "1"}, "value": "0"},
+            {"propertyPath": "m_LocalScale.x",
+             "target": {"fileID": "1"}, "value": "2.5"},
+        ]
+
+        # An active SceneConversionContext is required by _ctx() helpers.
+        ctx = SceneConversionContext()
+        sc._current_ctx = ctx
+        try:
+            parts = sc._convert_prefab_instance(
+                pi, prefab_lib, guid_index=guid_index,
+                material_mappings={}, uploaded_assets={},
+            )
+        finally:
+            sc._current_ctx = None
+        assert parts, "Resolver returned no parts"
+        part = parts[0]
+
+        # Effective scale should be 2.5 (single application), not 6.25.
+        # X-extent: 0.32 m × 2.5 × STUDS_PER_METER (3.571) ≈ 2.857 studs.
+        # The bug it guards against produces ~7.14 studs (~6.25× mesh) so
+        # any value under 5 studs proves the prefab scale isn't double-counted.
+        assert part.size[0] < 5.0, (
+            f"Part X size {part.size[0]:.3f} > 5: prefab root scale "
+            f"double-counted (expected ~2.86 from 0.32 m × 2.5 × STUDS_PER_METER)"
+        )
+        # Sanity: not collapsed to zero either.
+        assert part.size[0] > 1.5, (
+            f"Part X size {part.size[0]:.3f} < 1.5: scale lost entirely "
+            f"(expected ~2.86)"
+        )

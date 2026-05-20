@@ -1665,6 +1665,29 @@ def _process_components(
         for c in node.components
     )
 
+    # Pre-scan: does this GameObject have a VISIBLE-MESH authority that
+    # the trigger collider must not clobber? When a MeshFilter/Renderer
+    # is present, the visible body's Size and Transparency are the
+    # ground truth — a trigger collider on the same node is detection
+    # semantics, not a renderable body, and "small visible body + larger
+    # proximity sphere on the same GameObject" (concrete case: SimpleFPS
+    # Mine — 0.32x0.10x0.35m MeshFilter+BoxCollider next to a 2m-radius
+    # trigger SphereCollider) otherwise renders as a 14-stud invisible
+    # cube. The trigger's intended volume gets stored as ``_Trigger*``
+    # attributes for scripts that need approach detection via
+    # OverlapParams.
+    #
+    # A node with a non-trigger collider but NO visible mesh is *invisible
+    # anyway* (collision proxy: Turret/Pier-style detector GameObjects),
+    # so trigger growth there is harmless and useful for Touched-range
+    # detection — we leave that path alone.
+    node_has_mesh_authority = bool(getattr(node, "mesh_guid", "")) or any(
+        c.component_type in ("MeshFilter", "MeshRenderer", "SkinnedMeshRenderer",
+                              "SpriteRenderer")
+        for c in node.components
+    )
+    trigger_owns_part_size = not node_has_mesh_authority
+
     for comp in node.components:
         ct = comp.component_type
 
@@ -1691,35 +1714,107 @@ def _process_components(
                 # Trigger colliders are detection zones — enable Touched events.
                 # When the same GameObject has BOTH a trigger and a physical
                 # collider (common Unity pattern: small body + larger
-                # proximity sphere), the trigger's behavior dominates so
-                # scripts using ``model:FindFirstChild("<NodeName>")`` reach
-                # the detection zone, not a wall. Drop physical-collide,
-                # grow Part size to the trigger's bounding box, and make it
-                # invisible. The physical collider's contribution is lost
-                # here — siblings (e.g. a separate Base MeshPart) usually
-                # carry the actual physical collision for the model.
+                # proximity sphere on a SIBLING), the trigger's behavior
+                # dominates so scripts using ``model:FindFirstChild(...)``
+                # reach the detection zone, not a wall. Drop physical-collide.
+                #
+                # However, when the visible body and trigger live on the
+                # SAME GameObject (``trigger_owns_part_size == False``), the
+                # trigger MUST NOT clobber the Part's Size or Transparency —
+                # otherwise a small visible mesh + 2m trigger sphere render
+                # as one giant invisible cube. In that case the trigger's
+                # intended volume is recorded as ``_Trigger*`` attributes
+                # for OverlapParams-based detection.
                 part.can_query = True
                 part.can_collide = False
                 trigger_size, _, trigger_offset = convert_collider(
                     ct, comp.properties, original_size,
                 )
-                # Grow part size to encompass the trigger zone.
-                part.size = (
-                    max(part.size[0], trigger_size[0]),
-                    max(part.size[1], trigger_size[1]),
-                    max(part.size[2], trigger_size[2]),
-                )
-                # Round trigger shape inferred from Unity collider type.
-                if ct == "SphereCollider":
-                    part.shape = 0  # Ball
-                # Hide the trigger zone visually since it's a detection volume.
-                part.transparency = 1.0
-                # Apply center offset so the trigger sits at Unity's
-                # specified center, not the GameObject origin.
-                if trigger_offset != (0.0, 0.0, 0.0):
-                    part.cframe.x += trigger_offset[0]
-                    part.cframe.y += trigger_offset[1]
-                    part.cframe.z += trigger_offset[2]
+                if trigger_owns_part_size:
+                    # No other Size authority on this node — size the Part
+                    # to the trigger volume, hide it, and shape-hint Ball
+                    # for spherical triggers.
+                    part.size = (
+                        max(part.size[0], trigger_size[0]),
+                        max(part.size[1], trigger_size[1]),
+                        max(part.size[2], trigger_size[2]),
+                    )
+                    if ct == "SphereCollider":
+                        part.shape = 0  # Ball
+                    part.transparency = 1.0
+                    # Apply center offset so the trigger sits at Unity's
+                    # specified center, not the GameObject origin.
+                    if trigger_offset != (0.0, 0.0, 0.0):
+                        part.cframe.x += trigger_offset[0]
+                        part.cframe.y += trigger_offset[1]
+                        part.cframe.z += trigger_offset[2]
+                else:
+                    # A visible mesh or non-trigger collider owns the
+                    # Part's Size/visibility. Two outputs:
+                    #
+                    # 1. Record the trigger volume on the visible Part as
+                    #    ``_Trigger*`` attributes so scripts that want to
+                    #    do an explicit OverlapParams / GetPartBoundsInRadius
+                    #    sweep can read the original Unity volume.
+                    #
+                    # 2. Emit a transparent child Part sized to the trigger
+                    #    volume so the auto-injected ``Touched`` fanout
+                    #    (and the AI's literal ``triggerPart.Touched``
+                    #    binding) still fires at the original approach
+                    #    radius. Without this child, Touched only fires
+                    #    on direct contact with the small visible mesh —
+                    #    breaking Unity's "walk near the door" / "approach
+                    #    the proximity zone" patterns (concrete case:
+                    #    SimpleFPS Beach doors, whose ``base`` GameObject
+                    #    mixes a thin floor-pad mesh with a 6m trigger
+                    #    sphere on the same node).
+                    #
+                    # The child is named ``TriggerZone`` so the existing
+                    # ``findTriggerPart`` helper (which checks a set of
+                    # TRIGGER_NAMES first) discovers it.
+                    if part.attributes is None:
+                        part.attributes = {}
+                    shape_map = {"SphereCollider": "Sphere",
+                                 "BoxCollider": "Box",
+                                 "CapsuleCollider": "Capsule"}
+                    part.attributes["_TriggerShape"] = shape_map.get(ct, ct)
+                    part.attributes["_TriggerSizeX"] = float(trigger_size[0])
+                    part.attributes["_TriggerSizeY"] = float(trigger_size[1])
+                    part.attributes["_TriggerSizeZ"] = float(trigger_size[2])
+                    if trigger_offset != (0.0, 0.0, 0.0):
+                        part.attributes["_TriggerCenterX"] = float(trigger_offset[0])
+                        part.attributes["_TriggerCenterY"] = float(trigger_offset[1])
+                        part.attributes["_TriggerCenterZ"] = float(trigger_offset[2])
+
+                    # Child trigger Part — invisible, non-colliding,
+                    # query+touch enabled. Placed at the parent's world
+                    # CFrame plus the trigger's local-space center offset
+                    # (matching the pre-fix code's un-rotated offset
+                    # behavior at line ~1748 above — a separate concern).
+                    trigger_child_cframe = RbxCFrame(
+                        x=part.cframe.x + trigger_offset[0],
+                        y=part.cframe.y + trigger_offset[1],
+                        z=part.cframe.z + trigger_offset[2],
+                        r00=part.cframe.r00, r01=part.cframe.r01, r02=part.cframe.r02,
+                        r10=part.cframe.r10, r11=part.cframe.r11, r12=part.cframe.r12,
+                        r20=part.cframe.r20, r21=part.cframe.r21, r22=part.cframe.r22,
+                    )
+                    trigger_child = RbxPart(
+                        name="TriggerZone",
+                        class_name="Part",
+                        cframe=trigger_child_cframe,
+                        size=trigger_size,
+                        transparency=1.0,
+                        anchored=part.anchored,
+                        can_collide=False,
+                        can_query=True,
+                        can_touch=True,
+                        cast_shadow=False,
+                        massless=True,
+                    )
+                    if ct == "SphereCollider":
+                        trigger_child.shape = 0  # Ball
+                    part.children.append(trigger_child)
             else:
                 # Apply each collider against the original size to avoid
                 # compounding when multiple colliders exist on one node.
@@ -3881,26 +3976,29 @@ def _convert_prefab_instance(
         )
         if root_has_mesh and not _root_multi:
             _builtin_root = _UNITY_BUILTIN_MESH_SHAPES.get(root.mesh_file_id or "") if hasattr(root, "mesh_file_id") else None
+            # ``scl`` is initialised from ``template.root.scale`` (the prefab
+            # root's Transform localScale) and then **set** — not multiplied
+            # — by any ``m_LocalScale.{x,y,z}`` modification on the
+            # PrefabInstance, matching Unity's "override replaces" semantics.
+            # Multiplying by ``root.scale`` here would compose the prefab's
+            # localScale a second time (concrete case: SimpleFPS Mine —
+            # prefab root localScale 2.5 + instance override 2.4999995
+            # produced 6.25× the correct size). Mirror the FBX-as-prefab
+            # path at the top of this file: use ``scl`` directly.
             if _builtin_root:
                 part = RbxPart(name=name, class_name="Part", cframe=cframe, anchored=True)
                 shape_enum, flatten, base_meters = _builtin_root
                 part.shape = shape_enum
-                root_sx = abs(root.scale[0]) if hasattr(root, "scale") else 1.0
-                root_sy = abs(root.scale[1]) if hasattr(root, "scale") else 1.0
-                root_sz = abs(root.scale[2]) if hasattr(root, "scale") else 1.0
-                sx_c = root_sx * abs(scl[0])
-                sy_c = root_sy * abs(scl[1])
-                sz_c = root_sz * abs(scl[2])
+                sx_c = abs(scl[0])
+                sy_c = abs(scl[1])
+                sz_c = abs(scl[2])
                 bx = sx_c * base_meters[0] * config.STUDS_PER_METER
                 by = sy_c * base_meters[1] * config.STUDS_PER_METER
                 bz = sz_c * base_meters[2] * config.STUDS_PER_METER
                 part.size = (max(bx, 0.001), max(by, 0.001), max(bz, 0.001))
             else:
                 # Create root as MeshPart with proper mesh sizing
-                root_sx = abs(root.scale[0]) if hasattr(root, "scale") else 1.0
-                root_sy = abs(root.scale[1]) if hasattr(root, "scale") else 1.0
-                root_sz = abs(root.scale[2]) if hasattr(root, "scale") else 1.0
-                combined_scl = (root_sx * abs(scl[0]), root_sy * abs(scl[1]), root_sz * abs(scl[2]))
+                combined_scl = (abs(scl[0]), abs(scl[1]), abs(scl[2]))
                 rbx_size = unity_scale_to_roblox_size(combined_scl)
                 part = RbxPart(name=name, class_name="MeshPart", cframe=cframe, size=rbx_size, anchored=True)
                 mesh_id = _resolve_mesh_id(root.mesh_guid, guid_index, uploaded_assets,
@@ -4004,13 +4102,14 @@ def _convert_prefab_instance(
         if hasattr(root, 'components') and root.components:
             _process_components(root, part, guid_index=guid_index, uploaded_assets=uploaded_assets)
     else:
-        # Determine size: combine prefab root scale with instance scale override
-        root_sx = abs(root.scale[0]) if hasattr(root, "scale") else 1.0
-        root_sy = abs(root.scale[1]) if hasattr(root, "scale") else 1.0
-        root_sz = abs(root.scale[2]) if hasattr(root, "scale") else 1.0
-        sx = max(root_sx * abs(scl[0]), 0.1)
-        sy = max(root_sy * abs(scl[1]), 0.1)
-        sz = max(root_sz * abs(scl[2]), 0.1)
+        # ``scl`` already encodes the effective instance scale (prefab
+        # template localScale, replaced — not multiplied — by any
+        # ``m_LocalScale.*`` PrefabInstance override). Multiplying by
+        # ``root.scale`` here would double-count the prefab's localScale
+        # (see the matching note above and ``TestPrefabInstanceScaleNotDoubled``).
+        sx = max(abs(scl[0]), 0.1)
+        sy = max(abs(scl[1]), 0.1)
+        sz = max(abs(scl[2]), 0.1)
 
         # Convert size using coordinate transform (Unity Z -> Roblox -Z, same magnitude)
         rbx_size = unity_scale_to_roblox_size((sx, sy, sz))
