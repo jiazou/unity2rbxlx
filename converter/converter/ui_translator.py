@@ -132,7 +132,10 @@ def _is_ui_image_mb(props: dict[str, Any]) -> bool:
     return isinstance(guid, str) and guid.startswith(_UI_IMAGE_SCRIPT_GUID_PREFIX)
 
 
-def convert_canvas(canvas_nodes: list[SceneNode]) -> list[RbxScreenGui]:
+def convert_canvas(
+    canvas_nodes: list[SceneNode],
+    scene_namespace: str = "",
+) -> list[RbxScreenGui]:
     """Convert a list of Unity Canvas root nodes to Roblox ScreenGui objects.
 
     Each Canvas node becomes an RbxScreenGui with its children converted
@@ -142,6 +145,9 @@ def convert_canvas(canvas_nodes: list[SceneNode]) -> list[RbxScreenGui]:
 
     Args:
         canvas_nodes: List of SceneNode objects that have a Canvas component.
+        scene_namespace: Scene-runtime namespace string used as the
+            ``_SceneRuntimeId`` prefix for stamped UI hosts. Empty string
+            means stamping is skipped (synthetic / legacy callers).
 
     Returns:
         List of RbxScreenGui objects.
@@ -154,8 +160,14 @@ def convert_canvas(canvas_nodes: list[SceneNode]) -> list[RbxScreenGui]:
         # Extract CanvasScaler settings and store as attributes.
         _apply_canvas_scaler(screen_gui, canvas_node)
 
+        # Stamp the ScreenGui host with ``_SceneRuntimeId`` so the PR4
+        # runtime can resolve a UI ``<scene>:<fileID>`` reference back to
+        # this instance. UI element descendants get stamped inside
+        # ``_convert_ui_element``.
+        _stamp_scene_runtime_id(screen_gui, canvas_node.file_id, scene_namespace)
+
         for child in canvas_node.children:
-            element = _convert_ui_element(child)
+            element = _convert_ui_element(child, scene_namespace)
             if element is not None:
                 screen_gui.elements.append(element)
 
@@ -167,6 +179,21 @@ def convert_canvas(canvas_nodes: list[SceneNode]) -> list[RbxScreenGui]:
         )
 
     return results
+
+
+def _stamp_scene_runtime_id(
+    target: RbxScreenGui | RbxUIElement, file_id: str, scene_namespace: str,
+) -> None:
+    """Stamp ``_SceneRuntimeId`` onto a UI host (ScreenGui or descendant
+    RbxUIElement).
+
+    A no-op when either side of the ``<scene>:<file_id>`` value is empty —
+    callers don't have to gate every stamp site. Mirrors the scene-side
+    helper in ``scene_converter._stamp_scene_runtime_id``.
+    """
+    if not scene_namespace or not file_id:
+        return
+    target.attributes["_SceneRuntimeId"] = f"{scene_namespace}:{file_id}"
 
 
 # ---------------------------------------------------------------------------
@@ -239,7 +266,9 @@ def _apply_canvas_scaler(screen_gui: RbxScreenGui, canvas_node: SceneNode) -> No
         break
 
 
-def _convert_ui_element(node: SceneNode) -> RbxUIElement | None:
+def _convert_ui_element(
+    node: SceneNode, scene_namespace: str = "",
+) -> RbxUIElement | None:
     """Recursively convert a SceneNode (under a Canvas) to an RbxUIElement.
 
     Determines the Roblox class based on attached UI components
@@ -247,6 +276,9 @@ def _convert_ui_element(node: SceneNode) -> RbxUIElement | None:
 
     Args:
         node: A SceneNode that is a child of a Canvas.
+        scene_namespace: Scene-runtime namespace for ``_SceneRuntimeId``
+            stamping; threaded through recursion so every descendant UI
+            host gets stamped under the same ``<scene>:<fileID>`` scheme.
 
     Returns:
         An RbxUIElement, or None if the node should be skipped.
@@ -324,6 +356,10 @@ def _convert_ui_element(node: SceneNode) -> RbxUIElement | None:
         visible=node.active,
         on_click_handlers=on_click_handlers,
     )
+    # Stamp the descendant UI host with ``_SceneRuntimeId`` (PR2). Done
+    # before any per-class property overlay so the attribute survives
+    # downstream rewrites that read but don't replace the attributes dict.
+    _stamp_scene_runtime_id(element, node.file_id, scene_namespace)
     # Store onClick method names as attributes for script wiring
     if on_click_handlers:
         methods = ",".join(h["method"] for h in on_click_handlers)
@@ -363,7 +399,7 @@ def _convert_ui_element(node: SceneNode) -> RbxUIElement | None:
 
     # Recurse into children.
     for child_node in node.children:
-        child_element = _convert_ui_element(child_node)
+        child_element = _convert_ui_element(child_node, scene_namespace)
         if child_element is not None:
             element.children.append(child_element)
 
