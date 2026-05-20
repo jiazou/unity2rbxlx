@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from collections.abc import Iterable
-from typing import Any
+from typing import Any, cast
 
 import config as _config
 from config import (
@@ -40,6 +40,12 @@ log = logging.getLogger(__name__)
 PHASES: list[str] = [
     "parse",
     "extract_assets",
+    # Plan the scene runtime artifact off parsed scenes + prefabs before
+    # any script-touching phase runs. Inert by default in PR1 — only the
+    # planner data lands in conversion_plan.json; the legacy transpile
+    # path doesn't consume it. PR3a opts in when ``--scene-runtime=generic``
+    # is requested.
+    "plan_scene_runtime",
     "moderate_assets",
     "upload_assets",
     "resolve_assets",
@@ -93,6 +99,12 @@ class PipelineState:
 
     guid_index: GuidIndex | None = None
     parsed_scene: ParsedScene | None = None
+    # All scenes parsed by the multi-scene driver before
+    # ``plan_scene_runtime`` runs — the planner needs every scene in one
+    # call so the per-scene namespacing in the artifact is consistent. In
+    # single-scene mode this stays empty and the planner reads from
+    # ``parsed_scene`` instead.
+    all_parsed_scenes: list[ParsedScene] = field(default_factory=list)
     asset_manifest: AssetManifest | None = None
     material_mappings: dict[str, MaterialMapping] = field(default_factory=dict)
     transpilation_result: TranspilationResult | None = None
@@ -477,11 +489,29 @@ class Pipeline:
 
         log.info("[multi] Found %d scenes to convert", len(scene_paths))
 
-        # Shared phases: extract + upload assets, materials, scripts, animations
-        # Use the first scene for initial parse (needed for asset extraction)
-        self.ctx.selected_scene = str(scene_paths[0])
+        # Parse EVERY scene up front. The plan_scene_runtime phase below
+        # needs the full set in one call so the per-scene namespacing in
+        # the artifact is consistent, and the per-scene loop further down
+        # gets to reuse the parsed result instead of re-parsing. Pre-PR1
+        # only the first scene was parsed before shared phases ran; that
+        # made the planner blind to every other scene's MonoBehaviours.
         from unity.scene_parser import parse_scene
-        self.state.parsed_scene = parse_scene(scene_paths[0])
+        all_parsed: list[ParsedScene] = []
+        for scene_path in scene_paths:
+            try:
+                all_parsed.append(parse_scene(scene_path))
+            except Exception as exc:
+                log.warning("[multi] Skipping unparseable %s: %s",
+                            scene_path.name, exc)
+        if not all_parsed:
+            log.warning("[multi] All scenes failed to parse")
+            return self.ctx
+        self.state.all_parsed_scenes = all_parsed
+        # Pre-select the first parseable scene as the "current" parsed
+        # scene for shared phases that consume a single scene
+        # (extract_assets reads textures referenced by it).
+        self.state.parsed_scene = all_parsed[0]
+        self.ctx.selected_scene = str(all_parsed[0].scene_path)
         self.ctx.total_game_objects = len(self.state.parsed_scene.all_nodes)
 
         # Run shared phases. ``resolve_assets`` belongs here too: without
@@ -490,23 +520,33 @@ class Pipeline:
         # the multi-scene path used to silently skip resolution and
         # produced visibly broken places. ``resolve_assets`` no-ops when
         # ``--no-upload`` is set or no universe/place IDs are configured.
-        for phase in ["extract_assets", "upload_assets", "convert_materials",
+        # ``plan_scene_runtime`` sits between extract_assets (which lazy-
+        # loads the prefab library) and transpile_scripts (PR3a will
+        # consume the artifact) — same slot as the single-scene driver.
+        for phase in ["extract_assets", "plan_scene_runtime",
+                       "upload_assets", "convert_materials",
                        "transpile_scripts", "convert_animations",
                        "resolve_assets"]:
             self._run_phase(phase)
 
-        # Per-scene: parse, convert, write
+        # Per-scene: convert, write. Reuses scenes pre-parsed above —
+        # parsing every scene twice was the pre-PR1 status quo and is the
+        # one cost the planner's "all scenes up front" move eliminates.
+        parsed_by_path: dict[str, ParsedScene] = {
+            str(p.scene_path): p for p in all_parsed
+        }
         for scene_path in scene_paths:
             scene_name = scene_path.stem
             log.info("[multi] === Converting scene: %s ===", scene_name)
 
             self.ctx.selected_scene = str(scene_path)
-            try:
-                self.state.parsed_scene = parse_scene(scene_path)
-            except Exception as exc:
-                log.warning("[multi] Failed to parse %s: %s", scene_name, exc)
+            parsed = parsed_by_path.get(str(scene_path))
+            if parsed is None:
+                # Lost a scene to a parse failure above; nothing to convert.
+                log.warning("[multi] Skipping %s — pre-parse missing",
+                            scene_name)
                 continue
-
+            self.state.parsed_scene = parsed
             self.ctx.total_game_objects = len(self.state.parsed_scene.all_nodes)
 
             # Convert scene
@@ -873,6 +913,69 @@ class Pipeline:
         log.info(
             "[extract_assets] Serialized field refs: %d scripts, %d fields",
             len(refs), total,
+        )
+
+    def plan_scene_runtime(self) -> None:
+        """Phase: build the project-level ``scene_runtime`` artifact.
+
+        Reads parsed scenes + the prefab library (lazy-loaded earlier by
+        ``extract_assets``) and emits the deterministic snapshot the host
+        runtime will consume in PR4. The artifact lands on
+        ``self.ctx.scene_runtime`` and round-trips through
+        ``conversion_context.json`` plus the persistence merge inside
+        ``_classify_storage`` so resumes reproduce it verbatim.
+
+        Inert by default in PR1 — only the planner data is written; no
+        legacy phase consumes it. PR3a opts in under
+        ``--scene-runtime=generic``.
+        """
+        from converter.scene_runtime_planner import plan_scene_runtime as _plan
+
+        # ``self.state.parsed_scene`` is the single-scene path; the
+        # multi-scene driver pre-parses every scene into
+        # ``self.state.all_parsed_scenes`` before invoking this phase so a
+        # single planner call sees them all (per-scene namespacing is
+        # already a planner invariant).
+        scenes_attr = getattr(self.state, "all_parsed_scenes", None)
+        scenes: list[ParsedScene]
+        if scenes_attr:
+            scenes = list(scenes_attr)
+        elif self.state.parsed_scene is not None:
+            scenes = [self.state.parsed_scene]
+        else:
+            scenes = []
+
+        if self.state.prefab_library is None:
+            # Multi-scene's pre-extract entry skipped the lazy load; force
+            # it here so prefab subplans are populated. Same fallback the
+            # serialized-field walk takes in ``_extract_serialized_field_refs``.
+            try:
+                from unity.prefab_parser import parse_prefabs
+                self.state.prefab_library = parse_prefabs(self.unity_project_path)
+            except Exception as exc:
+                log.warning(
+                    "[plan_scene_runtime] Could not parse prefabs: %s", exc,
+                )
+
+        artifact = _plan(
+            parsed_scenes=scenes,
+            prefab_library=self.state.prefab_library,
+            guid_index=self.state.guid_index,
+            unity_project_root=self.unity_project_path,
+        )
+        # Persist directly on the context; the structural type belongs to
+        # the planner module (avoids a core→converter dependency).
+        self.ctx.scene_runtime = dict(artifact)
+
+        modules = artifact["modules"]
+        runtime_bearing = sum(
+            1 for m in modules.values() if m.get("runtime_bearing")
+        )
+        log.info(
+            "[plan_scene_runtime] %d modules (%d runtime-bearing), "
+            "%d scene(s), %d prefab(s)",
+            len(modules), runtime_bearing,
+            len(artifact["scenes"]), len(artifact["prefabs"]),
         )
 
     def _compute_fbx_bounding_boxes(self) -> None:
@@ -3384,11 +3487,20 @@ script.Disabled = true
             animation_routing = getattr(self.state.animation_result, "routing", {}) or {}
 
         plan_path = self.output_dir / "conversion_plan.json"
+
+        # PR1 merge: the planner artifact stored on ``ctx.scene_runtime``
+        # (and any sticky ``domain_overrides`` an operator edited into a
+        # prior ``conversion_plan.json`` on disk) must survive this
+        # wholesale rewrite. Pre-PR1 ``_classify_storage`` emitted a fixed
+        # 3-key dict that silently dropped anything else.
+        scene_runtime = self._merge_scene_runtime(plan_path)
+
         plan_path.write_text(
             _json.dumps({
                 "storage_plan": plan.to_dict(),
                 "script_paths": script_paths,
                 "animation_routing": animation_routing,
+                "scene_runtime": scene_runtime,
             }, indent=2),
             encoding="utf-8",
         )
@@ -3397,6 +3509,57 @@ script.Disabled = true
             len(plan.decisions),
             plan_path.name,
         )
+
+    def _merge_scene_runtime(self, plan_path: Path) -> dict[str, object]:
+        """Compose the ``scene_runtime`` block written into
+        ``conversion_plan.json``.
+
+        Structural sub-blocks (``modules`` / ``scenes`` / ``prefabs``) come
+        from ``ctx.scene_runtime`` — recomputed each run by the
+        ``plan_scene_runtime`` phase. ``domain_overrides`` is **sticky**:
+        if an operator edited it into a prior on-disk plan, the value
+        wins over whatever the planner produced (planner emits ``{}``;
+        PR3b's classifier never touches this key). Unknown keys present
+        on disk are preserved too — forward-compatible with future
+        schema extensions without re-touching every consumer.
+        """
+        import json as _json
+
+        merged: dict[str, object] = dict(self.ctx.scene_runtime or {})
+
+        # On-disk plan may carry a sticky ``domain_overrides`` block from
+        # an operator edit or a previous run. Load it; ignore parse
+        # failures (worst case we lose the override, which is recorded in
+        # ctx.warnings rather than crashing classify_storage).
+        on_disk: dict[str, object] = {}
+        if plan_path.exists():
+            try:
+                raw = _json.loads(plan_path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    sr = raw.get("scene_runtime")
+                    if isinstance(sr, dict):
+                        on_disk = cast("dict[str, object]", sr)
+            except Exception as exc:
+                log.debug(
+                    "[classify_storage] scene_runtime merge: "
+                    "ignoring unreadable plan: %s", exc,
+                )
+
+        # Sticky domain_overrides: on-disk value wins when present, even
+        # when empty — operator may have deliberately cleared it.
+        if "domain_overrides" in on_disk:
+            merged["domain_overrides"] = on_disk["domain_overrides"]
+        elif "domain_overrides" not in merged:
+            merged["domain_overrides"] = {}
+
+        # Forward-compat: anything else the on-disk plan carries under
+        # scene_runtime that we don't recompute (future schema additions)
+        # is preserved unless the planner output explicitly overwrites it.
+        for key, value in on_disk.items():
+            if key not in merged:
+                merged[key] = value
+
+        return merged
 
     def _bind_scripts_to_parts(self) -> None:
         """Bind transpiled scripts to their target parts using _ScriptClass attributes.
