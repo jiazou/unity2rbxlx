@@ -187,34 +187,22 @@ def run_packs(
 
 @dataclass(frozen=True)
 class WeaponMount:
-    prefab_name: str           # workspace prefab name (camelCase)
+    prefab_name: str           # workspace prefab name (camelCase) — the
+                               # converter materialises the Unity prefab
+                               # at this name in workspace, with the full
+                               # mesh hierarchy (bipod, scope, etc.). The
+                               # pack clones from THIS instance, not from
+                               # ``ReplicatedStorage.Templates``, which
+                               # carries a stripped variant whose smaller
+                               # bbox drops below the camera frustum at
+                               # the authored slot offset.
     equip_function: str        # AI-stubbed function name on the Player controller
     sentinel_var: str          # already-equipped flag, flipped to true on equip
     scale_expr: str            # Lua-source fragment for rifle:ScaleTo(<expr>)
-    view_offset_expr: str      # camera-relative CFrame for the viewmodel pose;
-                               # used both at clone time AND in the per-frame
-                               # follower so the weapon tracks the live camera
+    fallback_offset_expr: str  # camera-relative CFrame, used ONLY when the
+                               # scene has no _MainCameraRig to seat into
     marker_tag: str            # composed into ``-- _FPS_<tag>`` for idempotency
     instance_var: str          # local that holds the cloned weapon Model
-    primary_var: str           # local that holds the weapon's PrimaryPart (used
-                               # by the per-frame ``RunService.RenderStepped``
-                               # follower to gate on a still-parented assembly)
-    # Asset name of the prefab as parented under ``ReplicatedStorage.Templates``
-    # by the prefab-packages writer. Derived from ``prefab_name`` by
-    # stripping a trailing ``Prefab``/``prefab`` and capitalising; override
-    # explicitly when the canonical asset name diverges from that
-    # convention.
-    template_name: str = ""
-
-
-def _default_template_name(prefab_name: str) -> str:
-    for suffix in ("Prefab", "prefab"):
-        if prefab_name.endswith(suffix):
-            stem = prefab_name[: -len(suffix)]
-            break
-    else:
-        stem = prefab_name
-    return (stem[:1].upper() + stem[1:]) if stem else prefab_name
 
 
 # Today's registry: one entry for the SimpleFPS rifle.
@@ -224,14 +212,9 @@ WEAPON_MOUNTS: tuple[WeaponMount, ...] = (
         equip_function="GetRifle",
         sentinel_var="gotWeapon",
         scale_expr="0.15",
-        view_offset_expr="CFrame.new(0.5, -0.5, -3)",
+        fallback_offset_expr="CFrame.new(0.5, -0.5, -3)",
         marker_tag="RIFLE_SYSTEM",
         instance_var="_fpsRifle",
-        primary_var="_fpsRiflePrimary",
-        # ReplicatedStorage.Templates.Rifle — the prefab packer's canonical
-        # asset name (derived would yield the same result for this entry,
-        # but spelling it out makes the registry self-documenting).
-        template_name="Rifle",
     ),
 )
 
@@ -257,16 +240,24 @@ def _detect_fps_weapon_mount(scripts: list["RbxScript"]) -> bool:
     weapon-mount patterns.
 
     A mount qualifies a script via either the prefab name (case variant
-    included) or the AI-stubbed equip function name. Either marker is
-    enough — Gamekit3D-style scripts contain neither and skip cleanly.
+    included) or any spelling of the equip function name. The Unity
+    source ships PascalCase (``GetRifle``); the AI transpiler emits
+    camelCase (``getRifle``) by Luau convention -- the detector must
+    accept both for ``run_packs`` to actually fire the pack on real
+    transpile output. Pre-fix the detector only checked PascalCase, so
+    the pack silently no-oped on every fresh transpile and the marker
+    on disk only persisted from older PascalCase-era runs.
+    Gamekit3D-style scripts contain none of these markers and skip
+    cleanly.
     """
     for s in scripts:
         src = s.source
         for mount in WEAPON_MOUNTS:
+            equip_variants = _equip_function_variants(mount.equip_function)
             if (
                 mount.prefab_name in src
                 or _prefab_alt_case(mount.prefab_name) in src
-                or mount.equip_function in src
+                or any(v in src for v in equip_variants)
             ):
                 return True
     return False
@@ -469,8 +460,7 @@ def _apply_weapon_mount(s: "RbxScript", mount: WeaponMount) -> bool:
     s.source = s.source.replace(
         f"local {mount.sentinel_var} = false",
         f"local {mount.sentinel_var} = false\n"
-        f"local {mount.instance_var} = nil  {marker}\n"
-        f"local {mount.primary_var} = nil",
+        f"local {mount.instance_var} = nil  {marker}",
     )
 
     # Match three emitted shapes from the AI transpiler:
@@ -500,82 +490,55 @@ def _apply_weapon_mount(s: "RbxScript", mount: WeaponMount) -> bool:
         # no per-weapon follower and no hardcoded offset. Seating order
         # of preference: the Unity "WeaponSlot" object inside the rig →
         # the rig Model itself → (no rig) a one-shot camera placement.
-        # Canonical lookup: ``ReplicatedStorage.Templates.<TemplateName>``.
-        # The prefab-packages writer parks every Unity prefab there with
-        # its Roblox asset name (e.g. ``Rifle``), not the Unity
-        # serialized-field name (e.g. ``riflePrefab``). Before this fix
-        # the emitted code looked in ``workspace`` for the Unity
-        # camelCase field, which never resolves -- the AI's
-        # ``getRifle()`` bailed silently after every pickup and the
-        # rifle never mounted.
-        # Restored from the pre-``fdb01c1`` emit shape. That earlier
-        # commit replaced the per-frame ``RunService.RenderStepped``
-        # follower + weld-to-primary logic with a rig-parenting design
-        # (rifle parented under ``_MainCameraRig`` Model, anchored
-        # parts following via ``Model:PivotTo`` propagation). The
-        # rig-following theory didn't pan out in practice -- the
-        # rifle stopped being visible after fresh AI-transpile runs,
-        # even though ``getRifle()`` and shooting both fired
-        # correctly. Codex review for PR #121 also flagged the rig
-        # detour as the wrong abstraction layer (the Unity-authored
-        # ``weaponSlot`` Transform reference never reached the
-        # pack, so the offset was a hardcoded guess regardless).
-        # Pre-fdb01c1 behaviour: weld every part to ``prim`` so the
-        # whole rifle moves as one assembly, parent under
-        # ``workspace`` with an initial Pivot at camera+offset, and
-        # splice a Render-frame follower onto the player's existing
-        # ``RenderStepped`` callback so the assembly tracks the camera.
-        # The new Templates-first lookup from PR #121 (``c65429b``)
-        # is preserved because it fixes a separate AI-emit-drift bug
-        # (the AI stubs ``riflePrefab = nil`` now instead of
-        # ``templates:WaitForChild("Rifle")``).
-        template_name = mount.template_name or _default_template_name(mount.prefab_name)
+        #
+        # Source the prefab from ``workspace`` (the scene-placed instance
+        # the converter materialises from Unity's Player.prefab) — NOT
+        # from ``ReplicatedStorage.Templates``. The two are structurally
+        # different on real conversions: the scene placement carries the
+        # full Unity prefab (e.g. SimpleFPS rifle has bipod legs + laser
+        # pointer + pod-support, 14 mesh parts, ~50-stud bbox), while
+        # the Templates entry the prefab-packages writer emits is a
+        # stripped variant (10 parts, ~8-stud bbox). After the same
+        # ``ScaleTo`` factor, the Templates clone is ~6× smaller and
+        # drops below the camera frustum at the authored slot offset.
+        # PR #121's ``c65429b`` introduced a Templates-first lookup that
+        # silently selected the smaller variant and made the held weapon
+        # invisible -- a regression the user surfaced as "I cannot see
+        # the rifle". The fallback case-variant probes the Pascal-case
+        # spelling of the same workspace name.
         new_body = (
             f'{matched_header}\n'
             f'    if {mount.sentinel_var} then return end\n'
-            f'    local rp = (function()\n'
-            f'        local templates = game:GetService("ReplicatedStorage"):FindFirstChild("Templates")\n'
-            f'        return (templates and templates:FindFirstChild("{template_name}"))\n'
-            f'            or workspace:FindFirstChild("{mount.prefab_name}", true)\n'
-            f'            or workspace:FindFirstChild("{alt}", true)\n'
-            f'    end)()\n'
+            f'    local rp = workspace:FindFirstChild("{mount.prefab_name}", true)\n'
+            f'        or workspace:FindFirstChild("{alt}", true)\n'
             f'    if not rp then return end\n'
             f'    local rifle = rp:Clone()\n'
             f'    if rifle:IsA("Model") then rifle:ScaleTo({mount.scale_expr}) end\n'
-            f'    local prim = rifle:FindFirstChildWhichIsA("BasePart")\n'
-            f'    if not prim then rifle:Destroy() return end\n'
             f'    for _, p in rifle:GetDescendants() do\n'
             f'        if p:IsA("BasePart") then\n'
             f'            p.Transparency = 0\n'
             f'            p.CanCollide = false\n'
             f'            p.Anchored = true\n'
-            f'            if p ~= prim then\n'
-            f'                local w = Instance.new("WeldConstraint")\n'
-            f'                w.Part0 = p; w.Part1 = prim; w.Parent = p\n'
-            f'            end\n'
             f'        end\n'
             f'    end\n'
-            f'    rifle:PivotTo(workspace.CurrentCamera.CFrame * {mount.view_offset_expr})\n'
-            f'    rifle.Parent = workspace\n'
+            f'    local rig\n'
+            f'    for _, m in workspace:GetDescendants() do\n'
+            f'        if m:IsA("Model") and m:GetAttribute("_MainCameraRig") then rig = m break end\n'
+            f'    end\n'
+            f'    local slot = rig and rig:FindFirstChild("WeaponSlot", true)\n'
+            f'    if slot then\n'
+            f'        rifle:PivotTo(slot:IsA("Model") and slot:GetPivot() or slot.CFrame)\n'
+            f'        rifle.Parent = slot\n'
+            f'    elseif rig then\n'
+            f'        rifle:PivotTo(rig:GetPivot() * {mount.fallback_offset_expr})\n'
+            f'        rifle.Parent = rig\n'
+            f'    else\n'
+            f'        rifle:PivotTo(workspace.CurrentCamera.CFrame * {mount.fallback_offset_expr})\n'
+            f'        rifle.Parent = workspace\n'
+            f'    end\n'
             f'    {mount.instance_var} = rifle\n'
-            f'    {mount.primary_var} = prim\n'
         )
         s.source = s.source[: m.start()] + new_body + s.source[m.start(3):]
-
-    # Splice a Render-frame follower onto the existing RenderStepped
-    # callback so the rifle assembly tracks the live camera. The pack
-    # idempotency-guards on ``-- _FPS_<tag>`` further up, so the
-    # follower is only added on the first apply.
-    if "RunService.RenderStepped:Connect" in s.source:
-        s.source = s.source.replace(
-            "RunService.RenderStepped:Connect(function(dt)",
-            "RunService.RenderStepped:Connect(function(dt)\n"
-            f"    if {mount.instance_var} and {mount.primary_var} "
-            f"and {mount.primary_var}.Parent then\n"
-            f"        {mount.instance_var}:PivotTo("
-            f"workspace.CurrentCamera.CFrame * {mount.view_offset_expr})\n"
-            f"    end",
-        )
 
     return s.source != before
 
