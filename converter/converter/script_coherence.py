@@ -1255,6 +1255,62 @@ def _expose_local_script_events(scripts: list[RbxScript]) -> int:
             log.info("  Rewired %d cross-script event binding(s) in '%s'",
                      sum(len(producers[p]) for p in var_to_producer.values()),
                      s.name)
+
+    # Step 4 -- consumers rewritten by ``_AutoLocalScriptShim`` to
+    # ``require(<X>Shared)`` are invisible to the WaitForChild-based
+    # detection above (the shim swapped the producer-LocalScript Instance
+    # for a re-exporting ModuleScript that drops cross-script event
+    # signals). Detect those consumers separately and rewrite their
+    # ``<var>.<EventKey>:Connect`` calls to read the BindableEvent
+    # directly off the producer LocalScript instance.
+    #
+    # The producer pass above already named each cross-script event
+    # ``<Key>`` and parented it to ``script`` -- so a runtime lookup of
+    # ``LocalPlayer.PlayerScripts:WaitForChild("<Producer>"):WaitForChild
+    # ("<Key>").Event`` resolves to the same BindableEvent.Event the
+    # ``Player.HealthUpdate`` etc. table-field assignments hold inside
+    # the producer.
+    if not producers:
+        return fixes
+    shim_require_re = re.compile(
+        r'^[ \t]*local\s+(?P<var>\w+)\s*=\s*require\([^\n]*WaitForChild'
+        r'\(\s*["\'](?P<mod>\w+)Shared["\']\s*\)[^\n]*\)',
+        re.MULTILINE,
+    )
+    for s in scripts:
+        if s.name in producers:
+            continue
+        original = s.source
+        # ``<var> = require(...XShared)`` -> ``X`` is the producer name.
+        shim_bindings: dict[str, str] = {}
+        for m in shim_require_re.finditer(s.source):
+            prod_name = m.group("mod")
+            if prod_name in producers:
+                shim_bindings[m.group("var")] = prod_name
+        if not shim_bindings:
+            continue
+        connections_rewritten = 0
+        for var, prod in shim_bindings.items():
+            for key in producers[prod]:
+                pat = re.compile(rf'\b{re.escape(var)}\.{re.escape(key)}:Connect\(')
+
+                def _repl(_m: "re.Match[str]", _var=var, _prod=prod, _key=key) -> str:
+                    return (
+                        f'(game:GetService("Players").LocalPlayer:WaitForChild'
+                        f'("PlayerScripts"):WaitForChild({_prod!r}):'
+                        f'WaitForChild({_key!r}).Event):Connect('
+                    )
+                new_src, n = pat.subn(_repl, s.source)
+                if n:
+                    s.source = new_src
+                    connections_rewritten += n
+        if connections_rewritten and s.source != original:
+            fixes += 1
+            log.info(
+                "  Re-routed %d shim-blocked event binding(s) in '%s' "
+                "to the producer LocalScript's BindableEvent children",
+                connections_rewritten, s.name,
+            )
     return fixes
 
 

@@ -1626,14 +1626,18 @@ def _fix_door_global_player_lookup(scripts: list["RbxScript"]) -> int:
 # Rewrite ``local function playerHasX(playerInstance)`` to read directly
 # from the Player-instance attribute that the pickup pack writes.
 
-# Match the ``playerHasX`` helper definition. ``\w*`` (not ``\w+``)
-# tolerates the zero-parameter shape — the AI transpiler emits both
-# ``playerHasKey(playerInstance)`` and, more recently, the bare
-# ``playerHasKey()`` form. The earlier ``\w+`` only matched the former,
-# so the pack silently no-oped on the bare shape and the door bug
-# survived (door never opens).
+# Match the helper definition for any "does the player hold X" probe.
+# The AI transpiler emits at least three variants:
+#   * ``playerHasKey(playerInstance)``  — Unity-style helper, two-arg
+#   * ``playerHasKey()``                — bare/no-arg
+#   * ``getPlayerHasKey()``             — get-prefixed accessor
+# The earlier regex anchored the name at ``player[Hh]as``, which
+# silently rejected the ``getPlayerHas*`` shape and the door bug
+# survived (door never opened in PR #121's fresh-transpile validation).
+# ``(?:get)?[pP]layer[Hh]as\w+`` covers all three; the ``\w*`` for the
+# parameter list still tolerates zero args.
 _DOOR_MODULE_PLAYER_HELPER_RE = re.compile(
-    r"local function (?P<fn>player[Hh]as\w+)\s*\(\s*\w*\s*\)"
+    r"local function (?P<fn>(?:get)?[pP]layer[Hh]as\w+)\s*\(\s*\w*\s*\)"
     r"(?P<body>.*?)"
     r"^end$",
     re.DOTALL | re.MULTILINE,
@@ -1645,9 +1649,27 @@ def _detect_door_module_player_lookup(scripts: list["RbxScript"]) -> bool:
         if s.name != "Door":
             continue
         src = s.source or ""
-        # Cheap detector: the playerHas* helper plus a PlayerScripts
-        # lookup OR a getPlayerMod call. Both are unique to this AI shape.
-        if "playerHas" in src and ("getPlayerMod" in src or 'PlayerScripts' in src):
+        # Cheap detector: any ``playerHas*`` OR ``getPlayerHas*`` helper
+        # paired with one of three Player-resolution shapes the AI
+        # transpiler picks between:
+        #   1. ``getPlayerMod()`` helper
+        #   2. ``PlayerScripts.Player`` lookup
+        #   3. ``script.Parent:FindFirstChild("Player")`` sibling-module
+        #      ``require`` (the third shape the AI emits more recently;
+        #      previously the detector missed it because of the
+        #      ``"playerHas"`` substring being case-sensitive against
+        #      ``getPlayerHasKey``).
+        # ``casefold()`` lets us catch both ``playerHas`` and
+        # ``PlayerHas`` without enumerating every spelling.
+        lower = src.casefold()
+        helper_hit = "playerhas" in lower
+        resolution_hit = (
+            "getplayermod" in lower
+            or "PlayerScripts" in src
+            or 'FindFirstChild("Player")' in src
+            or "FindFirstChild('Player')" in src
+        )
+        if helper_hit and resolution_hit:
             return True
     return False
 
@@ -1683,15 +1705,30 @@ def _fix_door_module_player_lookup(scripts: list["RbxScript"]) -> int:
         def _replace(m: "re.Match[str]") -> str:
             fn_name = m.group("fn")
             body = m.group("body")
-            # Skip helpers that don't reference the module/PlayerScripts
-            # path — they're already correct.
-            if "getPlayerMod" not in body and "PlayerScripts" not in body:
+            # Skip helpers that don't reference one of the three
+            # broken Player-resolution shapes -- they're already correct.
+            if (
+                "getPlayerMod" not in body
+                and "PlayerScripts" not in body
+                and 'FindFirstChild("Player")' not in body
+                and "FindFirstChild('Player')" not in body
+            ):
                 return m.group(0)
             # Derive attribute name from the function name:
-            # ``playerHasKey`` → ``hasKey``. ``len("playerHas")`` == 9
-            # covers both the ``playerHas`` and ``playerhas`` spellings.
-            suffix = fn_name[9:]
-            attr = ("has" + suffix) if suffix else "hasKey"
+            #   ``playerHasKey``    -> ``hasKey``    (strip leading ``player``)
+            #   ``getPlayerHasKey`` -> ``hasKey``    (strip leading ``getPlayer``)
+            # Use a case-insensitive regex so both ``Player`` and
+            # ``player`` spellings are handled without hardcoding offsets.
+            import re as _re
+            suffix_match = _re.match(
+                r"^(?:get)?[pP]layer([Hh]as\w+)$", fn_name,
+            )
+            if suffix_match:
+                suffix = suffix_match.group(1)
+                # ``HasKey`` -> ``hasKey`` (camelCase attr)
+                attr = suffix[0].lower() + suffix[1:]
+            else:
+                attr = "hasKey"
             rewritten[fn_name] = attr
             return (
                 f"local function {fn_name}(_part)\n"
