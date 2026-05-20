@@ -1012,10 +1012,25 @@ class TestExposeLocalScriptEventsShimBlocked:
         )
         _expose_local_script_events([producer, consumer])
         # ``Player.HealthUpdate:Connect`` is gone; the call now routes
-        # through the producer LocalScript's BindableEvent child.
+        # through the producer LocalScript's BindableEvent child via
+        # a hoisted local declaration.
         assert "Player.HealthUpdate:Connect(" not in consumer.source
+        # Producer instance hoisted to a local once per consumer.
+        assert "local _AutoProducer_Player = " in consumer.source
         assert "WaitForChild('Player')" in consumer.source
-        assert "WaitForChild('HealthUpdate').Event" in consumer.source
+        # Rewritten Connect starts with the hoisted identifier (not
+        # ``(``), so Luau parses it unambiguously. Anti-regression for
+        # the "this looks like an argument list for a function call,
+        # but could also be a start of new statement" parse error a
+        # naive ``(<chain>):Connect(...)`` rewrite would have triggered.
+        assert (
+            "_AutoProducer_Player:WaitForChild('HealthUpdate').Event:Connect("
+            in consumer.source
+        )
+        # No ``.Event):Connect`` -- the prior version wrapped each
+        # call site as ``(game:GetService(...).Event):Connect(...)``,
+        # which Luau parsed as the previous statement's argument list.
+        assert ").Event):Connect(" not in consumer.source
 
     def test_no_shared_module_no_rewrite(self):
         # When the consumer doesn't require a ``<X>Shared`` module, the

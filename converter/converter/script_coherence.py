@@ -1314,25 +1314,45 @@ def _expose_local_script_events(scripts: list[RbxScript]) -> int:
             f'("PlayerScripts"):WaitForChild({prod_name!r})'
         )
 
+    # ``producer_local_name`` keeps the identifier we hoist the runtime
+    # lookup into per consumer. Hoisting matters: the runtime-lookup
+    # chain begins with ``game:GetService(...)``, so a naive
+    # ``(<chain>):Connect(...)`` rewrite emits lines that START with
+    # ``(``. Luau then sees the previous statement's trailing ``)``
+    # followed by ``(`` and raises an "ambiguous syntax" parse error
+    # ("this looks like an argument list for a function call, but
+    # could also be a start of new statement"). Hoisting to a local
+    # makes every rewritten Connect start with an identifier, which
+    # Luau parses unambiguously.
+    def _producer_local_name(prod: str) -> str:
+        return f"_AutoProducer_{prod}"
+
     for s in scripts:
         if s.name in producers:
             continue
         original = s.source
         # ``<var> = require(...XShared)`` -> ``X`` is the producer name.
         shim_bindings: dict[str, str] = {}
+        shim_require_end: dict[str, int] = {}  # producer -> match end offset
         for m in shim_require_re.finditer(s.source):
             prod_name = m.group("mod")
             if prod_name in producers:
                 shim_bindings[m.group("var")] = prod_name
+                # Track the LAST require's end position per producer --
+                # that's where we insert the hoisted local declaration so
+                # it's in scope for every subsequent Connect rewrite.
+                shim_require_end[prod_name] = max(
+                    shim_require_end.get(prod_name, 0), m.end(),
+                )
         if not shim_bindings:
             continue
         connections_rewritten = 0
         for var, prod in shim_bindings.items():
-            producer_lookup = _runtime_lookup_for_producer(prod)
+            producer_local = _producer_local_name(prod)
             for key in producers[prod]:
                 pat = re.compile(rf'\b{re.escape(var)}\.{re.escape(key)}:Connect\(')
                 repl = (
-                    f'({producer_lookup}:WaitForChild({key!r}).Event):Connect('
+                    f'{producer_local}:WaitForChild({key!r}).Event:Connect('
                 )
 
                 def _repl(_m: "re.Match[str]", _repl=repl) -> str:
@@ -1341,6 +1361,20 @@ def _expose_local_script_events(scripts: list[RbxScript]) -> int:
                 if n:
                     s.source = new_src
                     connections_rewritten += n
+        # Inject one hoisted local per producer right after the
+        # matching require line. Sort by offset descending so later
+        # inserts don't shift earlier offsets.
+        if connections_rewritten:
+            producers_used = {p for p in shim_bindings.values()}
+            inserts: list[tuple[int, str]] = []
+            for prod in producers_used:
+                lookup = _runtime_lookup_for_producer(prod)
+                local_decl = (
+                    f"\nlocal {_producer_local_name(prod)} = {lookup}"
+                )
+                inserts.append((shim_require_end[prod], local_decl))
+            for offset, decl in sorted(inserts, key=lambda x: -x[0]):
+                s.source = s.source[:offset] + decl + s.source[offset:]
         if connections_rewritten and s.source != original:
             fixes += 1
             log.info(
