@@ -2237,6 +2237,24 @@ def _resolve_sub_mesh(
         return None
 
     relative = guid_index.resolve_relative(mesh_guid)
+
+    # Meshes embedded in legacy .prefab/.asset files are uploaded
+    # under a synthetic key ``<rel_path>#<file_id>`` (see
+    # ``unity.embedded_mesh_extractor`` + ``pipeline._upload_embedded_meshes``).
+    # Resolve them here before falling through to the FBX/OBJ path so
+    # the per-sub-mesh lookup never sees an empty hierarchies dict
+    # for them.
+    if (mesh_file_id and asset_path.suffix.lower() in (".prefab", ".asset")
+            and relative is not None):
+        embedded_key = f"{relative}#{mesh_file_id}"
+        if embedded_key in _ctx().mesh_hierarchies:
+            sub_meshes = _ctx().mesh_hierarchies[embedded_key]
+            if sub_meshes:
+                # Synthesised embedded meshes carry exactly one sub-mesh
+                # (the OBJ we uploaded), so the first entry is always
+                # the right one — no file_id-to-index math needed.
+                return sub_meshes[0]
+
     for key in ([str(relative), str(asset_path)] if relative else [str(asset_path)]):
         if key in _ctx().mesh_hierarchies:
             sub_meshes = _ctx().mesh_hierarchies[key]
@@ -2295,6 +2313,17 @@ def _resolve_mesh_id(
 
     # Check uploaded_assets with multiple key formats (absolute, relative, forward/back slashes)
     relative = guid_index.resolve_relative(mesh_guid)
+
+    # Embedded-in-.prefab/.asset meshes are uploaded under a synthetic
+    # ``<rel>#<file_id>`` key by ``pipeline._upload_embedded_meshes``. Check
+    # that first so the regular path-string lookup never falls back to a
+    # cube-decal render when the synthesised OBJ has been uploaded.
+    if (mesh_file_id and asset_path.suffix.lower() in (".prefab", ".asset")
+            and relative is not None):
+        embedded_key = f"{relative}#{mesh_file_id}"
+        if embedded_key in uploaded_assets:
+            return uploaded_assets[embedded_key]
+
     candidates = [str(asset_path)]
     if relative:
         candidates.append(str(relative))
