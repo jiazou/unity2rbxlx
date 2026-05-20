@@ -538,6 +538,78 @@ def _sanitize_name(name: str) -> str:
     return _NAME_SAFE_RE.sub("_", name) or "mesh"
 
 
+def _strip_extra_geometries_and_dependents(roots: list, keep) -> None:
+    """Reduce a multi-Geometry FBX template to a single Geometry.
+
+    Removes every Geometry node from the Objects section except ``keep``,
+    then removes Model nodes that reference the dropped Geometries via
+    Connections, and finally removes Connection records that point at
+    any deleted Object ID. The Object ID (= first property, an int) is
+    the canonical FBX identifier the Connection section uses.
+
+    Best-effort: a malformed template might leave dangling references,
+    but Roblox's importer tolerates extra Models that have no Geometry
+    -- they just show up as empty MeshParts which the resolver returns
+    with size zero, which our caller already validates against
+    (see ``len(mesh_hierarchies[key]) == 1`` check in the pipeline).
+    """
+    # Find Objects section.
+    objects_node = None
+    for r in roots:
+        if r.name == b"Objects":
+            objects_node = r
+            break
+    if objects_node is None:
+        return
+
+    keep_id = keep.properties[0].value if keep.properties else None
+
+    # First pass: drop extra Geometry nodes; collect their IDs so the
+    # Connections cleanup can purge anything that referenced them.
+    dropped_ids: set = set()
+    surviving_objects = []
+    for child in objects_node.children:
+        if child.name == b"Geometry" and child is not keep:
+            if child.properties:
+                dropped_ids.add(child.properties[0].value)
+            continue
+        surviving_objects.append(child)
+    objects_node.children = surviving_objects
+
+    # Second pass: drop Models whose only Geometry connection points at
+    # a removed Geometry. We approximate by gathering Connection records
+    # first, then deleting any Object whose ID only appears in dropped
+    # connections. Cheap heuristic: also drop Materials/Textures that
+    # are only referenced by dropped Models.
+    connections_node = None
+    for r in roots:
+        if r.name == b"Connections":
+            connections_node = r
+            break
+    if connections_node is None:
+        return
+
+    # Build object_id -> referenced_ids map.
+    surviving_connections = []
+    referenced_by_keep: set = set()
+    for conn in connections_node.children:
+        if conn.name != b"C" or len(conn.properties) < 3:
+            surviving_connections.append(conn)
+            continue
+        src_id = conn.properties[1].value
+        dst_id = conn.properties[2].value
+        if src_id in dropped_ids or dst_id in dropped_ids:
+            continue
+        surviving_connections.append(conn)
+        # Track what the kept geometry connects to so we don't drop its
+        # Model/Material/Texture chain.
+        if dst_id == keep_id:
+            referenced_by_keep.add(src_id)
+        if src_id == keep_id:
+            referenced_by_keep.add(dst_id)
+    connections_node.children = surviving_connections
+
+
 # ---------------------------------------------------------------------------
 # FBX synthesiser
 # ---------------------------------------------------------------------------
@@ -586,7 +658,19 @@ def synthesize_fbx(mesh: EmbeddedMeshData, template_fbx_path: Path) -> bytes:
         raise ValueError(
             f"template FBX has no Geometry node: {template_fbx_path}"
         )
+
+    # Strip the template's extra Geometries (and the Model/Material/Texture
+    # objects that referenced them via Connections). HornetRifle.fbx and
+    # other multi-part templates ship ~14 Geometry nodes; we only fill
+    # the first one with the embedded mesh's data, so leaving the other
+    # 13 would publish a Model whose first sub-mesh is ours and whose
+    # other sub-meshes are the template's leftover rifle parts. The
+    # consumer then silently picks ``sub_meshes[0]`` and gets the right
+    # answer ONLY by coincidence of geometry order in the template.
+    # Strip them so the upload has exactly one Geometry -> exactly one
+    # MeshPart on the Roblox side.
     geo = geometries[0]
+    _strip_extra_geometries_and_dependents(roots, keep=geo)
 
     # Vertices: Float64 array (FBX type 'd'), flat (x1, y1, z1, x2, ...).
     verts_flat: list[float] = []

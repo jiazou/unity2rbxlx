@@ -363,6 +363,16 @@ def _get_fbx_import_scale(
     if asset_path is None:
         return 0.01
 
+    # ``.prefab``/``.asset`` meshes are embedded as ``!u!43`` documents
+    # whose ``m_LocalAABB.m_Extent`` is already in Unity metres -- not
+    # in FBX file units that need ``globalScale`` correction. Returning
+    # the FBX default 0.01 here would shrink synthesised embedded
+    # meshes 100× and push their Size below the rbxlx writer's 0.05
+    # stud floor (concrete case: SimpleFPS landmines went invisible
+    # because 0.323 m * 0.01 * 3.571 = 0.012 studs ≪ 0.05).
+    if asset_path.suffix.lower() in (".prefab", ".asset"):
+        return 1.0
+
     meta_path = Path(str(asset_path) + ".meta")
     if not meta_path.exists():
         return 0.01

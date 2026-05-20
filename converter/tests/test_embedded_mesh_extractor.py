@@ -444,3 +444,86 @@ class TestSimpleFpsLandmineRealAsset:
         obj_bytes = serialize_obj(result)
         assert b"f " in obj_bytes
         assert obj_bytes.count(b"\nv ") == len(result.positions)
+
+
+class TestMultiGeometryTemplateStripping:
+    """``synthesize_fbx`` rewrites only the FIRST Geometry node in the
+    template, so leaving the template's other Geometries intact would
+    publish a Model whose first sub-mesh is ours and whose other sub-
+    meshes are leftover template geometries (HornetRifle.fbx ships ~14
+    Geometry nodes). The consumer side picks ``sub_meshes[0]``, which
+    is correct by COINCIDENCE of geometry order in the template -- a
+    different template would silently bind Mines to the wrong geometry.
+
+    These tests guard the "strip extras before serialising" invariant.
+    """
+
+    def test_multi_geometry_template_collapses_to_one_geometry(
+        self, tmp_path,
+    ) -> None:
+        from converter.fbx_binary import (
+            FbxNode,
+            FbxProperty,
+            _find_geometry_nodes,
+            read_fbx,
+            write_fbx,
+        )
+
+        # Take WaterBasicPlane (single-Geometry, version-7.x) and
+        # synthetically duplicate its Geometry node twice so the
+        # template has THREE geometries. Then run synthesize_fbx
+        # and assert only one survives.
+        template_real = Path(
+            "/Users/jiazou/workspace/unity2rbxlx/test_projects/SimpleFPS/"
+            "Assets/Standard Assets/Environment/Water (Basic)/Models/"
+            "WaterBasicPlane.fbx"
+        )
+        if not template_real.exists():
+            pytest.skip("Template FBX unavailable")
+        version, roots, footer = read_fbx(template_real)
+        original_geometries = _find_geometry_nodes(roots)
+        assert len(original_geometries) == 1
+
+        # Inject two extra fake Geometry nodes (just enough structure
+        # for the FBX writer; their object IDs are unique so the
+        # Connections sweep can identify them).
+        objects_node = next(n for n in roots if n.name == b"Objects")
+        for extra_id in (99000001, 99000002):
+            extra_geo = FbxNode(
+                name=b"Geometry",
+                properties=[
+                    FbxProperty("L", extra_id),
+                    FbxProperty("S", b"FakeGeometry"),
+                    FbxProperty("S", b"Mesh"),
+                ],
+                children=[
+                    FbxNode(b"Vertices", [FbxProperty("d", [0.0, 0.0, 0.0])]),
+                    FbxNode(b"PolygonVertexIndex", [FbxProperty("i", [0])]),
+                ],
+            )
+            objects_node.children.append(extra_geo)
+
+        # Re-serialise so the multi-Geometry template is a real file on disk.
+        polluted = tmp_path / "polluted_template.fbx"
+        write_fbx(polluted, version, roots, footer)
+
+        # Sanity check: the polluted template really does have 3 geos.
+        _v, polluted_roots, _f = read_fbx(polluted)
+        assert len(_find_geometry_nodes(polluted_roots)) == 3
+
+        # Now synthesise an embedded mesh against the polluted template.
+        mesh = EmbeddedMeshData(
+            name="TestMesh",
+            positions=[(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)],
+            triangles=[(0, 1, 2)],
+        )
+        fbx_bytes = synthesize_fbx(mesh, polluted)
+        result = tmp_path / "out.fbx"
+        result.write_bytes(fbx_bytes)
+        _v, out_roots, _f = read_fbx(result)
+        out_geos = _find_geometry_nodes(out_roots)
+        assert len(out_geos) == 1, (
+            f"multi-Geometry template leaked {len(out_geos)} Geometry "
+            "nodes into the synthesised FBX; the consumer would bind "
+            "to whatever sub-mesh came first."
+        )

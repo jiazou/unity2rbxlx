@@ -1273,7 +1273,12 @@ class Pipeline:
             )
 
         if parsed_scene is not None:
-            for node in parsed_scene.all_nodes:
+            # ``all_nodes`` is a ``dict[str, SceneNode]``; iterate ``.values()``
+            # so we get nodes, not file-ID strings. The previous iteration
+            # silently missed any embedded mesh referenced by a scene-level
+            # MeshFilter (prefab-library walks below still worked, which
+            # masked the bug for SimpleFPS).
+            for node in parsed_scene.all_nodes.values():
                 _maybe_collect(
                     getattr(node, "mesh_guid", None),
                     getattr(node, "mesh_file_id", None),
@@ -1834,21 +1839,13 @@ class Pipeline:
         # resolved_count (3) >= uploaded_mesh_count (2) would falsely
         # report "all resolved" and skip resolution of D and E entirely.
         #
-        # ``_is_mesh_key`` accepts both ``.fbx``/``.obj`` keys (the
+        # Mesh-key predicate accepts both ``.fbx``/``.obj`` keys (the
         # external-mesh upload path) and synthetic ``<rel>#<file_id>``
         # keys (the embedded-mesh upload path -- see
-        # ``unity.embedded_mesh_extractor``). Without the synthetic
-        # check, a freshly-uploaded embedded mesh would slip past the
-        # all-resolved gate and the next assemble would publish its
-        # raw Model ID instead of the resolved MeshId.
-        def _is_mesh_key(k: str) -> bool:
-            kl = k.lower()
-            if any(kl.endswith(ext) for ext in ('.fbx', '.obj')):
-                return True
-            if "#" in k:
-                prefix = kl.split("#", 1)[0]
-                return prefix.endswith(".prefab") or prefix.endswith(".asset")
-            return False
+        # ``unity.embedded_mesh_extractor``). Hoisted to
+        # ``core.asset_keys`` so the Studio resolver and the scene
+        # converter use the same definition.
+        from core.asset_keys import is_mesh_asset_key as _is_mesh_key
 
         uploaded_mesh_keys = {
             k for k in self.ctx.uploaded_assets if _is_mesh_key(k)
@@ -2081,6 +2078,29 @@ return table.concat(allData, "\\n")'''
                 if texture_id:
                     entry["textureId"] = texture_id
                 mesh_hierarchies[path].append(entry)
+
+            # Invariant: synthetic embedded-mesh keys MUST resolve to
+            # exactly one sub-mesh (our synthesised FBX has a single
+            # Geometry node by construction in
+            # ``unity.embedded_mesh_extractor.synthesize_fbx``). When
+            # the resolver returns more, the FBX template-cleanup
+            # leaked extra Geometries and ``sub_meshes[0]`` would
+            # silently bind to whichever Geometry the upload happened
+            # to enumerate first -- a correctness-by-coincidence bug.
+            # Loud-fail so the next leak is caught at conversion time,
+            # not via a Studio playtest.
+            from core.asset_keys import is_embedded_mesh_key
+            for k, subs in mesh_hierarchies.items():
+                if is_embedded_mesh_key(k) and len(subs) != 1:
+                    log.warning(
+                        "[resolve_assets] Embedded-mesh key %r resolved to "
+                        "%d sub-meshes (expected exactly 1). The FBX "
+                        "template likely shipped extra Geometry nodes that "
+                        "weren't stripped; sub_meshes[0] binding is now "
+                        "non-deterministic and may bind to the wrong "
+                        "geometry. Names: %s",
+                        k, len(subs), [s.get("name") for s in subs],
+                    )
 
             # Merge into existing tables instead of replacing. A transient
             # batch failure during a force-rerun would otherwise shrink a

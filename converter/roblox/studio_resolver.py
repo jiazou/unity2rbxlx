@@ -28,19 +28,14 @@ def generate_mesh_resolution_luau(
 
     Returns a list of Luau script strings, one per batch.
     """
+    # ``is_mesh_asset_key`` covers both ``.fbx``/``.obj`` paths and the
+    # synthetic ``<rel>#<file_id>`` keys minted by
+    # ``unity.embedded_mesh_extractor`` for legacy embedded meshes.
+    from core.asset_keys import is_mesh_asset_key
+
     mesh_entries = []
     for path, url in uploaded_assets.items():
-        is_mesh = any(path.lower().endswith(ext) for ext in ['.fbx', '.obj'])
-        # Synthetic keys for legacy ``.prefab``/``.asset`` embedded meshes
-        # are formatted as ``<rel_path>#<file_id>`` by
-        # ``unity.embedded_mesh_extractor`` + ``pipeline._upload_embedded_meshes``.
-        # Resolve them through the same LoadAsset path so the returned
-        # Model's inner MeshPart yields a real MeshId.
-        if not is_mesh and "#" in path:
-            prefix = path.split("#", 1)[0].lower()
-            if prefix.endswith(".prefab") or prefix.endswith(".asset"):
-                is_mesh = True
-        if is_mesh:
+        if is_mesh_asset_key(path):
             asset_id = url.replace("rbxassetid://", "")
             mesh_entries.append((path, int(asset_id)))
 
