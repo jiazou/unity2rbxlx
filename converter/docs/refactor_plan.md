@@ -5,7 +5,7 @@ Companion: `docs/architecture_critique.md`.
 
 ## In one paragraph
 
-Eight PRs reshape three mega-files (`pipeline.py` 3897 LOC, `script_coherence_packs.py` 4667 LOC, `scene_converter.py` 4856 LOC) into focused modules without behavior change. Phase 1 (six PRs) ships first; Phase 2 (two PRs) waits for the scene-runtime-contract effort to free up `scene_converter.py`. Total ~3.5 engineer-weeks of AI-driven work.
+Nine PRs (PR-A through PR-H, plus PR-E0 ordering audit) reshape three mega-files (`pipeline.py` 3897 LOC, `script_coherence_packs.py` 4667 LOC, `scene_converter.py` 4856 LOC) into focused modules without behavior change. Phase 1 (seven PRs including PR-E0) ships first; Phase 2 (two PRs) waits for the scene-runtime-contract effort to free up `scene_converter.py`. Total ~3.5 engineer-weeks of AI-driven work.
 
 ## Constraints
 
@@ -19,10 +19,17 @@ Eight PRs reshape three mega-files (`pipeline.py` 3897 LOC, `script_coherence_pa
 1. **Dispatch:** PR-D replaces 49 `Pipeline` methods with `PHASE_FUNCS: dict[str, Callable]`. Per-phase methods deleted. Tests use new public `pipeline.run_phase(name)`.
 2. **PR-E shim:** explicit submodule imports — `from .packs import fps, doors, pickups, proximity, misc`. No `import *`.
 3. **Script-assembly split:** PR-D extracts the 15-helper grab bag into 5 themed modules now, not deferred.
-4. **Golden snapshot:** canonicalize-then-hash. Script source content hashed (not line count). Hierarchy/sibling order preserved (no flat-sort). Excludes mtimes, timestamps, temp paths.
+4. **Golden snapshot:** canonicalize-then-hash, scheme fully specified:
+   - JSON document with **sorted keys**, but **list / sibling order PRESERVED** — parent/child hierarchy is load-bearing in the rbxlx writer (cf. `roblox/rbxlx_writer.py:810`, `core/roblox_types.py:118`); flat-sorting siblings erases real regressions.
+   - For each script: `(name, sha256(source))` — NOT line count (misses constant-length content edits).
+   - Sets are sorted before hashing: `unhandled_components`, asset GUID sets.
+   - UUID referents normalized via existing `_REFERENT_RE` in `tests/test_byte_equivalence.py`.
+   - Excluded fields: `generated_at` timestamps, `mtime`, absolute temp paths.
 5. **Golden test home:** extend existing `tests/test_byte_equivalence.py` with `TestFrozenBaseline`. No new file.
 6. **Baselines:** SimpleFPS + Gamekit3D + 3D-Platformer (text YAML / scale stress / BINARY YAML).
-7. **Phase signature:** `(state: PipelineState, ctx: ConversionContext, services: PipelineServices)`. New `PipelineServices` dataclass holds `output_dir`, `skip_binary_rbxl`, `context_path`, `is_resume`, `fps_artifacts_at_init`, plus bound helper callables.
+7. **Phase signature:** `(state: PipelineState, ctx: ConversionContext, services: PipelineServices)`. New `PipelineServices` dataclass has two halves:
+   - Config fields: `output_dir`, `skip_binary_rbxl`, `context_path`, `is_resume`, `fps_artifacts_at_init`.
+   - Bound helper callables (the 8 cross-cutting helpers extracted from `class Pipeline`): `classify_storage`, `bind_scripts_to_parts`, `rehydrate_scripts_from_disk`, `inject_runtime_modules`, `generate_prefab_packages`, `collect_all_scripts`, `collect_method_warnings`, `apply_scaffolding`.
 8. **Test rewrites in PR-D:** 16+ sites calling `pipeline.<phase>()` rewrite to `pipeline.run_phase('<phase>')`.
 9. **PR-E0 prelude:** audit pack execution order on `origin/main`; add explicit `@patch_pack(after=...)` edges so the split can't reorder behavior.
 
@@ -59,7 +66,12 @@ After PR-B, lane C (PR-C → PR-D) and lane D (PR-E0 → PR-E → PR-F) can run 
 Cut: Autonomous Work Plan, Recent Session blocks, Development History (2026-03-24 → -28), Full upload test (2026-03-25). Keep: bug fix protocol, upload semantics, coordinate system, test projects, CLI commands, mesh sizing, asset resolution, inline-over-runtime, Roblox safety rules. ~1.5K tokens saved per session.
 
 ### PR-B — Frozen baselines
-Extend `tests/test_byte_equivalence.py` with `TestFrozenBaseline`. New files: `tests/golden/{simplefps,gamekit3d,platformer}.rbxlx.sha256`; `tests/golden/canonicalize.py` (decision #4). Determinism guard runs each conversion twice on the test host and asserts canonical hash matches before comparing to baseline.
+Extend `tests/test_byte_equivalence.py` with `TestFrozenBaseline`. New files: `tests/golden/{simplefps,gamekit3d,platformer}.rbxlx.sha256`; `tests/golden/canonicalize.py` implementing the scheme from decision #4. Determinism guard runs each conversion twice on the test host and asserts canonical hash matches before comparing to baseline.
+
+**+ done criteria** (PR-B specific — the template's "frozen baselines unchanged" criterion doesn't apply yet because PR-B is what creates them):
+- `pytest -m slow tests/test_byte_equivalence.py::TestFrozenBaseline` passes on `origin/main` HEAD with all three baselines.
+- Determinism guard exercised: each baseline runs twice on the test host with matching canonical hashes BEFORE comparing to the checked-in `.sha256`.
+- The three `.sha256` files are committed and reproducible from `origin/main` HEAD by re-running the test.
 
 ### PR-C — `write_output` subphases + `PipelineServices`
 New `phases/services.py` with `PipelineServices` dataclass (decision #7). New `phases/output/` package, one module per `_subphase_*` method: `emit_scripts.py`, `cohere_scripts.py`, `inject_autogen.py` (264 LOC, includes pre-scaffolding migration at `pipeline.py:2370-2384`), `encode_terrain.py`, `inject_mesh_loader.py`, `patch_setup_sounds.py`, `finalize_scripts.py`. Each: `def <name>(state, ctx, services) -> None`. `Pipeline.write_output` becomes a ~30-line orchestrator. New regression test covers the previously-uncovered pre-scaffolding migration branch.
