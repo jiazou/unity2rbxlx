@@ -1076,6 +1076,87 @@ def _collect_runtime_referenced_ids(
     return referenced
 
 
+def _collect_ui_child_suppression_ids(
+    scene_runtime: dict[str, object] | None,
+) -> frozenset[str]:
+    """Build the set of UI GameObject ids whose static child trees the
+    converter should drop under generic mode (PR3c carve-out 2).
+
+    A UI element's children are suppressed iff a runtime-bearing
+    MonoBehaviour mounted on the same GameObject owns a serialized field
+    referencing an asset or prefab. Under generic the host runtime owns
+    instantiation of that content via ``host.instantiatePrefab`` —
+    emitting the static descendants AS WELL would double-stamp the tree
+    (runtime adds its copy; static copy never gets removed).
+
+    Algorithm:
+      1. Index each instance by ``instance_id → (script_id, game_object_id)``.
+      2. Walk references; for any row whose ``target_kind`` is ``asset`` or
+         ``prefab``, look up the source instance's module
+         (``modules[script_id]``) and check ``runtime_bearing == True``.
+      3. If so, add the source instance's ``game_object_id`` to the set.
+
+    A missing module row, missing ``runtime_bearing`` flag, or unknown
+    instance ref is silently skipped — under generic the planner is
+    authoritative; the carve-out fires only on confirmed signals. Empty
+    set under all uncertainty preserves the legacy static-emit path.
+    """
+    if not scene_runtime:
+        return frozenset()
+    modules = scene_runtime.get("modules", {})
+    if not isinstance(modules, dict):
+        return frozenset()
+
+    suppressed: set[str] = set()
+
+    def _process_block(block: object) -> None:
+        if not isinstance(block, dict):
+            return
+        # instance_id -> (script_id, game_object_id) lookup within the block.
+        # Scoping per-block matches the planner's namespace separation:
+        # scene instance_ids never collide with prefab instance_ids.
+        instance_lookup: dict[str, tuple[str, str]] = {}
+        for inst in block.get("instances", []) or []:
+            if not isinstance(inst, dict):
+                continue
+            iid = inst.get("instance_id")
+            sid = inst.get("script_id")
+            gid = inst.get("game_object_id")
+            if isinstance(iid, str) and isinstance(sid, str) and isinstance(gid, str):
+                instance_lookup[iid] = (sid, gid)
+
+        for ref in block.get("references", []) or []:
+            if not isinstance(ref, dict):
+                continue
+            tk = ref.get("target_kind")
+            if tk not in ("asset", "prefab"):
+                continue
+            src = ref.get("from")
+            if not isinstance(src, str):
+                continue
+            lookup = instance_lookup.get(src)
+            if lookup is None:
+                continue
+            script_id, game_object_id = lookup
+            module_row = modules.get(script_id)
+            if not isinstance(module_row, dict):
+                continue
+            if not module_row.get("runtime_bearing"):
+                continue
+            suppressed.add(game_object_id)
+
+    scenes = scene_runtime.get("scenes", {})
+    if isinstance(scenes, dict):
+        for scene_block in scenes.values():
+            _process_block(scene_block)
+    prefabs = scene_runtime.get("prefabs", {})
+    if isinstance(prefabs, dict):
+        for prefab_block in prefabs.values():
+            _process_block(prefab_block)
+
+    return frozenset(suppressed)
+
+
 def _scene_runtime_id_for(file_id: str) -> str:
     """Build the ``"<scene_namespace>:<file_id>"`` lookup key for the
     in-flight ``convert_scene`` call. Returns the empty string when either
@@ -1560,12 +1641,24 @@ def convert_scene(
     # Convert Unity Canvas UI elements to Roblox ScreenGuis. Pass the
     # scene namespace so UI hosts get ``_SceneRuntimeId`` stamps under the
     # same ``<scene>:<fileID>`` scheme as workspace parts (PR2, Piece 3).
+    # PR3c: thread the requested scene-runtime mode + the per-GO
+    # asset/prefab-serialized-field set so the generic-only child-
+    # suppression carve-out (Piece 4) can fire for runtime-bearing UI
+    # controllers. Legacy mode passes the empty set + mode="legacy" so
+    # the static-emit path is byte-identical to pre-PR3c.
     from converter.ui_translator import find_canvas_nodes, convert_canvas
     canvas_nodes = find_canvas_nodes(parsed_scene.roots)
     if canvas_nodes:
+        ui_suppress_ids = (
+            _collect_ui_child_suppression_ids(scene_runtime)
+            if scene_runtime_mode == "generic" and scene_runtime
+            else frozenset()
+        )
         place.screen_guis = convert_canvas(
             canvas_nodes,
             scene_namespace=_ctx().scene_runtime_namespace,
+            scene_runtime_mode=scene_runtime_mode,
+            suppress_static_children_ids=ui_suppress_ids,
         )
         log.info("Converted %d Canvas nodes to ScreenGuis", len(place.screen_guis))
 
