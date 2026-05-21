@@ -446,6 +446,80 @@ bracket-quote everything else.
 
 These remain tracked in the carry-over markers section below.
 
+### Codex review round 5 (2026-05-21)
+
+Round-5 codex surfaced 2 P1s on top of round-4 absorption. Both
+absorbed in PR4 (FINAL ROUND -- user explicitly capped iteration at
+this round per [[review_loops_stay_high_level]]).
+
+**R5-P1.2 ABSORBED** -- deep ancestor semantics for
+``activeInHierarchy``. The R4-P1.2 fix split ``activeSelf`` from
+``activeInHierarchy`` host-side, but the host could only walk the
+DOWNWARD subtree via ``collectSubtreeIdsWithParents`` -- it had no
+upward parent info. Two regressions remained:
+
+1. Boot-time: an inactive parent + active child still fired the
+   child's ``OnEnable`` at boot. The gate was seeded from
+   ``activeSelf`` alone instead of the ancestor walk.
+2. ``setActive(grandchild, true)`` while a grandparent was inactive
+   wrongly opened the grandchild's gate -- the toggled root's own
+   ancestor gate was approximated as ``true``.
+
+Fix (user-greenlit): planner emits ``parent_game_object_id`` on every
+instance via a new ``SceneRuntimeInstanceExtra(TypedDict,
+total=False)`` -- preserves the PR1 ``total=True`` invariant for
+existing fields, mirrors the ``SceneRuntimeReferenceExtra`` pattern.
+Runtime builds a ``goId -> parentGoId`` map at ``start()`` via a
+pre-pass, then walks UP via
+``_computeActiveInHierarchyViaParentMap`` when seeding boot-time
+gates and when computing the toggled-root's ancestor gate in
+``setActive``. All three ``setActive`` subtree-walk branches
+(``collectSubtreeIdsWithParents``, ``collectDescendantIds``,
+no-helper fallback) now AND in ``toggledAncestorGate`` so the deep-
+ancestor invariant holds across every service shape.
+
+Bounded scope: the planner walks runtime-bearing MonoBehaviours only,
+so GOs without any MB get no entry in the parent map. The runtime
+defaults a missing ``_goActiveSelf`` to ``true``, matching Unity's
+"no authored flag means active" rule for MB-less GameObjects.
+
+Tests: ``TestDeepAncestorActiveInHierarchy`` x3 -- boot suppression
+with inactive parent, ``setActive(grandchild)`` blocked by inactive
+grandparent + unblocked by grandparent re-enable, planner emits
+parent edge on child rows but not on scene roots
+(`converter/tests/test_scene_runtime_host_behavior.py`, commit
+`6591c26`).
+
+**R5-P1 (UNCONVERTED.md clobber) ABSORBED** --
+``_subphase_inject_scene_runtime`` was writing the cross-domain edge
+block to ``UNCONVERTED.md`` mid-pipeline (with marker-aware
+append/strip to preserve unrelated content). Later in
+``write_output``, ``_write_unconverted_md`` rebuilt the file from
+scratch off ``sections`` (animation / shared_state / material /
+component categories) -- silently CLOBBERING the cross-domain block
+on every conversion that had at least one non-cross-domain
+unconverted entry.
+
+Fix (user-greenlit): ``_subphase_inject_scene_runtime`` stages edges
+on ``ctx.scene_runtime["cross_domain_edges"]`` only -- no file write.
+``_write_unconverted_md`` becomes the single source of truth: reads
+sections + cross-domain edges and produces the file in one pass. The
+file is removed cleanly when both inputs are empty (no
+stale-block-after-edge-free-rerun footgun).
+
+Tests: existing pipeline-emit tests now call both stages (matches the
+real pipeline ordering);
+``test_cross_domain_block_survives_write_unconverted_md`` is the
+direct regression -- seed an animation unconverted entry + a
+cross-domain plan, run both stages, assert both blocks survive +
+rerun is byte-stable
+(`converter/tests/test_scene_runtime_pipeline_emit.py`, commit
+`6e317fd`).
+
+**Status update**: R4-P1.2 carry-over marker is now FULLY absorbed
+(was PARTIAL after R4 -- host-side only). The planner now ships the
+parent edge so the deep-ancestor invariant holds end-to-end.
+
 ### Contract resolutions pinned in the design doc
 
 The three R2 P1s the user explicitly resolved are pinned in
@@ -487,12 +561,24 @@ The three R2 P1s the user explicitly resolved are pinned in
       matrix (trash-dash + SimpleFPS) supplies the concrete
       fixtures needed to resolve the scene-namespace boundary
       contract decision the design doc punted on.
-- [x] **R4-P1.2**: split `activeSelf` / `activeInHierarchy`. **ABSORBED**
-      in PR4 (this round) — host-side via per-GO `_goActiveSelf` +
-      `_goActiveInHierarchy` maps + new
-      `collectSubtreeIdsWithParents` service. Tests:
-      `TestSetActivePreservesDescendantActiveSelf` x3,
-      `TestSetActiveSubtreeIdsWithParentsHelperEmitted`.
+- [x] **R4-P1.2**: split `activeSelf` / `activeInHierarchy`. **FULLY
+      ABSORBED** (PR4 across rounds 4 + 5). Round 4 split the gates
+      host-side via per-GO `_goActiveSelf` + `_goActiveInHierarchy`
+      maps + the `collectSubtreeIdsWithParents` service. Round 5
+      added the planner parent edge (`parent_game_object_id` via
+      `SceneRuntimeInstanceExtra`) so the runtime can walk ancestors
+      UP -- fixing boot-time inactive-parent suppression and
+      `setActive(grandchild, true)` ancestor-gating. Tests:
+      `TestSetActivePreservesDescendantActiveSelf` x3 (R4),
+      `TestSetActiveSubtreeIdsWithParentsHelperEmitted` (R4),
+      `TestDeepAncestorActiveInHierarchy` x3 (R5).
+- [x] **R5-P1 (UNCONVERTED.md clobber)**: **ABSORBED** in PR4
+      (round 5). `_subphase_inject_scene_runtime` no longer writes
+      UNCONVERTED.md mid-pipeline -- it stages edges on ctx and
+      `_write_unconverted_md` is the single writer (sections +
+      cross-domain edges in one pass). Tests:
+      `test_cross_domain_block_survives_write_unconverted_md` +
+      updated `TestCrossDomainReport*` / `TestCrossDomainReportEdgeFreeRerun*`.
 - [x] **R4-P1.3**: Unity → Roblox class translation. **ABSORBED** in
       PR4 (this round) — host-side via `_unityToRobloxClass(name)`
       in `scene_runtime.luau` with `Transform` short-circuit + raw
