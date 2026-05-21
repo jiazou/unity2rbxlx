@@ -598,7 +598,19 @@ function SceneRuntime:_runAwakeEnableStart(instances)
 			self:_callMethod(comp, "OnEnable")
 		end
 	end
-	-- Step 5: Start on next tick.
+	-- Step 5: Start on next tick (only for components booted active + enabled;
+	-- dormant components Start on first false->true gate transition via
+	-- ``_scheduleStartIfPending``).
+	self:_scheduleStartIfPending(instances)
+end
+
+function SceneRuntime:_scheduleStartIfPending(instances)
+	-- Defer Start to next tick per the Unity lifecycle contract.
+	-- ``instances`` may be a single-element list (called from
+	-- setEnabled/setActive after a late re-enable) or the full batch
+	-- (initial boot). Only components currently in the active+enabled gate
+	-- that haven't fired Start yet are queued; ``_startFired`` flips to
+	-- true once Start runs so subsequent gate transitions are no-ops.
 	local engine = self
 	self._services.task.defer(function()
 		for _, comp in ipairs(instances) do
@@ -679,11 +691,17 @@ end
 function SceneRuntime:_cancelAllTasks(comp)
 	local list = self._tasks[comp]
 	if not list then return end
-	for _, handle in ipairs(list) do
-		-- task.cancel exists in Roblox's task lib; in the harness the
-		-- handle can be a sentinel that the stub checks.
+	for _, entry in ipairs(list) do
+		-- ``invoke`` / ``invokeRepeating`` overwrite the raw thread with
+		-- a ``{handle=, method=, repeating?=}`` wrapper table (so
+		-- ``cancelInvoke`` can find handles by method label). Roblox's
+		-- ``task.cancel`` expects the raw thread/handle, NOT a table --
+		-- pcall would silently swallow the failure and the repeating
+		-- task would keep firing. Unwrap here the same way
+		-- ``cancelInvoke`` already does.
+		local h = (type(entry) == "table" and entry.handle) or entry
 		if self._services.task.cancel then
-			pcall(self._services.task.cancel, handle)
+			pcall(self._services.task.cancel, h)
 		end
 	end
 	self._tasks[comp] = nil
@@ -780,38 +798,82 @@ end
 -- Active / enabled toggles
 -- ---------------------------------------------------------------------
 
+function SceneRuntime:_applyActiveToComponent(comp, bool, pendingStarts)
+	local m = self._meta[comp]
+	if not m then return end
+	local was = m.activeSelf and m.enabled
+	m.activeSelf = bool and true or false
+	local now = m.activeSelf and m.enabled
+	if was and not now then
+		m.disableCalled = true
+		m.enableCalled = false
+		self:_disarmSubs(comp)
+		self:_callMethod(comp, "OnDisable")
+	elseif (not was) and now then
+		m.enableCalled = true
+		m.disableCalled = false
+		self:_rearmSubs(comp)
+		self:_callMethod(comp, "OnEnable")
+		-- Late re-enable: Unity fires Start on the FIRST transition to
+		-- active+enabled. If the component never satisfied that gate at
+		-- boot (dormant: active=false or enabled=false), queue Start now.
+		if not m.startCalled and pendingStarts ~= nil then
+			table.insert(pendingStarts, comp)
+		end
+	end
+end
+
 function SceneRuntime:setActive(go, bool)
 	-- ``go`` may be either a Roblox Instance or a game_object_id string.
 	-- We key by id internally; the entrypoint usually passes a stamped
 	-- Instance whose ``_SceneRuntimeId`` we can read.
+	--
+	-- Cascades to the GameObject's subtree per Unity's
+	-- ``activeInHierarchy`` contract -- a parent toggled false must
+	-- suspend every descendant's host.connect subscriptions and
+	-- OnEnable/OnDisable bookkeeping. Walk via the services'
+	-- ``collectDescendantIds`` (same DFS post-order ``destroy()`` uses)
+	-- when a Roblox Instance is passed; fall back to the single-id path
+	-- when only an id string is provided (no instance to walk).
 	local goId
+	local goInst
 	if type(go) == "string" then
 		goId = go
-	elseif type(go) == "table" and self._services.getInstanceId then
-		goId = self._services.getInstanceId(go)
+	elseif type(go) == "table" then
+		goInst = go
+		if self._services.getInstanceId then
+			goId = self._services.getInstanceId(go)
+		end
 	else
 		return
 	end
-	local list = self._componentsByGameObject[goId]
-	if not list then return end
-	for _, comp in ipairs(list) do
-		local m = self._meta[comp]
-		if m then
-			local was = m.activeSelf and m.enabled
-			m.activeSelf = bool and true or false
-			local now = m.activeSelf and m.enabled
-			if was and not now then
-				m.disableCalled = true
-				m.enableCalled = false
-				self:_disarmSubs(comp)
-				self:_callMethod(comp, "OnDisable")
-			elseif (not was) and now then
-				m.enableCalled = true
-				m.disableCalled = false
-				self:_rearmSubs(comp)
-				self:_callMethod(comp, "OnEnable")
-			end
+	local pendingStarts = {}
+	local function applyTo(id)
+		local list = self._componentsByGameObject[id]
+		if not list then return end
+		-- Snapshot so per-component state mutations don't disturb iteration.
+		local snap = {}
+		for i, c in ipairs(list) do snap[i] = c end
+		for _, comp in ipairs(snap) do
+			self:_applyActiveToComponent(comp, bool, pendingStarts)
 		end
+	end
+	if goInst ~= nil and self._services.collectDescendantIds then
+		local ids = self._services.collectDescendantIds(goInst)
+		-- Track which ids we visited so a missing root id (no
+		-- ``_SceneRuntimeId`` on the live Roblox instance) still
+		-- toggles the keyed bucket the caller intended.
+		local seenRoot = false
+		for _, id in ipairs(ids) do
+			if id == goId then seenRoot = true end
+			applyTo(id)
+		end
+		if goId and not seenRoot then applyTo(goId) end
+	elseif goId then
+		applyTo(goId)
+	end
+	if #pendingStarts > 0 then
+		self:_scheduleStartIfPending(pendingStarts)
 	end
 end
 
@@ -831,6 +893,12 @@ function SceneRuntime:setEnabled(comp, bool)
 		m.disableCalled = false
 		self:_rearmSubs(comp)
 		self:_callMethod(comp, "OnEnable")
+		-- Late re-enable: Unity fires Start on the FIRST transition to
+		-- active+enabled. Defer Start when this is the first time the
+		-- component has been active+enabled.
+		if not m.startCalled then
+			self:_scheduleStartIfPending({comp})
+		end
 	end
 end
 

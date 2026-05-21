@@ -1472,3 +1472,171 @@ class TestAutogenCollectDescendantIdsIsDfsPostOrder:
         assert "table.insert(out, 1," not in block, (
             "reversing GetDescendants is not equivalent to DFS post-order"
         )
+
+
+# ---------------------------------------------------------------------------
+# R2-P1.4: setActive cascades to subtree.
+# ---------------------------------------------------------------------------
+
+class TestSetActiveCascadesToSubtree:
+    """Codex round-2 P1: ``engine:setActive(parent, false)`` must suspend
+    every component in the parent's GameObject subtree, not just the
+    components directly attached to the parent GO. Round-2 verified the
+    pre-fix bug with ``childHits=2`` (child callback still fired after
+    parent disabled). Regression test: a child component's
+    ``host.connect`` subscription must NOT fire after the parent toggles
+    inactive, and must fire again after the parent toggles active."""
+
+    def test_set_active_false_disables_child_components(self):
+        scenario = textwrap.dedent("""\
+            local parentSig = mockSignal()
+            local childHits = 0
+            local Child = {} ; Child.__index = Child
+            function Child.new(_) return setmetatable({}, Child) end
+            function Child:Awake()
+                self.host:connect(parentSig, function()
+                    childHits = childHits + 1
+                end)
+            end
+            local plan = {
+                modules = {child = {stem = "Child", runtime_bearing = true,
+                                    module_path = "x"}},
+                scenes = {
+                    A = {
+                        instances = {{instance_id = "A:1", script_id = "child",
+                                      game_object_id = "childGo", active = true,
+                                      enabled = true, config = {}}},
+                        references = {},
+                        lifecycle_order = {"A:1"},
+                    },
+                },
+                prefabs = {}, domain_overrides = {},
+            }
+            local parent = {Name = "Parent", _sceneRuntimeId = "parentGo",
+                             _children = {}}
+            local child = {Name = "ChildGo", _sceneRuntimeId = "childGo",
+                            _children = {}}
+            parent._children.child = child
+            local services = servicesFor(plan, {child = Child},
+                                          {childGo = child, parentGo = parent})
+            local engine = SceneRuntime.new(services, plan)
+            engine:start(nil)
+            runDeferred()
+
+            parentSig:fire()  -- should hit child (parent still active)
+            engine:setActive(parent, false)
+            parentSig:fire()  -- must NOT hit child (parent disabled, cascade)
+            print("afterDisable=" .. childHits)
+            engine:setActive(parent, true)
+            parentSig:fire()  -- should hit again (cascade re-arms)
+            print("afterReEnable=" .. childHits)
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, err
+        assert "afterDisable=1" in out, (
+            f"child component must NOT fire after parent setActive(false); "
+            f"got: {out}"
+        )
+        assert "afterReEnable=2" in out, (
+            f"child component must fire again after parent setActive(true); "
+            f"got: {out}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# R2-P1.5: late re-enable delivers the first Start.
+# ---------------------------------------------------------------------------
+
+class TestLateReEnableFiresStartOnFirstTransition:
+    """Codex round-2 P1: a component booted with ``enabled=false`` gets
+    ``Awake`` but never ``Start``, even after a later ``setEnabled(true)``.
+    Unity semantics: Start fires once on the FIRST transition to
+    active+enabled -- the transition can happen at boot OR later.
+    Subsequent toggles must NOT re-fire Start."""
+
+    def test_dormant_then_setenabled_fires_start_exactly_once(self):
+        scenario = textwrap.dedent("""\
+            local starts = 0
+            local Foo = {} ; Foo.__index = Foo
+            function Foo.new(_) return setmetatable({}, Foo) end
+            function Foo:Start() starts = starts + 1 end
+            local plan = {
+                modules = {foo = {stem = "Foo", runtime_bearing = true,
+                                  module_path = "x"}},
+                scenes = {
+                    A = {
+                        instances = {{instance_id = "A:1", script_id = "foo",
+                                      game_object_id = "g", active = true,
+                                      enabled = false, config = {}}},
+                        references = {},
+                        lifecycle_order = {"A:1"},
+                    },
+                },
+                prefabs = {}, domain_overrides = {},
+            }
+            local go = {Name = "G", _sceneRuntimeId = "g", _children = {}}
+            local services = servicesFor(plan, {foo = Foo}, {g = go})
+            local engine = SceneRuntime.new(services, plan)
+            engine:start(nil)
+            runDeferred()
+            print("atBoot=" .. starts)
+            local comp = engine:findObjectOfType('Foo')
+            engine:setEnabled(comp, true)
+            runDeferred()
+            print("afterEnable=" .. starts)
+            -- Second toggle: false -> true again. Start must NOT re-fire.
+            engine:setEnabled(comp, false)
+            engine:setEnabled(comp, true)
+            runDeferred()
+            print("afterToggle=" .. starts)
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, err
+        assert "atBoot=0" in out, (
+            f"dormant component must NOT fire Start at boot; got: {out}"
+        )
+        assert "afterEnable=1" in out, (
+            f"setEnabled(comp, true) must fire Start once; got: {out}"
+        )
+        assert "afterToggle=1" in out, (
+            f"second toggle must NOT re-fire Start; got: {out}"
+        )
+
+    def test_dormant_then_setactive_fires_start_exactly_once(self):
+        scenario = textwrap.dedent("""\
+            local starts = 0
+            local Foo = {} ; Foo.__index = Foo
+            function Foo.new(_) return setmetatable({}, Foo) end
+            function Foo:Start() starts = starts + 1 end
+            local plan = {
+                modules = {foo = {stem = "Foo", runtime_bearing = true,
+                                  module_path = "x"}},
+                scenes = {
+                    A = {
+                        instances = {{instance_id = "A:1", script_id = "foo",
+                                      game_object_id = "g", active = false,
+                                      enabled = true, config = {}}},
+                        references = {},
+                        lifecycle_order = {"A:1"},
+                    },
+                },
+                prefabs = {}, domain_overrides = {},
+            }
+            local go = {Name = "G", _sceneRuntimeId = "g", _children = {}}
+            local services = servicesFor(plan, {foo = Foo}, {g = go})
+            local engine = SceneRuntime.new(services, plan)
+            engine:start(nil)
+            runDeferred()
+            print("atBoot=" .. starts)
+            engine:setActive(go, true)
+            runDeferred()
+            print("afterSetActive=" .. starts)
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, err
+        assert "atBoot=0" in out, (
+            f"inactive component must NOT fire Start at boot; got: {out}"
+        )
+        assert "afterSetActive=1" in out, (
+            f"setActive(go, true) must fire Start once; got: {out}"
+        )
