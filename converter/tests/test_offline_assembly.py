@@ -32,6 +32,7 @@ after a real conversion.
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 from pathlib import Path
 
@@ -282,24 +283,61 @@ def _run_luau_analyze(scripts_dir: Path) -> tuple[int, int, list[str]]:
     return (passed, len(failures), failures)
 
 
+def _claude_cli_available() -> bool:
+    """Return True if the Claude CLI is installed and on PATH.
+
+    The full-flow offline-assembly tests run the real AI transpiler so
+    every phase of the converter (transpile, coherence, autogen, test
+    seam injection, scene conversion, place builder) is exercised
+    end-to-end. Without Claude CLI the test cannot run, so we skip
+    cleanly rather than fail with a confusing subprocess error.
+    """
+    return shutil.which("claude") is not None
+
+
 @pytest.mark.slow
 class TestOfflineAssembly:
-    """Phase A — assemble rbxlx + place_builder against cached IDs, no cloud."""
+    """Phase A — full converter end-to-end against cached asset IDs.
+
+    Exercises the entire pipeline (parse → extract → transpile via AI →
+    coherence → seam injection → convert_scene → write_output → place
+    builder) with ``skip_upload=True`` so no Open Cloud calls happen.
+    The snapshot seeds ``uploaded_assets`` + ``mesh_native_sizes`` so
+    downstream phases see real Roblox IDs.
+
+    Designed for manual + nightly runs, not per-PR. First run on a
+    given project is ~10 min (full AI transpile); subsequent runs hit
+    the system's ``.cache/llm/`` and finish in ~30s. The test is
+    ``@pytest.mark.slow`` and skipped automatically when Claude CLI is
+    not on PATH so CI environments without the CLI don't fail.
+    """
 
     @pytest.fixture(autouse=True)
-    def _disable_ai(self):
-        """Match test_pipeline_e2e: no AI transpilation in tests."""
+    def _enable_ai(self, monkeypatch):
+        """Force AI transpilation on for the full-flow regression run.
+
+        Other tests in the suite disable AI via ``_disable_ai`` to avoid
+        Claude CLI hangs — this test deliberately re-enables it because
+        the whole point is to validate the production transpile path.
+        ``USE_AI_TRANSPILATION`` is read live from ``config`` by
+        ``pipeline.transpile_scripts`` (pipeline.py:1780 — ``_config.``
+        prefix means no import-time binding to worry about), so a single
+        monkeypatch.setattr on the config module is sufficient.
+        """
         import config
-        old = config.USE_AI_TRANSPILATION
-        config.USE_AI_TRANSPILATION = False
-        yield
-        config.USE_AI_TRANSPILATION = old
+        monkeypatch.setattr(config, "USE_AI_TRANSPILATION", True)
 
     @pytest.mark.skipif(
         not is_populated(SIMPLEFPS_PROJECT),
         reason="SimpleFPS not available (init submodule, set "
                "UNITY2RBXLX_TEST_PROJECTS_ROOT, or run a real conversion "
                "first so the snapshot bakes in source_unity_project)",
+    )
+    @pytest.mark.skipif(
+        not _claude_cli_available(),
+        reason="claude CLI required (full-flow test runs real AI "
+               "transpile; install Claude CLI or run nightly with it "
+               "available)",
     )
     def test_simplefps_assembly_with_cached_ids(self, tmp_path: Path) -> None:
         from converter.pipeline import Pipeline
@@ -344,11 +382,44 @@ class TestOfflineAssembly:
             + "\n".join(fails[:10])
         )
 
+        # Test seam check: production-quality Player.luau (AI-transpiled)
+        # calls UserInputService:GetMouseDelta() for camera yaw. The
+        # converter's _subphase_inject_test_seams rewrites those calls
+        # to _getMouseDelta() so offline behavior fixtures can drive
+        # mouse-look via _G._mockMouseDelta. This assertion would fail
+        # if (a) AI transpilation didn't land the mouse code (Claude
+        # CLI failed or returned a degenerate stub), (b) the seam
+        # injector subphase regressed, or (c) the subphase order broke
+        # and the injector ran before the AI-transpiled scripts were
+        # emitted.
+        player_lua = (tmp_path / "scripts" / "Player.luau").read_text(
+            encoding="utf-8"
+        )
+        assert "local function _getMouseDelta" in player_lua, (
+            "Player.luau is missing the _getMouseDelta() test seam — "
+            "either the AI transpile didn't land mouse-look code (check "
+            "the transpile logs) or the test_seam_injector subphase "
+            "regressed."
+        )
+        # The user's call site should have been rewritten away; only the
+        # helper's fallback line should remain.
+        assert player_lua.count("UserInputService:GetMouseDelta()") == 1, (
+            f"expected exactly 1 UserInputService:GetMouseDelta() call "
+            f"(the helper's fallback), found "
+            f"{player_lua.count('UserInputService:GetMouseDelta()')} — "
+            f"the seam injector failed to rewrite user-side calls."
+        )
+
     @pytest.mark.skipif(
         not is_populated(TRASHDASH_PROJECT),
         reason="Trash Dash not available — set "
                "UNITY2RBXLX_TEST_PROJECTS_ROOT, or run a real conversion "
                "first so the snapshot bakes in source_unity_project",
+    )
+    @pytest.mark.skipif(
+        not _claude_cli_available(),
+        reason="claude CLI required (full-flow test runs real AI "
+               "transpile)",
     )
     def test_trashdash_assembly_with_cached_ids(self, tmp_path: Path) -> None:
         from converter.pipeline import Pipeline

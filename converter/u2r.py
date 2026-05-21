@@ -1082,7 +1082,9 @@ def resolve(output_dir: str) -> None:
 @click.option("--project-name", type=str, default=None,
               help="Project label baked into the snapshot for traceability "
                    "(default: output_dir basename).")
-def snapshot_ids(output_dir: str, out: str, project_name: str | None) -> None:
+def snapshot_ids(
+    output_dir: str, out: str, project_name: str | None,
+) -> None:
     """Snapshot uploaded asset IDs + mesh resolutions from a prior conversion.
 
     Reads ``conversion_context.json`` and ``.roblox_ids.json`` from a real
