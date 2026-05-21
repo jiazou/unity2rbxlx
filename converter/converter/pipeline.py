@@ -3184,7 +3184,10 @@ script.Disabled = true
     # Retired FPS-scaffolding auto-gen script names. ``_rehydrate_scripts_from_disk``
     # skips these so a pre-PR8 output dir that still carries them under
     # ``scripts/`` doesn't resurrect the retired functionality on an
-    # ``assemble`` / ``upload`` rebuild.
+    # ``assemble`` / ``upload`` rebuild. Pruning is gated on the name
+    # AND a marker substring from the retired auto-gen header so a
+    # user-authored .cs that happens to transpile to the same stem
+    # (no marker) is preserved.
     _RETIRED_FPS_AUTOGEN_NAMES: frozenset[str] = frozenset({
         "FPSController",
         "FpsClient",
@@ -3192,6 +3195,11 @@ script.Disabled = true
         "AutoFpsHudController",
         "AutoFpsEventDispatch",
     })
+    _RETIRED_FPS_AUTOGEN_MARKERS: tuple[str, ...] = (
+        "-- HUD Controller (auto-generated)",
+        "-- FPS Client Controller (auto-generated)",
+        "-- EventDispatch: cross-class connect helper",
+    )
 
     def _rehydrate_scripts_from_disk(self, scripts_dir: Path) -> None:
         """Populate rbx_place.scripts from disk for the preserved-scripts path.
@@ -3229,23 +3237,25 @@ script.Disabled = true
                     or name == "character_animator"):
                 continue
 
+            source = luau_path.read_text(encoding="utf-8")
+
             # PR8: skip retired FPS-scaffolding artifacts. An output dir
             # created before PR8 by ``--scaffolding=fps`` may still hold
             # FPSController / AutoFpsHudController / HUDController /
             # FpsClient / AutoFpsEventDispatch under ``scripts/``;
-            # rehydrating them would resurrect retired functionality
-            # on an ``assemble`` / ``upload`` rebuild against the old
-            # dir even though every converter-side code path that emits
-            # them is gone. These are converter-internal auto-gen
-            # names; user-authored ``.cs`` files with the same stem
-            # would not survive a converted transpile loop because the
-            # corresponding ``.cs`` no longer exists in any modern
-            # Unity test project, so name-only filtering is safe.
-            if name in self._RETIRED_FPS_AUTOGEN_NAMES:
+            # rehydrating them would resurrect retired functionality on
+            # an ``assemble`` / ``upload`` rebuild against the old dir
+            # even though every converter-side code path that emits
+            # them is gone. Gate on BOTH the stem AND a content marker
+            # from the retired auto-gen header so a user-authored
+            # ``HUDController.cs`` / ``FPSController.cs`` that
+            # transpiled to the same .luau name is preserved.
+            if (
+                name in self._RETIRED_FPS_AUTOGEN_NAMES
+                and any(m in source[:512] for m in self._RETIRED_FPS_AUTOGEN_MARKERS)
+            ):
                 pruned_retired += 1
                 continue
-
-            source = luau_path.read_text(encoding="utf-8")
 
             if name in plan_lookup:
                 script_type, parent_path = plan_lookup[name]
