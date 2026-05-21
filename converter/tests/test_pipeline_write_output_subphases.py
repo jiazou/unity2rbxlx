@@ -31,6 +31,7 @@ def _parse_write_output_call_sequence() -> list[str]:
     tree = ast.parse(PIPELINE_PATH.read_text())
     ORCHESTRATION_PATTERNS = {
         "_classify_storage",
+        "_check_auto_fail_closed",
         "_bind_scripts_to_parts",
         "_inject_runtime_modules",
         "_generate_prefab_packages",

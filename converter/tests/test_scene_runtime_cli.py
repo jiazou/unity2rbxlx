@@ -1,11 +1,10 @@
 """test_scene_runtime_cli.py -- CLI front-door surface for ``--scene-runtime``.
 
-PR3a wired the flag at every conversion front door; PR4 lifts the
-hard-rejection of ``generic`` and lights up the host runtime path.
-``auto`` is still rejected because its fallback-routing decision lands
-in PR5 with its canary projects. ``generic`` flows through to the
-pipeline; bad downstream state (no Unity project, etc.) surfaces
-normally.
+PR3a wired the flag at every conversion front door; PR4 lit up
+``generic`` (host runtime); **PR5 lifts the ``auto`` rejection** so all
+three modes route through the pipeline. ``auto`` routes through the
+generic branch and surfaces fail-closed signals as structured errors
+(see ``Pipeline._check_auto_fail_closed``).
 
 Front doors covered:
   * ``u2r.py convert``        -- main conversion command
@@ -15,7 +14,6 @@ Front doors covered:
 
 from __future__ import annotations
 
-import json
 import sys
 from pathlib import Path
 
@@ -69,20 +67,21 @@ class TestConvertFlag:
             "should no longer appear in the output."
         )
 
-    def test_auto_still_rejected(self, tmp_path):
-        # PR5 owns ``auto`` (try-generic-then-legacy with canary
-        # projects); PR4 keeps it rejected at the CLI.
+    def test_auto_no_longer_rejected_at_cli(self, tmp_path):
+        # PR5 lifts the ``auto`` rejection at the CLI; the conversion
+        # routes through the generic pipeline. Like ``generic``, it may
+        # still error downstream (tmp_path isn't a real Unity project),
+        # but the failure should NOT be the PR4-era spike-pointer
+        # rejection text -- that rejection has been removed.
         runner = CliRunner()
         result = runner.invoke(u2r_main, [
             "convert", str(tmp_path),
             "--skip-architecture-step",
             "--scene-runtime=auto",
         ])
-        assert result.exit_code != 0
-        assert "auto" in result.output
-        assert "PR5" in result.output, (
-            "auto rejection should attribute deferral to PR5 so users "
-            "see the timeline."
+        assert "auto is not yet supported" not in result.output, (
+            "PR5 lifted the auto rejection; the PR4 deferral text should "
+            "no longer appear in the output."
         )
 
     def test_invalid_value_rejected_by_click(self, tmp_path):
@@ -110,13 +109,13 @@ class TestEvalFlag:
         assert result.exit_code == 0
         assert "--scene-runtime" in result.output
 
-    def test_eval_still_rejects_auto(self):
-        # PR4: ``generic`` is accepted at eval; ``auto`` is the only
-        # remaining CLI-level rejection (PR5 turf).
+    def test_eval_auto_no_longer_rejected(self):
+        # PR5: ``auto`` is now lifted across all eval front doors as
+        # well. Eval may still fail without a project arg, but the
+        # PR4-era rejection text should be absent.
         runner = CliRunner()
         result = runner.invoke(u2r_main, ["eval", "--scene-runtime=auto"])
-        assert result.exit_code != 0
-        assert "auto" in result.output
+        assert "auto is not yet supported" not in result.output
 
 
 # ---------------------------------------------------------------------------
@@ -131,9 +130,11 @@ class TestInteractiveTranspileFlag:
         assert result.exit_code == 0
         assert "--scene-runtime" in result.output
 
-    def test_auto_rejected_with_structured_json(self, tmp_path):
-        # PR4: ``auto`` is the remaining CLI-rejected mode (PR5 turf).
-        # The interactive CLI emits structured JSON on errors.
+    def test_auto_no_longer_rejected_with_pr4_deferral(self, tmp_path):
+        # PR5: the interactive transpile front door no longer rejects
+        # ``auto``. It may still error downstream (no Unity project at
+        # ``tmp_path``), but the PR4 "auto deferred to PR5" payload
+        # should be absent.
         runner = CliRunner()
         project = tmp_path / "project"
         project.mkdir()
@@ -144,24 +145,13 @@ class TestInteractiveTranspileFlag:
             str(output),
             "--scene-runtime=auto",
         ])
-        assert result.exit_code != 0
-        # ``_emit`` prints a (multi-line indented) JSON object to stdout.
-        start = result.output.find("{")
-        end = result.output.rfind("}")
-        payload = None
-        if start != -1 and end != -1:
-            try:
-                payload = json.loads(result.output[start:end + 1])
-            except json.JSONDecodeError:
-                payload = None
-        assert payload is not None, (
-            "interactive transpile must emit a structured JSON error "
-            f"payload, but stdout was: {result.output[:500]!r}"
-        )
-        assert payload.get("phase") == "transpile"
-        assert payload.get("success") is False
-        assert any("PR5" in e for e in payload.get("errors", [])), (
-            f"auto rejection should attribute deferral to PR5: {payload}"
+        # PR5 rejection-attribute string should NOT appear: the old
+        # error message linked the failure to "PR5 turf"; PR5 is now
+        # in production. We don't assert exit_code (legitimate
+        # downstream failures are still possible).
+        assert "is not yet supported" not in result.output, (
+            "PR5 lifted the auto deferral; the PR4 rejection envelope "
+            "should no longer appear."
         )
 
 

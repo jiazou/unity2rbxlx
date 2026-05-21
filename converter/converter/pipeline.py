@@ -2338,6 +2338,7 @@ return table.concat(allData, "\\n")'''
         "_subphase_emit_scripts_to_disk",
         "_subphase_cohere_scripts",
         "_classify_storage",
+        "_check_auto_fail_closed",
         "_bind_scripts_to_parts",
         "_subphase_inject_autogen_scripts",
         "_inject_runtime_modules",
@@ -2416,6 +2417,12 @@ return table.concat(allData, "\\n")'''
         self._subphase_emit_scripts_to_disk()
         self._subphase_cohere_scripts()
         self._classify_storage()
+        # PR5: auto-mode fail-closed signal aggregation. Runs after
+        # ``_classify_storage`` (which is where PR3b's domain-classifier
+        # stamps ``fail_closed_reason`` onto ``scene_runtime.modules``)
+        # and BEFORE ``_subphase_inject_scene_runtime`` so a fail-closed
+        # signal under ``auto`` short-circuits the host-runtime emit.
+        self._check_auto_fail_closed()
         self._bind_scripts_to_parts()
         self._subphase_inject_autogen_scripts()
         self._inject_runtime_modules()
@@ -4359,6 +4366,128 @@ script.Disabled = true
 
         if injected:
             log.info("[write_output] Injected %d runtime library modules", injected)
+
+    def _check_auto_fail_closed(self) -> None:
+        """PR5: aggregate ``auto``-mode fail-closed signals + route.
+
+        Runs only when ``ctx.scene_runtime_mode == "auto"``. After this
+        subphase ``ctx.scene_runtime_mode`` is ``"generic"`` (no
+        signals) or ``"legacy"`` (one or more signals) -- downstream
+        gates can then read a binary mode value without auto-awareness.
+
+        Why the routing decision happens HERE, not at CLI parse time:
+        most fail-closed signals (verifier reprompt outcomes, require
+        graph resolution, classifier conflicts) are only computable
+        AFTER transpile + classify run. The orchestrator runs them in
+        generic mode first; this subphase reads the artifacts and
+        decides without re-driving the AI backend.
+
+        Routing semantics (PR5 conservative):
+          - No signals: ``ctx.scene_runtime_mode = "generic"``. The
+            subsequent ``_subphase_inject_scene_runtime`` emits the
+            host runtime + plan + entrypoints. PR5 -> PR7 canary gate
+            condition.
+          - One or more signals: ``ctx.scene_runtime_mode = "legacy"``.
+            ``_subphase_inject_scene_runtime`` short-circuits; the host
+            runtime + planner ModuleScript are NOT emitted. Every
+            trigger is staged on ``ctx.scene_runtime["auto_fail_closed"]``
+            and logged at WARNING.
+
+        Two known limitations of the PR5 fallback (tracked in
+        ``scene-runtime-pr5-followups.md``):
+
+          1. **Not byte-identical to ``--scene-runtime=legacy``.** The
+             transpile phase ran in generic mode -- emitted Luau may
+             still carry contract shapes (``self.host:connect``,
+             ``require("@scene_runtime/...")``). A user wanting full
+             byte-equivalence with the pre-contract pipeline must
+             explicitly rerun with ``--scene-runtime=legacy``. PR3c's
+             scene_converter / ui_translator carve-outs were also
+             active during ``convert_scene`` -- inactive retentions
+             survive in the .rbxlx.
+          2. **No per-module coexistence.** The brief's per-module
+             fallback (host runtime handles its modules, legacy
+             bootstrap handles the rest) is deferred. PR5 implements
+             project-level fallback as the conservative starting
+             point. Per-module gating requires the legacy
+             ``ClientBootstrap`` emit path to learn which scripts the
+             host runtime is binding, which itself requires the host
+             runtime to ship even when SOME modules fail-closed --
+             both larger lifts.
+
+        See ``scene-runtime-pr5-followups.md`` for the deferred
+        re-route + per-module coexistence designs.
+        """
+        if self.ctx.scene_runtime_mode != "auto":
+            return
+        scene_runtime = self.ctx.scene_runtime
+        if not scene_runtime:
+            # Auto with no planner artifact: route to generic; the
+            # downstream emit subphase is a further no-op when there
+            # are no runtime-bearing modules.
+            self.ctx.scene_runtime_mode = "generic"
+            return
+        if not self.state.transpilation_result:
+            # Auto with no transpile artifact (--no-ai or stub-only):
+            # treat as generic. The host emit is a no-op when no
+            # runtime-bearing modules survived.
+            self.ctx.scene_runtime_mode = "generic"
+            return
+
+        # ``analyze_all_scripts`` is deterministic; re-running here
+        # matches what ``transpile_scripts`` consumed earlier in the
+        # pipeline. Bounded disk scan; no AI work.
+        from unity.script_analyzer import analyze_all_scripts
+        from converter.contract_pipeline import detect_fail_closed_signals
+
+        try:
+            script_infos = analyze_all_scripts(self.unity_project_path)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "[auto] script_analyzer failed during fail-closed scan "
+                "(%s); routing through generic without signal check", exc,
+            )
+            self.ctx.scene_runtime_mode = "generic"
+            return
+
+        fail_closed = detect_fail_closed_signals(
+            self.state.transpilation_result,
+            cast("dict", scene_runtime),
+            script_infos,
+            self.unity_project_path,
+        )
+
+        # Always stash the (possibly empty) trigger list so the
+        # publish / report path can distinguish "auto ran clean"
+        # vs "auto never ran".
+        scene_runtime["auto_fail_closed"] = [
+            {"kind": fc.kind, "detail": fc.detail} for fc in fail_closed
+        ]
+
+        if not fail_closed:
+            # PR5 -> PR7 canary gate happy path.
+            self.ctx.scene_runtime_mode = "generic"
+            log.info(
+                "[auto] no fail-closed signals; routing through generic"
+            )
+            return
+
+        # Fail-closed: legacy + log every trigger.
+        log.warning(
+            "[auto] %d fail-closed signal(s); falling back to legacy "
+            "(host runtime emit suppressed; see PR5 followups for the "
+            "byte-identical re-route + per-module coexistence designs)",
+            len(fail_closed),
+        )
+        by_kind: dict[str, int] = {}
+        for fc in fail_closed:
+            by_kind[fc.kind] = by_kind.get(fc.kind, 0) + 1
+            log.warning("[auto]   %s: %s", fc.kind, fc.detail)
+        log.warning(
+            "[auto] fallback summary by kind: %s",
+            ", ".join(f"{k}={v}" for k, v in sorted(by_kind.items())),
+        )
+        self.ctx.scene_runtime_mode = "legacy"
 
     def _subphase_inject_scene_runtime(self) -> None:
         """PR4: emit the scene-runtime host runtime + plan + entrypoints.

@@ -607,22 +607,10 @@ def transpile(unity_project_path: str, output_dir: str,
               api_key: str | None, no_ai: bool, scene_runtime: str,
               clean: bool) -> None:
     """Phase 3b: transpile C# scripts to Luau."""
-    # PR4: only ``auto`` is rejected (PR5 turf). ``generic`` flows
-    # through the host runtime; see ``_enforce_scene_runtime_mode_supported``
-    # in u2r.py for the shared rationale.
-    if scene_runtime == "auto":
-        _emit({
-            "phase": "transpile",
-            "success": False,
-            "errors": [
-                "--scene-runtime=auto is not yet supported. PR4 lights "
-                "up 'generic'; 'auto' lands in PR5 alongside its "
-                "fallback-routing canaries. Use --scene-runtime=generic "
-                "for the contract pipeline.",
-            ],
-        })
-        sys.exit(1)
-
+    # PR5 lifts the ``auto`` rejection across all three skill front
+    # doors. ``auto`` now routes through the generic pipeline; on a
+    # fail-closed signal the pipeline surfaces a structured error
+    # listing the trigger (see ``Pipeline._check_auto_fail_closed``).
     # PR3b: mode stamp + mismatch guard at the front door.
     _guard_scene_runtime_mode_or_emit(
         "transpile", Path(output_dir).resolve(), scene_runtime, clean,
@@ -803,16 +791,7 @@ def assemble(unity_project_path: str, output_dir: str,
              scaffolding: str | None,
              scene_runtime: str, clean: bool) -> None:
     """Phase 4: upload assets, resolve, convert animations + scene, write .rbxlx."""
-    # PR4: only ``auto`` is still rejected (PR5 turf).
-    if scene_runtime == "auto":
-        _emit({
-            "phase": "assemble", "success": False, "errors": [
-                "--scene-runtime=auto is not yet supported. PR4 lights "
-                "up 'generic'; 'auto' lands in PR5. Use "
-                "--scene-runtime=generic for the contract pipeline.",
-            ],
-        })
-        sys.exit(1)
+    # PR5: ``auto`` is now lifted across all skill front doors.
     _guard_scene_runtime_mode_or_emit(
         "assemble", Path(output_dir).resolve(), scene_runtime, clean,
     )
@@ -958,16 +937,8 @@ def upload(output_dir: str, api_key: str | None,
            scene_runtime: str, clean: bool) -> None:
     """Publish the .rbxlx to Roblox via headless place builder."""
     out = Path(output_dir).resolve()
-    # PR4: only ``auto`` is still rejected (PR5 turf).
-    if scene_runtime == "auto":
-        _emit({
-            "phase": "upload", "success": False, "errors": [
-                "--scene-runtime=auto is not yet supported. PR4 lights "
-                "up 'generic'; 'auto' lands in PR5. Use "
-                "--scene-runtime=generic for the contract pipeline.",
-            ],
-        })
-        sys.exit(1)
+    # PR5: ``auto`` is now lifted; route through the generic pipeline
+    # and surface fail-closed signals in the publish summary.
     _guard_scene_runtime_mode_or_emit("upload", out, scene_runtime, clean)
     ctx_path = _context_path(out)
     if not ctx_path.exists():

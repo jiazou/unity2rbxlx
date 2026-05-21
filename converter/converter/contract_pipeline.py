@@ -271,6 +271,132 @@ def resolve_requires(
 # Orchestrator
 # ---------------------------------------------------------------------------
 
+def detect_fail_closed_signals(
+    transpilation: TranspilationResult,
+    scene_runtime: _SceneRuntimeArtifact,
+    script_infos: list[ScriptInfo],
+    unity_project_root: str | Path,
+) -> list[FailClosed]:
+    """Post-transpile fail-closed signal aggregation for PR5's auto-mode.
+
+    The pipeline already invokes ``code_transpiler.transpile_scripts`` in
+    the main ``transpile_scripts`` phase; ``transpile_with_contract``
+    duplicates that work. PR5's auto-mode wiring needs the fail-closed
+    *list* without re-running the AI backend, so it walks the already-
+    transpiled artifacts and ``scene_runtime`` artifact and assembles the
+    same ``FailClosed`` rows ``transpile_with_contract`` would emit.
+
+    Mirrors the seven kinds the contract orchestrator surfaces:
+      - ``runtime_bearing_collision``
+      - ``stub_strategy``
+      - ``verifier`` (post-reprompt warning surviving)
+      - ``require_missing``
+      - ``require_collision``
+
+    Two further kinds come from the domain classifier (PR3b) and live
+    on ``scene_runtime`` itself:
+      - ``both_side_api`` / ``intra_class_conflict``: rows in
+        ``scene_runtime.modules`` whose ``domain == "legacy"`` with a
+        ``domain_signals.fail_closed_reason`` matching one of the
+        classifier's reasons.
+      - ``reachability_conflict``: same, with the reachability reason.
+
+    Pure function; does not mutate inputs.
+    """
+    modules = scene_runtime.get("modules", {}) or {}
+    out: list[FailClosed] = []
+
+    # Domain-classifier surface (PR3b). These rows already live on the
+    # planner artifact; the classifier sets ``domain == "legacy"`` and
+    # stamps ``domain_signals.fail_closed_reason`` to a string we surface
+    # here as a structured FailClosed kind.
+    for sid, row in modules.items():
+        if row.get("domain") != "legacy":
+            continue
+        signals = row.get("domain_signals") or {}
+        if not isinstance(signals, dict):
+            continue
+        reason = signals.get("fail_closed_reason", "")
+        if not isinstance(reason, str) or not reason:
+            continue
+        # The classifier emits these three reason strings exactly --
+        # mirror them as the FailClosed kind so downstream consumers
+        # can switch on a stable vocabulary.
+        if reason in ("both_side_api", "intra_class_conflict",
+                       "reachability_conflict"):
+            out.append(FailClosed(
+                kind=reason,
+                detail=(
+                    f"{row.get('stem', sid)} (script_id={sid}): domain "
+                    f"classifier fell to legacy ({reason})"
+                ),
+            ))
+
+    # Contract-orchestrator surface. Recompute runtime-bearing paths +
+    # require-graph from the same artifacts ``transpile_with_contract``
+    # uses, but read warnings off the *existing* transpilation.
+    runtime_bearing_paths, bearing_collisions = _runtime_bearing_paths(
+        modules, script_infos, unity_project_root,
+    )
+    for collision in bearing_collisions:
+        out.append(FailClosed(
+            kind="runtime_bearing_collision",
+            detail=(
+                f"runtime-bearing stem {collision.stem!r} matches "
+                f"{len(collision.paths)} .cs files: "
+                + ", ".join(p.name for p in collision.paths)
+            ),
+        ))
+
+    for script in transpilation.scripts:
+        if Path(script.source_path) not in runtime_bearing_paths:
+            continue
+        if script.strategy != "ai":
+            out.append(FailClosed(
+                kind="stub_strategy",
+                detail=(
+                    f"{Path(script.source_path).name}: runtime-bearing "
+                    f"module fell through to {script.strategy!r} strategy"
+                ),
+            ))
+        post_warnings = [
+            w for w in script.warnings if _is_post_reprompt_warning(w)
+        ]
+        if post_warnings:
+            out.append(FailClosed(
+                kind="verifier",
+                detail=(
+                    f"{Path(script.source_path).name}: "
+                    f"{len(post_warnings)} violation(s) survived reprompt"
+                ),
+            ))
+
+    by_stem, collisions = _build_require_graph(modules)
+    require_resolutions = resolve_requires(
+        transpilation.scripts, by_stem, collisions,
+    )
+    for r in require_resolutions:
+        if r.reason == "missing_stem":
+            out.append(FailClosed(
+                kind="require_missing",
+                detail=(
+                    f"{Path(r.from_script).name}: "
+                    f"require('@scene_runtime/{r.stem}') has no matching "
+                    f"module in the planner's by_stem table"
+                ),
+            ))
+        elif r.reason == "stem_collision":
+            out.append(FailClosed(
+                kind="require_collision",
+                detail=(
+                    f"{Path(r.from_script).name}: "
+                    f"require('@scene_runtime/{r.stem}') is ambiguous"
+                ),
+            ))
+
+    return out
+
+
 def transpile_with_contract(
     unity_project_path: str | Path,
     script_infos: list[ScriptInfo],

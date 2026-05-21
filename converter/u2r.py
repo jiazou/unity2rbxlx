@@ -43,26 +43,34 @@ def _guard_scene_runtime_mode(
 
 
 def _enforce_scene_runtime_mode_supported(value: str) -> None:
-    """Reject ``--scene-runtime`` modes that PR4 hasn't wired yet.
+    """All three ``--scene-runtime`` modes are user-reachable after PR5.
 
-    PR3a wired the flag at every conversion front door. PR4 lights up
+    PR3a wired the flag at every conversion front door. PR4 lit up
     ``generic`` (host runtime ``runtime/scene_runtime.luau`` + Piece 6
-    services); ``auto`` is still rejected because its fallback-routing
-    decision (try ``generic`` -> on any fail-closed trigger fall back
-    to a clean ``legacy`` dir) lands in PR5 with the canary projects
-    that exercise the trigger surface. The PR4 row in the design doc
-    keeps ``auto`` deferred — see
-    ``converter/docs/design/scene-runtime-contract.md``.
+    services). PR5 lifts the ``auto`` rejection: ``auto`` now routes
+    through ``generic`` and, on any fail-closed signal (verifier,
+    require_missing, require_collision, runtime_bearing_collision,
+    stub_strategy, both_side_api, intra_class_conflict,
+    reachability_conflict -- the full ``FailClosed`` kinds set), the
+    pipeline raises a structured UsageError documenting the trigger.
+
+    PR5's auto-mode fallback is **detection-only**: on a fail-closed
+    signal the operator is told to rerun explicitly with
+    ``--scene-runtime=legacy``. The design-doc-aligned "clean legacy
+    dir + mode-isolated salvage" automatic re-route is deferred to a
+    follow-up so per-PR3a invariants (legacy byte-identical output,
+    no silent mode switch) survive the gate. Per-module coexistence
+    is also deferred -- see scene-runtime-pr5-followups.md.
+
+    No mode is rejected here today; the function is retained for the
+    front-door symmetry the brief specifies and as the canonical
+    extension point for future restrictions (PR6 / PR7 may revisit).
     """
-    if value == "auto":
-        raise click.UsageError(
-            "--scene-runtime=auto is not yet supported. PR4 lights up "
-            "'generic'; 'auto' lands in PR5 alongside the canary "
-            "projects that exercise its fallback-routing decision. "
-            "Use --scene-runtime=generic for the contract pipeline or "
-            "--scene-runtime=legacy (default) for the pre-contract "
-            "pipeline. See converter/docs/design/scene-runtime-contract.md."
-        )
+    # Intentionally no-op as of PR5. Kept for explicit front-door
+    # symmetry across u2r.py / convert_interactive.py + ease of future
+    # restriction. ``click``'s Choice on the CLI option already enforces
+    # the legacy / auto / generic vocabulary.
+    return
 
 
 def _scan_rbxl_collision_fidelity_targets(rbxl_path: Path) -> list[dict]:
