@@ -6,6 +6,16 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
 
 ---
 
+## Refactor effort — held
+
+- [ ] **P2 — Refactor plan held until scene-runtime-contract 9-PR effort lands (2026-05-21).**
+  See `docs/refactor_plan.md` on branch `arch-critique`. 8-PR sequence (PR-A → PR-H) targets the AI-hostile file concentrations (`pipeline.py` 3897 LOC, `script_coherence_packs.py` 4667 LOC, `scene_converter.py` 4856 LOC). All PRs held until ntornow upstream merges scene-runtime PR1-PR8 (drafts #122/#123/#124 plus PR3b→PR8 chain).
+  - Plan went through `/plan-eng-review` with codex outside voice; 9 decisions locked.
+  - Before starting PR-A, re-baseline frozen-snapshot hashes against current `origin/main` HEAD (file line numbers in plan may drift).
+  - PR-E will need to update P1.a/P1.b/P1.c entries below to point at new file locations under `coherence/packs/misc.py`.
+
+---
+
 ## Pipeline / runtime gaps
 
 - [ ] **P1 — Genre-genericness follow-ups for FPS-leftward-migration PR (codex 2026-05-17).**
