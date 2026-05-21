@@ -3411,34 +3411,76 @@ script.Disabled = true
                 category = entry.get("category", "component")
                 sections.setdefault(category, []).append(entry)
 
+        # R5-P1 fix: the scene-runtime cross-domain edge block is a
+        # cross-domain artefact, not a category in ``sections``. Pre-R5
+        # ``_subphase_inject_scene_runtime`` wrote it directly mid-
+        # pipeline, but this writer runs LATER and rewrote the file from
+        # scratch -- silently clobbering the cross-domain block on every
+        # rerun. The fix: ``_subphase_inject_scene_runtime`` stages the
+        # edges on ``ctx.scene_runtime["cross_domain_edges"]`` only, and
+        # the final UNCONVERTED.md write happens here -- the single
+        # source of truth for the file's contents.
+        cross_domain_edges = []
+        scene_runtime_ctx = self.ctx.scene_runtime or {}
+        if isinstance(scene_runtime_ctx, dict):
+            raw_edges = scene_runtime_ctx.get("cross_domain_edges") or []
+            if isinstance(raw_edges, list):
+                cross_domain_edges = [dict(e) for e in raw_edges if isinstance(e, dict)]
+
         out_path = self.output_dir / UNCONVERTED_FILENAME
-        if not sections:
+        if not sections and not cross_domain_edges:
             if out_path.exists():
                 out_path.unlink()
             return
 
-        lines = [
-            "# UNCONVERTED",
-            "",
-            "Features dropped from this specific conversion run. Each "
-            "bullet had no in-policy Roblox equivalent, or required "
-            "source data the converter cannot parse yet. For the static "
-            "catalog of known gaps see `docs/UNSUPPORTED.md`; for roadmap "
-            "items see `TODO.md`.",
-            "",
-        ]
-        for category in sorted(sections):
-            lines.append(f"## {category}")
-            lines.append("")
-            for entry in sections[category]:
-                item = entry.get("item", "?")
-                reason = entry.get("reason", "")
-                lines.append(f"- `{item}` — {reason}")
-            lines.append("")
+        lines: list[str] = []
+        if sections:
+            lines.extend([
+                "# UNCONVERTED",
+                "",
+                "Features dropped from this specific conversion run. Each "
+                "bullet had no in-policy Roblox equivalent, or required "
+                "source data the converter cannot parse yet. For the static "
+                "catalog of known gaps see `docs/UNSUPPORTED.md`; for roadmap "
+                "items see `TODO.md`.",
+                "",
+            ])
+            for category in sorted(sections):
+                lines.append(f"## {category}")
+                lines.append("")
+                for entry in sections[category]:
+                    item = entry.get("item", "?")
+                    reason = entry.get("reason", "")
+                    lines.append(f"- `{item}` — {reason}")
+                lines.append("")
+        elif cross_domain_edges:
+            # No standard unconverted entries, but cross-domain edges
+            # still need a file. Emit a minimal header so the cross-
+            # domain block has context.
+            lines.extend([
+                "# UNCONVERTED",
+                "",
+                "Cross-domain references the host runtime injects ``nil`` "
+                "for at start. See the table below.",
+                "",
+            ])
+
+        if cross_domain_edges:
+            from converter.autogen import render_cross_domain_report
+            report_md = render_cross_domain_report(cross_domain_edges)
+            if report_md:
+                # render_cross_domain_report already terminates with a
+                # newline; splitlines() drops the trailing blank so the
+                # join doesn't double-newline.
+                lines.extend(report_md.rstrip("\n").split("\n"))
+                lines.append("")
+
         out_path.write_text("\n".join(lines), encoding="utf-8")
         log.info(
-            "[write_output] UNCONVERTED.md written (%d entries across %d categories)",
+            "[write_output] UNCONVERTED.md written "
+            "(%d entries across %d categories, %d cross-domain edges)",
             sum(len(v) for v in sections.values()), len(sections),
+            len(cross_domain_edges),
         )
 
     # ------------------------------------------------------------------
@@ -4358,7 +4400,6 @@ script.Disabled = true
             generate_scene_runtime_client_entrypoint,
             generate_scene_runtime_plan_module,
             generate_scene_runtime_server_entrypoint,
-            render_cross_domain_report,
         )
         from converter.scene_runtime_domain import compute_cross_domain_edges
 
@@ -4448,40 +4489,20 @@ script.Disabled = true
         edges = compute_cross_domain_edges(
             cast("dict", scene_runtime),
         )
-        # Stash on ctx so the report writers (and tests) can inspect.
+        # R5-P1 fix: store edges on ctx ONLY. The actual UNCONVERTED.md
+        # write is owned by ``_write_unconverted_md`` (single source of
+        # truth for the file). Pre-R5 this subphase wrote the cross-
+        # domain block directly here, but ``_write_unconverted_md``
+        # runs LATER in write_output and rewrites the file from scratch
+        # -- so the mid-pipeline append got clobbered every time. Tests
+        # and downstream consumers still read the edges via
+        # ``ctx.scene_runtime["cross_domain_edges"]``.
         scene_runtime["cross_domain_edges"] = list(edges)
-        # Idempotency: strip the prior cross-domain marker block on every
-        # re-run, then re-append a fresh one ONLY when edges exist. The
-        # pre-R2 path only stripped when ``edges`` was non-empty, so a
-        # rerun that went from edgeful -> edge-free left a stale block
-        # behind (codex round-2 P2).
-        unconverted_path = self.output_dir / "UNCONVERTED.md"
-        try:
-            existing_md = (
-                unconverted_path.read_text(encoding="utf-8")
-                if unconverted_path.exists() else ""
-            )
-        except OSError:
-            existing_md = ""
-        marker = "## Cross-domain references (scene-runtime v1)"
-        had_marker = marker in existing_md
-        if had_marker:
-            existing_md = existing_md.split(marker, 1)[0].rstrip() + "\n"
         if edges:
-            report_md = render_cross_domain_report([dict(e) for e in edges])
-            unconverted_path.write_text(
-                (existing_md.rstrip() + ("\n\n" if existing_md.strip() else ""))
-                + report_md,
-                encoding="utf-8",
-            )
             log.info(
                 "[write_output] scene-runtime generic: %d cross-domain "
-                "edges -> UNCONVERTED.md", len(edges),
+                "edges staged for UNCONVERTED.md", len(edges),
             )
-        elif had_marker:
-            # Edge-free rerun: write back the marker-stripped body so the
-            # stale block doesn't linger (R2-P2 idempotency fix).
-            unconverted_path.write_text(existing_md, encoding="utf-8")
         injected_total = 4
         if "SceneRuntime" in existing_names:
             injected_total -= 0  # we always replace, so count remains

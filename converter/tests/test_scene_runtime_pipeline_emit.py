@@ -46,6 +46,13 @@ def _make_pipeline_with_ctx(
     state = MagicMock()
     state.rbx_place = RbxPlace()
     state.rbx_place.scripts = []
+    # ``_write_unconverted_md`` reads these; set them to None so the
+    # writer's category aggregation produces an empty section list
+    # unless a test seeds something explicitly.
+    state.animation_result = None
+    state.transpilation_result = None
+    state.material_mappings = {}
+    state.rbx_place.unconverted_components = []
     p.state = state
     return p
 
@@ -164,6 +171,12 @@ class TestCrossDomainReport:
         assert p.ctx.scene_runtime.get("cross_domain_edges") == []
 
     def test_edges_written_to_unconverted_md(self, tmp_path):
+        # R5-P1 fix: ``_subphase_inject_scene_runtime`` no longer writes
+        # UNCONVERTED.md directly -- it stages edges on ctx and the
+        # later ``_write_unconverted_md`` produces the file (single
+        # source of truth). The full pipeline calls
+        # ``_write_unconverted_md`` after the subphase; tests now
+        # invoke both stages.
         plan = {
             "modules": {
                 "src": {"stem": "Src", "runtime_bearing": True,
@@ -203,6 +216,11 @@ class TestCrossDomainReport:
         assert edges[0]["from_script"] == "src"
         assert edges[0]["to_script"] == "tgt"
 
+        # Subphase no longer writes the file directly; the writer below
+        # owns it.
+        assert not (tmp_path / "UNCONVERTED.md").exists()
+
+        p._write_unconverted_md()
         report = (tmp_path / "UNCONVERTED.md").read_text(encoding="utf-8")
         assert "Cross-domain references" in report
         # The report renders the canonical script_id (planner key), not
@@ -212,8 +230,9 @@ class TestCrossDomainReport:
         assert "| tgt | server |" in report
 
     def test_rerun_replaces_cross_domain_block(self, tmp_path):
-        # First run writes the report; second run with different edges
-        # should replace, not duplicate.
+        # First run writes the report; second run with same edges
+        # should produce byte-stable output (single source of truth, no
+        # accidental drift across reruns).
         plan_v1 = {
             "modules": {
                 "src": {"stem": "Src", "runtime_bearing": True,
@@ -243,20 +262,26 @@ class TestCrossDomainReport:
         }
         p = _make_pipeline_with_ctx(tmp_path, "generic", plan_v1)
         p._subphase_inject_scene_runtime()
+        p._write_unconverted_md()
         first = (tmp_path / "UNCONVERTED.md").read_text(encoding="utf-8")
         # Re-run with same plan; report content should be byte-stable.
         p._subphase_inject_scene_runtime()
+        p._write_unconverted_md()
         second = (tmp_path / "UNCONVERTED.md").read_text(encoding="utf-8")
         assert first == second
         # Only one cross-domain section.
         assert second.count("## Cross-domain references") == 1
 
-    def test_unrelated_unconverted_content_preserved(self, tmp_path):
-        # If something else wrote UNCONVERTED.md before us (e.g. a
-        # different "## X" section), our cross-domain block appends.
-        (tmp_path / "UNCONVERTED.md").write_text(
-            "## Unrelated\n\nthis stays\n", encoding="utf-8",
-        )
+    def test_unrelated_unconverted_content_coexists_with_cross_domain(
+        self, tmp_path,
+    ):
+        # R5-P1 fix: ``_write_unconverted_md`` owns the file. Other
+        # pipeline stages contribute via their result objects'
+        # ``unconverted`` lists (the ``sections`` aggregator). The
+        # cross-domain block coexists with those entries in a single
+        # write, not via mid-pipeline appending.
+        from converter.animation_converter import AnimationConversionResult
+
         plan = {
             "modules": {
                 "src": {"stem": "Src", "runtime_bearing": True,
@@ -285,10 +310,18 @@ class TestCrossDomainReport:
             "prefabs": {}, "domain_overrides": {},
         }
         p = _make_pipeline_with_ctx(tmp_path, "generic", plan)
+        # Seed a standard unconverted entry through the supported channel.
+        p.state.animation_result = AnimationConversionResult(unconverted=[
+            {"category": "animator_controller",
+             "item": "Enemy.controller",
+             "reason": "binary-encoded"},
+        ])
         p._subphase_inject_scene_runtime()
+        p._write_unconverted_md()
         contents = (tmp_path / "UNCONVERTED.md").read_text(encoding="utf-8")
-        assert "## Unrelated" in contents
-        assert "this stays" in contents
+        # Both the animation entry and the cross-domain block survive.
+        assert "## animator_controller" in contents
+        assert "Enemy.controller" in contents
         assert "## Cross-domain references" in contents
 
 
@@ -297,10 +330,13 @@ class TestCrossDomainReport:
 # ---------------------------------------------------------------------------
 
 class TestCrossDomainReportEdgeFreeRerun:
-    """Codex round-2 P2: when a re-run goes from edgeful to edge-free,
-    the prior cross-domain block must be removed from UNCONVERTED.md.
-    Pre-fix the subphase only stripped when ``edges`` was non-empty, so
-    the stale block lingered forever."""
+    """Codex round-2 P2 / R5-P1: when a re-run goes from edgeful to
+    edge-free, the prior cross-domain block must be absent in the final
+    UNCONVERTED.md. With the R5 fix the subphase no longer writes the
+    file directly; ``_write_unconverted_md`` re-builds the file from
+    scratch each time (sections + cross-domain edges off ctx), so the
+    stale block can't survive a rerun.
+    """
 
     def test_edgeful_then_edgefree_rerun_strips_stale_block(self, tmp_path):
         plan_edgeful = {
@@ -332,6 +368,7 @@ class TestCrossDomainReportEdgeFreeRerun:
         }
         p = _make_pipeline_with_ctx(tmp_path, "generic", plan_edgeful)
         p._subphase_inject_scene_runtime()
+        p._write_unconverted_md()
         # First run: marker present.
         contents = (tmp_path / "UNCONVERTED.md").read_text(encoding="utf-8")
         assert "## Cross-domain references" in contents
@@ -348,29 +385,105 @@ class TestCrossDomainReportEdgeFreeRerun:
         }
         p.ctx.scene_runtime = plan_edgefree
         p._subphase_inject_scene_runtime()
-        contents_after = (tmp_path / "UNCONVERTED.md").read_text(
-            encoding="utf-8",
-        )
-        assert "## Cross-domain references" not in contents_after, (
-            f"edge-free rerun must strip the stale block; got: "
-            f"{contents_after!r}"
+        p._write_unconverted_md()
+        # With no edges and no other unconverted entries the writer
+        # removes the file entirely.
+        assert not (tmp_path / "UNCONVERTED.md").exists(), (
+            f"edge-free rerun with no sections must remove the file"
         )
 
-    def test_edgefree_rerun_preserves_unrelated_blocks(self, tmp_path):
-        (tmp_path / "UNCONVERTED.md").write_text(
-            "## Unrelated\n\nkeepme\n\n"
-            "## Cross-domain references (scene-runtime v1)\n\n"
-            "stale stuff\n",
-            encoding="utf-8",
+    def test_cross_domain_block_survives_write_unconverted_md(
+        self, tmp_path,
+    ):
+        """R5-P1 regression: pre-fix ``_subphase_inject_scene_runtime``
+        wrote the cross-domain block to UNCONVERTED.md mid-pipeline,
+        and the LATER ``_write_unconverted_md`` rewrote the file from
+        scratch off ``sections`` -- silently CLOBBERING the cross-
+        domain block on every conversion. Post-fix the subphase only
+        stages edges on ctx; the writer reads them off ctx so the
+        block survives.
+        """
+        from converter.animation_converter import AnimationConversionResult
+
+        plan = {
+            "modules": {
+                "src": {"stem": "Src", "runtime_bearing": True,
+                        "domain": "client", "module_path": "ReplicatedStorage.Src"},
+                "tgt": {"stem": "Tgt", "runtime_bearing": True,
+                        "domain": "server", "module_path": "ReplicatedStorage.Tgt"},
+            },
+            "scenes": {
+                "A.unity": {
+                    "instances": [
+                        {"instance_id": "a:1", "script_id": "src",
+                         "game_object_id": "a:1", "active": True,
+                         "enabled": True, "config": {}},
+                        {"instance_id": "a:2", "script_id": "tgt",
+                         "game_object_id": "a:2", "active": True,
+                         "enabled": True, "config": {}},
+                    ],
+                    "references": [{
+                        "from": "a:1", "field": "p", "index": None,
+                        "target_kind": "component", "target_ref": "a:2",
+                        "target_is_ui": False,
+                    }],
+                    "lifecycle_order": ["a:1", "a:2"],
+                },
+            },
+            "prefabs": {}, "domain_overrides": {},
+        }
+        p = _make_pipeline_with_ctx(tmp_path, "generic", plan)
+        # Seed at least one non-cross-domain unconverted entry to
+        # exercise the sections rewrite path (the clobber scenario).
+        p.state.animation_result = AnimationConversionResult(unconverted=[
+            {"category": "blend_tree", "item": "Move", "reason": "2D"},
+        ])
+        # Stage 1: the subphase computes edges and stages them on ctx.
+        p._subphase_inject_scene_runtime()
+        # Stage 2: pipeline's standard UNCONVERTED.md writer. This is
+        # the call that pre-R5 silently wiped the cross-domain block
+        # because it rebuilt the file from sections only.
+        p._write_unconverted_md()
+        contents = (tmp_path / "UNCONVERTED.md").read_text(encoding="utf-8")
+        assert "## blend_tree" in contents, (
+            f"section entry must be preserved; got: {contents}"
         )
+        assert "## Cross-domain references" in contents, (
+            f"R5-P1 regression: ``_write_unconverted_md`` must NOT "
+            f"clobber the cross-domain block; got: {contents}"
+        )
+        # Resume-path (re-run both stages): block still there, no drift.
+        first = contents
+        p._subphase_inject_scene_runtime()
+        p._write_unconverted_md()
+        second = (tmp_path / "UNCONVERTED.md").read_text(encoding="utf-8")
+        assert first == second, (
+            f"resume path drifted: first={first!r} second={second!r}"
+        )
+
+    def test_edgefree_rerun_with_other_entries_drops_stale_cross_domain(
+        self, tmp_path,
+    ):
+        # R5-P1 contract: ``_write_unconverted_md`` rewrites the file
+        # from scratch. With no edges but other entries present (e.g.
+        # an animation unconverted item), the rewrite contains those
+        # entries but NO cross-domain block.
+        from converter.animation_converter import AnimationConversionResult
+
         plan = _runtime_bearing_plan()  # no cross-domain edges
         p = _make_pipeline_with_ctx(tmp_path, "generic", plan)
+        p.state.animation_result = AnimationConversionResult(unconverted=[
+            {"category": "animator_controller", "item": "Enemy.controller",
+             "reason": "binary"},
+        ])
+        # Pretend a prior run left a stale cross-domain block on ctx.
+        p.ctx.scene_runtime["cross_domain_edges"] = []
         p._subphase_inject_scene_runtime()
+        p._write_unconverted_md()
         contents = (tmp_path / "UNCONVERTED.md").read_text(encoding="utf-8")
-        assert "## Unrelated" in contents
-        assert "keepme" in contents
+        assert "## animator_controller" in contents
+        assert "Enemy.controller" in contents
         assert "## Cross-domain references" not in contents
-        assert "stale stuff" not in contents
 
 
 # ---------------------------------------------------------------------------
