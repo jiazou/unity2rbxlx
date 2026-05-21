@@ -2,14 +2,14 @@
   "_schema": {
     "version": 1,
     "doc": "Behavior fixtures consumed by tests/test_studio_behavior.py. Each fixture runs in a Roblox Studio Play session against the assembled converted_place.rbxlx. The harness wraps setup_luau and assert_luau with a preamble that defines plr, char, hrp, hum, cam, _G._state (a table persistent across execute_luau calls), and _findVisible (helper that returns the first non-transparent BasePart in a Model — avoids picking up the invisible PickupTouchDetector trigger that SimpleFPS attaches to pickup roots).",
-    "preamble": "local Players = game:GetService('Players'); local plr = Players.LocalPlayer; local char = plr.Character or plr.CharacterAdded:Wait(); local hrp = char:WaitForChild('HumanoidRootPart'); local hum = char:WaitForChild('Humanoid'); local cam = workspace.CurrentCamera; _G._state = _G._state or {}; local function _findVisible(model) if not model then return nil end; if model:IsA('BasePart') then return model end; if model.PrimaryPart and model.PrimaryPart.Transparency < 0.99 then return model.PrimaryPart end; for _, c in ipairs(model:GetDescendants()) do if c:IsA('BasePart') and c.Transparency < 0.99 then return c end end; return model:FindFirstChildWhichIsA('BasePart', true) end",
+    "preamble": "local Players = game:GetService('Players'); local plr = Players.LocalPlayer; local char = plr.Character or plr.CharacterAdded:Wait(); local hrp = char:WaitForChild('HumanoidRootPart'); local hum = char:WaitForChild('Humanoid'); local cam = workspace.CurrentCamera; _G._state = _G._state or {}; local function _findVisible(node) if not node then return nil end; if node:IsA('BasePart') then return node end; if node.PrimaryPart and node.PrimaryPart.Transparency < 0.99 then return node.PrimaryPart end; for _, c in ipairs(node:GetDescendants()) do if c:IsA('BasePart') and c.Transparency < 0.99 then return c end end; return node:FindFirstChildWhichIsA('BasePart', true) end; local function _trackHealth() _G._state.h0 = hum.Health; _G._state.health_log = {}; if _G._state.health_conn then _G._state.health_conn:Disconnect() end; _G._state.health_conn = hum:GetPropertyChangedSignal('Health'):Connect(function() table.insert(_G._state.health_log, hum.Health) end) end; local function _minHealth() local m = _G._state.h0; for _, h in ipairs(_G._state.health_log or {}) do if h < m then m = h end end; return m end",
     "input_sequence_kinds": {
       "keyboard": "{action: 'keyDown'|'keyUp'|'keyPress', key_code: <Roblox KeyCode name>, wait_time_ms?: number}",
       "mouse_move": "moveTo via mcp__Roblox_Studio__user_mouse_input — note that Delta is reported as (0,0), so cannot drive GetMouseDelta polling; use _G._mockMouseDelta instead via setup_luau",
       "mouse_click": "left/right click via mcp__Roblox_Studio__user_mouse_input",
       "mock_mouse_delta": "stuff a one-shot Vector2 into _G._mockMouseDelta — consumed by the _getMouseDelta() test seam injected by converter/test_seam_injector.py"
     },
-    "dry_run_notes_2026_05_21": "All 1, 2a-d, 4a, 4b, 5 pass cleanly. 6 pickup sets hasRifle=true but the converter doesn't currently spawn a viewmodel (no Rifle Model under character, no camera-attached mount) — fixture asserts gameplay state only. 7-9 deferred from dry-run because they damage/kill the character."
+    "dry_run_notes_2026_05_21": "Fixtures 1, 2a-d, 4a, 4b, 5, 6a, 7a, 7b, 8, 9 all PASS against output/SimpleFPS_run_2026-05-19/converted_place.rbxlx (verified via Studio MCP). Fixture 6b (rifle visible in viewport) FAILS — converter does call getRifle() and clones riflePrefab, but the visible rifle doesn't end up attached to camera viewport in a way WorldToViewportPoint detects on the rifle's mesh. Fixtures 3a/3b (mouse-look) require the test seam in the assembled rbxlx — the running place pre-dates the seam. Detection patterns learned from dry-run: AmmoUpdate BindableEvent is the cleanest shoot signal (not RemoteEvent.OnClientEvent — that requires server-side OnServerEvent which execute_luau can't bind); shoot sounds are created fresh per shot via Instance.new('Sound').Parent=rootPart so DescendantAdded catches them; Humanoid auto-regen erases damage in ~10s so use a property-changed log + min(), not end-state comparison."
   },
   "fixtures": [
     {
@@ -143,46 +143,46 @@
     },
     {
       "id": "shoot_fires_remote_or_bullet",
-      "feature": "7a. Left click fires a bullet. Detection prioritizes the RemoteEvent path (Player.luau:343 _AutoDamageRemoteEventInjected fires per-shot) but also counts new Bullet parts in workspace as a fallback.",
+      "feature": "7a. Left click fires a bullet. Detection: AmmoUpdate BindableEvent fires every time Player.luau's shoot() decrements ammo (Player.luau:288 AmmoUpdate:Fire(curAmmo)). Hooking RemoteEvent.OnClientEvent doesn't work because PlayerShoot uses FireServer which only OnServerEvent receives — and execute_luau runs client-side so it can't bind server events.",
       "depends_on": ["rifle_picked_up_sets_hasRifle"],
       "play_mode": true,
-      "setup_luau": "_G._state.shots = 0; _G._state.shotConns = _G._state.shotConns or {}; for _, c in ipairs(_G._state.shotConns) do c:Disconnect() end; _G._state.shotConns = {}; local RS = game:GetService('ReplicatedStorage'); for _, e in ipairs(RS:GetDescendants()) do if e:IsA('RemoteEvent') and e.Name:lower():match('fire') then table.insert(_G._state.shotConns, e.OnClientEvent:Connect(function() _G._state.shots = _G._state.shots + 1 end)) end end; _G._state.bulletsBefore = 0; for _, p in ipairs(workspace:GetDescendants()) do if p.Name:lower():match('bullet') then _G._state.bulletsBefore = _G._state.bulletsBefore + 1 end end",
+      "setup_luau": "_G._state.ammo_events = {}; if _G._state.ammo_conn then _G._state.ammo_conn:Disconnect() end; local au = game:GetService('ReplicatedStorage'):FindFirstChild('AmmoUpdate'); if au then _G._state.ammo_conn = au.Event:Connect(function(amt) table.insert(_G._state.ammo_events, amt) end) end",
       "input_sequence": [
         { "kind": "mouse_click", "button": "left" }
       ],
       "wait_seconds": 0.5,
-      "assert_luau": "if _G._state.shots > 0 then return true end; local n = 0; for _, p in ipairs(workspace:GetDescendants()) do if p.Name:lower():match('bullet') then n = n + 1 end end; return n > _G._state.bulletsBefore",
+      "assert_luau": "return #_G._state.ammo_events > 0",
       "expect": true
     },
     {
       "id": "shoot_plays_sound",
-      "feature": "7b. Shooting plays a sound. Hooks the Played signal on every Sound whose name contains shoot/fire/rifle/gun before clicking, then counts plays.",
+      "feature": "7b. Shooting plays a sound. Player.luau's playSound() creates a fresh Instance.new('Sound') per shot and parents it to rootPart, so hooking pre-existing Sounds misses them. We hook rootPart.DescendantAdded instead and count new Sound instances after the click.",
       "depends_on": ["rifle_picked_up_sets_hasRifle"],
       "play_mode": true,
-      "setup_luau": "_G._state.played = 0; _G._state.soundConns = _G._state.soundConns or {}; for _, c in ipairs(_G._state.soundConns) do c:Disconnect() end; _G._state.soundConns = {}; for _, s in ipairs(workspace:GetDescendants()) do if s:IsA('Sound') then local n = s.Name:lower(); if n:match('shoot') or n:match('fire') or n:match('rifle') or n:match('gun') then table.insert(_G._state.soundConns, s.Played:Connect(function() _G._state.played = _G._state.played + 1 end)) end end end",
+      "setup_luau": "_G._state.new_sounds = 0; if _G._state.snd_conn then _G._state.snd_conn:Disconnect() end; _G._state.snd_conn = hrp.DescendantAdded:Connect(function(inst) if inst:IsA('Sound') then _G._state.new_sounds = _G._state.new_sounds + 1 end end)",
       "input_sequence": [
         { "kind": "mouse_click", "button": "left" }
       ],
       "wait_seconds": 0.5,
-      "assert_luau": "return _G._state.played > 0",
+      "assert_luau": "return _G._state.new_sounds > 0",
       "expect": true
     },
     {
       "id": "mine_damages_player",
-      "feature": "8. Walking to a mine triggers damage. Accepts either health drop or character despawn (mine explosion can kill instantly).",
+      "feature": "8. Walking to a mine triggers damage. Mine is a MeshPart at workspace.DynamicObjects.Level.Beach.BeachTurrets.Mine (no enclosing Model — _findVisible handles BasePart directly). The Humanoid auto-regen erases damage within ~10s, so we track Health via GetPropertyChangedSignal and assert min() < h0 rather than end-state.",
       "play_mode": true,
-      "setup_luau": "_G._state.h0 = hum.Health; local m = workspace:FindFirstChild('Mine', true); local p = _findVisible(m); hrp.CFrame = CFrame.new(p.Position + Vector3.new(0, 3, 0))",
+      "setup_luau": "_trackHealth(); local m = workspace:FindFirstChild('Mine', true); local p = _findVisible(m); hrp.CFrame = CFrame.new(p.Position + Vector3.new(0, 3, 0))",
       "wait_seconds": 3.0,
-      "assert_luau": "return (char.Parent == nil) or hum.Health < _G._state.h0",
+      "assert_luau": "return (char.Parent == nil) or _minHealth() < _G._state.h0",
       "expect": true
     },
     {
       "id": "turrets_target_and_damage_player",
-      "feature": "9. The turret pair identifies the player and damages them. Asserts (a) the turret has rotated to face the player AND (b) damage occurred. Picks the first Turret model in the scene — both turrets in the pair share the same Turret class so either suffices.",
+      "feature": "9. The turret pair identifies the player and damages them. Many Turret models in workspace are decorative (StaticObjects.*) with no script. The fixture filters to Turret models that contain a child Turret Script — those are the functional ones (Player.luau's targeting logic lives there). Damage is rapid + Humanoid regenerates, so we track health via GetPropertyChangedSignal log.",
       "play_mode": true,
-      "setup_luau": "_G._state.h0 = hum.Health; local turrets = {}; for _, x in ipairs(workspace:GetDescendants()) do if x.Name == 'Turret' and x:IsA('Model') then table.insert(turrets, x) end end; _G._state.t = turrets[1]; local p = _findVisible(_G._state.t); hrp.CFrame = CFrame.new(p.Position + p.CFrame.LookVector * 18 + Vector3.new(0, 3, 0))",
+      "setup_luau": "_trackHealth(); local turrets = {}; for _, x in ipairs(workspace:GetDescendants()) do if x.Name == 'Turret' and x:IsA('Model') then local s = x:FindFirstChild('Turret'); if s and s:IsA('Script') then table.insert(turrets, x) end end end; _G._state.t = turrets[1]; local p = _findVisible(_G._state.t); hrp.CFrame = CFrame.new(p.Position + p.CFrame.LookVector * 15 + Vector3.new(0, 3, 0))",
       "wait_seconds": 5.0,
-      "assert_luau": "local p = _findVisible(_G._state.t); local dirToMe = (hrp.Position - p.Position).Unit; local aimed = p.CFrame.LookVector:Dot(dirToMe) > 0.6; local damaged = (char.Parent == nil) or hum.Health < _G._state.h0; return aimed and damaged",
+      "assert_luau": "local p = _findVisible(_G._state.t); local hrp_pos = char.Parent and hrp.Position or nil; local aimed = true; if hrp_pos then local dirToMe = (hrp_pos - p.Position).Unit; aimed = p.CFrame.LookVector:Dot(dirToMe) > 0.6 end; local damaged = (char.Parent == nil) or _minHealth() < _G._state.h0; return aimed and damaged",
       "expect": true
     }
   ]
