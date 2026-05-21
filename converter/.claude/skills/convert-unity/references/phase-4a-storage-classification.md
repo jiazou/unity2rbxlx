@@ -66,17 +66,7 @@ The classifier (`converter/converter/storage_classifier.py`) emits a proposed `s
 
 ## Structured overrides (per-project)
 
-Two override surfaces survive the conversion through `conversion_plan.json` and are honored by the contract pipeline (`--scene-runtime=generic|auto`) without ad-hoc skill-side script injection. Use these instead of hand-editing transpiled `.luau` between 4b and 4c — they round-trip across resume/rebuild.
-
-### `storage_plan.overrides_applied`
-
-Pre-4b operator edits to per-script / per-template container choices. Shape:
-
-```
-overrides_applied: [{script, from, to, reason}]
-```
-
-`storage_classifier` re-reads this each time it runs, so a `transpile → review → assemble` loop keeps the override pinned. Use when the classifier's first-match rule misclassifies a script the call graph can't disambiguate (e.g. a config module both client and server read but neither requires).
+`scene_runtime.domain_overrides` is the single override surface the contract pipeline (`--scene-runtime=generic|auto`) currently honors round-trip. Use it instead of hand-editing transpiled `.luau` between 4b and 4c — entries survive resume/rebuild.
 
 ### `scene_runtime.domain_overrides`
 
@@ -86,6 +76,10 @@ Per-MonoBehaviour-class `client`/`server` pins for the contract pipeline (Piece 
 - Pin a low-confidence-classified class flagged in the `scene_runtime.low_confidence_modules` list.
 
 The displaced-instance report (`scene_runtime.displaced_instances`) enumerates which instance hosts moved as a consequence — review before signing off.
+
+### `storage_plan.overrides_applied` (NOT yet sticky)
+
+`StoragePlan` declares `overrides_applied: [{script, from, to, reason}]` and the classifier emits it as a *report* of moves it applied, but the pipeline does NOT yet ingest operator-edited entries — `_classify_storage` rebuilds the plan from scratch on every `write_output` pass and overwrites `conversion_plan.json`. The wiring gap is tracked in `converter/TODO.md` (P1, "Phase 4a.5 agent-override ingestion is unimplemented"). Until that lands, expect manual `storage_plan` edits to be discarded by the next `assemble`; prefer the `scene_runtime.domain_overrides` path for any override that has a domain-classification equivalent.
 
 ## Output
 

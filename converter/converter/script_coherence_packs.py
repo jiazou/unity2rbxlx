@@ -170,12 +170,11 @@ def run_packs(
 #
 # ``_PICKUP_REPLACEMENT`` is the canonical Pickup script body the
 # ``pickup_visual_target`` pack rewires onto any genre's Pickup script
-# (Rifle, Battery, Key, Ammo, Health, …). ``_PICKUP_TOUCHED_CODE`` is
-# the mount-agnostic client-side Touched listener the
-# ``pickup_remote_event_client`` pack splices into Player-style
-# controllers. Both blocks survived the PR8 retirement of the
-# FPS-specific weapon-mount pack because non-FPS Pickup conversions
-# rely on them.
+# (Rifle, Battery, Key, Ammo, Health, …). It survived the PR8
+# retirement of the FPS-specific weapon-mount pack because non-FPS
+# Pickup conversions rely on it; ``pickup_remote_event_client``
+# emits its own client listener body directly so the mount-agnostic
+# Touched block that previously lived here is no longer needed.
 
 
 _PICKUP_REPLACEMENT = """local RunService = game:GetService("RunService")
@@ -308,34 +307,6 @@ if touchPart then
 \tend)
 end
 """
-
-
-# Client-side pickup detection is genre-agnostic — runs once per Player
-# script. The marker is the leading comment line itself, so this remains
-# byte-identical to the pre-refactor output.
-_PICKUP_TOUCHED_MARKER = "-- Client-side pickup detection"
-_PICKUP_TOUCHED_CODE = (
-    '\n' + _PICKUP_TOUCHED_MARKER + '\n'
-    'if character then\n'
-    '    for _, part in character:GetChildren() do\n'
-    '        if part:IsA("BasePart") then\n'
-    '            part.Touched:Connect(function(other)\n'
-    '                local pm = other:FindFirstAncestorOfClass("Model")\n'
-    '                if pm and (pm.Name:lower():find("pickup") or pm:FindFirstChild("Pickup")) then\n'
-    '                    local sc = pm:FindFirstChild("Pickup") or pm:FindFirstChildWhichIsA("Script")\n'
-    '                    local iname = (sc and sc:GetAttribute("itemName"))\n'
-    '                        or pm:GetAttribute("itemName") or ""\n'
-    '                    if iname == "" and pm.Name:lower():find("rifle") then iname = "Rifle" end\n'
-    '                    if iname == "" and pm.Name:lower():find("key") then iname = "Key" end\n'
-    '                    if iname == "" and pm.Name:lower():find("ammo") then iname = "Ammo" end\n'
-    '                    if iname == "" and (pm.Name:lower():find("health") or pm.Name:lower():find("hp")) then iname = "Health" end\n'
-    '                    if iname ~= "" then getItem(iname); pm:Destroy() end\n'
-    '                end\n'
-    '            end)\n'
-    '        end\n'
-    '    end\n'
-    'end\n'
-)
 
 
 # ---------------------------------------------------------------------------

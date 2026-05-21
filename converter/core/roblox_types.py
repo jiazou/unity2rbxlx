@@ -79,7 +79,8 @@ class RbxScript:
     # and rehydration paths in write_output so the final rewrite can reach
     # nested-dir scripts (animations/, animation_data/, scriptable_objects/,
     # ...). ``None`` for scripts injected in-memory after rehydration (e.g.
-    # bootstrap, FPS controller).
+    # the ClientBootstrap LocalScript or any auto-gen script reseeded after
+    # the disk cache was wiped).
     source_path: str | None = None
 
 
