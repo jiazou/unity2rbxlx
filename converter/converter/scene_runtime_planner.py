@@ -159,6 +159,13 @@ class SceneRuntimeScene(TypedDict):
 
 class SceneRuntimePrefab(TypedDict):
     name: str
+    # R2-P1.2: bare template name as emitted under
+    # ``ReplicatedStorage.Templates`` by ``prefab_packages``. The stable
+    # ``prefab_id`` (the key in ``scene_runtime.prefabs``) carries the
+    # GUID + path; the host runtime can't feed that to
+    # ``Templates:FindFirstChild(...)`` directly, so the planner persists
+    # the bare name here. Always equals ``PrefabTemplate.name``.
+    template_name: str
     instances: list[SceneRuntimeInstance]
     references: list[SceneRuntimeReference]
     lifecycle_order: list[str]
@@ -761,6 +768,9 @@ def _walk_prefab(
 
     return {
         "name": template.name,
+        # R2-P1.2: bare template name resolves prefab_id ->
+        # ReplicatedStorage.Templates[name] for runtime lookup.
+        "template_name": template.name,
         "instances": instances,
         "references": references,
         "lifecycle_order": lifecycle,

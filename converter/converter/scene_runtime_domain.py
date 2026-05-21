@@ -551,11 +551,21 @@ def _stamp_container_and_path(
     module: SceneRuntimeModule, scripts_by_class: dict[str, RbxScript],
 ) -> None:
     """Copy storage_classifier's parent_path onto the module row, plus
-    a relative module_path the host runtime can require.
+    the dotted DataModel path the host runtime requires().
 
     The storage classifier has already routed scripts to their concrete
     containers. PR3b doesn't second-guess that decision; it just makes
     the choice visible in the artifact alongside ``domain``.
+
+    Contract (per scene-runtime-contract.md Piece 5 / R2-P1.1
+    resolution): ``module_path`` is the live Roblox DataModel path,
+    dot-joined (``"ReplicatedStorage.Foo"``,
+    ``"StarterPlayer.StarterPlayerScripts.Bar"``). The generated
+    SceneRuntimeClient/Server entrypoints walk
+    ``game:FindFirstChild(...)`` down the dotted path to resolve the
+    ModuleScript. Pre-R2 the planner emitted an on-disk path
+    (``"scripts/Foo.luau"``) the entrypoints could not resolve --
+    every runtime-bearing MonoBehaviour failed to require at boot.
     """
     script = scripts_by_class.get(module.get("class_name", ""))
     if script is None:
@@ -563,11 +573,12 @@ def _stamp_container_and_path(
     container = script.parent_path or ""
     if container:
         module["container"] = container
-    # Module path: scripts always land under ``scripts/`` per the
-    # pipeline's emit phase. The stem is the canonical script id key,
-    # but the *file* name follows the RbxScript.name (class name).
-    if script.name:
-        module["module_path"] = f"scripts/{script.name}.luau"
+    # Module path: dotted DataModel path the host can FindFirstChild
+    # down. ``container`` is the same shape (e.g.
+    # ``"StarterPlayer.StarterPlayerScripts"``) -- joining with a "."
+    # produces a path Roblox's path-walker can navigate.
+    if script.name and container:
+        module["module_path"] = f"{container}.{script.name}"
 
 
 # ---------------------------------------------------------------------------

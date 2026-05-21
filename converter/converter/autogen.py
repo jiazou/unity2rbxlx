@@ -607,10 +607,13 @@ local function workspaceFind(sceneRuntimeId)
 end
 
 local function resolveModule(scriptId, modulePath)
-    -- modulePath is a forward-slashed Roblox path like
-    -- ``ReplicatedStorage/Foo`` or ``StarterPlayer/StarterPlayerScripts/Bar``.
+    -- modulePath is the live DataModel path, dot-joined
+    -- (``"ReplicatedStorage.Foo"`` /
+    -- ``"StarterPlayer.StarterPlayerScripts.Bar"``). The planner stamps
+    -- this in scene_runtime_domain._stamp_container_and_path; the host
+    -- splits on "." and walks game:FindFirstChild(...) down the chain.
     if type(modulePath) ~= "string" or modulePath == "" then return nil end
-    local parts = string.split(modulePath, "/")
+    local parts = string.split(modulePath, ".")
     local node = game
     for _, part in ipairs(parts) do
         node = node:FindFirstChild(part)
@@ -621,6 +624,22 @@ local function resolveModule(scriptId, modulePath)
         if ok then return mod end
     end
     return nil
+end
+
+-- SceneRuntimePlan carries ``plan.prefabs[prefab_id].template_name``
+-- (R2-P1.2 resolution): the bare template name prefab_packages emitted
+-- under ReplicatedStorage.Templates. Look up via that map so the
+-- stable prefab_id resolves to the right Templates entry even when
+-- two prefabs share a bare name in different folders.
+local function _resolveTemplate(prefabId)
+    local prefab = (Plan.prefabs or {})[prefabId]
+    local templateName = prefab and prefab.template_name
+    if type(templateName) ~= "string" or templateName == "" then
+        return nil
+    end
+    local templates = RS:FindFirstChild("Templates")
+    if not templates then return nil end
+    return templates:FindFirstChild(templateName)
 end
 
 local services = {
@@ -638,9 +657,7 @@ local services = {
         return inst and inst:GetAttribute("_SceneRuntimeId")
     end,
     clonePrefabTemplate = function(prefabId, parent, cframe)
-        local templates = RS:FindFirstChild("ScenePrefabs")
-        if not templates then return nil end
-        local tpl = templates:FindFirstChild(prefabId)
+        local tpl = _resolveTemplate(prefabId)
         if not tpl then return nil end
         local clone = tpl:Clone()
         if parent then clone.Parent = parent end
@@ -702,8 +719,11 @@ local function workspaceFind(sceneRuntimeId)
 end
 
 local function resolveModule(scriptId, modulePath)
+    -- modulePath is the live DataModel path, dot-joined
+    -- (``"ReplicatedStorage.Foo"`` /
+    -- ``"ServerScriptService.Bar"``). Matches client entrypoint.
     if type(modulePath) ~= "string" or modulePath == "" then return nil end
-    local parts = string.split(modulePath, "/")
+    local parts = string.split(modulePath, ".")
     local node = game
     for _, part in ipairs(parts) do
         node = node:FindFirstChild(part)
@@ -714,6 +734,20 @@ local function resolveModule(scriptId, modulePath)
         if ok then return mod end
     end
     return nil
+end
+
+-- See SceneRuntimeClient for the rationale: prefab templates live
+-- under ReplicatedStorage.Templates keyed by bare prefab name; the
+-- plan's ``template_name`` field bridges the stable prefab_id.
+local function _resolveTemplate(prefabId)
+    local prefab = (Plan.prefabs or {})[prefabId]
+    local templateName = prefab and prefab.template_name
+    if type(templateName) ~= "string" or templateName == "" then
+        return nil
+    end
+    local templates = RS:FindFirstChild("Templates")
+    if not templates then return nil end
+    return templates:FindFirstChild(templateName)
 end
 
 local services = {
@@ -731,10 +765,7 @@ local services = {
         return inst and inst:GetAttribute("_SceneRuntimeId")
     end,
     clonePrefabTemplate = function(prefabId, parent, cframe)
-        local templates = game:GetService("ServerStorage"):FindFirstChild("ScenePrefabs")
-            or RS:FindFirstChild("ScenePrefabs")
-        if not templates then return nil end
-        local tpl = templates:FindFirstChild(prefabId)
+        local tpl = _resolveTemplate(prefabId)
         if not tpl then return nil end
         local clone = tpl:Clone()
         if parent then clone.Parent = parent end

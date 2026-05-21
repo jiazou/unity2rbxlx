@@ -113,7 +113,7 @@ class TestPlanToLuauEncoder:
         plan = {
             "modules": {
                 "g1": {"stem": "Foo", "runtime_bearing": True,
-                       "domain": "client", "module_path": "RS/Foo"},
+                       "domain": "client", "module_path": "ReplicatedStorage.Foo"},
                 "g2": {"stem": "Bar", "runtime_bearing": False},
             },
             "scenes": {
@@ -208,6 +208,53 @@ class TestEntrypointGenerators:
         assert script.source.strip().startswith("--")
         assert "return" in script.source
 
+    def test_entrypoints_split_module_path_on_dot_not_slash(self):
+        """R2-P1.1: ``module_path`` is the dotted DataModel path. Both
+        client and server entrypoints must split on ``"."`` so they can
+        walk ``game:FindFirstChild(...)`` down the chain. Pre-fix the
+        entrypoints used ``string.split(modulePath, "/")`` which silently
+        accepted the planner's old ``"scripts/Foo.luau"`` shape but
+        couldn't actually resolve a ModuleScript in production.
+        """
+        for gen in (
+            generate_scene_runtime_client_entrypoint,
+            generate_scene_runtime_server_entrypoint,
+        ):
+            src = gen().source
+            assert 'string.split(modulePath, ".")' in src, (
+                f"{gen.__name__} must split modulePath on '.'; source: {src}"
+            )
+            assert 'string.split(modulePath, "/")' not in src, (
+                f"{gen.__name__} must NOT split modulePath on '/'; that "
+                f"shape was the pre-R2 on-disk path the host couldn't "
+                f"resolve in production"
+            )
+
+    def test_entrypoints_resolve_prefab_via_template_name_map(self):
+        """R2-P1.2: prefab templates live under
+        ``ReplicatedStorage.Templates`` keyed by bare prefab name.
+        Entrypoints must look up the bare name via
+        ``plan.prefabs[prefab_id].template_name`` rather than feeding
+        the stable ``prefab_id`` (which includes a GUID + path) directly
+        to ``Templates:FindFirstChild(...)``.
+        """
+        for gen in (
+            generate_scene_runtime_client_entrypoint,
+            generate_scene_runtime_server_entrypoint,
+        ):
+            src = gen().source
+            assert "Templates" in src, (
+                f"{gen.__name__} must read from ReplicatedStorage.Templates"
+            )
+            assert "ScenePrefabs" not in src, (
+                f"{gen.__name__} must NOT reference the legacy "
+                f"ScenePrefabs folder (typo from PR4 round 1)"
+            )
+            assert "template_name" in src, (
+                f"{gen.__name__} must resolve via the plan's "
+                f"template_name map (R2-P1.2)"
+            )
+
 
 # ---------------------------------------------------------------------------
 # compute_cross_domain_edges
@@ -219,9 +266,9 @@ def _make_artifact_with_edge(
     return {
         "modules": {
             "src": {"stem": "Src", "runtime_bearing": True,
-                    "domain": src_domain, "module_path": "RS/Src"},
+                    "domain": src_domain, "module_path": "ReplicatedStorage.Src"},
             "tgt": {"stem": "Tgt", "runtime_bearing": True,
-                    "domain": tgt_domain, "module_path": "RS/Tgt"},
+                    "domain": tgt_domain, "module_path": "ReplicatedStorage.Tgt"},
         },
         "scenes": {
             "A.unity": {
@@ -290,9 +337,9 @@ class TestComputeCrossDomainEdges:
         plan = {
             "modules": {
                 "src": {"stem": "Src", "runtime_bearing": True,
-                        "domain": "client", "module_path": "RS/Src"},
+                        "domain": "client", "module_path": "ReplicatedStorage.Src"},
                 "tgt": {"stem": "Tgt", "runtime_bearing": True,
-                        "domain": "server", "module_path": "RS/Tgt"},
+                        "domain": "server", "module_path": "ReplicatedStorage.Tgt"},
             },
             "scenes": {},
             "prefabs": {

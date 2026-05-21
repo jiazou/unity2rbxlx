@@ -57,7 +57,7 @@ def _runtime_bearing_plan() -> dict:
                 "stem": "Foo",
                 "runtime_bearing": True,
                 "domain": "client",
-                "module_path": "ReplicatedStorage/Foo",
+                "module_path": "ReplicatedStorage.Foo",
             },
         },
         "scenes": {},
@@ -167,9 +167,9 @@ class TestCrossDomainReport:
         plan = {
             "modules": {
                 "src": {"stem": "Src", "runtime_bearing": True,
-                        "domain": "client", "module_path": "RS/Src"},
+                        "domain": "client", "module_path": "ReplicatedStorage.Src"},
                 "tgt": {"stem": "Tgt", "runtime_bearing": True,
-                        "domain": "server", "module_path": "RS/Tgt"},
+                        "domain": "server", "module_path": "ReplicatedStorage.Tgt"},
             },
             "scenes": {
                 "A.unity": {
@@ -217,9 +217,9 @@ class TestCrossDomainReport:
         plan_v1 = {
             "modules": {
                 "src": {"stem": "Src", "runtime_bearing": True,
-                        "domain": "client", "module_path": "RS/Src"},
+                        "domain": "client", "module_path": "ReplicatedStorage.Src"},
                 "tgt": {"stem": "Tgt", "runtime_bearing": True,
-                        "domain": "server", "module_path": "RS/Tgt"},
+                        "domain": "server", "module_path": "ReplicatedStorage.Tgt"},
             },
             "scenes": {
                 "A.unity": {
@@ -260,9 +260,9 @@ class TestCrossDomainReport:
         plan = {
             "modules": {
                 "src": {"stem": "Src", "runtime_bearing": True,
-                        "domain": "client", "module_path": "RS/Src"},
+                        "domain": "client", "module_path": "ReplicatedStorage.Src"},
                 "tgt": {"stem": "Tgt", "runtime_bearing": True,
-                        "domain": "server", "module_path": "RS/Tgt"},
+                        "domain": "server", "module_path": "ReplicatedStorage.Tgt"},
             },
             "scenes": {
                 "A.unity": {
