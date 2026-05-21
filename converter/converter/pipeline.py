@@ -4961,9 +4961,35 @@ script.Disabled = true
         # if this run is clean (or a legacy fallback), the list must
         # be empty; if this run downgrades, the code below re-stages
         # the current diagnostics.
+        #
+        # Codex R2-P2 (round 2): the same persistence issue applies to
+        # ``cross_domain_edges`` -- ``_subphase_inject_scene_runtime``
+        # only rewrites them on the non-early-out path (generic + has
+        # runtime-bearing). A prior generic-run-with-edges followed by
+        # a legacy or no-runtime-bearing rerun would leave the stale
+        # edge block in UNCONVERTED.md. Reset both here so the guard
+        # subphase owns the per-write_output reset of every
+        # scene-runtime artefact UNCONVERTED.md renders.
         scene_runtime_for_reset = self.ctx.scene_runtime
         if isinstance(scene_runtime_for_reset, dict):
             scene_runtime_for_reset["nonplayable_warnings"] = []
+            # Only reset edges when this run is NOT going to write them
+            # itself -- i.e. when mode is legacy (subphase short-
+            # circuited and edges from a prior generic run would
+            # survive otherwise). Under generic the
+            # ``_subphase_inject_scene_runtime`` already overwrote them
+            # earlier in write_output; clearing here would race with
+            # that fresh write. The mode check below also handles
+            # generic-with-no-runtime-bearing, which returns before
+            # touching edges and so needs the explicit clear.
+            mode = self.ctx.scene_runtime_mode
+            modules = scene_runtime_for_reset.get("modules") or {}
+            has_runtime_bearing = isinstance(modules, dict) and any(
+                isinstance(r, dict) and r.get("runtime_bearing")
+                for r in modules.values()
+            )
+            if mode != "generic" or not has_runtime_bearing:
+                scene_runtime_for_reset["cross_domain_edges"] = []
 
         # PR6: legacy never emitted the host runtime; let the legacy
         # path through. ``auto`` rewrote ``scene_runtime_mode`` to

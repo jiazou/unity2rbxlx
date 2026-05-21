@@ -697,6 +697,69 @@ class TestNonplayableWarningResetAcrossReruns:
         # Legacy short-circuit still must have cleared the list.
         assert p.ctx.scene_runtime["nonplayable_warnings"] == []
 
+    def test_legacy_rerun_clears_stale_cross_domain_edges(self, tmp_path):
+        # Codex R2-P2 absorbed: cross_domain_edges are only rewritten
+        # by ``_subphase_inject_scene_runtime`` on the non-early-out
+        # path. A prior generic run with edges followed by a legacy
+        # rerun would leave the stale block in UNCONVERTED.md. The
+        # guard subphase now resets ``cross_domain_edges`` to ``[]``
+        # under any non-generic mode (or generic with no
+        # runtime-bearing modules).
+        p = _make_pipeline_with_ctx(
+            tmp_path, "legacy", _valid_runtime_plan(),
+        )
+        p.ctx.scene_runtime["cross_domain_edges"] = [
+            {"from_script": "src", "to_script": "tgt",
+             "from_domain": "client", "to_domain": "server"}
+        ]
+        p._check_runtime_playability_guard()
+        # Legacy doesn't carry cross-domain edges; the guard wiped
+        # the stale block.
+        assert p.ctx.scene_runtime.get("cross_domain_edges") == []
+
+    def test_generic_with_no_runtime_bearing_clears_cross_domain(
+        self, tmp_path,
+    ):
+        # Same P2 case but under generic with no runtime-bearing
+        # modules (the host emit subphase early-returns and never
+        # touches edges itself). The guard must still wipe.
+        plan = {
+            "modules": {
+                "guid-helper": {"stem": "H", "runtime_bearing": False},
+            },
+            "scenes": {}, "prefabs": {}, "domain_overrides": {},
+        }
+        p = _make_pipeline_with_ctx(tmp_path, "generic", plan)
+        p.ctx.scene_runtime["cross_domain_edges"] = [
+            {"from_script": "old", "to_script": "old_tgt",
+             "from_domain": "client", "to_domain": "server"}
+        ]
+        p._check_runtime_playability_guard()
+        assert p.ctx.scene_runtime["cross_domain_edges"] == []
+
+    def test_generic_with_runtime_bearing_keeps_fresh_cross_domain(
+        self, tmp_path,
+    ):
+        # Counter-test: under generic with runtime-bearing modules,
+        # ``_subphase_inject_scene_runtime`` already overwrote edges
+        # earlier in write_output. The guard MUST NOT clobber that
+        # fresh write -- the reset is gated on
+        # mode != "generic" OR no-runtime-bearing.
+        p = _make_pipeline_with_ctx(
+            tmp_path, "generic", _valid_runtime_plan(),
+        )
+        for s in _host_scripts():
+            p.state.rbx_place.scripts.append(s)
+        # Simulate the post-_subphase_inject_scene_runtime state.
+        p.ctx.scene_runtime["cross_domain_edges"] = [
+            {"from_script": "fresh", "to_script": "fresh_tgt",
+             "from_domain": "client", "to_domain": "server"}
+        ]
+        p._check_runtime_playability_guard()
+        # The guard did NOT clobber the fresh edges.
+        assert len(p.ctx.scene_runtime["cross_domain_edges"]) == 1
+        assert p.ctx.scene_runtime["cross_domain_edges"][0]["from_script"] == "fresh"
+
 
 class TestStickyOptInPersistsThroughResume:
     """Codex R1-P1.A: ``--allow-nonplayable-output`` must survive a
@@ -760,16 +823,26 @@ class TestPR7CrossReference:
     fires after the auto->generic routing).
     """
 
-    def test_auto_clean_to_generic_then_guard_fires_on_incomplete_plan(
+    def test_auto_clean_routes_to_generic_then_guard_fires(
         self, tmp_path,
     ):
-        # Mimic what PR7's e2e default conversion will exercise: the
-        # user passes nothing, mode resolves to ``auto`` (PR7
-        # default), then ``_check_auto_fail_closed`` routes to
-        # ``generic`` because the plan is consistent enough to
-        # transpile (no fail-closed signals were raised). But the
-        # plan is incomplete -- the PR3b classifier never ran on this
-        # synthetic fixture, so ``module_path`` is empty.
+        # Codex R2-P3: the prior version of this test set
+        # ``scene_runtime_mode="generic"`` directly, never exercising
+        # ``_check_auto_fail_closed``. The whole PR7 cross-reference
+        # depends on auto correctly routing to generic before the
+        # guard runs -- otherwise PR7 could regress auto routing
+        # while the guard alone still works and this test wouldn't
+        # catch it.
+        #
+        # Mimic the PR7 default-auto flow more honestly:
+        # 1. Operator passes nothing; mode defaults to ``auto``.
+        # 2. ``_check_auto_fail_closed`` sees no fail-closed signals
+        #    (plan looks "consistent enough to transpile") and routes
+        #    to generic.
+        # 3. But the plan is structurally incomplete --
+        #    ``module_path`` is empty (the PR3b classifier never ran
+        #    on this synthetic fixture).
+        # 4. PR6 guard fires, refusing to write the broken place.
         plan = {
             "modules": {
                 "guid": {"stem": "PartialPlan", "runtime_bearing": True,
@@ -778,17 +851,58 @@ class TestPR7CrossReference:
                          "module_path": ""},
             },
             "scenes": {}, "prefabs": {}, "domain_overrides": {},
-            # Empty auto_fail_closed list -- the auto router routes
-            # to generic since no signals were detected.
-            "auto_fail_closed": [],
         }
-        p = _make_pipeline_with_ctx(tmp_path, "generic", plan)
+        p = _make_pipeline_with_ctx(tmp_path, "auto", plan)
         for s in _host_scripts():
             p.state.rbx_place.scripts.append(s)
+        # _check_auto_fail_closed needs ``state.transpilation_result``
+        # to drive the contract_pipeline scan. The mode-resolution
+        # branch we want hits the ``not transpilation_result`` /
+        # ``no prior verdict`` path -- but that conservatively
+        # routes to legacy, which would NOT fire the guard.
+        #
+        # The actual PR7 contract is: under auto with a clean
+        # transpile result + no fail-closed signals, mode resolves
+        # to generic. To exercise that path without standing up a
+        # real transpilation_result fixture, stage the post-route
+        # state directly: set the prior verdict to "[]" so the
+        # cached-decision branch reproduces "clean -> generic"
+        # ([pipeline.py:_check_auto_fail_closed], R2-P1.2 path).
+        p.ctx.scene_runtime["auto_fail_closed"] = []
+        p._check_auto_fail_closed()
+        assert p.ctx.scene_runtime_mode == "generic", (
+            "auto with clean prior verdict must route to generic; "
+            "PR7's default flip depends on this routing"
+        )
+        # Now the PR6 guard fires on the incomplete plan.
         with pytest.raises(RuntimeError) as exc_info:
             p._check_runtime_playability_guard()
         msg = str(exc_info.value)
-        # PR6 backstops PR7's default flip: even a "successful"
-        # generic routing under auto cannot ship a broken place.
         assert "PR6 playability guard" in msg
         assert "module_path" in msg
+
+    def test_auto_with_fail_closed_signal_routes_to_legacy_skips_guard(
+        self, tmp_path,
+    ):
+        # Symmetric to the test above: auto with a fail-closed
+        # verdict routes to legacy; the PR6 guard must NOT fire
+        # (legacy fallback is the intended safety net the PR5
+        # router already provides).
+        plan = {
+            "modules": {
+                "guid": {"stem": "X", "runtime_bearing": True,
+                         "domain": "client",
+                         "module_path": ""},
+            },
+            "scenes": {}, "prefabs": {}, "domain_overrides": {},
+            # Non-empty prior verdict -> _check_auto_fail_closed
+            # reproduces legacy routing.
+            "auto_fail_closed": [{"kind": "verifier", "detail": "synthetic"}],
+        }
+        p = _make_pipeline_with_ctx(tmp_path, "auto", plan)
+        # No host scripts and no transpile result -- the prior verdict
+        # branch fires.
+        p._check_auto_fail_closed()
+        assert p.ctx.scene_runtime_mode == "legacy"
+        # Guard short-circuits under legacy.
+        p._check_runtime_playability_guard()
