@@ -37,6 +37,7 @@ from converter.scene_converter import (
 )
 from converter.ui_translator import convert_canvas
 from core.unity_types import ComponentData, ParsedScene, SceneNode
+from roblox.rbxlx_writer import write_rbxlx
 
 
 SCENE_PATH = Path("Assets/Scenes/UI.unity")
@@ -176,9 +177,10 @@ class TestCollectUiChildSuppressionIds:
         })
 
     def test_non_runtime_bearing_mb_does_not_trigger(self):
-        """The carve-out gates on ``runtime_bearing`` — a legacy-routed
-        controller with the same prefab ref must NOT trigger suppression
-        (the host runtime never wires it; static emit is the only source)."""
+        """The carve-out gates on ``runtime_bearing`` — a module the
+        planner never marked runtime-bearing (e.g. a helper class
+        bound at edit time but not running on a MonoBehaviour) must
+        not trigger suppression."""
         artifact = {
             "modules": {
                 "OldController": {
@@ -193,6 +195,58 @@ class TestCollectUiChildSuppressionIds:
                         {
                             "instance_id": f"{SCENE_PATH.as_posix()}:2002",
                             "script_id": "OldController",
+                            "game_object_id": f"{SCENE_PATH.as_posix()}:200",
+                            "active": True,
+                            "enabled": True,
+                            "config": {},
+                        },
+                    ],
+                    "references": [
+                        {
+                            "from": f"{SCENE_PATH.as_posix()}:2002",
+                            "field": "itemPrefab",
+                            "index": None,
+                            "target_kind": "prefab",
+                            "target_ref": "guidpath:Assets/Prefabs/Item.prefab",
+                            "target_is_ui": False,
+                        },
+                    ],
+                    "lifecycle_order": [],
+                },
+            },
+        }
+        assert _collect_ui_child_suppression_ids(artifact) == frozenset()
+
+    def test_fail_closed_legacy_domain_does_not_trigger(self):
+        """Codex P1: when PR3b's domain classifier forces a runtime-
+        bearing module to ``domain="legacy"`` (both-side API,
+        intra-class conflict, reachability conflict), the host runtime
+        never wires that module — so the static UI subtree under its
+        host element MUST persist. The carve-out must exclude
+        domain=legacy entries even when ``runtime_bearing`` is True.
+
+        At ``convert_scene`` time the classifier hasn't run yet
+        (subphase order: convert_scene → _classify_storage), so the
+        ``domain`` field is typically absent in the artifact. This
+        test pins the guard for the case where a post-classify
+        artifact is threaded through (e.g. by a future architecture
+        change, or by a caller that runs convert_scene a second time
+        after classify)."""
+        artifact = {
+            "modules": {
+                "ConflictedController": {
+                    "stem": "ConflictedController",
+                    "class_name": "ConflictedController",
+                    "runtime_bearing": True,
+                    "domain": "legacy",  # PR3b fail-closed verdict.
+                },
+            },
+            "scenes": {
+                str(SCENE_PATH): {
+                    "instances": [
+                        {
+                            "instance_id": f"{SCENE_PATH.as_posix()}:2002",
+                            "script_id": "ConflictedController",
                             "game_object_id": f"{SCENE_PATH.as_posix()}:200",
                             "active": True,
                             "enabled": True,
@@ -491,12 +545,27 @@ class TestEndToEndConvertScene:
             controller_host.children, "StaticGrandchild",
         ) is not None
 
-    def test_legacy_snapshot_unaffected_by_scene_runtime_argument(self, tmp_path):
-        """Snapshot invariant: build the same UI scene twice under
-        legacy — once with no artifact, once with the populated one —
-        and assert the converted ScreenGui tree (recursive name list +
-        per-element attributes) is identical. Pins the brief's
-        "legacy emit byte-unchanged" guarantee for the UI path."""
+    def test_legacy_rbxlx_bytes_unchanged_with_or_without_scene_runtime(self, tmp_path):
+        """Strong byte-identity snapshot (codex P3): build the same UI
+        scene twice under legacy mode — once with no artifact, once
+        with the populated one — write each ``RbxPlace`` to disk via
+        ``write_rbxlx`` and assert the XML payload (with random
+        ``referent`` UUIDs stripped) is identical.
+
+        Stripping referents is necessary because ``rbxlx_writer``
+        generates them via ``uuid4`` per-call; the rest of the XML
+        (every per-element position, size, text, color, layout,
+        attribute) is fully deterministic and any carve-out leak
+        would surface as a byte diff. Strictly stronger pin than the
+        original class/name/attributes structural snapshot."""
+        import re
+        _referent_re = re.compile(rb' referent="RBX[0-9A-F]+"')
+        _ref_re = re.compile(rb'<Ref name="[^"]+">RBX[0-9A-F]+</Ref>')
+
+        def _normalize(b: bytes) -> bytes:
+            b = _referent_re.sub(b' referent="<DROPPED>"', b)
+            return _ref_re.sub(b'<Ref name="X"><DROPPED></Ref>', b)
+
         def _build() -> ParsedScene:
             return _build_scene(
                 tmp_path, _canvas_with_controller_and_static_descendants(),
@@ -511,20 +580,15 @@ class TestEndToEndConvertScene:
             scene_runtime_mode="legacy",
         )
 
-        def _snapshot(place) -> list[tuple[str, str, dict]]:
-            out: list[tuple[str, str, dict]] = []
-            for gui in place.screen_guis:
-                out.append(("ScreenGui", gui.name, dict(gui.attributes)))
-                stack: list = list(gui.elements)
-                while stack:
-                    e = stack.pop(0)
-                    out.append((e.class_name, e.name, dict(e.attributes)))
-                    stack[:0] = list(e.children)
-            return out
+        out_baseline = tmp_path / "baseline.rbxlx"
+        out_with_runtime = tmp_path / "with_runtime.rbxlx"
+        write_rbxlx(place_no_runtime, out_baseline)
+        write_rbxlx(place_with_runtime_legacy, out_with_runtime)
 
-        assert _snapshot(place_no_runtime) == _snapshot(
-            place_with_runtime_legacy
-        ), (
-            "legacy UI emit must be byte-unchanged regardless of whether "
-            "a scene_runtime artifact is threaded through"
+        baseline_bytes = _normalize(out_baseline.read_bytes())
+        with_runtime_bytes = _normalize(out_with_runtime.read_bytes())
+        assert baseline_bytes == with_runtime_bytes, (
+            "legacy UI emit must be byte-identical on disk (modulo "
+            "random referent UUIDs) regardless of whether a "
+            "scene_runtime artifact is threaded through"
         )

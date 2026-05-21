@@ -32,6 +32,7 @@ from converter.scene_converter import (
     convert_scene,
 )
 from core.unity_types import ComponentData, ParsedScene, SceneNode
+from roblox.rbxlx_writer import write_rbxlx
 
 
 SCENE_PATH = Path("Assets/Scenes/PR3c.unity")
@@ -46,6 +47,7 @@ def _make_node(
     children: list[SceneNode] | None = None,
     components: list[ComponentData] | None = None,
     position: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    rotation: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0),
 ) -> SceneNode:
     return SceneNode(
         name=name,
@@ -57,7 +59,7 @@ def _make_node(
         children=children or [],
         parent_file_id=None,
         position=position,
-        rotation=(0.0, 0.0, 0.0, 1.0),
+        rotation=rotation,
         scale=(1.0, 1.0, 1.0),
     )
 
@@ -309,6 +311,53 @@ class TestInactiveRetentionUnderGeneric:
         # one that activates / instantiates content under it.
         assert dormant.children == []
 
+    def test_dormant_holder_preserves_authored_rotation(self, tmp_path):
+        """Codex P2: a rotated inactive GO must reactivate at the
+        authored ORIENTATION, not identity. Pin this by emitting a
+        rotated dormant GO and asserting the holder's CFrame rotation
+        matrix matches what the active branch would produce for the
+        same authored quaternion.
+
+        Quaternion (0, sin(45°), 0, cos(45°)) ≈ (0, 0.707, 0, 0.707)
+        is a 90° rotation around Y. After Unity→Roblox quat conversion
+        + matrix expansion this must NOT be the 3x3 identity.
+        """
+        import math
+        rot_y_90 = (0.0, math.sin(math.pi / 4), 0.0, math.cos(math.pi / 4))
+        inactive = _make_node(
+            "RotatedDormant", file_id="42", active=False,
+            position=(0.0, 0.0, 0.0), rotation=rot_y_90,
+        )
+        scene = _make_scene([inactive], tmp_path)
+        artifact = _scene_runtime_referencing(f"{SCENE_PATH.as_posix()}:42")
+
+        place = convert_scene(
+            parsed_scene=scene,
+            unity_project_root=tmp_path,
+            scene_runtime=artifact,
+            scene_runtime_mode="generic",
+        )
+
+        dormant = _find_part_by_name(place.workspace_parts, "RotatedDormant")
+        assert dormant is not None
+        cf = dormant.cframe
+        # Identity 3x3 would have r00=r11=r22=1 and off-diagonals=0.
+        # A 90° Y rotation gives r00 ≈ 0, r02 ≈ ±1, r20 ≈ ∓1, r22 ≈ 0.
+        # The point is: the matrix is NOT identity — that's the codex
+        # P2 regression pin.
+        is_identity = (
+            abs((cf.r00 or 0.0) - 1.0) < 1e-6
+            and abs((cf.r11 or 0.0) - 1.0) < 1e-6
+            and abs((cf.r22 or 0.0) - 1.0) < 1e-6
+            and abs(cf.r01 or 0.0) < 1e-6 and abs(cf.r02 or 0.0) < 1e-6
+            and abs(cf.r10 or 0.0) < 1e-6 and abs(cf.r12 or 0.0) < 1e-6
+            and abs(cf.r20 or 0.0) < 1e-6 and abs(cf.r21 or 0.0) < 1e-6
+        )
+        assert not is_identity, (
+            "dormant holder must carry the authored rotation matrix, "
+            "not the 3x3 identity — codex P2 regression"
+        )
+
     def test_unreferenced_inactive_still_pruned_under_generic(self, tmp_path):
         """Carve-out is keyed on the planner reference set. An inactive
         GameObject the planner didn't tag remains pruned even under
@@ -359,19 +408,41 @@ class TestLegacyEmitByteUnchanged:
         assert _find_part_by_name(place.workspace_parts, "DormantTarget") is None
         assert _find_part_by_name(place.workspace_parts, "Live") is not None
 
-    def test_legacy_snapshot_unaffected_by_scene_runtime_argument(self, tmp_path):
-        """Snapshot: build the same scene twice under legacy mode — once
-        with no ``scene_runtime`` arg, once with a populated artifact that
-        references every inactive GO — and assert the resulting workspace
-        tree (recursive name list) is identical. This pins the
-        "legacy emit byte-unchanged" invariant in the brief: the carve-out
-        cannot perturb legacy output regardless of what the planner
-        produced (PR3b might emit something; PR3c legacy must ignore it).
+    def test_legacy_rbxlx_bytes_unchanged_with_or_without_scene_runtime(self, tmp_path):
+        """Strong byte-identity snapshot (codex P3): build the same
+        scene twice under legacy mode — once with no ``scene_runtime``
+        arg, once with a populated artifact that references every
+        inactive GO — write each ``RbxPlace`` to disk via
+        ``write_rbxlx`` and assert the XML payload (with random
+        ``referent="..."`` attributes stripped) is identical.
+
+        Stripping referents is necessary because ``rbxlx_writer``
+        generates them via ``uuid4`` per-call; the rest of the XML
+        (CFrames, sizes, colors, attributes — every per-instance
+        serialized field) is fully deterministic and any carve-out
+        leak would surface as a byte diff. This is a strictly
+        stronger pin than the original ``(name, class_name,
+        attributes)`` tuple snapshot.
         """
+        import re
+        # Drop random referent values (uuid4-generated, non-deterministic)
+        # while keeping the attribute slot so byte indexes still line up
+        # — what we care about is every OTHER serialized field staying
+        # identical between the two emits.
+        _referent_re = re.compile(rb' referent="RBX[0-9A-F]+"')
+        _ref_re = re.compile(rb'<Ref name="[^"]+">RBX[0-9A-F]+</Ref>')
+
+        def _normalize(b: bytes) -> bytes:
+            b = _referent_re.sub(b' referent="<DROPPED>"', b)
+            return _ref_re.sub(b'<Ref name="X"><DROPPED></Ref>', b)
+
         def _build_scene() -> ParsedScene:
             return _make_scene(
                 [
-                    _make_node("Live", file_id="10", active=True),
+                    _make_node(
+                        "Live", file_id="10", active=True,
+                        position=(1.0, 2.0, 3.0),
+                    ),
                     _make_node("InactiveA", file_id="20", active=False),
                     _make_node("InactiveB", file_id="30", active=False),
                 ],
@@ -415,15 +486,15 @@ class TestLegacyEmitByteUnchanged:
             scene_runtime_mode="legacy",
         )
 
-        def _snapshot(place) -> list[tuple[str, str, dict]]:
-            return [
-                (p.name, p.class_name, dict(p.attributes))
-                for p in _all_parts(place.workspace_parts)
-            ]
+        out_baseline = tmp_path / "baseline.rbxlx"
+        out_with_runtime = tmp_path / "with_runtime.rbxlx"
+        write_rbxlx(place_no_runtime, out_baseline)
+        write_rbxlx(place_with_runtime_under_legacy, out_with_runtime)
 
-        assert _snapshot(place_no_runtime) == _snapshot(
-            place_with_runtime_under_legacy
-        ), (
-            "legacy emit must be byte-unchanged regardless of whether a "
-            "scene_runtime artifact is threaded through"
+        baseline_bytes = _normalize(out_baseline.read_bytes())
+        with_runtime_bytes = _normalize(out_with_runtime.read_bytes())
+        assert baseline_bytes == with_runtime_bytes, (
+            "legacy emit must be byte-identical on disk (modulo random "
+            "referent UUIDs) regardless of whether a scene_runtime "
+            "artifact is threaded through"
         )

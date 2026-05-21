@@ -1143,6 +1143,20 @@ def _collect_ui_child_suppression_ids(
                 continue
             if not module_row.get("runtime_bearing"):
                 continue
+            # Codex P1: when the domain classifier has already run
+            # (`module_row["domain"]` is populated), exclude fail-closed
+            # modules. PR3b's classifier may force a module to
+            # ``domain="legacy"`` (both-side API, intra-class conflict,
+            # reachability conflict); the host runtime never wires those
+            # modules, so the static UI subtree must persist. At
+            # ``convert_scene`` time the classifier hasn't run yet
+            # (subphase order: ``convert_scene`` → ``_classify_storage``),
+            # so the field is typically absent — in that case we fall
+            # back to ``runtime_bearing`` per the brief. This guard fires
+            # only when callers (or future architecture changes) thread
+            # a post-classify artifact in.
+            if module_row.get("domain") == "legacy":
+                continue
             suppressed.add(game_object_id)
 
     scenes = scene_runtime.get("scenes", {})
@@ -1183,10 +1197,14 @@ def _emit_dormant_holder(
     CFrame is composed the same way as the active branch so the runtime
     sees the GameObject in its authored location.
     """
-    # World position composition mirrors the active branch in ``_convert_node``
-    # — walk the parent chain, accumulating each ancestor's local position
-    # rotated into the running world frame. Kept local instead of factored
-    # to avoid perturbing the hot path for active conversion.
+    # World position + rotation composition mirrors the active branch in
+    # ``_convert_node`` — walk the parent chain, accumulating each
+    # ancestor's local position rotated into the running world frame and
+    # multiplying the running world rotation. A rotated authoring of an
+    # inactive GO must reactivate at the right ORIENTATION as well as the
+    # right position; emitting identity rotation lost the authored quat
+    # (codex P2). Kept local instead of factored to avoid perturbing the
+    # hot path for active conversion.
     _chain: list[SceneNode] = []
     _pf = node.parent_file_id
     while _pf and _pf in scene_nodes:
@@ -1206,12 +1224,20 @@ def _emit_dormant_holder(
     wx = world_pos[0] + node_pos_rotated[0]
     wy = world_pos[1] + node_pos_rotated[1]
     wz = world_pos[2] + node_pos_rotated[2]
+    world_rot = _quat_multiply(world_rot, list(node.rotation))
 
     rx, ry, rz = unity_to_roblox_pos(wx, wy, wz)
+    rqx, rqy, rqz, rqw = unity_quat_to_roblox_quat(*world_rot)
+    rot = quaternion_to_rotation_matrix(rqx, rqy, rqz, rqw)
     holder = RbxPart(
         name=node.name,
         class_name="Model",
-        cframe=RbxCFrame(x=rx, y=ry, z=rz),
+        cframe=RbxCFrame(
+            x=rx, y=ry, z=rz,
+            r00=rot[0], r01=rot[1], r02=rot[2],
+            r10=rot[3], r11=rot[4], r12=rot[5],
+            r20=rot[6], r21=rot[7], r22=rot[8],
+        ),
     )
     # Stamp the holder with ``_SceneRuntimeId`` so the planner row binds
     # to it the same way an active GameObject would. ``_Active = false``
