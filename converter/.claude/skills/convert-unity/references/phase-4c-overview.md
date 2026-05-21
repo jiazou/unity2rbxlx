@@ -6,6 +6,8 @@ Bootstrap emission, spawner wiring, animator-on-clone bindings, residual transpi
 
 **4c stays small.** Anything reliably automatable should move to 4b. The 4c list shrinks over time.
 
+**No genre-specific scaffolding.** PR8 retired the `--scaffolding=fps` injection path; FPS controllers, HUD ScreenGuis, and weapon-mount helpers are not generated on the skill side. If a project needs a behavior that previously rode along on FPS scaffolding, express it as either a domain pin (`scene_runtime.domain_overrides`) or a storage placement override (`storage_plan.overrides_applied`) in `conversion_plan.json` — both are documented in `phase-4a-storage-classification.md` and round-trip through the contract pipeline.
+
 ## Files
 
 | File | Topic |

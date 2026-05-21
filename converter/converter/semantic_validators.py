@@ -14,9 +14,10 @@ until the converter learns to detect it. This module is the detection
 half — it emits structured warnings only. Automatic rewriting is
 deliberately out of scope: the rules over-detect by design (sub-meter
 literals are sometimes legitimate stud-space offsets), so a programmatic
-rewrite would regress correct code. The FPS-weapon-mount class of bug
-gets a targeted fix via the ``fps_weapon_mount_inject`` patch pack in
-``script_coherence_packs.py``, not via this module.
+rewrite would regress correct code. The FPS-weapon-mount targeted fix
+pack was retired in PR8 along with the rest of the FPS scaffolding;
+projects whose AI-emitted Player controllers ship visible-rifle bugs
+now surface here as warnings only.
 
 Public entry point: :func:`run_semantic_validators`. Returns a list of
 :class:`SemanticIssue` records.

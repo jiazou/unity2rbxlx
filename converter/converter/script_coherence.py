@@ -29,9 +29,7 @@ from converter.script_coherence_packs import (  # noqa: F401  (re-exports)
     _add_pickup_remote_listener,
     _add_trigger_stay_polling,
     _convert_pickup_to_remote_event,
-    _disable_default_controls_in_fps_scripts,
     _fix_pickup_visual_target,
-    _inject_fps_weapon_mounts,
 )
 
 log = logging.getLogger(__name__)

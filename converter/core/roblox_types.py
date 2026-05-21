@@ -408,7 +408,6 @@ class RbxPlace:
     terrains: list[RbxTerrain] = field(default_factory=list)
     water_regions: list[RbxWaterRegion] = field(default_factory=list)
     post_processing: RbxPostProcessing | None = None
-    is_fps_game: bool = False
     # Phase 4.10: per-prefab models that get written into
     # ``ReplicatedStorage.Templates`` so scripts can ``:Clone()`` them
     # at runtime. Each entry is a fully-converted RbxPart tree whose

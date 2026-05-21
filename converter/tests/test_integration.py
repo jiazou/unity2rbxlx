@@ -162,15 +162,6 @@ class TestSimpleFPSConversion:
         tr = transpile_scripts(SIMPLEFPS_DIR, scripts, use_ai=True, api_key="")
         assert tr.total_transpiled > 0
 
-    def test_fps_client_generator(self):
-        from converter.scaffolding.fps import generate_hud_client_script
-
-        script = generate_hud_client_script()
-        assert "HUD" in script.source
-        assert "FindFirstChild" in script.source
-        # Should not reference "Pause" via WaitForChild (Canvas-converted HUD may not have it)
-        assert "WaitForChild(\"Pause\")" not in script.source
-
 
 @pytest.mark.skipif(not _has_project(BOATATTACK_DIR), reason="BoatAttack project not found")
 class TestBoatAttackConversion:

@@ -165,107 +165,18 @@ def run_packs(
 
 
 # ---------------------------------------------------------------------------
-# FPS weapon-mount registry
+# Pickup helpers
 # ---------------------------------------------------------------------------
 #
-# Each ``WeaponMount`` entry parameterises one Unity FPS weapon-pickup
-# pattern: the world prefab name, the equip-function the AI transpiler
-# stubs out, the sentinel flag, scale, and the local variable name the
-# rewrite uses. Adding a second FPS weapon (e.g. a pistol on a future
-# test project) is a one-tuple append — no code change to the detector
-# or injection logic.
-#
-# Camera tracking is NOT done here. Unity parents the weapon to a
-# camera-child "WeaponSlot" transform; the converter reproduces that
-# GameObject inside the ``_MainCameraRig`` Model, and the auto-injected
-# CameraRigFollower pivots that whole rig onto ``workspace.CurrentCamera``
-# each frame. The rewritten equip path just seats the cloned weapon into
-# the rig, so it rides the player's view with no per-weapon follower and
-# no hardcoded offset. ``fallback_offset_expr`` is used only when the
-# scene has no rig at all.
+# ``_PICKUP_REPLACEMENT`` is the canonical Pickup script body the
+# ``pickup_visual_target`` pack rewires onto any genre's Pickup script
+# (Rifle, Battery, Key, Ammo, Health, …). ``_PICKUP_TOUCHED_CODE`` is
+# the mount-agnostic client-side Touched listener the
+# ``pickup_remote_event_client`` pack splices into Player-style
+# controllers. Both blocks survived the PR8 retirement of the
+# FPS-specific weapon-mount pack because non-FPS Pickup conversions
+# rely on them.
 
-
-@dataclass(frozen=True)
-class WeaponMount:
-    prefab_name: str           # workspace prefab name (camelCase) — the
-                               # converter materialises the Unity prefab
-                               # at this name in workspace, with the full
-                               # mesh hierarchy (bipod, scope, etc.). The
-                               # pack clones from THIS instance, not from
-                               # ``ReplicatedStorage.Templates``, which
-                               # carries a stripped variant whose smaller
-                               # bbox drops below the camera frustum at
-                               # the authored slot offset.
-    equip_function: str        # AI-stubbed function name on the Player controller
-    sentinel_var: str          # already-equipped flag, flipped to true on equip
-    scale_expr: str            # Lua-source fragment for rifle:ScaleTo(<expr>)
-    fallback_offset_expr: str  # camera-relative CFrame, used ONLY when the
-                               # scene has no _MainCameraRig to seat into
-    marker_tag: str            # composed into ``-- _FPS_<tag>`` for idempotency
-    instance_var: str          # local that holds the cloned weapon Model
-
-
-# Today's registry: one entry for the SimpleFPS rifle.
-WEAPON_MOUNTS: tuple[WeaponMount, ...] = (
-    WeaponMount(
-        prefab_name="riflePrefab",
-        equip_function="GetRifle",
-        sentinel_var="gotWeapon",
-        scale_expr="0.15",
-        fallback_offset_expr="CFrame.new(0.5, -0.5, -3)",
-        marker_tag="RIFLE_SYSTEM",
-        instance_var="_fpsRifle",
-    ),
-)
-
-
-def _prefab_alt_case(name: str) -> str:
-    """Return the upper-first-letter variant of a camelCase prefab name.
-
-    SimpleFPS stores the rifle prefab under either ``riflePrefab`` or
-    ``RiflePrefab`` depending on which Unity export pass ran. Emitting
-    both ``FindFirstChild`` lookups in the injected code handles both.
-    """
-    if not name:
-        return name
-    return name[:1].upper() + name[1:]
-
-
-# ---------------------------------------------------------------------------
-# Detectors
-# ---------------------------------------------------------------------------
-
-def _detect_fps_weapon_mount(scripts: list["RbxScript"]) -> bool:
-    """Pack runs when any script references one of the registered FPS
-    weapon-mount patterns.
-
-    A mount qualifies a script via either the prefab name (case variant
-    included) or any spelling of the equip function name. The Unity
-    source ships PascalCase (``GetRifle``); the AI transpiler emits
-    camelCase (``getRifle``) by Luau convention -- the detector must
-    accept both for ``run_packs`` to actually fire the pack on real
-    transpile output. Pre-fix the detector only checked PascalCase, so
-    the pack silently no-oped on every fresh transpile and the marker
-    on disk only persisted from older PascalCase-era runs.
-    Gamekit3D-style scripts contain none of these markers and skip
-    cleanly.
-    """
-    for s in scripts:
-        src = s.source
-        for mount in WEAPON_MOUNTS:
-            equip_variants = _equip_function_variants(mount.equip_function)
-            if (
-                mount.prefab_name in src
-                or _prefab_alt_case(mount.prefab_name) in src
-                or any(v in src for v in equip_variants)
-            ):
-                return True
-    return False
-
-
-# ---------------------------------------------------------------------------
-# Pack: fps_rifle_pickup
-# ---------------------------------------------------------------------------
 
 _PICKUP_REPLACEMENT = """local RunService = game:GetService("RunService")
 local Debris = game:GetService("Debris")
@@ -399,10 +310,9 @@ end
 """
 
 
-# Client-side pickup detection is mount-agnostic — runs once per Player
-# script regardless of how many WeaponMount entries fired. The marker is
-# the leading comment line itself, so this remains byte-identical to the
-# pre-refactor output.
+# Client-side pickup detection is genre-agnostic — runs once per Player
+# script. The marker is the leading comment line itself, so this remains
+# byte-identical to the pre-refactor output.
 _PICKUP_TOUCHED_MARKER = "-- Client-side pickup detection"
 _PICKUP_TOUCHED_CODE = (
     '\n' + _PICKUP_TOUCHED_MARKER + '\n'
@@ -426,174 +336,6 @@ _PICKUP_TOUCHED_CODE = (
     '    end\n'
     'end\n'
 )
-
-
-def _equip_function_variants(name: str) -> tuple[str, ...]:
-    """Name variants under which the AI transpiler may have emitted the
-    equip function. Unity ships PascalCase (``GetRifle``); the Luau
-    convention favours camelCase (``getRifle``), so the post-transpile
-    output uses the latter. We support both.
-    """
-    if not name:
-        return ()
-    pascal = name[:1].upper() + name[1:]
-    camel = name[:1].lower() + name[1:]
-    return (camel,) if pascal == camel else (pascal, camel)
-
-
-def _apply_weapon_mount(s: "RbxScript", mount: WeaponMount) -> bool:
-    """Rewrite the AI-stubbed equip path for one weapon mount.
-
-    Returns True iff this mount mutated the script. The caller appends
-    the mount-agnostic pickup-Touched block exactly once per script
-    after all mounts have run.
-    """
-    marker = f"-- _FPS_{mount.marker_tag}"
-    variants = _equip_function_variants(mount.equip_function)
-    if not any(v in s.source for v in variants):
-        return False
-    if marker in s.source:
-        return False
-
-    before = s.source
-
-    s.source = s.source.replace(
-        f"local {mount.sentinel_var} = false",
-        f"local {mount.sentinel_var} = false\n"
-        f"local {mount.instance_var} = nil  {marker}",
-    )
-
-    # Match three emitted shapes from the AI transpiler:
-    #   1. ``GetRifle = function()`` (table-field / forward-decl assignment)
-    #   2. ``function getRifle()`` (top-level function statement, Luau idiom)
-    #   3. ``local function getRifle()`` (local function statement)
-    # Body extends until the sentinel-set line that follows.
-    name_alt = "|".join(re.escape(v) for v in variants)
-    body_re = re.compile(
-        rf"((?:local\s+)?function\s+(?:{name_alt})\s*\(\s*\)|(?:{name_alt})\s*=\s*function\s*\(\s*\))"
-        rf"(.*?)"
-        rf"(\n\s*{mount.sentinel_var}\s*=\s*true)",
-        re.DOTALL,
-    )
-    m = body_re.search(s.source)
-    if m:
-        alt = _prefab_alt_case(mount.prefab_name)
-        # Preserve the matched header verbatim. The injection target may
-        # have been `GetRifle = function()` (table-field form) or
-        # `function getRifle()` (function-statement form, Luau idiom).
-        matched_header = m.group(1)
-        # The equipped weapon is seated into the converted Unity camera
-        # rig — the ``_MainCameraRig`` Model that the auto-injected
-        # CameraRigFollower pivots onto the live camera each frame.
-        # ``Model:PivotTo`` propagates to descendants, so a weapon
-        # parented anywhere under the rig rides the player's view with
-        # no per-weapon follower and no hardcoded offset. Seating order
-        # of preference: the Unity "WeaponSlot" object inside the rig →
-        # the rig Model itself → (no rig) a one-shot camera placement.
-        #
-        # Source the prefab from ``workspace`` (the scene-placed instance
-        # the converter materialises from Unity's Player.prefab) — NOT
-        # from ``ReplicatedStorage.Templates``. The two are structurally
-        # different on real conversions: the scene placement carries the
-        # full Unity prefab (e.g. SimpleFPS rifle has bipod legs + laser
-        # pointer + pod-support, 14 mesh parts, ~50-stud bbox), while
-        # the Templates entry the prefab-packages writer emits is a
-        # stripped variant (10 parts, ~8-stud bbox). After the same
-        # ``ScaleTo`` factor, the Templates clone is ~6× smaller and
-        # drops below the camera frustum at the authored slot offset.
-        # PR #121's ``c65429b`` introduced a Templates-first lookup that
-        # silently selected the smaller variant and made the held weapon
-        # invisible -- a regression the user surfaced as "I cannot see
-        # the rifle". The fallback case-variant probes the Pascal-case
-        # spelling of the same workspace name.
-        new_body = (
-            f'{matched_header}\n'
-            f'    if {mount.sentinel_var} then return end\n'
-            f'    local rp = workspace:FindFirstChild("{mount.prefab_name}", true)\n'
-            f'        or workspace:FindFirstChild("{alt}", true)\n'
-            f'    if not rp then return end\n'
-            f'    local rifle = rp:Clone()\n'
-            f'    if rifle:IsA("Model") then rifle:ScaleTo({mount.scale_expr}) end\n'
-            f'    for _, p in rifle:GetDescendants() do\n'
-            f'        if p:IsA("BasePart") then\n'
-            f'            p.Transparency = 0\n'
-            f'            p.CanCollide = false\n'
-            f'            p.Anchored = true\n'
-            f'        end\n'
-            f'    end\n'
-            f'    local rig\n'
-            f'    for _, m in workspace:GetDescendants() do\n'
-            f'        if m:IsA("Model") and m:GetAttribute("_MainCameraRig") then rig = m break end\n'
-            f'    end\n'
-            f'    local slot = rig and rig:FindFirstChild("WeaponSlot", true)\n'
-            f'    if slot then\n'
-            f'        rifle:PivotTo(slot:IsA("Model") and slot:GetPivot() or slot.CFrame)\n'
-            f'        rifle.Parent = slot\n'
-            f'    elseif rig then\n'
-            f'        rifle:PivotTo(rig:GetPivot() * {mount.fallback_offset_expr})\n'
-            f'        rifle.Parent = rig\n'
-            f'    else\n'
-            f'        rifle:PivotTo(workspace.CurrentCamera.CFrame * {mount.fallback_offset_expr})\n'
-            f'        rifle.Parent = workspace\n'
-            f'    end\n'
-            f'    {mount.instance_var} = rifle\n'
-        )
-        s.source = s.source[: m.start()] + new_body + s.source[m.start(3):]
-
-    return s.source != before
-
-
-def _append_pickup_touched_block(s: "RbxScript") -> None:
-    if _PICKUP_TOUCHED_MARKER in s.source:
-        return
-    return_m = re.search(r"^return\b", s.source, re.MULTILINE)
-    if return_m:
-        s.source = (
-            s.source[: return_m.start()]
-            + _PICKUP_TOUCHED_CODE
-            + s.source[return_m.start():]
-        )
-    else:
-        s.source = s.source.rstrip() + "\n" + _PICKUP_TOUCHED_CODE
-
-
-@patch_pack(
-    name="fps_weapon_mount_inject",
-    description="Inject a working FPS weapon-mount system into Player "
-    "scripts that the AI transpiler emits as a stub. Driven by the "
-    "``WEAPON_MOUNTS`` registry — adding a second weapon means appending "
-    "one tuple, not writing new pack code.",
-    detect=_detect_fps_weapon_mount,
-)
-def _inject_fps_weapon_mounts(scripts: list["RbxScript"]) -> int:
-    """For each script, apply every registered weapon mount whose
-    markers fire, then emit the mount-agnostic pickup-Touched block once.
-
-    Each mount idempotency-guards on its own ``-- _FPS_<tag>`` marker;
-    the pickup-Touched block guards on the leading comment as its marker.
-
-    Steps per mount:
-    1. Find the prefab in workspace (camelCase or PascalCase variant)
-    2. Clone, scale, make visible (anchored parts)
-    3. Seat the clone into the converted Unity camera rig — the
-       ``_MainCameraRig`` Model the auto-injected CameraRigFollower
-       pivots onto the live camera, so the weapon rides the view with
-       no per-weapon follower and no hardcoded offset
-    """
-    fixes = 0
-    for s in scripts:
-        mutated = False
-        for mount in WEAPON_MOUNTS:
-            if _apply_weapon_mount(s, mount):
-                mutated = True
-                log.info(
-                    "  Injected FPS weapon mount %r in %r",
-                    mount.marker_tag, s.name,
-                )
-        if mutated:
-            _append_pickup_touched_block(s)
-            fixes += 1
-    return fixes
 
 
 # ---------------------------------------------------------------------------
@@ -1038,7 +780,7 @@ def _canonicalize_pickup_remote_event(scripts: list["RbxScript"]) -> int:
     "just in FPS-rifle projects. Without this, broadening the server pack "
     "to any genre would remove the legacy client-side ``GetItem`` "
     "attribute trigger and leave non-FPS pickups silently unwired.",
-    after=("fps_weapon_mount_inject", "pickup_remote_event_server", "pickup_visual_target"),
+    after=("pickup_remote_event_server", "pickup_visual_target"),
     detect=_detect_pickup_remote_event_in_use,
 )
 def _add_pickup_remote_listener(scripts: list["RbxScript"]) -> int:
@@ -2006,119 +1748,6 @@ def _strip_door_ai_rotation(scripts: list["RbxScript"]) -> int:
                 "  Stripped AI-invented rotation tween from Door '%s'",
                 s.name,
             )
-    return fixes
-
-
-# ---------------------------------------------------------------------------
-# Pack: fps_default_controls_off
-# ---------------------------------------------------------------------------
-
-_FPS_LOCK_CENTER_RE = re.compile(
-    r"MouseBehavior\s*=\s*Enum\.MouseBehavior\.LockCenter"
-)
-
-
-def _detect_fps_default_controls(scripts: list["RbxScript"]) -> bool:
-    """Pack runs when any LocalScript locks the mouse — the unmistakable
-    signature of an FPS controller."""
-    return any(
-        s.script_type == "LocalScript" and _FPS_LOCK_CENTER_RE.search(s.source)
-        for s in scripts
-    )
-
-
-@patch_pack(
-    name="fps_default_controls_off",
-    description="Disable Roblox's default PlayerModule controls in FPS-style "
-    "client scripts. Without this, the auto-loaded "
-    "StarterPlayerScripts/PlayerModule resets MouseBehavior back to Default "
-    "every frame, so the FPS lock never sticks. Also hides the local "
-    "character body and snaps the spawn to the floor below — both standard "
-    "FPS expectations Roblox doesn't provide by default.",
-    detect=_detect_fps_default_controls,
-)
-def _disable_default_controls_in_fps_scripts(scripts: list["RbxScript"]) -> int:
-    fixes = 0
-    marker = "-- u2r: disable default PlayerModule controls"
-    setup = (
-        f"{marker} + assert FPS mouse state + first-person body hide + spawn floor-snap\n"
-        "-- Re-applies on CharacterAdded because Roblox's character spawn flow\n"
-        "-- re-enables the default PlayerModule and resets MouseBehavior, and\n"
-        "-- because Roblox loads avatar accessories asynchronously after the\n"
-        "-- character spawns — DescendantAdded catches each late-added Handle\n"
-        "-- so the user's hat/chain/glasses don't float across the FPS camera.\n"
-        "do\n"
-        "    local _lp = game:GetService(\"Players\").LocalPlayer\n"
-        "    local _UIS = game:GetService(\"UserInputService\")\n"
-        "    local function _applyFpsMouseState()\n"
-        "        local _ps = _lp:WaitForChild(\"PlayerScripts\", 10)\n"
-        "        local _pm = _ps and _ps:WaitForChild(\"PlayerModule\", 10)\n"
-        "        if _pm then\n"
-        "            local ok, mod = pcall(require, _pm)\n"
-        "            if ok and mod then\n"
-        "                local ok2, controls = pcall(function() return mod:GetControls() end)\n"
-        "                if ok2 and controls and controls.Disable then\n"
-        "                    pcall(function() controls:Disable() end)\n"
-        "                end\n"
-        "            end\n"
-        "        end\n"
-        "        _UIS.MouseBehavior = Enum.MouseBehavior.LockCenter\n"
-        "        _UIS.MouseIconEnabled = false\n"
-        "    end\n"
-        "    local function _isInWeaponSlot(inst)\n"
-        "        local p = inst.Parent\n"
-        "        while p and p ~= game do\n"
-        "            if p.Name == \"WeaponSlot\" then return true end\n"
-        "            p = p.Parent\n"
-        "        end\n"
-        "        return false\n"
-        "    end\n"
-        "    local function _hidePart(part)\n"
-        "        if (part:IsA(\"BasePart\") or part:IsA(\"Decal\")) and not _isInWeaponSlot(part) then\n"
-        "            part.LocalTransparencyModifier = 1\n"
-        "        end\n"
-        "    end\n"
-        "    local function _hideCharacter(char)\n"
-        "        if not char then return end\n"
-        "        char.DescendantAdded:Connect(_hidePart)\n"
-        "        for _, part in char:GetDescendants() do _hidePart(part) end\n"
-        "    end\n"
-        "    local function _snapToFloor(char)\n"
-        "        if not char then return end\n"
-        "        local hrp = char:WaitForChild(\"HumanoidRootPart\", 5)\n"
-        "        if not hrp then return end\n"
-        "        task.wait()\n"
-        "        local rp = RaycastParams.new()\n"
-        "        rp.FilterDescendantsInstances = {char}\n"
-        "        rp.FilterType = Enum.RaycastFilterType.Exclude\n"
-        "        local hit = workspace:Raycast(hrp.Position, Vector3.new(0, -200, 0), rp)\n"
-        "        if not hit then return end\n"
-        "        local target = hit.Position + Vector3.new(0, 3, 0)\n"
-        "        if (hrp.Position - target).Magnitude > 2 then\n"
-        "            hrp.CFrame = hrp.CFrame + (target - hrp.Position)\n"
-        "        end\n"
-        "    end\n"
-        "    _applyFpsMouseState()\n"
-        "    _hideCharacter(_lp.Character)\n"
-        "    _snapToFloor(_lp.Character)\n"
-        "    _lp.CharacterAdded:Connect(function(char)\n"
-        "        task.wait()\n"
-        "        _applyFpsMouseState()\n"
-        "        _hideCharacter(char)\n"
-        "        _snapToFloor(char)\n"
-        "    end)\n"
-        "end\n\n"
-    )
-    for s in scripts:
-        if s.script_type != "LocalScript":
-            continue
-        if marker in s.source:
-            continue
-        if not _FPS_LOCK_CENTER_RE.search(s.source):
-            continue
-        s.source = setup + s.source
-        fixes += 1
-        log.info("  Disabled default PlayerModule controls in '%s'", s.name)
     return fixes
 
 
@@ -4483,11 +4112,12 @@ def _inject_proximity_fanout_v2_migration(scripts: list["RbxScript"]) -> int:
 # weapon-slot Part), the cloned BaseParts inherit Transparency=1 and the
 # weapon is invisible in-game.
 #
-# The original WeaponMount pack handled this for the SimpleFPS rifle by
-# wholesale-rewriting a stub-shaped ``GetRifle = function() ... end``
+# The retired (PR8) FPS weapon-mount pack handled this for the SimpleFPS
+# rifle by wholesale-rewriting a stub-shaped ``GetRifle = function() ... end``
 # body. As the AI's transpile output drifted to use a ``cloneTemplate``
-# helper plus a ``function getRifle()`` statement, the WeaponMount
-# detector stopped matching and visible-rifle setup silently dropped.
+# helper plus a ``function getRifle()`` statement, that detector stopped
+# matching and visible-rifle setup silently dropped — motivating this
+# narrower, genre-agnostic replacement.
 #
 # This pack is narrower and shape-tolerant: it splices a visibility +
 # weld fixup right after any line that clones a Template descendant and
@@ -4623,112 +4253,3 @@ def _inject_template_clone_visibility(scripts: list["RbxScript"]) -> int:
     return fixes
 
 
-# ---------------------------------------------------------------------------
-# Pack: fps_camera_pitch_inversion
-# ---------------------------------------------------------------------------
-#
-# Unity's ``Input.GetAxis("Mouse Y")`` is positive-UP; Roblox's
-# ``UserInputService:GetMouseDelta().Y`` is positive-DOWN. A correct FPS
-# pitch combines two sign decisions with OPPOSITE polarity:
-#   - the mouse-delta accumulation: ``pitch = pitch +/- d.Y * k``
-#   - the camera application:        ``CFrame.Angles(+/- pitch, ...)``
-# Correct vertical look needs these two signs to disagree (e.g. the
-# canonical ``pitch = pitch - d.Y`` paired with ``CFrame.Angles(pitch)``,
-# which the transpiler prompt teaches).
-#
-# The AI transpiler sometimes emits AGREEING signs — observed shape:
-# ``pitch = pitch - d.Y`` together with ``CFrame.Angles(math.rad(-pitch))``
-# — which inverts vertical look (pushing the mouse forward tilts the view
-# down). Yaw is unaffected because it has no second negation.
-#
-# Fix: when the two signs agree, flip the MOUSE-delta line's sign. The
-# camera ``-pitch`` form is left intact on purpose — recoil kicks
-# (``pitch = pitch - 2``) and asymmetric pitch clamps are authored
-# against that convention, so flipping the camera term would break them.
-
-# Matches the mouse-delta pitch accumulation: ``<pv> = <pv> +/- <x>.Y``.
-# An optional ``math.clamp(`` wrapper is tolerated so the inline-clamp
-# shape (``pv = math.clamp(pv - d.Y * k, lo, hi)``) is handled too. The
-# match deliberately stops at ``.Y`` so any trailing ``* SENSITIVITY``
-# survives untouched.
-_PITCH_ACCUM_RE = re.compile(
-    r'^(?P<lead>[ \t]*)(?P<pv>[A-Za-z_]\w*)\s*=\s*'
-    r'(?P<wrap>math\.clamp\(\s*)?'
-    r'(?P=pv)\s*(?P<sign>[+-])\s*(?P<delta>[A-Za-z_]\w*\s*\.\s*Y)\b',
-    re.MULTILINE,
-)
-
-
-def _camera_pitch_sign_is_negated(src: str, pv: str) -> bool | None:
-    """Return True if the camera applies ``-<pv>`` inside a
-    ``CFrame.Angles`` call, False if it applies ``+<pv>``, None if no
-    such application is found.
-    """
-    m = re.search(
-        r'CFrame\.Angles\s*\(\s*(?:math\.rad\s*\(\s*)?(?P<cs>-?)\s*'
-        + re.escape(pv) + r'\b',
-        src,
-    )
-    if m is None:
-        return None
-    return m.group('cs') == '-'
-
-
-def _pitch_vars_to_flip(src: str) -> set[str]:
-    """Pitch vars whose mouse-delta sign AGREES with the camera
-    application sign — the inverted combination."""
-    out: set[str] = set()
-    for m in _PITCH_ACCUM_RE.finditer(src):
-        pv = m.group('pv')
-        negated = _camera_pitch_sign_is_negated(src, pv)
-        if negated is None:
-            continue
-        mouse_is_negative = m.group('sign') == '-'
-        if mouse_is_negative == negated:
-            out.add(pv)
-    return out
-
-
-def _detect_fps_camera_pitch_inversion(scripts: list["RbxScript"]) -> bool:
-    for s in scripts:
-        if _pitch_vars_to_flip(s.source or ""):
-            return True
-    return False
-
-
-@patch_pack(
-    name="fps_camera_pitch_inversion",
-    description="Flip the mouse-delta pitch accumulation sign when an "
-    "FPS controller pairs it with a same-sign camera CFrame.Angles "
-    "application. Roblox GetMouseDelta().Y is positive-down (vs Unity's "
-    "positive-up Mouse Y axis); a same-sign pairing inverts vertical "
-    "look so pushing the mouse forward tilts the view down.",
-    detect=_detect_fps_camera_pitch_inversion,
-)
-def _fix_fps_camera_pitch_inversion(scripts: list["RbxScript"]) -> int:
-    fixes = 0
-    for s in scripts:
-        src = s.source or ""
-        to_flip = _pitch_vars_to_flip(src)
-        if not to_flip:
-            continue
-
-        def _flip(m: "re.Match[str]") -> str:
-            pv = m.group('pv')
-            if pv not in to_flip:
-                return m.group(0)
-            new_sign = '+' if m.group('sign') == '-' else '-'
-            return (
-                f"{m.group('lead')}{pv} = "
-                f"{m.group('wrap') or ''}{pv} {new_sign} {m.group('delta')}"
-            )
-
-        new_src = _PITCH_ACCUM_RE.sub(_flip, src)
-        if new_src != src:
-            s.source = new_src
-            fixes += 1
-            log.info(
-                "  Fixed inverted FPS camera pitch in '%s' (vars: %s)",
-                s.name, sorted(to_flip),
-            )
-    return fixes

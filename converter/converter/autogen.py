@@ -14,8 +14,9 @@ Scripts the converter considers regardless of game genre:
   Model onto ``workspace.CurrentCamera`` each frame, only emitted when
   the scene contains a part carrying the ``_MainCameraRig`` attribute.
 
-Genre-specific scaffolding (FPS controller, HUD ScreenGui, etc.) lives
-in :mod:`converter.scaffolding`; this module stays project-agnostic.
+This module stays project-agnostic; PR8 retired the
+``converter.scaffolding`` siblings that previously hosted genre-specific
+emitters (FPS controller, HUD ScreenGui).
 """
 from __future__ import annotations
 

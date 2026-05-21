@@ -1512,11 +1512,6 @@ def write_rbxlx(place: RbxPlace, output_path: Path) -> dict[str, int]:
             near_clip = getattr(cam, "near_clip", 0.3)
             if near_clip and near_clip > 0.3:
                 _add_float(sp_props, "CameraMinZoomDistance", near_clip)
-        # Lock first-person camera for FPS games
-        if getattr(place, "is_fps_game", False):
-            _add_token(sp_props, "CameraMode", 1)  # 1 = LockFirstPerson
-            _add_float(sp_props, "CameraMinZoomDistance", 0.5)
-            _add_float(sp_props, "CameraMaxZoomDistance", 0.5)
     starter_player_scripts_item, _ = _make_item(starter_player, "StarterPlayerScripts", "StarterPlayerScripts")
     starter_char_scripts_item, _ = _make_item(starter_player, "StarterCharacterScripts", "StarterCharacterScripts")
     starter_gui = _make_service(root, "StarterGui")

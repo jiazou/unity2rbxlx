@@ -312,12 +312,6 @@ def main(verbose: bool) -> None:
               help="Roblox Universe ID for mesh resolution (reuse across runs)")
 @click.option("--place-id", type=int, default=None,
               help="Roblox Place ID for mesh resolution (reuse across runs)")
-@click.option("--scaffolding", type=str, default=None,
-              help="Comma-separated genre scaffolding to inject (e.g. "
-              "'fps' to add the FPS client controller + HUD ScreenGui + "
-              "HUDController). Default: none — the converter makes no "
-              "game-genre assumptions and only emits scaffolding when "
-              "explicitly requested.")
 @click.option("--skip-architecture-step", is_flag=True,
               help="Acknowledge that this CLI does NOT perform the "
               "client/server architecture step (Step 4a); required to run "
@@ -353,7 +347,6 @@ def convert(
     creator_id: str | None,
     universe_id: int | None,
     place_id: int | None,
-    scaffolding: str | None,
     skip_architecture_step: bool,
     scene_runtime: str,
     clean: bool,
@@ -432,18 +425,10 @@ def convert(
     if no_ai:
         config.USE_AI_TRANSPILATION = False
 
-    # Parse comma-separated scaffolding list. Unknown names are passed
-    # through to the pipeline; the inject site logs (and ignores) values
-    # it doesn't recognise rather than failing the whole conversion.
-    scaffolding_set: frozenset[str] = frozenset(
-        s.strip().lower() for s in (scaffolding or "").split(",") if s.strip()
-    )
-
     pipeline = Pipeline(
         unity_project_path=project_path,
         output_dir=output_path,
         skip_upload=no_upload,
-        scaffolding=scaffolding_set,
     )
 
     # PR3b: plumb the requested mode through to ctx so
@@ -576,13 +561,6 @@ def convert(
 @click.option("--creator-id", type=str, default=None, help="Roblox Creator ID (number or path to file)")
 @click.option("--universe-id", type=int, default=None)
 @click.option("--place-id", type=int, default=None)
-@click.option("--scaffolding", type=str, default=None,
-              help="Comma-separated genre scaffolding for the rebuild "
-              "fallback path (e.g. 'fps'). Merged additively with whatever "
-              "is persisted in conversion_context.json — pass this when "
-              "rebuilding an output directory created before the "
-              "scaffolding field existed and you want the FPS scripts/HUD "
-              "back without re-running the full conversion.")
 @click.option("--scene-runtime",
               type=click.Choice(["legacy", "auto", "generic"]),
               default="legacy",
@@ -599,7 +577,6 @@ def publish(
     creator_id: str | None,
     universe_id: int | None,
     place_id: int | None,
-    scaffolding: str | None,
     scene_runtime: str,
     clean: bool,
 ) -> None:
@@ -665,15 +642,6 @@ def publish(
         click.echo("ERROR: --universe-id and --place-id required (or cached in .roblox_ids.json)")
         sys.exit(1)
 
-    # ``--scaffolding`` only takes effect on the rebuild fallback —
-    # the fast path uploads the cached ``.rbxl`` byte-for-byte, so
-    # the scripts in that cache are whatever the prior conversion
-    # produced. Warn loudly when the user passes ``--scaffolding``
-    # alongside an existing cache so the silent no-op surfaces.
-    scaffolding_was_requested = bool(
-        scaffolding and scaffolding.strip()
-    )
-
     # Fast path: upload the existing binary place file. Preserves
     # CollisionFidelity and other Plugin-gated MeshPart properties that
     # the chunked execute_luau path can't write. Open Cloud
@@ -684,16 +652,6 @@ def publish(
     # without the binary writer's lz4 dependency.
     click.echo(f"Publishing to universe={uid} place={pid}...")
     rbxl_path = output_path / "converted_place.rbxl"
-    if rbxl_path.exists() and scaffolding_was_requested:
-        click.echo(
-            f"  --scaffolding={scaffolding!r} requested but "
-            f"{rbxl_path.name} exists — the fast path uploads the "
-            "cached .rbxl byte-for-byte, so the requested scaffolding "
-            "is IGNORED. To rebuild from source with the new "
-            "scaffolding, delete the cached .rbxl (and "
-            "place_builder_chunks.json) and re-run, or use "
-            "u2r.py convert --scaffolding=fps."
-        )
     if rbxl_path.exists():
         # Build CollisionFidelity fixup targets from the rbxl on disk
         # so non-Default fidelities re-cook on the live place. Without
@@ -724,15 +682,10 @@ def publish(
             )
             sys.exit(1)
 
-        scaffolding_list = [
-            s.strip().lower()
-            for s in (scaffolding or "").split(",") if s.strip()
-        ]
         pipeline = Pipeline(
             unity_project_path=prior_ctx.unity_project_path,
             output_dir=output_path,
             skip_binary_rbxl=True,
-            scaffolding=scaffolding_list,
         )
         pipeline.ctx = prior_ctx
         pipeline.ctx.universe_id = uid
@@ -741,25 +694,13 @@ def publish(
         # the requested mode (default legacy) so the domain classifier
         # doesn't mutate parent_path on a legacy rebuild.
         pipeline.ctx.scene_runtime_mode = scene_runtime
-        # Mark this rebuild path as an explicit resume so the
-        # backward-compat FPS migration treats on-disk FPS scripts
-        # as legitimately preserved rather than stale leftovers.
+        # Mark this rebuild path as an explicit resume so any
+        # same-project-only migrations distinguish it from a fresh
+        # convert that happens to share the output dir.
         # ``hasattr`` guards tolerate ``Pipeline`` stubs in the
         # publish-cache tests.
         if hasattr(pipeline, "_is_resume"):
             pipeline._is_resume = True
-        if hasattr(pipeline, "_fps_artifacts_on_disk"):
-            # Re-snapshot now that ctx carries selected_scene so the
-            # rbxlx scan can scope per-scene for multi-scene rebuilds.
-            pipeline._fps_artifacts_at_init = pipeline._fps_artifacts_on_disk()
-        # Re-merge the caller's scaffolding request after the ctx swap.
-        # Old contexts (saved before the scaffolding field existed)
-        # rehydrate as ``scaffolding=[]``; passing ``--scaffolding=fps``
-        # to ``u2r.py publish`` is the documented opt-back-in path so
-        # rebuilds reproduce the original FPS scripts/HUD without
-        # re-running the full conversion.
-        if scaffolding_list and hasattr(pipeline, "apply_scaffolding"):
-            pipeline.apply_scaffolding(scaffolding_list)
 
         # Run prereqs through extract_assets + moderate_assets so we can
         # check whether any assets actually need uploading before deciding
