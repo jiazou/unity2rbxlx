@@ -35,6 +35,9 @@ def _parse_write_output_call_sequence() -> list[str]:
         "_bind_scripts_to_parts",
         "_inject_runtime_modules",
         "_generate_prefab_packages",
+        # PR6: hard playability guard rail. Bare ``_check_*`` so the
+        # parser picks it up alongside ``_check_auto_fail_closed``.
+        "_check_runtime_playability_guard",
     }
     calls: list[str] = []
     for node in ast.walk(tree):

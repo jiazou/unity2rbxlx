@@ -137,6 +137,17 @@ class ConversionContext:
     # "default output byte-identical" invariant carried over from PR3a).
     scene_runtime_mode: str = "legacy"
 
+    # PR6: operator escape for the playability guard rail. When True,
+    # ``Pipeline._check_runtime_playability_guard`` downgrades a hard
+    # failure (runtime-bearing MonoBehaviours present under
+    # ``generic``/``auto`` with no valid plan+host emit) into a warning
+    # surfaced via ``UNCONVERTED.md`` so the converted place still
+    # writes. Plumbed in from every front door
+    # (``--allow-nonplayable-output``). Default ``False`` so the guard
+    # is fail-closed; legacy and resume paths that never set
+    # ``scene_runtime_mode`` to generic/auto are unaffected regardless.
+    allow_nonplayable_output: bool = False
+
     def __post_init__(self) -> None:
         # JSON load via `cls(**data)` populates storage_plan as a dict (the
         # asdict() form). Reconstruct it as a StoragePlan when present so the

@@ -604,9 +604,14 @@ def materials(unity_project_path: str, output_dir: str) -> None:
 @click.option("--clean", is_flag=True,
               help="PR3b: wipe + re-stamp the output dir before "
               "transpiling (mode-mismatch remediation).")
+@click.option("--allow-nonplayable-output", is_flag=True,
+              help="PR6 escape: downgrade the scene-runtime "
+              "playability guard from a hard fail to a warning. "
+              "Persisted in ctx so subsequent ``assemble`` / "
+              "``upload`` runs reproduce the same opt-in.")
 def transpile(unity_project_path: str, output_dir: str,
               api_key: str | None, no_ai: bool, scene_runtime: str,
-              clean: bool) -> None:
+              clean: bool, allow_nonplayable_output: bool) -> None:
     """Phase 3b: transpile C# scripts to Luau."""
     # PR5 lifts the ``auto`` rejection across all three skill front
     # doors. ``auto`` now routes through the generic pipeline; on a
@@ -628,6 +633,11 @@ def transpile(unity_project_path: str, output_dir: str,
     # PR3b: thread the requested mode into ctx so _classify_storage's
     # domain classifier knows whether to run.
     pipeline.ctx.scene_runtime_mode = scene_runtime
+    # PR6: thread the playability-guard escape. Transpile alone never
+    # reaches write_output, but ctx persists into the on-disk
+    # conversion_context.json so subsequent ``assemble`` runs against
+    # the same dir see the same opt-in without re-passing the flag.
+    pipeline.ctx.allow_nonplayable_output = allow_nonplayable_output
     try:
         _run_through(pipeline, "transpile_scripts")
     except Exception as exc:
@@ -786,12 +796,18 @@ def validate(output_dir: str, write: bool) -> None:
 @click.option("--clean", is_flag=True,
               help="PR3b: wipe + re-stamp the output dir before "
               "assembling (mode-mismatch remediation).")
+@click.option("--allow-nonplayable-output", is_flag=True,
+              help="PR6 escape: downgrade the scene-runtime "
+              "playability guard from a hard fail to a warning so the "
+              "assemble write_output still produces a .rbxlx + "
+              "UNCONVERTED.md report.")
 def assemble(unity_project_path: str, output_dir: str,
              no_upload: bool, no_resolve: bool, retranspile: bool,
              api_key: str | None, creator_id: str | None,
              universe_id: int | None, place_id: int | None,
              scaffolding: str | None,
-             scene_runtime: str, clean: bool) -> None:
+             scene_runtime: str, clean: bool,
+             allow_nonplayable_output: bool) -> None:
     """Phase 4: upload assets, resolve, convert animations + scene, write .rbxlx."""
     # PR5: ``auto`` is now lifted across all skill front doors.
     _guard_scene_runtime_mode_or_emit(
@@ -846,6 +862,9 @@ def assemble(unity_project_path: str, output_dir: str,
     # PR3b: thread the requested mode into ctx so _classify_storage's
     # domain classifier knows whether to run.
     pipeline.ctx.scene_runtime_mode = scene_runtime
+    # PR6: thread the playability-guard escape so write_output's
+    # guard either fails closed or downgrades per the caller.
+    pipeline.ctx.allow_nonplayable_output = allow_nonplayable_output
 
     # Plumb --universe-id / --place-id into ctx so resolve_assets can run
     # headless mesh resolution on the first assemble invocation. Without
@@ -935,9 +954,15 @@ def assemble(unity_project_path: str, output_dir: str,
 @click.option("--clean", is_flag=True,
               help="PR3b: wipe + re-stamp the output dir before "
               "uploading (mode-mismatch remediation).")
+@click.option("--allow-nonplayable-output", is_flag=True,
+              help="PR6 escape: downgrade the scene-runtime "
+              "playability guard so upload's rebuild pass through "
+              "write_output still produces an artifact even when the "
+              "generic plan+host pair is incomplete.")
 def upload(output_dir: str, api_key: str | None,
            universe_id: int | None, place_id: int | None,
-           scene_runtime: str, clean: bool) -> None:
+           scene_runtime: str, clean: bool,
+           allow_nonplayable_output: bool) -> None:
     """Publish the .rbxlx to Roblox via headless place builder."""
     out = Path(output_dir).resolve()
     # PR5: ``auto`` is now lifted; route through the generic pipeline
@@ -1020,6 +1045,10 @@ def upload(output_dir: str, api_key: str | None,
     # PR3b: honor the requested mode for the rebuild path. The default
     # legacy is the safe choice (this is upload, not transpile).
     pipeline.ctx.scene_runtime_mode = scene_runtime
+    # PR6: thread the playability-guard escape through the rebuild
+    # path so write_output's guard either fails or downgrades per the
+    # caller.
+    pipeline.ctx.allow_nonplayable_output = allow_nonplayable_output
 
     # Rebuild rbx_place via the pipeline. Cloud side-effect phases
     # (moderate_assets, upload_assets, resolve_assets) are skipped because

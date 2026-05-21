@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from collections.abc import Iterable
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 import config as _config
 from config import (
@@ -2343,6 +2343,7 @@ return table.concat(allData, "\\n")'''
         "_subphase_inject_autogen_scripts",
         "_inject_runtime_modules",
         "_subphase_inject_scene_runtime",
+        "_check_runtime_playability_guard",
         "_generate_prefab_packages",
         "_subphase_encode_terrain",
         "_subphase_inject_mesh_loader",
@@ -2427,6 +2428,15 @@ return table.concat(allData, "\\n")'''
         self._subphase_inject_autogen_scripts()
         self._inject_runtime_modules()
         self._subphase_inject_scene_runtime()
+        # PR6: hard playability guard. Runs AFTER the host runtime +
+        # plan emit subphase (so a clean generic run has its scripts
+        # in place) and BEFORE the rbxlx encoder, prefab packages, and
+        # downstream artifact emits — failing here aborts before any
+        # broken artifact lands on disk. Fail-closed under
+        # generic/auto when runtime-bearing MonoBehaviours exist with
+        # no valid plan+host; ``--allow-nonplayable-output`` downgrades
+        # to a warning surfaced through UNCONVERTED.md.
+        self._check_runtime_playability_guard()
         self._generate_prefab_packages()
         self._subphase_encode_terrain()
         self._subphase_inject_mesh_loader()
@@ -3441,8 +3451,22 @@ script.Disabled = true
             if isinstance(raw_edges, list):
                 cross_domain_edges = [dict(e) for e in raw_edges if isinstance(e, dict)]
 
+        # PR6: playability-guard warnings staged by
+        # ``_check_runtime_playability_guard`` when
+        # ``--allow-nonplayable-output`` downgrades a hard fail. Each
+        # entry covers one guard fire (resume reruns push another) so
+        # operators see the complete history of degraded-output runs
+        # against this dir.
+        nonplayable_warnings: list[dict[str, object]] = []
+        if isinstance(scene_runtime_ctx, dict):
+            raw_warnings = scene_runtime_ctx.get("nonplayable_warnings") or []
+            if isinstance(raw_warnings, list):
+                nonplayable_warnings = [
+                    dict(w) for w in raw_warnings if isinstance(w, dict)
+                ]
+
         out_path = self.output_dir / UNCONVERTED_FILENAME
-        if not sections and not cross_domain_edges:
+        if not sections and not cross_domain_edges and not nonplayable_warnings:
             if out_path.exists():
                 out_path.unlink()
             return
@@ -3467,15 +3491,15 @@ script.Disabled = true
                     reason = entry.get("reason", "")
                     lines.append(f"- `{item}` — {reason}")
                 lines.append("")
-        elif cross_domain_edges:
-            # No standard unconverted entries, but cross-domain edges
-            # still need a file. Emit a minimal header so the cross-
-            # domain block has context.
+        elif cross_domain_edges or nonplayable_warnings:
+            # No standard unconverted entries, but scene-runtime
+            # artefacts still need a file. Emit a minimal header so
+            # the downstream blocks have context.
             lines.extend([
                 "# UNCONVERTED",
                 "",
-                "Cross-domain references the host runtime injects ``nil`` "
-                "for at start. See the table below.",
+                "Scene-runtime artefacts surfaced by this conversion. "
+                "See the section(s) below.",
                 "",
             ])
 
@@ -3489,12 +3513,62 @@ script.Disabled = true
                 lines.extend(report_md.rstrip("\n").split("\n"))
                 lines.append("")
 
+        if nonplayable_warnings:
+            # PR6: render the playability-guard downgrade block. Only
+            # appears when ``--allow-nonplayable-output`` was passed
+            # against a converter run that would otherwise have hard-
+            # failed at write_output.
+            lines.append("## Non-playable converted place (guard rail downgraded)")
+            lines.append("")
+            lines.append(
+                "``--allow-nonplayable-output`` was set, so the "
+                "scene-runtime playability guard logged a warning "
+                "rather than aborting the write. The converted place "
+                "ships with runtime-bearing MonoBehaviours that the "
+                "host runtime cannot bind at start; gameplay attached "
+                "to those components will not run."
+            )
+            lines.append("")
+            for warning in nonplayable_warnings:
+                mode = warning.get("scene_runtime_mode", "?")
+                rb_count = warning.get("runtime_bearing_count", 0)
+                lines.append(
+                    f"- ``--scene-runtime={mode}`` with {rb_count} "
+                    "runtime-bearing module(s):"
+                )
+                invalid = warning.get("invalid_modules") or []
+                if isinstance(invalid, list) and invalid:
+                    lines.append(
+                        f"  - {len(invalid)} module(s) missing a valid plan entry:"
+                    )
+                    for entry in invalid[:20]:
+                        if not isinstance(entry, dict):
+                            continue
+                        sid = entry.get("script_id", "?")
+                        stem = entry.get("stem", "")
+                        reason = entry.get("reason", "")
+                        stem_suffix = f" ({stem})" if stem else ""
+                        lines.append(
+                            f"    - ``{sid}``{stem_suffix}: {reason}"
+                        )
+                    if len(invalid) > 20:
+                        lines.append(
+                            f"    - ...and {len(invalid) - 20} more"
+                        )
+                missing_hosts = warning.get("missing_host_scripts") or []
+                if isinstance(missing_hosts, list) and missing_hosts:
+                    lines.append("  - Missing host scripts:")
+                    for name in missing_hosts:
+                        lines.append(f"    - ``{name}``")
+            lines.append("")
+
         out_path.write_text("\n".join(lines), encoding="utf-8")
         log.info(
             "[write_output] UNCONVERTED.md written "
-            "(%d entries across %d categories, %d cross-domain edges)",
+            "(%d entries across %d categories, %d cross-domain edges, "
+            "%d non-playable warnings)",
             sum(len(v) for v in sections.values()), len(sections),
-            len(cross_domain_edges),
+            len(cross_domain_edges), len(nonplayable_warnings),
         )
 
     # ------------------------------------------------------------------
@@ -4795,6 +4869,227 @@ script.Disabled = true
             "plan, and entrypoints (%d runtime-bearing modules)",
             len(runtime_bearing),
         )
+
+    # ------------------------------------------------------------------
+    # PR6: write_output hard playability guard
+    # ------------------------------------------------------------------
+
+    # Names of the four host-runtime scripts ``_subphase_inject_scene_runtime``
+    # emits under ``generic`` mode. PR6's guard treats absence of any of
+    # these (specifically the host engine ``SceneRuntime`` module) as
+    # "no valid host emit" -- runtime-bearing MonoBehaviours have nothing
+    # to bind against at place start.
+    _SCENE_RUNTIME_HOST_SCRIPTS: ClassVar[tuple[str, ...]] = (
+        "SceneRuntime",
+        "SceneRuntimePlan",
+        "SceneRuntimeClient",
+        "SceneRuntimeServer",
+    )
+
+    def _check_runtime_playability_guard(self) -> None:
+        """PR6: fail-closed before write when the converted place would
+        ship runtime-bearing MonoBehaviours with no host runtime to
+        instantiate them.
+
+        Lands BEFORE PR7's default ``--scene-runtime=auto`` flip so the
+        new default cannot silently produce a broken place. The brief
+        condition (design doc PR6 row):
+
+          Under ``--scene-runtime=generic|auto``, fail when ANY
+          runtime-bearing MonoBehaviour exists with EITHER
+          (a) no entry in ``scene_runtime.modules`` carrying
+              ``runtime_bearing: True``, ``domain ∈ {client, server}``,
+              and a ``module_path``; OR
+          (b) no host-runtime emit (``SceneRuntime`` ModuleScript +
+              ``SceneRuntimePlan`` + ``SceneRuntimeClient`` +
+              ``SceneRuntimeServer``) in ``rbx_place.scripts``.
+
+        Order (load-bearing): runs AFTER
+        ``_subphase_inject_scene_runtime`` so a clean ``generic`` run
+        has every host script staged before the predicate fires, and
+        BEFORE the rbxlx encoder runs so no broken artifact lands.
+
+        Mode gating:
+
+          - ``legacy``: short-circuit -- legacy never emitted the host
+            runtime; firing here would be a false positive.
+          - ``auto``: ``_check_auto_fail_closed`` already rewrote the
+            effective mode to either ``generic`` or ``legacy`` before
+            we get here. Under the ``legacy`` branch the host emit
+            short-circuits and the guard would false-positive on every
+            fail-closed fallback; treat that branch as legacy. Under
+            the ``generic`` branch the guard fires normally.
+          - ``generic``: guard fires.
+
+        Operator escape: ``ctx.allow_nonplayable_output`` (plumbed in
+        from every front door's ``--allow-nonplayable-output`` flag)
+        downgrades the raise to a structured warning. The warning is
+        appended to ``ctx.scene_runtime["nonplayable_warnings"]`` so
+        ``_write_unconverted_md`` can render it; the rbxlx still
+        writes.
+        """
+        # PR6: legacy never emitted the host runtime; let the legacy
+        # path through. ``auto`` rewrote ``scene_runtime_mode`` to
+        # ``"generic"`` or ``"legacy"`` in ``_check_auto_fail_closed``
+        # earlier in write_output, so reading the effective mode here
+        # captures both the clean-generic and the fail-closed-legacy
+        # auto branches correctly.
+        if self.ctx.scene_runtime_mode != "generic":
+            return
+        if self.state.rbx_place is None:
+            return
+
+        scene_runtime = self.ctx.scene_runtime or {}
+        modules = scene_runtime.get("modules") if isinstance(scene_runtime, dict) else None
+        if not isinstance(modules, dict):
+            modules = {}
+
+        # Runtime-bearing set: every module whose ``runtime_bearing``
+        # flag is True. The planner stamps this for both scene-MB
+        # scripts and prefab-attached MBs caught by ``walk_prefab_tree``.
+        runtime_bearing_ids: list[str] = []
+        for sid, row in modules.items():
+            if isinstance(row, dict) and row.get("runtime_bearing"):
+                runtime_bearing_ids.append(sid)
+
+        if not runtime_bearing_ids:
+            # Generic run on a scene with no runtime-bearing MBs --
+            # nothing to bind, nothing to fail on. The host emit
+            # subphase already short-circuited above.
+            return
+
+        # Per-module plan-validity check. Each runtime-bearing module
+        # MUST carry ``domain ∈ {client, server}`` + a non-empty
+        # ``module_path``. Both are PR3b classifier outputs; either
+        # missing means the host runtime has nowhere to ``require()``
+        # the component from at start.
+        invalid_modules: list[dict[str, str]] = []
+        valid_domains = {"client", "server"}
+        for sid in runtime_bearing_ids:
+            row = modules.get(sid)
+            if not isinstance(row, dict):
+                invalid_modules.append({
+                    "script_id": sid,
+                    "stem": "",
+                    "reason": "module row missing or malformed",
+                })
+                continue
+            stem = row.get("stem") if isinstance(row.get("stem"), str) else ""
+            domain = row.get("domain")
+            module_path = row.get("module_path")
+            if domain not in valid_domains:
+                invalid_modules.append({
+                    "script_id": sid,
+                    "stem": stem,
+                    "reason": (
+                        f"domain={domain!r} not in {{'client','server'}}"
+                    ),
+                })
+                continue
+            if not isinstance(module_path, str) or not module_path:
+                invalid_modules.append({
+                    "script_id": sid,
+                    "stem": stem,
+                    "reason": "module_path missing or empty",
+                })
+                continue
+
+        # Host emit check. Even when every module row is valid, an
+        # absent ``SceneRuntime`` script means the place loads without
+        # the engine that would bind those modules -- equally
+        # non-playable. We assert presence of every host script the
+        # subphase is supposed to emit.
+        emitted_names = {s.name for s in self.state.rbx_place.scripts}
+        missing_host_scripts = [
+            name for name in self._SCENE_RUNTIME_HOST_SCRIPTS
+            if name not in emitted_names
+        ]
+
+        if not invalid_modules and not missing_host_scripts:
+            log.debug(
+                "[write_output] PR6 playability guard: %d runtime-bearing "
+                "module(s) all carry valid plan + host emit; OK",
+                len(runtime_bearing_ids),
+            )
+            return
+
+        # Compose a single structured message covering BOTH failure
+        # surfaces so a single guard fire enumerates everything that's
+        # wrong with the converted place. Operators get one report
+        # instead of N reruns peeling off failures one at a time.
+        lines: list[str] = [
+            "[write_output] PR6 playability guard: refusing to write a "
+            "non-playable converted place.",
+            (
+                f"  --scene-runtime={self.ctx.scene_runtime_mode!r} with "
+                f"{len(runtime_bearing_ids)} runtime-bearing "
+                "MonoBehaviour module(s) requires both a complete "
+                "scene_runtime.modules plan and the SceneRuntime host "
+                "emit; the converted place would load without binding "
+                "those components."
+            ),
+        ]
+        if invalid_modules:
+            lines.append(
+                f"  {len(invalid_modules)} module(s) missing a valid plan entry:"
+            )
+            for entry in invalid_modules[:20]:
+                stem_suffix = (
+                    f" ({entry['stem']})" if entry.get("stem") else ""
+                )
+                lines.append(
+                    f"    - {entry['script_id']}{stem_suffix}: {entry['reason']}"
+                )
+            if len(invalid_modules) > 20:
+                lines.append(
+                    f"    - ...and {len(invalid_modules) - 20} more"
+                )
+        if missing_host_scripts:
+            lines.append(
+                "  Missing SceneRuntime host scripts in rbx_place.scripts:"
+            )
+            for name in missing_host_scripts:
+                lines.append(f"    - {name}")
+        lines.append(
+            "  Remediation: rerun with --scene-runtime=legacy (PR3a "
+            "byte-identical pre-contract pipeline), or pass "
+            "--allow-nonplayable-output to downgrade this hard "
+            "failure to a warning surfaced in UNCONVERTED.md."
+        )
+        message = "\n".join(lines)
+
+        # Stage the warning for UNCONVERTED.md regardless of which
+        # branch we take -- the operator wants the diagnostic visible
+        # whether the place ships (escape flag set) or the run aborts
+        # (so a partial state on disk from a prior successful generic
+        # run carries the warning until the next clean conversion).
+        if isinstance(scene_runtime, dict):
+            warnings_list = scene_runtime.setdefault(
+                "nonplayable_warnings", []
+            )
+            if isinstance(warnings_list, list):
+                warnings_list.append({
+                    "invalid_modules": invalid_modules,
+                    "missing_host_scripts": missing_host_scripts,
+                    "runtime_bearing_count": len(runtime_bearing_ids),
+                    "scene_runtime_mode": self.ctx.scene_runtime_mode,
+                })
+
+        if self.ctx.allow_nonplayable_output:
+            log.warning(
+                "[write_output] PR6 playability guard: "
+                "--allow-nonplayable-output set -- downgrading hard "
+                "fail to warning. The .rbxlx will write but the "
+                "scene-runtime contract is incomplete.\n%s",
+                message,
+            )
+            return
+
+        # Hard fail. RuntimeError matches the existing fail surface
+        # (``resolve_assets`` raises ``RuntimeError`` when a mesh-id
+        # mismatch would produce a dead-on-arrival rbxlx; same shape
+        # the front-door commands already catch + render).
+        raise RuntimeError(message)
 
     def _build_scriptable_object_module_map(
         self, scene_runtime: dict[str, object],

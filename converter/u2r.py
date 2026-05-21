@@ -341,6 +341,16 @@ def main(verbose: bool) -> None:
               "running any phase. Use when switching modes on an "
               "existing output dir (e.g., legacy run on a "
               "generic-stamped dir). PR3b.")
+@click.option("--allow-nonplayable-output", is_flag=True,
+              help="PR6: operator escape for the scene-runtime "
+              "playability guard rail. Under "
+              "``--scene-runtime=generic|auto``, write_output normally "
+              "fails when runtime-bearing MonoBehaviours have no valid "
+              "plan + SceneRuntime host emit (the converted place "
+              "would load broken). This flag downgrades the hard fail "
+              "to a warning logged into UNCONVERTED.md so the .rbxlx "
+              "still writes. Use only for diagnostic / debugging "
+              "workflows where the broken artifact is expected.")
 def convert(
     unity_project: str,
     output: str,
@@ -357,6 +367,7 @@ def convert(
     skip_architecture_step: bool,
     scene_runtime: str,
     clean: bool,
+    allow_nonplayable_output: bool,
 ) -> None:
     """Convert a Unity project to a Roblox experience.
 
@@ -449,6 +460,9 @@ def convert(
     # PR3b: plumb the requested mode through to ctx so
     # _classify_storage's domain classifier knows whether to run.
     pipeline.ctx.scene_runtime_mode = scene_runtime
+    # PR6: plumb the playability-guard escape so write_output knows
+    # whether to downgrade or fail on missing plan + host emit.
+    pipeline.ctx.allow_nonplayable_output = allow_nonplayable_output
 
     # Plumb --universe-id / --place-id into the pipeline context so the
     # resolve_assets phase can run headless mesh resolution. Without this,
@@ -593,6 +607,13 @@ def convert(
               help="Wipe the output directory before publishing (PR3b "
               "mode-mismatch remediation). Use with --scene-runtime "
               "when switching modes.")
+@click.option("--allow-nonplayable-output", is_flag=True,
+              help="PR6 publish-path mirror of the convert flag: "
+              "downgrade the scene-runtime playability guard from a "
+              "hard fail to an UNCONVERTED.md warning when the "
+              "rebuild fallback would otherwise produce a non-playable "
+              "place. No effect on the cached-chunks / cached-rbxl "
+              "fast paths (those skip write_output entirely).")
 def publish(
     output_dir: str,
     api_key: str | None,
@@ -602,6 +623,7 @@ def publish(
     scaffolding: str | None,
     scene_runtime: str,
     clean: bool,
+    allow_nonplayable_output: bool,
 ) -> None:
     """Publish a previously converted place to Roblox with proper meshes.
 
@@ -741,6 +763,10 @@ def publish(
         # the requested mode (default legacy) so the domain classifier
         # doesn't mutate parent_path on a legacy rebuild.
         pipeline.ctx.scene_runtime_mode = scene_runtime
+        # PR6: thread the escape through the rebuild path too -- this
+        # is the branch that actually re-runs write_output (the cached
+        # ``.rbxl`` / chunked-cache fast paths above bypass it).
+        pipeline.ctx.allow_nonplayable_output = allow_nonplayable_output
         # Mark this rebuild path as an explicit resume so the
         # backward-compat FPS migration treats on-disk FPS scripts
         # as legitimately preserved rather than stale leftovers.
@@ -1562,8 +1588,14 @@ def audit_assets(output_dir: str, api_key: str | None, fail_on_reject: bool) -> 
 @click.option("--clean", is_flag=True,
               help="PR3b: wipe per-project output dirs before "
               "converting (mode-mismatch remediation).")
+@click.option("--allow-nonplayable-output", is_flag=True,
+              help="PR6 eval-path mirror: downgrade the scene-runtime "
+              "playability guard from a hard fail to a warning so the "
+              "eval driver can still measure structural metrics on "
+              "projects whose generic conversion is incomplete.")
 def eval_cmd(
     output: str, baseline: str | None, scene_runtime: str, clean: bool,
+    allow_nonplayable_output: bool,
 ) -> None:
     """Convert all test projects and capture quality metrics.
 
@@ -1632,6 +1664,9 @@ def eval_cmd(
             )
             # PR3b: plumb mode to ctx so the domain classifier honors it.
             pipeline.ctx.scene_runtime_mode = _eval_scene_runtime
+            # PR6: thread the escape so the eval driver doesn't abort
+            # mid-suite when one project hits the playability guard.
+            pipeline.ctx.allow_nonplayable_output = allow_nonplayable_output
             pipeline.run_all()
             elapsed = _time.monotonic() - t0
 
