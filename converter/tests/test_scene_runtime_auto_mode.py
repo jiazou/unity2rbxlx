@@ -320,12 +320,15 @@ class TestDetectFailClosedSignals:
         kinds = [s.kind for s in signals]
         assert "reachability_conflict" in kinds
 
-    def test_unrecognized_classifier_reason_ignored(self, tmp_path):
-        """Future-proofing: an unknown ``fail_closed_reason`` string
-        from the classifier doesn't surface as a fail-closed kind.
-        Forward-compat keeps PR5 from breaking on a PR6+ classifier
-        adding new conflict shapes the auto router doesn't yet know
-        to route on."""
+    def test_unrecognized_classifier_reason_surfaces_as_legacy(self, tmp_path):
+        """R2-P1.3 (codex round 2): forward-compat must NOT fail-open
+        on unknown reason strings. A runtime-bearing module sent to
+        ``domain == "legacy"`` is a fail-closed signal regardless of
+        which reason string the classifier stamped -- a PR6+
+        classifier adding a new conflict vocabulary must not silently
+        re-open auto to generic just because the auto router doesn't
+        recognise the string.
+        """
         artifact = {
             "modules": {
                 "guid-Foo": {
@@ -341,10 +344,41 @@ class TestDetectFailClosedSignals:
         signals = detect_fail_closed_signals(
             transpilation, artifact, [], tmp_path,
         )
-        # No signals raised for unrecognized reasons.
-        assert all(
-            s.kind not in {"future_unseen_reason"} for s in signals
+        # An unrecognized reason surfaces under the bucketing kind
+        # ``classifier_legacy`` so the auto router still treats the
+        # legacy verdict as a fail-closed signal.
+        kinds = [s.kind for s in signals]
+        assert "classifier_legacy" in kinds
+        # Detail string carries the original reason for the operator.
+        legacy_signal = next(
+            s for s in signals if s.kind == "classifier_legacy"
         )
+        assert "future_unseen_reason" in legacy_signal.detail
+
+    def test_legacy_domain_without_runtime_bearing_does_not_surface(
+        self, tmp_path,
+    ):
+        """Helpers (non-runtime-bearing) sitting in ``domain == "legacy"``
+        are the classifier's default verdict, NOT a fail-closed
+        signal. Only runtime-bearing MBs that the classifier kicked
+        back are PR5 fail-closed triggers.
+        """
+        artifact = {
+            "modules": {
+                "guid-Helper": {
+                    "stem": "Helper", "runtime_bearing": False,
+                    "domain": "legacy",
+                    "domain_signals": {
+                        "fail_closed_reason": "future_unseen_reason",
+                    },
+                },
+            },
+        }
+        signals = detect_fail_closed_signals(
+            _empty_transpilation([]), artifact, [], tmp_path,
+        )
+        # Non-runtime-bearing legacy row is not a fail-closed signal.
+        assert signals == []
 
 
 # ---------------------------------------------------------------------------
@@ -403,12 +437,49 @@ class TestCheckAutoFailClosedRouting:
         p._check_auto_fail_closed()
         assert p.ctx.scene_runtime_mode == "generic"
 
-    def test_auto_no_transpile_routes_to_generic(self, tmp_path):
+    def test_auto_no_transpile_no_prior_verdict_routes_to_legacy(self, tmp_path):
+        """R2-P1.2 (codex round 2): when transpile was skipped (assemble/
+        upload rehydrate paths) AND the persisted artifact carries
+        no prior ``auto_fail_closed`` verdict, the subphase cannot
+        prove generic safety -- safe choice is legacy."""
         p = _make_pipeline_with_artifact(
             tmp_path, "auto", {"modules": {}}, None,
         )
         p._check_auto_fail_closed()
+        assert p.ctx.scene_runtime_mode == "legacy"
+        triggers = p.ctx.scene_runtime["auto_fail_closed"]
+        assert any(t["kind"] == "no_transpile_result" for t in triggers)
+
+    def test_auto_no_transpile_prior_clean_verdict_reproduces_generic(
+        self, tmp_path,
+    ):
+        """R2-P1.2: when transpile was skipped but a prior generic
+        run on the same output dir was clean (``auto_fail_closed == []``
+        on the persisted artifact), reproduce the prior verdict and
+        route to generic. This is the assemble/upload happy path."""
+        p = _make_pipeline_with_artifact(
+            tmp_path, "auto",
+            {"modules": {}, "auto_fail_closed": []},
+            None,
+        )
+        p._check_auto_fail_closed()
         assert p.ctx.scene_runtime_mode == "generic"
+
+    def test_auto_no_transpile_prior_dirty_verdict_reproduces_legacy(
+        self, tmp_path,
+    ):
+        """R2-P1.2: when a prior auto run flipped to legacy, the
+        rehydrate path must NOT re-open to generic just because the
+        transpile artifact is absent on this invocation. Honor the
+        prior verdict."""
+        prior_triggers = [{"kind": "verifier", "detail": "prior fail"}]
+        p = _make_pipeline_with_artifact(
+            tmp_path, "auto",
+            {"modules": {}, "auto_fail_closed": prior_triggers},
+            None,
+        )
+        p._check_auto_fail_closed()
+        assert p.ctx.scene_runtime_mode == "legacy"
 
     def test_auto_clean_routes_to_generic(self, tmp_path):
         """The PR5 -> PR7 canary gate: auto + no fail-closed signals
@@ -578,8 +649,10 @@ class TestAutoFallbackRestoresParentPaths:
         )
         p.state.rbx_place.scripts = [script]
         # Simulate the snapshot the classifier subphase would have
-        # taken, then a mutation to a generic placement.
-        p._auto_parent_path_snapshot = {"Helper": "ServerStorage"}
+        # taken, then a mutation to a generic placement. The snapshot
+        # is keyed by ``id(script)`` (R2-P2.1) so duplicate-name
+        # scripts each get their own restore.
+        p._auto_parent_path_snapshot = {id(script): "ServerStorage"}
         script.parent_path = "ReplicatedStorage"
 
         p._check_auto_fail_closed()
@@ -621,6 +694,57 @@ class TestAutoFallbackRestoresParentPaths:
         # parent_path unchanged because no snapshot existed.
         assert script.parent_path == "ReplicatedStorage"
 
+    def test_duplicate_name_scripts_restored_independently(self, tmp_path):
+        """R2-P2.1 (codex round 2): the snapshot must key by object
+        identity, not script name. Two same-name scripts in different
+        containers each need their own legacy ``parent_path`` back on
+        fallback -- the pre-fix snapshot keyed by ``name`` and one
+        entry would silently win, routing one of the scripts to the
+        wrong container.
+        """
+        from core.roblox_types import RbxScript
+        artifact = {
+            "modules": {
+                "guid-Foo": {
+                    "stem": "Foo", "runtime_bearing": True,
+                    "domain": "legacy",
+                    "domain_signals": {
+                        "fail_closed_reason": "both_side_api",
+                    },
+                },
+            },
+        }
+        p = _make_pipeline_with_artifact(
+            tmp_path, "auto", artifact, _empty_transpilation([]),
+        )
+        helper_a = RbxScript(
+            name="Helper", source="// from A",
+            script_type="ModuleScript",
+            parent_path="ServerStorage",
+        )
+        helper_b = RbxScript(
+            name="Helper", source="// from B",
+            script_type="ModuleScript",
+            parent_path="ReplicatedStorage.A",
+        )
+        p.state.rbx_place.scripts = [helper_a, helper_b]
+        # Snapshot pre-classifier state with id() keys so both rows
+        # survive.
+        p._auto_parent_path_snapshot = {
+            id(helper_a): "ServerStorage",
+            id(helper_b): "ReplicatedStorage.A",
+        }
+        # Classifier mutates both to a common container.
+        helper_a.parent_path = "ReplicatedStorage"
+        helper_b.parent_path = "ReplicatedStorage"
+
+        p._check_auto_fail_closed()
+
+        assert p.ctx.scene_runtime_mode == "legacy"
+        # Each script gets its own legacy container back.
+        assert helper_a.parent_path == "ServerStorage"
+        assert helper_b.parent_path == "ReplicatedStorage.A"
+
     def test_clean_auto_path_does_not_restore(self, tmp_path):
         """When auto routes to generic (no fail-closed signals), the
         snapshot must NOT be applied -- generic mode keeps the
@@ -636,7 +760,7 @@ class TestAutoFallbackRestoresParentPaths:
             parent_path="ReplicatedStorage",  # post-classifier
         )
         p.state.rbx_place.scripts = [script]
-        p._auto_parent_path_snapshot = {"Helper": "ServerStorage"}
+        p._auto_parent_path_snapshot = {id(script): "ServerStorage"}
 
         p._check_auto_fail_closed()
 
@@ -741,7 +865,7 @@ class TestAnalyzerFailureUnderAutoFallsBackToLegacy:
         # Simulate the classifier path: take the snapshot the
         # production code takes, then mutate.
         p._auto_parent_path_snapshot = {
-            s.name: s.parent_path for s in p.state.rbx_place.scripts
+            id(s): s.parent_path for s in p.state.rbx_place.scripts
         }
         helper.parent_path = "ReplicatedStorage"  # classifier hoist
 
@@ -771,7 +895,7 @@ class TestAnalyzerFailureUnderAutoFallsBackToLegacy:
             parent_path="ReplicatedStorage",
         )
         p.state.rbx_place.scripts = [script]
-        p._auto_parent_path_snapshot = {"Helper": "ServerStorage"}
+        p._auto_parent_path_snapshot = {id(script): "ServerStorage"}
 
         def _boom(_path):
             raise OSError("forced for test")

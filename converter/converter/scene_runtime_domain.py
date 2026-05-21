@@ -657,6 +657,17 @@ def _apply_reachability_rule(
             if module_id and module_id in modules:
                 module_row = modules[module_id]
                 module_row["container"] = REPLICATED_STORAGE
+                # PR5 / R2-P1.1 (codex round 2): the reachability
+                # hoist must also re-stamp ``module_path`` -- pre-fix
+                # the stamp ran ONCE in ``_stamp_container_and_path``
+                # before the reachability pass, so a hoisted helper
+                # shipped a plan with the stale ``ServerStorage.X``
+                # path and ``host.require`` would FindFirstChild
+                # against ServerStorage from the client and miss.
+                if script.name:
+                    module_row["module_path"] = (
+                        f"{REPLICATED_STORAGE}.{script.name}"
+                    )
                 signals = cast(
                     SceneRuntimeDomainSignals,
                     module_row.get("domain_signals", {}),

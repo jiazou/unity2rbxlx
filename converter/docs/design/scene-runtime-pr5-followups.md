@@ -238,6 +238,81 @@ flag or ``conversion_summary.json`` entry.
 
 ## Codex review absorption
 
-Codex review of PR5 was capped at 2 rounds per
-``[[review_loops_stay_high_level]]``. Per-round absorption +
-deferrals will be appended below when the codex pass runs.
+Codex review capped at 2 rounds per
+``[[review_loops_stay_high_level]]``.
+
+### Round 1 (2026-05-21)
+
+**R1-P1 ABSORBED**: auto-fallback now reverts classifier-driven
+``parent_path`` mutations. ``_classify_storage`` snapshots
+``{id(script) -> parent_path}`` for every RbxScript when
+``scene_runtime_mode == "auto"`` BEFORE the domain classifier
+runs. ``_restore_auto_parent_paths`` writes the snapshot back on
+fail-closed fallback. Tests:
+``TestAutoFallbackRestoresParentPaths`` x3 +
+``test_classify_storage_followed_by_fallback_restores_path``.
+
+**R1-P2 ABSORBED**: ``_check_auto_fail_closed`` now falls back
+to legacy (not generic) on ``analyze_all_scripts`` failure.
+Stages a ``script_analyzer_failure`` diagnostic on
+``auto_fail_closed`` + restores parent paths before the legacy
+flip. Tests:
+``TestAnalyzerFailureUnderAutoFallsBackToLegacy`` x2.
+
+**R1-P3 ABSORBED**: ``--help`` text + followups doc consistency.
+``u2r convert/eval`` + ``convert_interactive transpile/assemble/
+upload`` now describe the PR5 routing rather than the PR4
+deferral. Test:
+``test_help_text_no_longer_marks_auto_as_reserved``.
+
+### Round 2 (2026-05-21)
+
+**R2-P1.1 ABSORBED**: ``module_path`` must follow the
+reachability hoist. ``scene_runtime_domain._apply_reachability_rule``
+re-stamps ``module["module_path"] = f"{REPLICATED_STORAGE}.{name}"``
+when it hoists a client-only helper -- pre-fix the planner
+emitted a stale ``ServerStorage.Helper`` path the host's
+``host.require`` would walk against ServerStorage from the
+client and miss. Regression assertion added to the existing
+``test_client_only_reach_hoists_helper_to_replicated_storage``.
+
+**R2-P1.2 ABSORBED**: rehydrate paths (``assemble``, ``upload``,
+``--phase write_output`` resume) reach ``_check_auto_fail_closed``
+without a fresh ``transpilation_result``. Pre-fix the subphase
+routed to generic in that case -- a previously fail-closed
+output could re-open to generic host emit. PR5 fix: read the
+prior ``auto_fail_closed`` verdict from the persisted
+``conversion_plan.json`` and honor it (empty list -> generic;
+non-empty list -> legacy + restore). When neither a transpile
+result nor a prior verdict exists, route to legacy
+(``no_transpile_result`` trigger). Tests:
+``test_auto_no_transpile_no_prior_verdict_routes_to_legacy``,
+``test_auto_no_transpile_prior_clean_verdict_reproduces_generic``,
+``test_auto_no_transpile_prior_dirty_verdict_reproduces_legacy``.
+
+**R2-P1.3 ABSORBED**: any runtime-bearing module the classifier
+sent to ``domain == "legacy"`` surfaces as a fail-closed signal,
+regardless of the ``fail_closed_reason`` string. Pre-fix the
+detector hardcoded three known reasons; a future or migrated
+classifier reason would fail-open auto to generic. The fix
+surfaces unrecognized reasons as ``classifier_legacy`` kind so
+downstream filters branching on the named-reason set still work.
+Tests:
+``test_unrecognized_classifier_reason_surfaces_as_legacy``,
+``test_legacy_domain_without_runtime_bearing_does_not_surface``.
+
+**R2-P2.1 ABSORBED**: snapshot key changed from ``script.name``
+to ``id(script)``. Duplicate-name scripts in different containers
+each get their own legacy ``parent_path`` back on fallback. Test:
+``test_duplicate_name_scripts_restored_independently``.
+
+**R2-P2.2 DEFERRED**: cross-scene serialized references. The
+PR5 per-place plan scoping filters ``scene_runtime["scenes"]``
+by namespace, but planner-side cross-scene refs may already
+have been rewritten into the active namespace by
+``scene_runtime_planner.py:499`` before scoping runs. Fixing
+this requires planner-side awareness of which refs cross scene
+boundaries (the planner today treats every scene as an island);
+the multi-scene canary fixture (item 1 above) is the test
+target. Out of scope for PR5's per-place plan scoping change;
+tracked here for the canary playtest follow-up.

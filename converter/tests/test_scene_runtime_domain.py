@@ -327,6 +327,16 @@ class TestReachability:
         assert artifact["modules"]["h"]["container"] == REPLICATED_STORAGE
         assert (artifact["modules"]["h"]["domain_signals"]
                 ["reachability_forced_container"]) == REPLICATED_STORAGE
+        # R2-P1.1 (codex round 2): ``module_path`` must also reflect
+        # the hoist. Pre-fix, ``_stamp_container_and_path`` ran ONCE
+        # before the reachability pass and emitted
+        # ``ServerStorage.Helper``; the post-pass hoist updated only
+        # ``container``, so the embedded plan shipped a stale
+        # ``module_path`` the host's ``host.require`` would walk
+        # against ServerStorage (and miss on the client).
+        assert artifact["modules"]["h"]["module_path"] == (
+            f"{REPLICATED_STORAGE}.Helper"
+        )
 
 
 # ---------------------------------------------------------------------------

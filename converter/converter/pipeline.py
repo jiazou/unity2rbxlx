@@ -3821,9 +3821,19 @@ script.Disabled = true
         # The snapshot is only taken under auto -- explicit
         # ``--scene-runtime=generic`` runs accept the classifier
         # mutations as intended (and have no fallback path).
+        #
+        # PR5 / R2-P2.1 (codex round 2): the snapshot key is
+        # ``id(script)``, not ``script.name``. Duplicate-name scripts
+        # (the converter treats them as legitimate elsewhere -- a
+        # stem collision is a fail-closed signal but a same-name
+        # script in different containers is not) would otherwise
+        # overwrite each other in the snapshot, and restore would
+        # silently route at least one script to the wrong
+        # ``parent_path``. ``id()`` is stable for the object's
+        # lifetime which spans this one write_output invocation.
         if self.ctx.scene_runtime_mode == "auto" and self.state.rbx_place.scripts:
             self._auto_parent_path_snapshot = {
-                s.name: s.parent_path for s in self.state.rbx_place.scripts
+                id(s): s.parent_path for s in self.state.rbx_place.scripts
             }
         if (
             self.ctx.scene_runtime_mode != "legacy"
@@ -4443,10 +4453,43 @@ script.Disabled = true
             self.ctx.scene_runtime_mode = "generic"
             return
         if not self.state.transpilation_result:
-            # Auto with no transpile artifact (--no-ai or stub-only):
-            # treat as generic. The host emit is a no-op when no
-            # runtime-bearing modules survived.
-            self.ctx.scene_runtime_mode = "generic"
+            # PR5 / R2-P1.2 (codex round 2): the prior implementation
+            # fail-opened to generic when ``transpilation_result`` was
+            # absent. That's wrong for the rehydrate paths
+            # (``assemble`` / ``upload`` skip ``transpile_scripts``
+            # and rehydrate cached Luau from disk; ``write_output``
+            # can also be invoked with the transpile phase skipped).
+            # In those paths, the persisted ``conversion_plan.json``
+            # carries ``auto_fail_closed`` from the original generic
+            # run; if any prior signal was non-empty we MUST honor
+            # the prior verdict on rerun. When the persisted artifact
+            # carries no prior signal AND no transpilation result is
+            # available, we cannot prove the prior run was clean ---
+            # fail-closed to legacy is the safe choice.
+            prior = scene_runtime.get("auto_fail_closed")
+            if isinstance(prior, list) and not prior:
+                # Prior run completed clean (empty list, not absent).
+                # Reproduce the routing decision: generic.
+                self.ctx.scene_runtime_mode = "generic"
+                return
+            if isinstance(prior, list) and prior:
+                # Prior run already routed to legacy; honor it.
+                self._restore_auto_parent_paths()
+                self.ctx.scene_runtime_mode = "legacy"
+                return
+            # No prior verdict on the artifact + no current transpile
+            # result. Conservative: legacy.
+            scene_runtime["auto_fail_closed"] = [{
+                "kind": "no_transpile_result",
+                "detail": (
+                    "auto-mode reached write_output without a "
+                    "transpilation_result and without a prior "
+                    "auto_fail_closed verdict on conversion_plan.json; "
+                    "cannot prove generic safety -- routing to legacy"
+                ),
+            }]
+            self._restore_auto_parent_paths()
+            self.ctx.scene_runtime_mode = "legacy"
             return
 
         # ``analyze_all_scripts`` is deterministic; re-running here
@@ -4549,8 +4592,17 @@ script.Disabled = true
         if not snapshot:
             return
         for script in self.state.rbx_place.scripts:
-            if script.name in snapshot:
-                original = snapshot[script.name]
+            # PR5 / R2-P2.1 (codex round 2): snapshot is keyed by
+            # ``id(script)`` so duplicate-name scripts in different
+            # containers each get their own legacy ``parent_path``
+            # back. Scripts added between snapshot and restore (the
+            # post-classifier ``_subphase_inject_*`` paths add
+            # SceneRuntime / autogen scripts that the snapshot
+            # legitimately doesn't cover) won't appear in the
+            # snapshot and are left untouched.
+            key = id(script)
+            if key in snapshot:
+                original = snapshot[key]
                 if script.parent_path != original:
                     log.debug(
                         "[auto] restoring %s parent_path: %r -> %r",

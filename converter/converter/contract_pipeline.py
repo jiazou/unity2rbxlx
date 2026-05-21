@@ -306,31 +306,49 @@ def detect_fail_closed_signals(
     modules = scene_runtime.get("modules", {}) or {}
     out: list[FailClosed] = []
 
-    # Domain-classifier surface (PR3b). These rows already live on the
-    # planner artifact; the classifier sets ``domain == "legacy"`` and
-    # stamps ``domain_signals.fail_closed_reason`` to a string we surface
-    # here as a structured FailClosed kind.
+    # Domain-classifier surface (PR3b). Any runtime-bearing module the
+    # classifier sent to ``domain == "legacy"`` is a fail-closed
+    # signal -- the legacy verdict IS the safety signal, regardless
+    # of which reason string the classifier stamped.
+    #
+    # PR5 / R2-P1.3 (codex round 2): surface ALL legacy-verdict rows,
+    # not just the three reasons in PR3b's vocabulary. A future or
+    # migrated classifier reason must not silently re-open auto to
+    # generic just because the auto router doesn't yet know the
+    # string. The kind defaults to "classifier_legacy" when the
+    # reason isn't one of PR3b's named conflicts, so downstream
+    # filters that branch on the named set still work.
+    _KNOWN_CLASSIFIER_REASONS: frozenset[str] = frozenset({
+        "both_side_api",
+        "intra_class_conflict",
+        "reachability_conflict",
+    })
     for sid, row in modules.items():
         if row.get("domain") != "legacy":
             continue
+        # Only surface runtime-bearing modules -- a non-runtime-bearing
+        # row sitting in "legacy" is the classifier's default verdict
+        # for helpers, NOT a fail-closed signal.
+        if not row.get("runtime_bearing"):
+            continue
         signals = row.get("domain_signals") or {}
         if not isinstance(signals, dict):
-            continue
-        reason = signals.get("fail_closed_reason", "")
-        if not isinstance(reason, str) or not reason:
-            continue
-        # The classifier emits these three reason strings exactly --
-        # mirror them as the FailClosed kind so downstream consumers
-        # can switch on a stable vocabulary.
-        if reason in ("both_side_api", "intra_class_conflict",
-                       "reachability_conflict"):
-            out.append(FailClosed(
-                kind=reason,
-                detail=(
-                    f"{row.get('stem', sid)} (script_id={sid}): domain "
-                    f"classifier fell to legacy ({reason})"
-                ),
-            ))
+            reason = ""
+        else:
+            raw_reason = signals.get("fail_closed_reason", "")
+            reason = raw_reason if isinstance(raw_reason, str) else ""
+        kind = (
+            reason if reason in _KNOWN_CLASSIFIER_REASONS
+            else "classifier_legacy"
+        )
+        out.append(FailClosed(
+            kind=kind,
+            detail=(
+                f"{row.get('stem', sid)} (script_id={sid}): domain "
+                f"classifier fell to legacy "
+                f"({reason or 'no fail_closed_reason recorded'})"
+            ),
+        ))
 
     # Contract-orchestrator surface. Recompute runtime-bearing paths +
     # require-graph from the same artifacts ``transpile_with_contract``
