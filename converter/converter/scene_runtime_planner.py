@@ -171,7 +171,15 @@ class SceneRuntimeDisplacedInstance(TypedDict):
     conversion-time report enumerates these so the operator sees which
     instances won't execute their lifecycle on the chosen side.
 
-    ``scene``: the scene path or prefab id the instance lives in.
+    ``owner_kind``: ``"scene"`` or ``"prefab"`` -- which planner block
+        the instance lives in.
+    ``owner_ref``: the scene path (``owner_kind == "scene"``) or stable
+        prefab id (``owner_kind == "prefab"``).
+    ``scene``: legacy alias for ``owner_ref`` (PR3b shipped only this
+        field; PR4 split it into ``owner_kind`` + ``owner_ref`` so the
+        report can render the two cases distinctly without re-parsing
+        the value). Kept populated for one release; readers should
+        migrate to the split pair.
     ``instance_id``: the per-instance id from PR1's planner.
     ``game_object_id``: the host GameObject's stable id.
     ``script_id``: which class the instance belongs to.
@@ -181,6 +189,8 @@ class SceneRuntimeDisplacedInstance(TypedDict):
         suggested (``"client"`` / ``"server"`` / ``"neither"``).
     """
 
+    owner_kind: str
+    owner_ref: str
     scene: str
     instance_id: str
     game_object_id: str

@@ -2334,6 +2334,7 @@ return table.concat(allData, "\\n")'''
         "_bind_scripts_to_parts",
         "_subphase_inject_autogen_scripts",
         "_inject_runtime_modules",
+        "_subphase_inject_scene_runtime",
         "_generate_prefab_packages",
         "_subphase_encode_terrain",
         "_subphase_inject_mesh_loader",
@@ -2411,6 +2412,7 @@ return table.concat(allData, "\\n")'''
         self._bind_scripts_to_parts()
         self._subphase_inject_autogen_scripts()
         self._inject_runtime_modules()
+        self._subphase_inject_scene_runtime()
         self._generate_prefab_packages()
         self._subphase_encode_terrain()
         self._subphase_inject_mesh_loader()
@@ -4308,6 +4310,127 @@ script.Disabled = true
 
         if injected:
             log.info("[write_output] Injected %d runtime library modules", injected)
+
+    def _subphase_inject_scene_runtime(self) -> None:
+        """PR4: emit the scene-runtime host runtime + plan + entrypoints.
+
+        Only fires when ``ctx.scene_runtime_mode == "generic"`` and the
+        plan carries at least one runtime-bearing module. Injects four
+        scripts:
+
+          - ``SceneRuntime`` (ReplicatedStorage ModuleScript) -- the
+            host engine from ``converter/runtime/scene_runtime.luau``.
+          - ``SceneRuntimePlan`` (ReplicatedStorage ModuleScript) -- the
+            per-place plan, derived from ``conversion_plan.json``.
+          - ``SceneRuntimeClient`` (StarterPlayerScripts LocalScript) --
+            wires the engine to client services + ``start("client")``.
+          - ``SceneRuntimeServer`` (ServerScriptService Script) --
+            mirrors the client entrypoint for the ``server`` domain.
+
+        Also stamps the conversion-time cross-domain edge report onto
+        ``ctx.scene_runtime`` and appends it to ``UNCONVERTED.md``.
+        The host runtime applies the v1 nil-injection policy at start;
+        the conversion-time emit lets operators see the boundary
+        before they ship the place.
+
+        Idempotent: re-runs (incremental ``--phase write_output``)
+        overwrite previous SceneRuntime* scripts in place.
+        """
+        if self.ctx.scene_runtime_mode != "generic":
+            return
+        if self.state.rbx_place is None:
+            return
+
+        scene_runtime = self.ctx.scene_runtime or {}
+        modules = scene_runtime.get("modules", {})
+        runtime_bearing = [
+            sid for sid, row in modules.items()
+            if row.get("runtime_bearing")
+        ]
+        if not runtime_bearing:
+            log.info(
+                "[write_output] scene-runtime generic mode: no "
+                "runtime-bearing modules; skipping host runtime emit"
+            )
+            return
+
+        from converter.autogen import (
+            generate_scene_runtime_client_entrypoint,
+            generate_scene_runtime_plan_module,
+            generate_scene_runtime_server_entrypoint,
+            render_cross_domain_report,
+        )
+        from converter.scene_runtime_domain import compute_cross_domain_edges
+
+        runtime_dir = Path(__file__).parent.parent / "runtime"
+        host_path = runtime_dir / "scene_runtime.luau"
+        existing_names = {s.name for s in self.state.rbx_place.scripts}
+
+        def _replace_or_add(script: RbxScript) -> None:
+            self.state.rbx_place.scripts = [
+                s for s in self.state.rbx_place.scripts
+                if s.name != script.name
+            ]
+            self.state.rbx_place.scripts.append(script)
+
+        if host_path.exists():
+            host_source = host_path.read_text(encoding="utf-8")
+            _replace_or_add(RbxScript(
+                name="SceneRuntime",
+                source=host_source,
+                script_type="ModuleScript",
+                parent_path="ReplicatedStorage",
+            ))
+        else:
+            log.warning(
+                "[write_output] scene-runtime host runtime missing at %s; "
+                "skipping (the place will fail to bind runtime-bearing "
+                "modules at start)", host_path,
+            )
+            return
+
+        _replace_or_add(generate_scene_runtime_plan_module(
+            cast("dict", scene_runtime),
+        ))
+        _replace_or_add(generate_scene_runtime_client_entrypoint())
+        _replace_or_add(generate_scene_runtime_server_entrypoint())
+
+        edges = compute_cross_domain_edges(
+            cast("dict", scene_runtime),
+        )
+        # Stash on ctx so the report writers (and tests) can inspect.
+        scene_runtime["cross_domain_edges"] = list(edges)
+        if edges:
+            report_md = render_cross_domain_report([dict(e) for e in edges])
+            unconverted_path = self.output_dir / "UNCONVERTED.md"
+            try:
+                existing_md = (
+                    unconverted_path.read_text(encoding="utf-8")
+                    if unconverted_path.exists() else ""
+                )
+            except OSError:
+                existing_md = ""
+            # Strip prior cross-domain block on re-run.
+            marker = "## Cross-domain references (scene-runtime v1)"
+            if marker in existing_md:
+                existing_md = existing_md.split(marker, 1)[0].rstrip() + "\n"
+            unconverted_path.write_text(
+                (existing_md.rstrip() + ("\n\n" if existing_md.strip() else ""))
+                + report_md,
+                encoding="utf-8",
+            )
+            log.info(
+                "[write_output] scene-runtime generic: %d cross-domain "
+                "edges -> UNCONVERTED.md", len(edges),
+            )
+        injected_total = 4
+        if "SceneRuntime" in existing_names:
+            injected_total -= 0  # we always replace, so count remains
+        log.info(
+            "[write_output] scene-runtime generic: injected host runtime, "
+            "plan, and entrypoints (%d runtime-bearing modules)",
+            len(runtime_bearing),
+        )
 
     def _run_phase(self, phase: str) -> None:
         """Execute a single phase with logging and context tracking."""
