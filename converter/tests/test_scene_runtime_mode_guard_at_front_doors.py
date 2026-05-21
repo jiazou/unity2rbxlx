@@ -86,6 +86,35 @@ class TestU2RConvertGuard:
         assert not (out / "stale.txt").exists()
 
 
+class TestU2RPublishGuard:
+    def test_legacy_publish_on_generic_stamp_refuses(
+        self, tmp_path: Path,
+    ) -> None:
+        # Seed a generic-stamped output dir + minimum context state for
+        # publish's discovery (it needs a conversion_context.json to know
+        # which Unity project to rebuild against). The guard fires before
+        # publish's other validations.
+        out = tmp_path / "out"
+        out.mkdir()
+        write_scene_runtime_stamp(out, "generic")
+        (out / "conversion_context.json").write_text(
+            '{"unity_project_path": "/dev/null"}'
+        )
+
+        from u2r import main as u2r_cli
+
+        runner = CliRunner()
+        result = runner.invoke(u2r_cli, [
+            "publish", str(out),
+            "--api-key", "dummy", "--creator-id", "1",
+        ])
+        # Either the guard fires (UsageError -> exit != 0) OR an earlier
+        # check fires for a missing API key etc. -- assert the guard
+        # message in either case to be specific about WHICH error.
+        assert result.exit_code != 0
+        assert "scene-runtime mode mismatch" in (result.output or "")
+
+
 class TestU2REvalGuard:
     def test_legacy_request_on_generic_project_dir_refuses(
         self, tmp_path: Path,

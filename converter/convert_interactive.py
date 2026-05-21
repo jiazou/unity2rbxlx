@@ -635,6 +635,9 @@ def transpile(unity_project_path: str, output_dir: str,
         config.USE_AI_TRANSPILATION = False
 
     pipeline = _make_pipeline(unity_project_path, output_dir)
+    # PR3b: thread the requested mode into ctx so _classify_storage's
+    # domain classifier knows whether to run.
+    pipeline.ctx.scene_runtime_mode = scene_runtime
     try:
         _run_through(pipeline, "transpile_scripts")
     except Exception as exc:
@@ -857,6 +860,9 @@ def assemble(unity_project_path: str, output_dir: str,
         scaffolding=scaffolding_list,
     )
     pipeline._retranspile = retranspile
+    # PR3b: thread the requested mode into ctx so _classify_storage's
+    # domain classifier knows whether to run.
+    pipeline.ctx.scene_runtime_mode = scene_runtime
 
     # Plumb --universe-id / --place-id into ctx so resolve_assets can run
     # headless mesh resolution on the first assemble invocation. Without
@@ -1034,6 +1040,9 @@ def upload(output_dir: str, api_key: str | None,
     pipeline = _make_pipeline(None, out, skip_binary_rbxl=True)
     pipeline.ctx.universe_id = uid
     pipeline.ctx.place_id = pid
+    # PR3b: honor the requested mode for the rebuild path. The default
+    # legacy is the safe choice (this is upload, not transpile).
+    pipeline.ctx.scene_runtime_mode = scene_runtime
 
     # Rebuild rbx_place via the pipeline. Cloud side-effect phases
     # (moderate_assets, upload_assets, resolve_assets) are skipped because

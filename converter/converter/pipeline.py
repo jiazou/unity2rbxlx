@@ -3738,15 +3738,23 @@ script.Disabled = true
 
         # PR3b: stamp per-module ``domain`` / ``container`` / ``module_path``
         # / ``domain_signals`` once the storage classifier has finalized
-        # every script's ``parent_path``. Safe to run under legacy too --
-        # the planner only adds optional fields, the contract pipeline
-        # ignores them under legacy, and the host runtime only consumes
-        # them under generic. Caller can disable by setting
-        # ``scene_runtime["__skip_domain_classifier__"] = True`` on ctx;
-        # tests use that escape hatch when probing classify_storage in
-        # isolation.
+        # every script's ``parent_path``. **Gated on
+        # ``ctx.scene_runtime_mode != "legacy"`` so the legacy emit path
+        # stays byte-identical** (per PR3a's "default output byte-identical"
+        # invariant). The reachability sub-pass mutates RbxScript.parent_path
+        # in service of the contract pipeline -- running it under legacy
+        # would shift script placement for ANY project whose code matches
+        # PR3b's new generic-only client patterns (RenderStepped, etc.)
+        # without an operator opt-in, which is exactly what PR3a's
+        # invariant prohibits.
+        #
+        # Tests can override the gate either by setting
+        # ``ctx.scene_runtime_mode = "generic"`` or, for the narrow
+        # case of probing classify_storage in isolation, by setting
+        # ``scene_runtime["__skip_domain_classifier__"] = True``.
         if (
-            scene_runtime.get("modules")
+            self.ctx.scene_runtime_mode != "legacy"
+            and scene_runtime.get("modules")
             and not scene_runtime.get("__skip_domain_classifier__")
         ):
             from converter.scene_runtime_domain import (

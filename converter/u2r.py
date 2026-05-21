@@ -443,6 +443,10 @@ def convert(
         scaffolding=scaffolding_set,
     )
 
+    # PR3b: plumb the requested mode through to ctx so
+    # _classify_storage's domain classifier knows whether to run.
+    pipeline.ctx.scene_runtime_mode = scene_runtime
+
     # Plumb --universe-id / --place-id into the pipeline context so the
     # resolve_assets phase can run headless mesh resolution. Without this,
     # the pipeline's resolve_assets warns "no IDs supplied" and the local
@@ -730,6 +734,10 @@ def publish(
         pipeline.ctx = prior_ctx
         pipeline.ctx.universe_id = uid
         pipeline.ctx.place_id = pid
+        # PR3b: publish's rebuild path re-runs _classify_storage; honor
+        # the requested mode (default legacy) so the domain classifier
+        # doesn't mutate parent_path on a legacy rebuild.
+        pipeline.ctx.scene_runtime_mode = scene_runtime
         # Mark this rebuild path as an explicit resume so the
         # backward-compat FPS migration treats on-disk FPS scripts
         # as legitimately preserved rather than stale leftovers.
@@ -1618,6 +1626,8 @@ def eval_cmd(
                 output_dir=proj_out,
                 skip_upload=True,
             )
+            # PR3b: plumb mode to ctx so the domain classifier honors it.
+            pipeline.ctx.scene_runtime_mode = _eval_scene_runtime
             pipeline.run_all()
             elapsed = _time.monotonic() - t0
 

@@ -82,3 +82,23 @@ honor the original design wording without re-relitigating Piece 4.
 - [ ] Confirm PR4's host runtime exercises these carve-outs (i.e.,
   the runtime DOES instantiate prefabs + wire UI refs) before
   declaring the carve-outs "live."
+
+## Additional codex P3 (from PR3b review)
+
+- `SceneRuntimeDisplacedInstance.scene` overloads two identities:
+  scene path or prefab id. Consumable as-is for PR4's cross-domain
+  report; splitting into `owner_kind` + `owner_ref` (with kind
+  ∈ `"scene"`/`"prefab"`) would make the PR4 report-generation
+  code simpler.
+
+## Codex P2 (deferred, NOT merge-blocking with generic CLI-rejected)
+
+- `--clean` on `u2r publish` and `convert_interactive upload` wipes
+  the whole output dir, which destroys `conversion_context.json` /
+  `converted_place.rbxlx` and leaves the rebuild path with no
+  state. Today these commands won't see a real mismatch until PR4
+  lifts the generic CLI rejection; once they can, either:
+    a. Make `--clean` scoped (only wipe the stamp + non-rebuild
+       artifacts), OR
+    b. Make `publish`/`upload` refuse `--clean` and tell the
+       operator to run `convert --clean` instead.
