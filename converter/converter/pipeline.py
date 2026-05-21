@@ -2310,6 +2310,7 @@ return table.concat(allData, "\\n")'''
             mesh_texture_ids=mesh_texture_ids,
             mesh_hierarchies=mesh_hierarchies,
             fbx_bounding_boxes=fbx_bounding_boxes,
+            unity_project_root=self.unity_project_path,
         )
         # Count all parts recursively (including nested prefab children)
         def _count_parts(parts):

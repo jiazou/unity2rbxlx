@@ -22,6 +22,7 @@ from core.unity_types import (
     AssetManifest,
     GuidIndex,
     ParsedScene,
+    PrefabTemplate,
     SceneNode,
 )
 from converter.material_mapper import MaterialMapping
@@ -175,6 +176,12 @@ class SceneConversionContext:
     material_mappings: dict[str, MaterialMapping] = field(default_factory=dict)
     fbx_bounding_boxes: dict[str, tuple[float, float, float]] = field(default_factory=dict)
     scene_xform_fids: set[str] = field(default_factory=set)
+    # Stable scene identifier (project-relative, forward-slashed path when
+    # computable) prefixed onto `_SceneRuntimeId` attributes so a host
+    # runtime can resolve `<scene>:<fileID>` back to a plan entry. Empty
+    # string means scene-runtime stamping is skipped for this conversion
+    # (no scene_path or no project root available).
+    scene_runtime_namespace: str = ""
 
     # Outputs (accumulated during conversion, consumed before convert_scene returns)
     water_regions: list[RbxWaterRegion] = field(default_factory=list)
@@ -198,6 +205,122 @@ def _ctx() -> SceneConversionContext:
             "SceneConversionContext (called outside convert_scene?)"
         )
     return _current_ctx
+
+
+# ---------------------------------------------------------------------------
+# Scene-runtime ID stamping (Piece 3 of scene-runtime-contract.md)
+# ---------------------------------------------------------------------------
+#
+# The host runtime (PR4) binds plan entries to Roblox instances by reading a
+# ``_SceneRuntimeId`` attribute of the form ``<scene>:<gameobject_fileID>``.
+# PR2 stamps the attribute on the logical GameObject host (the outer
+# RbxPart/Model returned for each SceneNode); the wrapped-geometry inner
+# ``*_Mesh`` child is intentionally NOT stamped — stamping both would make
+# lookup ambiguous. The legacy ``unity_file_id`` constraint-referent path
+# is untouched; ``_SceneRuntimeId`` is purely additive.
+#
+# Scene namespace format matches PR1's ``scene_runtime_planner._scene_namespace``
+# exactly so that ``_SceneRuntimeId`` collides with the plan's
+# ``game_object_id`` (``f"{namespace}:{node.file_id}"``). Mirrored rather than
+# imported because PR2 is independently landable off ``origin/main`` — the
+# two helpers consolidate when both PRs are in.
+
+def _scene_namespace(
+    scene_path: Path | None, unity_project_root: Path | None,
+) -> str:
+    """Project-relative, forward-slashed scene identifier used as the
+    ``_SceneRuntimeId`` prefix.
+
+    Returns the empty string (→ "skip stamping" upstream) whenever a
+    *portable* identifier cannot be produced: no scene path, no project
+    root, or scene path outside the project root. The alternative — an
+    absolute posix path — bakes machine-specific roots into every stamp
+    and on Windows drive-prefixed paths (``C:/.../Scene.unity:42``)
+    introduces a second colon that breaks the ``<scene>:<fileID>``
+    contract PR4 parses.
+
+    Matches the project-relative branch of PR1's
+    ``scene_runtime_planner._scene_namespace``; that helper's absolute
+    fallback exists for the planner's per-scene artifact (where any
+    stable string suffices) but is unsafe here, where stamps land in
+    user-visible Roblox places and have to round-trip through PR4's
+    parser.
+    """
+    if scene_path is None or unity_project_root is None:
+        return ""
+    try:
+        rel = scene_path.resolve().relative_to(unity_project_root.resolve())
+    except ValueError:
+        return ""
+    return rel.as_posix()
+
+
+def _stamp_scene_runtime_id(
+    part: RbxPart, file_id: str, namespace: str | None = None,
+) -> None:
+    """Stamp ``_SceneRuntimeId`` onto a logical GameObject host.
+
+    The ``namespace`` argument lets prefab-conversion callers pass the
+    stable ``prefab_id`` instead of the scene namespace from the
+    active context — under PR1's planner, prefab-internal GameObjects
+    live in a ``<prefab_id>:<file_id>`` namespace, not the scene's, and
+    PR4's lookup keys on the value stamped here. When ``namespace`` is
+    None, falls back to ``_ctx().scene_runtime_namespace`` (the scene
+    path of the in-flight ``convert_scene`` call).
+
+    No-op when the resolved namespace or file_id is empty so callers
+    don't have to gate every stamp site.
+    """
+    ns = namespace if namespace is not None else _ctx().scene_runtime_namespace
+    if not ns or not file_id:
+        return
+    part.attributes["_SceneRuntimeId"] = f"{ns}:{file_id}"
+
+
+def _prefab_stable_id(
+    template: PrefabTemplate,
+    guid_index: GuidIndex | None,
+    by_guid: dict[str, PrefabTemplate],
+    unity_project_root: Path | None,
+) -> str:
+    """Stable ``prefab_id`` = ``"<guid>:<project-relative-path>"``.
+
+    Mirrors ``scene_runtime_planner._prefab_stable_id`` (PR1) so a
+    converter-time stamp produced by ``_convert_prefab_node`` matches
+    the ``game_object_id`` PR1 emits for the same prefab template.
+    Returns the empty string when neither a GUID nor a project-relative
+    path is computable — same conservative "skip stamping" rule as
+    ``_scene_namespace`` (avoids leaking machine-specific absolute
+    paths into Roblox attribute values).
+
+    Tolerant of templates missing ``prefab_path`` (synthetic test
+    fixtures predate this helper); such templates fall through to the
+    empty-string "skip stamping" branch instead of crashing.
+    """
+    prefab_path = getattr(template, "prefab_path", None)
+    if not isinstance(prefab_path, Path):
+        return ""
+    guid = ""
+    if guid_index is not None:
+        guid = guid_index.guid_for_path(prefab_path) or ""
+    if not guid:
+        # Fall back to the library's by_guid index (prefab-variant
+        # templates land there before meta GUIDs are indexed).
+        for g, t in by_guid.items():
+            if t is template:
+                guid = g
+                break
+    if unity_project_root is None:
+        return guid if guid else ""
+    try:
+        rel = prefab_path.resolve().relative_to(
+            unity_project_root.resolve(),
+        ).as_posix()
+    except ValueError:
+        # Prefab outside the project root — same posture as
+        # ``_scene_namespace`` for outside-root scenes.
+        return ""
+    return f"{guid}:{rel}" if guid else rel
 
 
 # Cache for mesh vertical offsets: mesh_guid -> offset_studs.
@@ -865,6 +988,7 @@ def convert_scene(
     mesh_texture_ids: dict[str, str] | None = None,
     mesh_hierarchies: dict[str, list[dict]] | None = None,
     fbx_bounding_boxes: dict[str, tuple[float, float, float]] | None = None,
+    unity_project_root: Path | None = None,
 ) -> RbxPlace:
     """Convert a parsed Unity scene to a Roblox place hierarchy.
 
@@ -894,6 +1018,9 @@ def convert_scene(
     global _current_ctx, _mesh_vertical_offset_cache, _embedded_mesh_aabb_cache
     _mesh_vertical_offset_cache = {}
     _embedded_mesh_aabb_cache = {}
+    _resolved_project_root = unity_project_root
+    if _resolved_project_root is None and guid_index is not None:
+        _resolved_project_root = getattr(guid_index, "project_root", None)
     _current_ctx = SceneConversionContext(
         mesh_native_sizes=mesh_native_sizes or {},
         mesh_texture_ids=mesh_texture_ids or {},
@@ -904,6 +1031,10 @@ def convert_scene(
             set(parsed_scene.transform_fid_to_go_fid.keys())
             if hasattr(parsed_scene, 'transform_fid_to_go_fid')
             else set()
+        ),
+        scene_runtime_namespace=_scene_namespace(
+            getattr(parsed_scene, "scene_path", None),
+            _resolved_project_root,
         ),
     )
     if not _ctx().mesh_native_sizes:
@@ -1241,11 +1372,16 @@ def convert_scene(
     if camera_config is not None:
         place.camera = camera_config
 
-    # Convert Unity Canvas UI elements to Roblox ScreenGuis.
+    # Convert Unity Canvas UI elements to Roblox ScreenGuis. Pass the
+    # scene namespace so UI hosts get ``_SceneRuntimeId`` stamps under the
+    # same ``<scene>:<fileID>`` scheme as workspace parts (PR2, Piece 3).
     from converter.ui_translator import find_canvas_nodes, convert_canvas
     canvas_nodes = find_canvas_nodes(parsed_scene.roots)
     if canvas_nodes:
-        place.screen_guis = convert_canvas(canvas_nodes)
+        place.screen_guis = convert_canvas(
+            canvas_nodes,
+            scene_namespace=_ctx().scene_runtime_namespace,
+        )
         log.info("Converted %d Canvas nodes to ScreenGuis", len(place.screen_guis))
 
     # Detect terrain components and convert them to terrain ground parts.
@@ -1439,6 +1575,13 @@ def _convert_node(
         size=size,
         unity_file_id=node.file_id,
     )
+
+    # Scene-runtime ID: stamp the logical GameObject host with
+    # ``_SceneRuntimeId = "<scene>:<file_id>"``. When this node's geometry
+    # is later wrapped under a Model (``_wrap_geometry_with_children_into_model``),
+    # the outer Model keeps this stamp; the synthetic ``*_Mesh`` child does
+    # NOT — see the duplication note in scene-runtime-contract.md Piece 3.
+    _stamp_scene_runtime_id(part, node.file_id)
 
     # -- Primitive shape --
     if _builtin_shape:
@@ -1708,7 +1851,10 @@ def _wrap_geometry_with_children_into_model(part: "RbxPart", node_name: str) -> 
     inner.collision_fidelity = part.collision_fidelity
     # Move geometry-specific attributes to inner. Other attributes (script
     # class hints, prefab markers, gameplay tags) stay on the outer Model
-    # so scripts that walk by name still find them.
+    # so scripts that walk by name still find them. ``_SceneRuntimeId`` is
+    # *intentionally* one of the "stay on outer" keys — stamping the same
+    # ID on both outer Model and inner ``*_Mesh`` would make host-runtime
+    # lookup ambiguous (scene-runtime-contract.md Piece 3).
     for _attr_key in list(part.attributes.keys()):
         if _attr_key.startswith("_Scale") or _attr_key in (
             "_MeshId", "_MeshFileId", "_TextureId", "_FbxImportScale",
@@ -1724,6 +1870,19 @@ def _wrap_geometry_with_children_into_model(part: "RbxPart", node_name: str) -> 
     # Append inner LAST so the original children's iteration order
     # (relied on by name-based hierarchy walks) is preserved.
     part.children.append(inner)
+    # Structural invariant: the synthetic ``*_Mesh`` inner child must
+    # NEVER carry ``_SceneRuntimeId`` — duplicating the outer Model's
+    # stamp would make PR4's host-runtime lookup ambiguous (Piece 3).
+    # Comments alone don't survive a future migration that adds a new
+    # key to the "move to inner" list; assert at the structural boundary
+    # so any drift fails loud at conversion time instead of silently
+    # producing wrong binds at runtime.
+    if "_SceneRuntimeId" in inner.attributes:
+        raise AssertionError(
+            f"scene-runtime invariant: synthetic inner '{inner.name}' must "
+            f"not carry _SceneRuntimeId (outer Model is the only logical "
+            f"host); attribute-migration table likely drifted."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -3862,6 +4021,16 @@ def _convert_prefab_instance(
             return _convert_fbx_prefab_instance(pi, resolved, guid_index, material_mappings, uploaded_assets)
         return []
 
+    # Stable prefab namespace for ``_SceneRuntimeId`` stamping (PR2,
+    # Piece 3). Computed once and threaded through ``_convert_prefab_node``
+    # so every descendant Roblox instance carries the same
+    # ``<prefab_id>:<file_id>`` value that PR1's prefab subplan keys on.
+    # Empty when no project root is available — same conservative
+    # "skip stamping" rule as the scene namespace.
+    by_guid = getattr(prefab_lib, "by_guid", {}) or {}
+    project_root = getattr(guid_index, "project_root", None) if guid_index else None
+    prefab_namespace = _prefab_stable_id(template, guid_index, by_guid, project_root)
+
     # Check for removed components -- these should not be instantiated
     removed_component_ids: set[str] = set()
     if hasattr(pi, "removed_components") and pi.removed_components:
@@ -4206,6 +4375,12 @@ def _convert_prefab_instance(
                 class_name="Model",
                 cframe=cframe,
             )
+        # NOTE: the prefab-root ``_SceneRuntimeId`` stamp lives at the
+        # convergence point below (after the has_children/else branches
+        # rejoin). Without that lift, the ``else`` branch -- which
+        # handles single-node prefab instances -- emitted root parts
+        # with no stamp at all, so PR4 couldn't bind plan rows for the
+        # most common prefab shape (codex P1 review).
         for child in root.children:
             # Convert child prefab nodes with parent world transform
             # so positions are in world space (Roblox Models don't
@@ -4216,6 +4391,7 @@ def _convert_prefab_instance(
                 child_modifications=child_modifications,
                 disabled_components=disabled_components,
                 parent_mesh_guid=root.mesh_guid if hasattr(root, 'mesh_guid') else None,
+                runtime_namespace=prefab_namespace,
             )
             if child_part:
                 part.children.append(child_part)
@@ -4350,6 +4526,18 @@ def _convert_prefab_instance(
         if hasattr(root, 'components') and root.components:
             _process_components(root, part, guid_index=guid_index, uploaded_assets=uploaded_assets)
 
+    # Stamp the prefab root with its ``<prefab_id>:<file_id>`` — PR4
+    # binds prefab subplan entries to converter-instantiated prefab
+    # roots via this attribute. Descendant nodes get the same stamp
+    # inside ``_convert_prefab_node``; this site catches BOTH the
+    # has-children branch (multi-node prefabs) AND the else branch
+    # (single-node prefabs) — see codex P1: the previous, in-branch
+    # placement silently skipped single-node prefab roots, leaving
+    # PR4 with no way to bind their plan entries.
+    _stamp_scene_runtime_id(
+        part, getattr(root, "file_id", ""), prefab_namespace,
+    )
+
     # Apply additional modification properties to the part
     if is_static:
         part.anchored = True
@@ -4400,6 +4588,7 @@ def _convert_prefab_node(
     child_modifications: dict[str, list[dict]] | None = None,
     disabled_components: set[str] | None = None,
     parent_mesh_guid: str | None = None,
+    runtime_namespace: str = "",
 ) -> RbxPart | None:
     """Convert a PrefabNode to an RbxPart.
 
@@ -4577,6 +4766,15 @@ def _convert_prefab_node(
         anchored=True,
     )
 
+    # Scene-runtime ID for prefab-instantiated GameObjects.
+    # ``runtime_namespace`` here is the prefab's stable ``<guid>:<path>``
+    # id (computed once by ``_convert_prefab_instance``), matching the
+    # prefab subplan PR1 emits — so PR4's host runtime can resolve
+    # `<prefab_id>:<file_id>` to this instance regardless of whether
+    # the prefab was pre-instantiated by the converter or spawned at
+    # runtime from the ReplicatedStorage template.
+    _stamp_scene_runtime_id(part, getattr(node, "file_id", ""), runtime_namespace)
+
     # -- Main-camera rig marker --
     # The main camera (and its weapon-slot / viewmodel children) is
     # usually authored inside a prefab — e.g. SimpleFPS's Player.prefab.
@@ -4699,6 +4897,7 @@ def _convert_prefab_node(
             child_modifications=child_modifications,
             disabled_components=disabled_components,
             parent_mesh_guid=node.mesh_guid if hasattr(node, 'mesh_guid') else None,
+            runtime_namespace=runtime_namespace,
         )
         if child_part:
             part.children.append(child_part)
@@ -4870,6 +5069,15 @@ def _flatten_single_child_models(parts: list[RbxPart]) -> int:
     Model with the child, keeping the Model's name.
 
     Recurses into the tree.  Returns the total number of flattened Models.
+
+    PR2 interaction: every GameObject host carries a ``_SceneRuntimeId``
+    attribute in production (any scene with a project root). The
+    ``not part.attributes`` guard therefore inhibits flattening in
+    production — that's the correct outcome: a serialized field on
+    another MonoBehaviour can reference the parent GameObject, and
+    flattening it away would leave PR4's host runtime with no instance
+    to resolve. Pre-PR2 or no-namespace callers (no project root → no
+    stamp → empty attributes) still flatten as before.
     """
     count = 0
     for i, part in enumerate(parts):
