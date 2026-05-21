@@ -557,47 +557,34 @@ def _detect_part_parent_requirement(scripts: list[RbxScript]) -> int:
 
 
 def _guard_script_parent_access(scripts: list[RbxScript]) -> int:
-    """Add early-return guard to ModuleScripts that use script.Parent for runtime access.
+    """Add early-return guard to ModuleScripts whose Part-parent contract
+    can't be honored when they get hoisted into ReplicatedStorage.
 
-    When a script is reclassified to ModuleScript in ReplicatedStorage,
-    script.Parent is ReplicatedStorage (not a game object). Code that accesses
-    .CFrame, .Position, .Size, .Touched etc. on script.Parent will crash.
+    When a script is reclassified to ModuleScript and routed to
+    ``ReplicatedStorage``, ``script.Parent`` is the service itself
+    (not a game object). Reading ``.CFrame``, ``.Position``, ``.Size``,
+    ``.Touched``, ``.Material``, ``.Anchored`` etc. off it then errors
+    at runtime.
 
-    This injects a guard after the module table declaration that returns early
-    if script.Parent is not a BasePart/Model/Folder.
+    Consumes :attr:`RbxScript.requires_part_parent` (set by
+    :func:`_detect_part_parent_requirement` upstream in the coherence
+    sequence) as the single source of truth for "does this script
+    actually depend on a BasePart parent". A previous implementation
+    duplicated that detection here with a narrower property list and
+    silently drifted from the upstream gate — a ModuleScript reading
+    e.g. ``.Transparency`` or ``.Material`` got flagged by the upstream
+    pass but missed by this one, so it shipped unguarded and crashed
+    in ReplicatedStorage. Sharing the field eliminates that drift.
     """
     fixes = 0
-    _RUNTIME_PROPS = ['.Position', '.CFrame', '.Size', '.Orientation',
-                      '.Touched:', '.Anchored']
 
     for s in scripts:
         if s.script_type != "ModuleScript":
             continue
+        if not s.requires_part_parent:
+            continue
         if '-- Guard: skip runtime' in s.source:
             continue  # Already guarded
-
-        # Check for script.Parent or alias usage with runtime properties
-        has_runtime = False
-        aliases = set()
-        for line in s.source.split('\n'):
-            stripped = line.strip()
-            if stripped.startswith('--'):
-                continue
-            # Track aliases: `local part = script.Parent`
-            m = re.match(r'local\s+(\w+)\s*=\s*script\.Parent\b', stripped)
-            if m:
-                aliases.add(m.group(1))
-            # Check for runtime property access at module scope
-            check_names = ['script.Parent'] + list(aliases)
-            for name in check_names:
-                if name in stripped and any(p in stripped for p in _RUNTIME_PROPS):
-                    has_runtime = True
-                    break
-            if has_runtime:
-                break
-
-        if not has_runtime:
-            continue
 
         # Find the module table declaration and insert guard after it
         module_m = re.search(r'^return\s+(\w+)\s*$', s.source, re.MULTILINE)

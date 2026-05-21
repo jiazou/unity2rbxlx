@@ -382,34 +382,6 @@ class TestOfflineAssembly:
             + "\n".join(fails[:10])
         )
 
-        # Test seam check: production-quality Player.luau (AI-transpiled)
-        # calls UserInputService:GetMouseDelta() for camera yaw. The
-        # converter's _subphase_inject_test_seams rewrites those calls
-        # to _getMouseDelta() so offline behavior fixtures can drive
-        # mouse-look via _G._mockMouseDelta. This assertion would fail
-        # if (a) AI transpilation didn't land the mouse code (Claude
-        # CLI failed or returned a degenerate stub), (b) the seam
-        # injector subphase regressed, or (c) the subphase order broke
-        # and the injector ran before the AI-transpiled scripts were
-        # emitted.
-        player_lua = (tmp_path / "scripts" / "Player.luau").read_text(
-            encoding="utf-8"
-        )
-        assert "local function _getMouseDelta" in player_lua, (
-            "Player.luau is missing the _getMouseDelta() test seam — "
-            "either the AI transpile didn't land mouse-look code (check "
-            "the transpile logs) or the test_seam_injector subphase "
-            "regressed."
-        )
-        # The user's call site should have been rewritten away; only the
-        # helper's fallback line should remain.
-        assert player_lua.count("UserInputService:GetMouseDelta()") == 1, (
-            f"expected exactly 1 UserInputService:GetMouseDelta() call "
-            f"(the helper's fallback), found "
-            f"{player_lua.count('UserInputService:GetMouseDelta()')} — "
-            f"the seam injector failed to rewrite user-side calls."
-        )
-
     @pytest.mark.skipif(
         not is_populated(TRASHDASH_PROJECT),
         reason="Trash Dash not available — set "

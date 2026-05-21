@@ -84,20 +84,33 @@ class RbxScript:
     # True when the script's body genuinely reads BasePart-only properties
     # off ``script.Parent`` (or an alias) — ``.Position``, ``.CFrame``,
     # ``.Touched``, ``.AssemblyLinearVelocity``, ``.Anchored``, ``.Size``,
-    # ``.Orientation``, ``.Velocity``. Computed by
-    # ``converter.script_coherence._detect_part_parent_requirement`` once
-    # during the coherence pass and persisted here so downstream stages
-    # (storage routing, the unbound-script guard, conversion report)
-    # all share the same answer.
+    # ``.Orientation``, ``.Material``, ``.Transparency``, etc.; full list
+    # in ``converter.script_coherence._PART_ONLY_PROPS``. Computed once by
+    # ``converter.script_coherence._detect_part_parent_requirement`` during
+    # the coherence pass, before storage classification + binding.
     #
-    # ``False`` is the safe default — scripts that *might* dereference a
-    # Part but don't actually access Part-only properties (e.g. defensive
-    # ``script.Parent:FindFirstChild(...)`` lookups) don't need a Part
-    # parent and shouldn't be gated by the BasePart guard. The guard
-    # in ``pipeline._disable_unbound_scripts`` reads this field so a
-    # LocalScript routed to PlayerScripts (where ``script.Parent`` is
-    # never a BasePart) doesn't get silently disabled by a catch-all
-    # regex matching defensive ``:FindFirstChild`` lookups.
+    # Current consumers (not yet exhaustive):
+    #   * ``script_coherence._guard_script_parent_access`` — injects a
+    #     ``script.Parent:IsA("BasePart") or :IsA("Model") or :IsA("Folder")``
+    #     early-return into flagged ModuleScripts that get hoisted into
+    #     ReplicatedStorage.
+    #   * ``pipeline._disable_unbound_scripts`` — gates the catch-all
+    #     ``if not script.Parent:IsA("BasePart") then return end`` guard
+    #     on this field. Without the field, the guard's regex matched
+    #     defensive ``script.Parent:FindFirstChild`` lookups and silently
+    #     disabled LocalScripts routed to PlayerScripts (where
+    #     ``script.Parent`` is PlayerScripts, never a BasePart).
+    #
+    # NOT yet consumed by ``storage_classifier`` — that's a future
+    # refinement (e.g. refuse to route a flagged script to
+    # StarterPlayerScripts; bind it to a Part first, or surface a
+    # build-time misroute warning).
+    #
+    # ``False`` is the safe default — defensive ``:FindFirstChild`` /
+    # ``:WaitForChild`` access works on any Instance and shouldn't
+    # trigger the BasePart guard. Over-flagging (false positives) is
+    # safer than under-flagging — it just preserves the historical
+    # guard behavior for more scripts.
     requires_part_parent: bool = False
 
 
