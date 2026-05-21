@@ -313,6 +313,87 @@ across `test_scene_runtime_host_behavior.py`,
 
 **P3:** none in round 3.
 
+### Codex review round 4 (2026-05-21) — NOT absorbed (architecture-level)
+
+Round-4 codex surfaced 3 P1s + 2 P2s on top of round-3 absorption.
+These are NOT absorbed in PR4 because each requires an architecture-
+level decision the user has not pre-greenlit (and the brief's hard
+rule says to stop and surface in that case). Full review at
+`/tmp/codex-pr4-review-v4.txt`.
+
+**R4-P1.1 — `SceneRuntimePlan` is project-wide, not per-place**
+(`converter/converter/pipeline.py:~4344`). The plan ModuleScript
+embeds every scene block from `ctx.scene_runtime`, but in
+`run_all_scenes()` each per-scene `.rbxlx` is its own place; the
+embedded plan should only carry that place's scene block.
+Repro: a two-scene project ships scene-B's instances inside
+scene-A's place; the host boots scene-B components whose
+`workspaceFind` resolves nil. Resolution: scope `scene_runtime`
+to the current scene namespace before generating
+`SceneRuntimePlan` (and gate the runtime-bearing + cross-domain
+checks on the scoped subset). Open question for the user: what is
+"the current scene" in single-scene mode where the planner-key is
+the scene path? Likely just `state.parsed_scene.scene_path` mapped
+to the planner namespace, but the boundary needs an explicit
+contract decision.
+
+**R4-P1.2 — `setActive` collapses `activeSelf` and `activeInHierarchy`**
+(`converter/runtime/scene_runtime.luau:~821`). The R2-P1.4 cascade
+fix overwrites `m.activeSelf` on every descendant, but a child
+authored inactive must STAY inactive when a parent re-enables.
+Repro: parent.setActive(false) -> parent.setActive(true) wrongly
+fires OnEnable on a child whose authored `activeSelf == false`.
+Resolution: split per-component (per-GameObject) `activeSelf`
+(authored, immutable except via direct `setActive(go, ...)`) from
+`activeInHierarchy` (computed = self AND every-ancestor self).
+The cascade then walks each descendant and recomputes
+`activeInHierarchy` from its own `activeSelf` plus the new
+ancestor chain. Open question: does the planner need to surface a
+per-GameObject hierarchy edge so the host can walk ancestors at
+toggle time (the current host only knows the descendant tree via
+`services.collectDescendantIds(root)`)?
+
+**R4-P1.3 — `findFirstChildWhichIsA` feeds Unity names to Roblox `IsA`**
+(`converter/converter/autogen.py:~655`). Contract-emitted code calls
+`self:GetComponent("Rigidbody")`, but Roblox's `IsA("Rigidbody")`
+always returns false because Unity's `Rigidbody` is the lowered
+`BasePart` on the Roblox side (and other Unity names like `Button`
+become `TextButton`/`ImageButton`/`GuiButton`). The harness mock
+masked this. Resolution: introduce a Unity→Roblox class-name map at
+the service-helper level (or at the contract emit level). Open
+question: should the contract emit Roblox names directly (changing
+the transpiler's output) or should the host translate at lookup
+time? The translation table is real game-coupled work.
+
+**R4-P2.1 — generic mode is user-reachable but inactive retention is
+deferred** (`converter/u2r.py`). PR4 lifted the legacy-until-PR4
+gate, but the inactive-retention carve-out (followups item 1)
+hasn't shipped. A generic scene with a runtime-bearing inactive
+GameObject still produces a broken place/plan pairing. Either
+re-gate or land the carve-out before merge.
+
+**R4-P2.2 — `_plan_to_luau` uses Python `str.isidentifier()` for
+Luau bare-key emit** (`converter/converter/autogen.py:~500`). Luau
+identifiers are stricter (no Unicode). A field named `"变量"` would
+emit `{ 变量 = 1 }` which standalone luau rejects. Resolution:
+explicit Luau identifier regex (`^[A-Za-z_][A-Za-z0-9_]*$`) and
+bracket-quote everything else.
+
+**Why deferred:**
+- R4-P1.1 + P1.2 require a contract-side decision the user has
+  not pre-greenlit. The brief allowed absorbing R2/R3 fixes inline
+  but explicitly requires stop-and-return on new architecture
+  questions.
+- R4-P1.3 hinges on a name-mapping table that touches the
+  contract's emitted code (transpiler) -- bigger surface than the
+  R2/R3 in-line fixes.
+- R4-P2.1 is a real concern but the resolution path (gate generic
+  vs land carve-out 1) is a scope decision.
+- R4-P2.2 is mechanical but only matters for projects using
+  non-ASCII serialized field names; ASCII projects are unaffected.
+
+These are tracked in the carry-over markers section below.
+
 ### Contract resolutions pinned in the design doc
 
 The three R2 P1s the user explicitly resolved are pinned in
@@ -349,3 +430,20 @@ The three R2 P1s the user explicitly resolved are pinned in
       converts the resolved GameObject Instance to its built-in
       component via `findFirstChildWhichIsA`). Today such refs
       arrive as the owning GameObject.
+- [ ] **R4-P1.1**: scope `SceneRuntimePlan` per-place in
+      `run_all_scenes`. Needs user input on the scene-namespace
+      lookup boundary.
+- [ ] **R4-P1.2**: split `activeSelf` / `activeInHierarchy` so
+      `setActive` cascade doesn't clobber descendant authored
+      flags. Needs user input on whether the planner should
+      surface a per-GameObject ancestor edge.
+- [ ] **R4-P1.3**: Unity component name → Roblox class translation
+      for the `findFirstChildWhichIsA` fallback. Needs user input
+      on contract-side vs host-side translation.
+- [ ] **R4-P2.1**: either re-gate `generic` to `legacy` until the
+      inactive-retention carve-out (followup item 1) lands, or
+      land the carve-out before merge.
+- [ ] **R4-P2.2**: switch `_plan_to_luau`'s bare-key regex from
+      Python `str.isidentifier()` to an explicit Luau-identifier
+      regex so non-ASCII serialized field names emit as
+      bracket-quoted keys.
