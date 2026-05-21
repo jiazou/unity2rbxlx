@@ -20,9 +20,26 @@ in :mod:`converter.scaffolding`; this module stays project-agnostic.
 from __future__ import annotations
 
 import logging
+import re
+
 from core.roblox_types import RbxScript
 
 log = logging.getLogger(__name__)
+
+
+# Luau bare-identifier rule (ASCII only). Python's ``str.isidentifier``
+# accepts PEP 3131 Unicode letters which Luau's lexer rejects, so
+# ``_plan_to_luau`` must use this regex to decide bare-vs-bracketed keys.
+_LUAU_BARE_IDENT_RE: re.Pattern[str] = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+# Luau reserved keywords that can't be used as bare table keys even
+# when they match the identifier regex.
+_LUAU_RESERVED_KEYWORDS: frozenset[str] = frozenset({
+    "and", "break", "do", "else", "elseif", "end",
+    "false", "for", "function", "if", "in", "local",
+    "nil", "not", "or", "repeat", "return", "then",
+    "true", "until", "while", "continue",
+})
 
 
 def generate_game_server_script() -> RbxScript:
@@ -497,13 +514,15 @@ def _plan_to_luau(plan: dict) -> str:
                 key_str = str(k)
                 # Reserved Luau keywords + non-identifier keys need
                 # bracket-syntax.
-                if (key_str.isidentifier()
-                        and key_str not in {
-                            "and", "break", "do", "else", "elseif", "end",
-                            "false", "for", "function", "if", "in", "local",
-                            "nil", "not", "or", "repeat", "return", "then",
-                            "true", "until", "while", "continue",
-                        }):
+                #
+                # R4-P2.2: Python's ``str.isidentifier()`` accepts
+                # Unicode identifier characters per PEP 3131
+                # (``"变量".isidentifier() == True``). Luau's lexer is
+                # ASCII-only, so an unquoted Unicode key is a parse
+                # error. Tighten to an explicit ASCII regex; anything
+                # else gets bracket-quoted.
+                if (_LUAU_BARE_IDENT_RE.match(key_str) is not None
+                        and key_str not in _LUAU_RESERVED_KEYWORDS):
                     encoded_key = key_str
                 else:
                     encoded_key = f"[{_encode(key_str)}]"
@@ -703,6 +722,28 @@ local services = {
         walk(inst)
         return out
     end,
+    collectSubtreeIdsWithParents = function(inst)
+        -- R4-P1.2: DFS preorder (root first, then children) with each
+        -- entry carrying its parent id so the host's setActive cascade
+        -- can recompute ``activeInHierarchy`` correctly. Returns a list
+        -- of ``{id = "...", parentId = "..." | nil}`` records; entries
+        -- whose Roblox Instance has no ``_SceneRuntimeId`` are dropped
+        -- but the walk still descends through them (mirrors how the
+        -- existing collectDescendantIds skips unstamped nodes).
+        local out = {}
+        local function walk(node, parentId)
+            local id = node:GetAttribute("_SceneRuntimeId")
+            if id then
+                table.insert(out, {id = id, parentId = parentId})
+            end
+            local childParentId = id or parentId
+            for _, child in node:GetChildren() do
+                walk(child, childParentId)
+            end
+        end
+        walk(inst, nil)
+        return out
+    end,
     destroyInstance = function(inst)
         if inst and inst.Destroy then inst:Destroy() end
     end,
@@ -818,6 +859,28 @@ local services = {
             if id then table.insert(out, id) end
         end
         walk(inst)
+        return out
+    end,
+    collectSubtreeIdsWithParents = function(inst)
+        -- R4-P1.2: DFS preorder (root first, then children) with each
+        -- entry carrying its parent id so the host's setActive cascade
+        -- can recompute ``activeInHierarchy`` correctly. Returns a list
+        -- of ``{id = "...", parentId = "..." | nil}`` records; entries
+        -- whose Roblox Instance has no ``_SceneRuntimeId`` are dropped
+        -- but the walk still descends through them (mirrors how the
+        -- existing collectDescendantIds skips unstamped nodes).
+        local out = {}
+        local function walk(node, parentId)
+            local id = node:GetAttribute("_SceneRuntimeId")
+            if id then
+                table.insert(out, {id = id, parentId = parentId})
+            end
+            local childParentId = id or parentId
+            for _, child in node:GetChildren() do
+                walk(child, childParentId)
+            end
+        end
+        walk(inst, nil)
         return out
     end,
     destroyInstance = function(inst)

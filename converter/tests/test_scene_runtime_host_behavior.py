@@ -216,6 +216,23 @@ local function servicesFor(plan, modules, instances)
             walk(inst)
             return out
         end,
+        collectSubtreeIdsWithParents = function(inst)
+            -- R4-P1.2: DFS preorder + parent id so the setActive
+            -- cascade can recompute activeInHierarchy correctly across
+            -- a multi-level tree with mixed-authored activeSelf flags.
+            local out = {}
+            local function walk(node, parentId)
+                local id = node._sceneRuntimeId
+                table.insert(out, {id = id, parentId = parentId})
+                if node._children then
+                    for _, child in pairs(node._children) do
+                        walk(child, id)
+                    end
+                end
+            end
+            walk(inst, nil)
+            return out
+        end,
         destroyInstance = function(inst) end,
     }
 end
@@ -678,6 +695,12 @@ class TestGetComponent:
         assert "OK" in out
 
     def test_builtin_fallback_for_rigidbody(self):
+        # R4-P1.3: GetComponent("Rigidbody") now translates Rigidbody
+        # to the Roblox-side class (BasePart) before calling
+        # findFirstChildWhichIsA. The fixture's _builtins map must be
+        # keyed by the translated Roblox name -- the harness mock does
+        # a direct key lookup mimicking how real findFirstChildWhichIsA
+        # only knows Roblox class names.
         scenario = textwrap.dedent("""\
             local mockRigidbody = {Name = "FakeRigidbody"}
             local Foo = {} ; Foo.__index = Foo
@@ -685,7 +708,7 @@ class TestGetComponent:
             function Foo:Awake()
                 local rb = self:GetComponent("Rigidbody")
                 assert(rb == mockRigidbody,
-                    "GetComponent fallback must hit findFirstChildWhichIsA")
+                    "GetComponent fallback must translate Rigidbody->BasePart")
             end
             local plan = {
                 modules = {foo = {stem = "Foo", runtime_bearing = true,
@@ -705,7 +728,7 @@ class TestGetComponent:
                 Name = "G",
                 _sceneRuntimeId = "g",
                 _children = {},
-                _builtins = {Rigidbody = mockRigidbody},
+                _builtins = {BasePart = mockRigidbody},
             }
             local services = servicesFor(plan, {foo = Foo}, {g = go})
             local engine = SceneRuntime.new(services, plan)
@@ -1968,3 +1991,435 @@ class TestInstantiatePrefabColonFormPreservesExternalRefs:
             f"externalRefs must arrive on colon-form instantiatePrefab; "
             f"got: {out}, err: {err}"
         )
+
+
+# ---------------------------------------------------------------------------
+# R4-P1.3: GetComponent translates Unity class names to Roblox class names.
+# ---------------------------------------------------------------------------
+
+class TestGetComponentTranslatesUnityToRobloxClassName:
+    """Codex round-4 P1.3: contract-emitted MonoBehaviours call
+    ``self:GetComponent("Rigidbody")`` with the Unity type name, but
+    Roblox's ``IsA``/``findFirstChildWhichIsA`` only knows Roblox class
+    names. The host runtime now translates known Unity names
+    (``Rigidbody`` -> ``BasePart``, ``MeshRenderer`` -> ``MeshPart``,
+    etc.) before the lookup. Unknown names fall through unchanged so
+    Roblox class names passed directly still work, and operators can
+    extend the table without breaking the contract."""
+
+    def test_rigidbody_translates_to_basepart(self):
+        scenario = textwrap.dedent("""\
+            local fakePart = {Name = "ThePart"}
+            local seen = nil
+            local Foo = {} ; Foo.__index = Foo
+            function Foo.new(_) return setmetatable({}, Foo) end
+            function Foo:Awake()
+                seen = self:GetComponent("Rigidbody")
+            end
+            local plan = {
+                modules = {foo = {stem = "Foo", runtime_bearing = true,
+                                  module_path = "x"}},
+                scenes = {
+                    A = {
+                        instances = {{instance_id = "A:1", script_id = "foo",
+                                      game_object_id = "g", active = true,
+                                      enabled = true, config = {}}},
+                        references = {},
+                        lifecycle_order = {"A:1"},
+                    },
+                },
+                prefabs = {}, domain_overrides = {},
+            }
+            -- Mock stores the lookup keyed by Roblox class name; if the
+            -- host failed to translate, the lookup would miss.
+            local go = {Name = "G", _sceneRuntimeId = "g", _children = {},
+                        _builtins = {BasePart = fakePart}}
+            local services = servicesFor(plan, {foo = Foo}, {g = go})
+            local engine = SceneRuntime.new(services, plan)
+            engine:start(nil)
+            assert(seen == fakePart,
+                "Rigidbody must translate to BasePart for the fallback")
+            print("OK")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, err
+        assert "OK" in out, out
+
+    def test_meshrenderer_translates_to_meshpart(self):
+        scenario = textwrap.dedent("""\
+            local fakeMesh = {Name = "Mesh"}
+            local seen = nil
+            local Foo = {} ; Foo.__index = Foo
+            function Foo.new(_) return setmetatable({}, Foo) end
+            function Foo:Awake()
+                seen = self:GetComponent("MeshRenderer")
+            end
+            local plan = {
+                modules = {foo = {stem = "Foo", runtime_bearing = true,
+                                  module_path = "x"}},
+                scenes = {
+                    A = {
+                        instances = {{instance_id = "A:1", script_id = "foo",
+                                      game_object_id = "g", active = true,
+                                      enabled = true, config = {}}},
+                        references = {},
+                        lifecycle_order = {"A:1"},
+                    },
+                },
+                prefabs = {}, domain_overrides = {},
+            }
+            local go = {Name = "G", _sceneRuntimeId = "g", _children = {},
+                        _builtins = {MeshPart = fakeMesh}}
+            local services = servicesFor(plan, {foo = Foo}, {g = go})
+            local engine = SceneRuntime.new(services, plan)
+            engine:start(nil)
+            assert(seen == fakeMesh,
+                "MeshRenderer must translate to MeshPart")
+            print("OK")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, err
+        assert "OK" in out, out
+
+    def test_transform_returns_self_gameobject(self):
+        scenario = textwrap.dedent("""\
+            local seen = nil
+            local Foo = {} ; Foo.__index = Foo
+            function Foo.new(_) return setmetatable({}, Foo) end
+            function Foo:Awake()
+                seen = self:GetComponent("Transform")
+            end
+            local plan = {
+                modules = {foo = {stem = "Foo", runtime_bearing = true,
+                                  module_path = "x"}},
+                scenes = {
+                    A = {
+                        instances = {{instance_id = "A:1", script_id = "foo",
+                                      game_object_id = "g", active = true,
+                                      enabled = true, config = {}}},
+                        references = {},
+                        lifecycle_order = {"A:1"},
+                    },
+                },
+                prefabs = {}, domain_overrides = {},
+            }
+            local go = {Name = "G", _sceneRuntimeId = "g", _children = {}}
+            local services = servicesFor(plan, {foo = Foo}, {g = go})
+            local engine = SceneRuntime.new(services, plan)
+            engine:start(nil)
+            -- Transform is intrinsic to a Unity GameObject; the Roblox
+            -- analog is the GameObject's own root instance.
+            assert(seen == go,
+                "GetComponent('Transform') must return the GameObject itself")
+            print("OK")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, err
+        assert "OK" in out, out
+
+    def test_unknown_unity_name_falls_through(self):
+        """Unmapped names pass through to the raw findFirstChildWhichIsA
+        lookup so:
+          (a) operators who pass Roblox class names directly still hit;
+          (b) unrecognized Unity names preserve the pre-fix nil result
+              rather than silently swallowing the lookup."""
+        scenario = textwrap.dedent("""\
+            local fakeAttachment = {Name = "Att"}
+            local seenKnown = nil
+            local seenUnknown = "sentinel"
+            local Foo = {} ; Foo.__index = Foo
+            function Foo.new(_) return setmetatable({}, Foo) end
+            function Foo:Awake()
+                -- Roblox class name passed directly -- raw passthrough.
+                seenKnown = self:GetComponent("Attachment")
+                -- Unmapped Unity-style name; raw lookup misses.
+                seenUnknown = self:GetComponent("SomeMadeUpUnityType")
+            end
+            local plan = {
+                modules = {foo = {stem = "Foo", runtime_bearing = true,
+                                  module_path = "x"}},
+                scenes = {
+                    A = {
+                        instances = {{instance_id = "A:1", script_id = "foo",
+                                      game_object_id = "g", active = true,
+                                      enabled = true, config = {}}},
+                        references = {},
+                        lifecycle_order = {"A:1"},
+                    },
+                },
+                prefabs = {}, domain_overrides = {},
+            }
+            local go = {Name = "G", _sceneRuntimeId = "g", _children = {},
+                        _builtins = {Attachment = fakeAttachment}}
+            local services = servicesFor(plan, {foo = Foo}, {g = go})
+            local engine = SceneRuntime.new(services, plan)
+            engine:start(nil)
+            assert(seenKnown == fakeAttachment,
+                "Roblox class name should pass through untranslated")
+            assert(seenUnknown == nil,
+                "Unknown Unity name should fall through to nil lookup")
+            print("OK")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, err
+        assert "OK" in out, out
+
+    def test_peer_module_lookup_still_wins_over_translation(self):
+        """A peer MonoBehaviour with stem matching the Unity-style name
+        should still beat the built-in fallback. The translation table
+        only fires AFTER the peer-component search misses."""
+        scenario = textwrap.dedent("""\
+            local seen = nil
+            local Rigidbody = {} ; Rigidbody.__index = Rigidbody
+            function Rigidbody.new(_) return setmetatable({mark = "peer"}, Rigidbody) end
+            local Foo = {} ; Foo.__index = Foo
+            function Foo.new(_) return setmetatable({}, Foo) end
+            function Foo:Awake()
+                seen = self:GetComponent("Rigidbody")
+            end
+            local plan = {
+                modules = {
+                    rb = {stem = "Rigidbody", runtime_bearing = true,
+                          module_path = "x"},
+                    foo = {stem = "Foo", runtime_bearing = true,
+                           module_path = "y"},
+                },
+                scenes = {
+                    A = {
+                        instances = {
+                            {instance_id = "A:1", script_id = "rb",
+                             game_object_id = "g", active = true,
+                             enabled = true, config = {}},
+                            {instance_id = "A:2", script_id = "foo",
+                             game_object_id = "g", active = true,
+                             enabled = true, config = {}},
+                        },
+                        references = {},
+                        lifecycle_order = {"A:1", "A:2"},
+                    },
+                },
+                prefabs = {}, domain_overrides = {},
+            }
+            local go = {Name = "G", _sceneRuntimeId = "g", _children = {},
+                        _builtins = {BasePart = {Name = "wrong"}}}
+            local services = servicesFor(plan, {rb = Rigidbody, foo = Foo},
+                                          {g = go})
+            local engine = SceneRuntime.new(services, plan)
+            engine:start(nil)
+            assert(seen ~= nil and seen.mark == "peer",
+                "peer MonoBehaviour named 'Rigidbody' must win over the "
+                .. "built-in translation table")
+            print("OK")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, err
+        assert "OK" in out, out
+
+
+# ---------------------------------------------------------------------------
+# R4-P1.2: setActive preserves descendant activeSelf (activeInHierarchy split).
+# ---------------------------------------------------------------------------
+
+class TestSetActivePreservesDescendantActiveSelf:
+    """Codex round-4 P1.2: Unity's GameObject has TWO active flags --
+    ``activeSelf`` (the GO's OWN authored flag) and
+    ``activeInHierarchy`` (``activeSelf`` AND every ancestor's
+    ``activeSelf``). Pre-fix the host conflated them: the cascade
+    overwrote each descendant's stored ``activeSelf`` to the toggled
+    value, so a child authored ``activeSelf == false`` wrongly
+    re-activated when its parent toggled back on. Post-fix:
+    ``setActive(parent, true)`` only changes the parent's
+    ``activeSelf``; descendant gates are recomputed but their authored
+    ``activeSelf`` is preserved, so a dormant child stays dormant
+    until ``setActive(child, true)`` is called directly.
+    """
+
+    def test_authored_inactive_child_stays_inactive_after_parent_retoggle(self):
+        scenario = textwrap.dedent("""\
+            local childEnableHits = 0
+            local Child = {} ; Child.__index = Child
+            function Child.new(_) return setmetatable({}, Child) end
+            function Child:OnEnable() childEnableHits = childEnableHits + 1 end
+            local plan = {
+                modules = {child = {stem = "Child", runtime_bearing = true,
+                                    module_path = "x"}},
+                scenes = {
+                    A = {
+                        instances = {{
+                            instance_id = "A:1", script_id = "child",
+                            game_object_id = "childGo",
+                            -- AUTHORED INACTIVE: must stay inactive across
+                            -- parent toggles.
+                            active = false, enabled = true, config = {},
+                        }},
+                        references = {},
+                        lifecycle_order = {"A:1"},
+                    },
+                },
+                prefabs = {}, domain_overrides = {},
+            }
+            local parent = {Name = "Parent", _sceneRuntimeId = "parentGo",
+                             _children = {}}
+            local child = {Name = "ChildGo", _sceneRuntimeId = "childGo",
+                            _children = {}}
+            parent._children.child = child
+            local services = servicesFor(plan, {child = Child},
+                                          {childGo = child, parentGo = parent})
+            local engine = SceneRuntime.new(services, plan)
+            engine:start(nil)
+            runDeferred()
+            print("atBoot=" .. childEnableHits)
+            engine:setActive(parent, false)
+            print("afterParentFalse=" .. childEnableHits)
+            engine:setActive(parent, true)
+            print("afterParentTrue=" .. childEnableHits)
+            -- Now directly enable the child; both gates should open.
+            engine:setActive(child, true)
+            print("afterChildTrue=" .. childEnableHits)
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, err
+        assert "atBoot=0" in out, (
+            f"authored-inactive child must NOT fire OnEnable at boot; "
+            f"got: {out}"
+        )
+        assert "afterParentFalse=0" in out, (
+            f"already-dormant child must not fire on parent disable; "
+            f"got: {out}"
+        )
+        # THE CORE R4-P1.2 ASSERTION: parent re-enable must NOT
+        # re-activate a child whose authored activeSelf is false.
+        assert "afterParentTrue=0" in out, (
+            f"R4-P1.2 regression: parent setActive(true) wrongly "
+            f"re-activated a child whose authored activeSelf == false; "
+            f"got: {out}"
+        )
+        assert "afterChildTrue=1" in out, (
+            f"direct setActive(child, true) must finally fire OnEnable; "
+            f"got: {out}"
+        )
+
+    def test_active_child_still_cascades_with_parent(self):
+        """Sanity: the cascade still works for an ACTIVE child --
+        toggling the parent off suspends the child, toggling parent
+        back on resumes it. The R4 fix must not regress the R2 cascade.
+        """
+        scenario = textwrap.dedent("""\
+            local sig = mockSignal()
+            local childHits = 0
+            local Child = {} ; Child.__index = Child
+            function Child.new(_) return setmetatable({}, Child) end
+            function Child:Awake()
+                self.host:connect(sig, function()
+                    childHits = childHits + 1
+                end)
+            end
+            local plan = {
+                modules = {child = {stem = "Child", runtime_bearing = true,
+                                    module_path = "x"}},
+                scenes = {
+                    A = {
+                        instances = {{instance_id = "A:1", script_id = "child",
+                                      game_object_id = "childGo", active = true,
+                                      enabled = true, config = {}}},
+                        references = {},
+                        lifecycle_order = {"A:1"},
+                    },
+                },
+                prefabs = {}, domain_overrides = {},
+            }
+            local parent = {Name = "Parent", _sceneRuntimeId = "parentGo",
+                             _children = {}}
+            local child = {Name = "ChildGo", _sceneRuntimeId = "childGo",
+                            _children = {}}
+            parent._children.child = child
+            local services = servicesFor(plan, {child = Child},
+                                          {childGo = child, parentGo = parent})
+            local engine = SceneRuntime.new(services, plan)
+            engine:start(nil)
+            runDeferred()
+            sig:fire()
+            engine:setActive(parent, false)
+            sig:fire()  -- must NOT hit (cascade suspends)
+            print("afterDisable=" .. childHits)
+            engine:setActive(parent, true)
+            sig:fire()  -- should hit (both gates open again)
+            print("afterReEnable=" .. childHits)
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, err
+        assert "afterDisable=1" in out, out
+        assert "afterReEnable=2" in out, out
+
+    def test_direct_setactive_on_authored_inactive_child_works(self):
+        """``setActive(child, true)`` on a child authored inactive must
+        open the gate when the parent is active. This is the documented
+        Unity behaviour the brief describes.
+        """
+        scenario = textwrap.dedent("""\
+            local enables = 0
+            local Child = {} ; Child.__index = Child
+            function Child.new(_) return setmetatable({}, Child) end
+            function Child:OnEnable() enables = enables + 1 end
+            local plan = {
+                modules = {child = {stem = "Child", runtime_bearing = true,
+                                    module_path = "x"}},
+                scenes = {
+                    A = {
+                        instances = {{instance_id = "A:1", script_id = "child",
+                                      game_object_id = "childGo",
+                                      active = false, enabled = true,
+                                      config = {}}},
+                        references = {},
+                        lifecycle_order = {"A:1"},
+                    },
+                },
+                prefabs = {}, domain_overrides = {},
+            }
+            local parent = {Name = "Parent", _sceneRuntimeId = "parentGo",
+                             _children = {}}
+            local child = {Name = "ChildGo", _sceneRuntimeId = "childGo",
+                            _children = {}}
+            parent._children.child = child
+            local services = servicesFor(plan, {child = Child},
+                                          {childGo = child, parentGo = parent})
+            local engine = SceneRuntime.new(services, plan)
+            engine:start(nil)
+            runDeferred()
+            engine:setActive(child, true)
+            print("afterDirect=" .. enables)
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, err
+        assert "afterDirect=1" in out, out
+
+
+class TestSetActiveSubtreeIdsWithParentsHelperEmitted:
+    """The host runtime's R4-P1.2 cascade prefers the optional
+    ``collectSubtreeIdsWithParents`` service when present (full
+    preorder + parent-id list). Both autogen entrypoints must emit
+    the helper so the generated entrypoints' cascade is correct in
+    production, not just in the test harness.
+    """
+
+    def test_both_entrypoints_emit_collect_subtree_ids_with_parents(self):
+        from converter.autogen import (
+            generate_scene_runtime_client_entrypoint,
+            generate_scene_runtime_server_entrypoint,
+        )
+        for gen in (
+            generate_scene_runtime_client_entrypoint,
+            generate_scene_runtime_server_entrypoint,
+        ):
+            src = gen().source
+            assert "collectSubtreeIdsWithParents" in src, (
+                f"{gen.__name__} must emit collectSubtreeIdsWithParents "
+                f"so the R4-P1.2 setActive cascade has parent info "
+                f"available in production; got: {src[:400]}"
+            )
+            # Sanity: the emitted helper must record parentId on each
+            # entry (the cascade reads ``entry.parentId``).
+            assert "parentId" in src, (
+                f"{gen.__name__} subtree helper must emit parentId "
+                f"per entry; got: {src[:400]}"
+            )

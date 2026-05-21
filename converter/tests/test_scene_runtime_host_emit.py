@@ -83,6 +83,52 @@ class TestPlanToLuauEncoder:
         assert "[\"end\"]" in out
         assert "[\"function\"]" in out
 
+    def test_unicode_identifier_keys_use_bracket_syntax(self):
+        """R4-P2.2: Python's ``str.isidentifier()`` returns True for
+        PEP 3131 Unicode identifiers (``"变量".isidentifier() == True``)
+        but Luau's lexer rejects non-ASCII bare identifiers. The
+        encoder must bracket-quote such keys so the embedded
+        ``SceneRuntimePlan`` ModuleScript parses on the live host.
+        """
+        out = _plan_to_luau({"变量": 1, "naïve": 2, "ascii_ok": 3})
+        # Non-ASCII keys must be bracket-quoted (string-keyed entry).
+        assert "[\"变量\"]" in out, out
+        assert "[\"naïve\"]" in out, out
+        # An ASCII identifier still uses bare-key form.
+        assert "ascii_ok = 3" in out, out
+        # The bare-key form for the Unicode keys must NOT appear.
+        assert "变量 = " not in out, out
+        assert "naïve = " not in out, out
+
+    @pytest.mark.skipif(not _luau_available(),
+                        reason="luau interpreter not installed")
+    def test_unicode_key_emit_parses_with_luau(self):
+        """R4-P2.2: the encoded plan with Unicode keys must round-trip
+        through standalone luau (the bracket-quoted form is required for
+        the lexer to accept it)."""
+        encoded = "return " + _plan_to_luau({"变量": "v", "naïve": 7})
+        wrapper = (f"local p = (function() {encoded} end)(); "
+                   "assert(type(p) == 'table'); "
+                   "assert(p[\"变量\"] == 'v'); "
+                   "assert(p[\"naïve\"] == 7); "
+                   "print('ok')")
+        with tempfile.NamedTemporaryFile(
+            suffix=".luau", mode="w", delete=False,
+        ) as fw:
+            fw.write(wrapper)
+            wpath = fw.name
+        try:
+            result = subprocess.run(
+                ["luau", wpath], capture_output=True, text=True, timeout=10,
+            )
+            assert result.returncode == 0, (
+                f"luau parse failed: stderr={result.stderr!r}, "
+                f"stdout={result.stdout!r}"
+            )
+            assert "ok" in result.stdout
+        finally:
+            Path(wpath).unlink(missing_ok=True)
+
     def test_nested_dict_and_list(self):
         plan = {
             "modules": {

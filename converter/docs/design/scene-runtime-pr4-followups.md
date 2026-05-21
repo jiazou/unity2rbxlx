@@ -313,13 +313,60 @@ across `test_scene_runtime_host_behavior.py`,
 
 **P3:** none in round 3.
 
-### Codex review round 4 (2026-05-21) — NOT absorbed (architecture-level)
+### Codex review round 4 (2026-05-21) — partial absorption
 
 Round-4 codex surfaced 3 P1s + 2 P2s on top of round-3 absorption.
-These are NOT absorbed in PR4 because each requires an architecture-
-level decision the user has not pre-greenlit (and the brief's hard
-rule says to stop and surface in that case). Full review at
-`/tmp/codex-pr4-review-v4.txt`.
+After user review the scope was greenlit as: absorb R4-P1.2, R4-P1.3,
+R4-P2.2 in PR4; defer R4-P1.1 to PR5; defer R4-P2.1 to a sibling PR3c
+shipping in parallel. Full review at `/tmp/codex-pr4-review-v4.txt`.
+
+**R4-P1.2 ABSORBED** — split `activeSelf` vs `activeInHierarchy` so
+the `setActive` cascade preserves descendant authored flags.
+`SceneRuntime.new` now tracks `_goActiveSelf` (per-GO authored,
+mutated only by direct `setActive(go=THIS, ...)`) AND
+`_goActiveInHierarchy` (per-GO computed gate). Every dispatch gate
+(`_isGateOpen`, `_tick`, `_runAwakeEnableStart`, `setEnabled`) now
+checks `m.activeInHierarchy AND m.enabled` instead of conflating
+`activeSelf` with the gate. `setActive` walks the subtree top-down
+via the new optional service `collectSubtreeIdsWithParents` (added to
+both autogen entrypoints + test harness) and recomputes each
+descendant's `activeInHierarchy = activeSelf[id] AND
+activeInHierarchy[parent(id)]`. Tests:
+`TestSetActivePreservesDescendantActiveSelf` x3 (the core
+parent-retoggle regression + sanity for cascading active children +
+direct setActive on an authored-inactive child),
+`TestSetActiveSubtreeIdsWithParentsHelperEmitted` (both entrypoints
+emit the new service helper).
+
+**R4-P1.3 ABSORBED** — Unity-name → Roblox-class translation table
+for the `GetComponent` built-in fallback. Added
+`_unityToRobloxClass(name)` in `scene_runtime.luau` with a
+starter table (`Rigidbody` → `BasePart`, `BoxCollider` /
+`SphereCollider` / `MeshCollider` / `CapsuleCollider` /
+`WheelCollider` / `CharacterController` → `BasePart`,
+`MeshRenderer` / `SkinnedMeshRenderer` / `MeshFilter` → `MeshPart`,
+`Camera` → `Camera`, `Light` → `Light`, `AudioSource` → `Sound`,
+`Animator` → `AnimationController`, `Button` → `GuiButton`,
+`Image` → `ImageLabel`, etc.). `Transform` / `RectTransform` short-
+circuit to the GameObject's own root instance via a sentinel.
+Unknown names fall through to the raw `findFirstChildWhichIsA` call
+so operators get the pre-fix failure mode (no silent regression) and
+callers passing Roblox class names directly still hit. Tests:
+`TestGetComponentTranslatesUnityToRobloxClassName` x5
+(Rigidbody → BasePart, MeshRenderer → MeshPart, Transform → self,
+unknown name falls through, peer-module lookup still wins over
+translation).
+
+**R4-P2.2 ABSORBED** — `_plan_to_luau` bare-key regex tightened
+from Python's `str.isidentifier()` (which accepts PEP 3131 Unicode
+identifiers like `"变量"`) to an explicit ASCII regex
+(`^[A-Za-z_][A-Za-z0-9_]*$`). Non-ASCII keys now correctly emit as
+bracket-quoted strings so the embedded `SceneRuntimePlan`
+ModuleScript parses on the live host. Tests:
+`test_unicode_identifier_keys_use_bracket_syntax` +
+`test_unicode_key_emit_parses_with_luau` (luau-harness round-trip).
+
+The remaining two round-4 items are deferred:
 
 **R4-P1.1 — `SceneRuntimePlan` is project-wide, not per-place**
 (`converter/converter/pipeline.py:~4344`). The plan ModuleScript
@@ -337,7 +384,7 @@ the scene path? Likely just `state.parsed_scene.scene_path` mapped
 to the planner namespace, but the boundary needs an explicit
 contract decision.
 
-**R4-P1.2 — `setActive` collapses `activeSelf` and `activeInHierarchy`**
+**R4-P1.2 — `setActive` collapses `activeSelf` and `activeInHierarchy`** [ABSORBED in this round; see above]
 (`converter/runtime/scene_runtime.luau:~821`). The R2-P1.4 cascade
 fix overwrites `m.activeSelf` on every descendant, but a child
 authored inactive must STAY inactive when a parent re-enables.
@@ -353,7 +400,7 @@ per-GameObject hierarchy edge so the host can walk ancestors at
 toggle time (the current host only knows the descendant tree via
 `services.collectDescendantIds(root)`)?
 
-**R4-P1.3 — `findFirstChildWhichIsA` feeds Unity names to Roblox `IsA`**
+**R4-P1.3 — `findFirstChildWhichIsA` feeds Unity names to Roblox `IsA`** [ABSORBED in this round; see above]
 (`converter/converter/autogen.py:~655`). Contract-emitted code calls
 `self:GetComponent("Rigidbody")`, but Roblox's `IsA("Rigidbody")`
 always returns false because Unity's `Rigidbody` is the lowered
@@ -373,26 +420,31 @@ GameObject still produces a broken place/plan pairing. Either
 re-gate or land the carve-out before merge.
 
 **R4-P2.2 — `_plan_to_luau` uses Python `str.isidentifier()` for
-Luau bare-key emit** (`converter/converter/autogen.py:~500`). Luau
-identifiers are stricter (no Unicode). A field named `"变量"` would
-emit `{ 变量 = 1 }` which standalone luau rejects. Resolution:
-explicit Luau identifier regex (`^[A-Za-z_][A-Za-z0-9_]*$`) and
+Luau bare-key emit** [ABSORBED in this round; see above]
+(`converter/converter/autogen.py:~500`). Luau identifiers are
+stricter (no Unicode). A field named `"变量"` would emit
+`{ 变量 = 1 }` which standalone luau rejects. Resolution: explicit
+Luau identifier regex (`^[A-Za-z_][A-Za-z0-9_]*$`) and
 bracket-quote everything else.
 
-**Why deferred:**
-- R4-P1.1 + P1.2 require a contract-side decision the user has
-  not pre-greenlit. The brief allowed absorbing R2/R3 fixes inline
-  but explicitly requires stop-and-return on new architecture
-  questions.
-- R4-P1.3 hinges on a name-mapping table that touches the
-  contract's emitted code (transpiler) -- bigger surface than the
-  R2/R3 in-line fixes.
-- R4-P2.1 is a real concern but the resolution path (gate generic
-  vs land carve-out 1) is a scope decision.
-- R4-P2.2 is mechanical but only matters for projects using
-  non-ASCII serialized field names; ASCII projects are unaffected.
+**Why the remaining two were deferred:**
+- **R4-P1.1** — multi-scene plan scoping is **deferred to PR5**.
+  The design doc places the multi-scene canary matrix in PR5, where
+  the scene-namespace boundary will be exercised by real fixtures
+  (trash-dash + SimpleFPS). Scoping `scene_runtime` per-place is
+  a contract decision PR5 can answer with concrete repros instead
+  of PR4 inventing one in isolation.
+- **R4-P2.1** — generic-mode-rejection vs land-the-carve-out is
+  **deferred to PR3c** (a sibling PR shipping in parallel off PR3b).
+  PR3c picks up followups items 1 + 2 (inactive retention + UI
+  child suppression). Once PR3c merges, PR4's lift of the generic
+  CLI rejection is no longer a footgun. PR3c MUST merge before PR4
+  lifts the rejection in production so generic users don't see the
+  broken inactive-runtime-referenced behaviour. PR4 keeps the
+  rejection lifted (per the design doc PR4 contract) but the
+  test matrix flags the limitation in `UNCONVERTED.md`.
 
-These are tracked in the carry-over markers section below.
+These remain tracked in the carry-over markers section below.
 
 ### Contract resolutions pinned in the design doc
 
@@ -430,20 +482,30 @@ The three R2 P1s the user explicitly resolved are pinned in
       converts the resolved GameObject Instance to its built-in
       component via `findFirstChildWhichIsA`). Today such refs
       arrive as the owning GameObject.
-- [ ] **R4-P1.1**: scope `SceneRuntimePlan` per-place in
-      `run_all_scenes`. Needs user input on the scene-namespace
-      lookup boundary.
-- [ ] **R4-P1.2**: split `activeSelf` / `activeInHierarchy` so
-      `setActive` cascade doesn't clobber descendant authored
-      flags. Needs user input on whether the planner should
-      surface a per-GameObject ancestor edge.
-- [ ] **R4-P1.3**: Unity component name → Roblox class translation
-      for the `findFirstChildWhichIsA` fallback. Needs user input
-      on contract-side vs host-side translation.
-- [ ] **R4-P2.1**: either re-gate `generic` to `legacy` until the
-      inactive-retention carve-out (followup item 1) lands, or
-      land the carve-out before merge.
-- [ ] **R4-P2.2**: switch `_plan_to_luau`'s bare-key regex from
+- [ ] **R4-P1.1** (DEFERRED TO PR5): scope `SceneRuntimePlan`
+      per-place in `run_all_scenes`. PR5's multi-scene canary
+      matrix (trash-dash + SimpleFPS) supplies the concrete
+      fixtures needed to resolve the scene-namespace boundary
+      contract decision the design doc punted on.
+- [x] **R4-P1.2**: split `activeSelf` / `activeInHierarchy`. **ABSORBED**
+      in PR4 (this round) — host-side via per-GO `_goActiveSelf` +
+      `_goActiveInHierarchy` maps + new
+      `collectSubtreeIdsWithParents` service. Tests:
+      `TestSetActivePreservesDescendantActiveSelf` x3,
+      `TestSetActiveSubtreeIdsWithParentsHelperEmitted`.
+- [x] **R4-P1.3**: Unity → Roblox class translation. **ABSORBED** in
+      PR4 (this round) — host-side via `_unityToRobloxClass(name)`
+      in `scene_runtime.luau` with `Transform` short-circuit + raw
+      fall-through for unknown names. Tests:
+      `TestGetComponentTranslatesUnityToRobloxClassName` x5.
+- [ ] **R4-P2.1** (DEFERRED TO PR3c): the sibling PR3c (in flight
+      off PR3b) lands followups items 1 + 2 (inactive retention +
+      UI child suppression). PR3c MUST merge BEFORE PR4 lifts the
+      generic CLI rejection in production so generic users don't
+      see the broken inactive-runtime-referenced behaviour.
+- [x] **R4-P2.2**: switch `_plan_to_luau`'s bare-key regex from
       Python `str.isidentifier()` to an explicit Luau-identifier
-      regex so non-ASCII serialized field names emit as
-      bracket-quoted keys.
+      regex. **ABSORBED** in PR4 (this round) —
+      `_LUAU_BARE_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")`.
+      Tests: `test_unicode_identifier_keys_use_bracket_syntax` +
+      `test_unicode_key_emit_parses_with_luau`.

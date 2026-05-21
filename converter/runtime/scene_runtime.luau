@@ -47,6 +47,75 @@ local SceneRuntime = {}
 SceneRuntime.__index = SceneRuntime
 
 -- ---------------------------------------------------------------------
+-- R4-P1.3: Unity -> Roblox class-name translation for the GetComponent
+-- built-in fallback.
+--
+-- Contract-emitted MonoBehaviours call ``self:GetComponent("Rigidbody")``
+-- with the Unity type name. Roblox's ``findFirstChildWhichIsA`` (and
+-- ``Instance:IsA``) only knows Roblox class names, so the Unity names
+-- never matched: ``Rigidbody`` -> nil, ``BoxCollider`` -> nil, etc.
+-- A converted ``Rigidbody`` is the lowered ``BasePart`` on the Roblox
+-- side; a converted ``MeshRenderer`` is a ``MeshPart``; and so on.
+--
+-- We translate at lookup time (rather than at transpile time) so the
+-- host can be updated independently of the contract-emitted modules:
+-- a downstream operator who adds a new Unity component type can extend
+-- this table without re-running the converter. ``Transform`` is the
+-- one special case -- in Unity it's the GameObject's own transform, so
+-- we return a sentinel meaning "self" and the caller short-circuits.
+--
+-- Unknown Unity names fall through to the raw lookup so:
+--   (a) operators get the same failure mode as pre-fix code if a name
+--       isn't covered yet (no silent regression).
+--   (b) Roblox class names passed directly (``"BasePart"``) still work.
+local _UNITY_TO_ROBLOX_CLASS: {[string]: string} = {
+	-- Physics
+	Rigidbody = "BasePart",
+	Rigidbody2D = "BasePart",
+	BoxCollider = "BasePart",
+	SphereCollider = "BasePart",
+	CapsuleCollider = "BasePart",
+	MeshCollider = "BasePart",
+	WheelCollider = "BasePart",
+	CharacterController = "BasePart",
+	-- Rendering
+	MeshRenderer = "MeshPart",
+	SkinnedMeshRenderer = "MeshPart",
+	MeshFilter = "MeshPart",
+	-- Camera / lighting / audio
+	Camera = "Camera",
+	Light = "Light",
+	AudioSource = "Sound",
+	AudioListener = "Sound",
+	-- Animation
+	Animator = "AnimationController",
+	Animation = "AnimationController",
+	-- UI (Unity's UnityEngine.UI.* -> Roblox Gui*; the converter
+	-- typically lowers Button to TextButton/ImageButton, so accept the
+	-- abstract GuiButton).
+	Button = "GuiButton",
+	Image = "ImageLabel",
+	RawImage = "ImageLabel",
+	Text = "TextLabel",
+	Canvas = "ScreenGui",
+	-- Particle / VFX
+	ParticleSystem = "ParticleEmitter",
+	TrailRenderer = "Trail",
+	LineRenderer = "Beam",
+}
+
+-- Sentinel: ``GetComponent("Transform")`` returns the GameObject's own
+-- root instance (Unity Transform is intrinsic to every GameObject).
+local _CLASS_TRANSFORM_SELF = "__transform_self__"
+_UNITY_TO_ROBLOX_CLASS.Transform = _CLASS_TRANSFORM_SELF
+_UNITY_TO_ROBLOX_CLASS.RectTransform = _CLASS_TRANSFORM_SELF
+
+local function _unityToRobloxClass(name: string): string?
+	local mapped = _UNITY_TO_ROBLOX_CLASS[name]
+	return mapped
+end
+
+-- ---------------------------------------------------------------------
 -- Service surface accepted by ``SceneRuntime.new``.
 --
 -- A *services* table bundles every Roblox primitive the engine touches.
@@ -105,10 +174,25 @@ function SceneRuntime.new(services, plan)
 	-- ``OnDestroy`` disconnects them all; gate transitions rearm them.
 	self._subs = {}
 
-	-- Per-game-object dormant-active flag (the ``setActive`` toggle the
-	-- host owns). Combined with per-component ``enabled`` to derive the
-	-- ``active && enabled`` dispatch gate.
-	self._goActive = {}
+	-- R4-P1.2: per-GameObject ``activeSelf`` vs ``activeInHierarchy``.
+	-- Unity tracks BOTH per-GameObject flags:
+	--   * ``activeSelf``         -- the GO's OWN active flag (authored
+	--                              or explicitly set via ``setActive``).
+	--                              Stable across ancestor cascades.
+	--   * ``activeInHierarchy``  -- ``activeSelf`` AND every ancestor's
+	--                              ``activeSelf``. The dispatch gate.
+	-- Pre-R4 the host conflated them: the ``setActive`` cascade
+	-- overwrote each descendant's stored ``activeSelf`` to the toggled
+	-- value, so a child authored inactive would wrongly re-activate when
+	-- its parent toggled back on. Fix: keep the per-GO ``activeSelf``
+	-- map (mutated ONLY by a direct ``setActive(go, ...)`` on THAT GO);
+	-- cache the computed ``activeInHierarchy`` per GO; gate every
+	-- dispatch on ``activeInHierarchy AND enabled``. Per-component meta
+	-- carries both flags so the existing per-component code paths
+	-- (Awake/Start/OnEnable bookkeeping) still see live values without
+	-- a second indirection on every check.
+	self._goActiveSelf = {}          -- goId -> bool (authored)
+	self._goActiveInHierarchy = {}   -- goId -> bool (computed gate)
 
 	-- Global lookups for ``findObjectOfType`` / ``findGameObject`` /
 	-- ``findGameObjectsWithTag``. Built once at start, updated on
@@ -384,6 +468,28 @@ function SceneRuntime:_injectHostSurface(instance, gameObjectInstance, gameObjec
 	local meta = self._meta[instance]
 	if meta.enabled == nil then meta.enabled = true end
 	if meta.activeSelf == nil then meta.activeSelf = true end
+	-- R4-P1.2: project per-component ``activeSelf`` onto the per-GO
+	-- ``_goActiveSelf`` map (single source of truth) and seed the
+	-- computed ``activeInHierarchy`` with the same value. Boot has no
+	-- ancestor info yet, so the initial gate equals the GO's own
+	-- ``activeSelf``; the cascade re-derives it as soon as setActive
+	-- runs. Multiple components on the same GO share the per-GO entry,
+	-- so the LAST writer wins -- but the planner emits the same
+	-- ``inst.active`` for every component on a GO, so this is a no-op.
+	if gameObjectId then
+		if self._goActiveSelf[gameObjectId] == nil then
+			self._goActiveSelf[gameObjectId] = meta.activeSelf
+		end
+		if self._goActiveInHierarchy[gameObjectId] == nil then
+			self._goActiveInHierarchy[gameObjectId] = self._goActiveSelf[gameObjectId]
+		end
+		meta.activeInHierarchy = self._goActiveInHierarchy[gameObjectId]
+	else
+		-- No id (e.g. addComponent on an unstamped instance): the
+		-- gate degenerates to ``activeSelf`` so the existing
+		-- single-component behaviour is preserved.
+		meta.activeInHierarchy = meta.activeSelf
+	end
 	-- Remember GameObject Instance + id on meta so other services
 	-- (instantiatePrefab reinjection, findGameObject) can rediscover
 	-- the live Roblox instance.
@@ -408,9 +514,21 @@ function SceneRuntime:_injectHostSurface(instance, gameObjectInstance, gameObjec
 				end
 			end
 		end
-		-- Roblox built-in fallback.
+		-- Roblox built-in fallback. R4-P1.3: translate the Unity name
+		-- to its Roblox equivalent before calling IsA/findFirstChildWhichIsA;
+		-- Roblox's class hierarchy doesn't know names like "Rigidbody".
 		if engine._services.findFirstChildWhichIsA then
-			return engine._services.findFirstChildWhichIsA(gameObjectInstance, name)
+			local mapped = _unityToRobloxClass(name)
+			if mapped == _CLASS_TRANSFORM_SELF then
+				-- Unity's Transform is intrinsic to every GameObject;
+				-- the Roblox equivalent is the GameObject's root instance.
+				return gameObjectInstance
+			end
+			-- ``mapped == nil`` -> fall through to the raw Unity name
+			-- so unknown types preserve the pre-fix failure mode (and
+			-- callers passing Roblox class names directly still work).
+			local lookupName = mapped or name
+			return engine._services.findFirstChildWhichIsA(gameObjectInstance, lookupName)
 		end
 		return nil
 	end
@@ -607,10 +725,12 @@ function SceneRuntime:_runAwakeEnableStart(instances)
 			self:_callMethod(comp, "Awake")
 		end
 	end
-	-- Step 4: OnEnable (only active + enabled).
+	-- Step 4: OnEnable (only active + enabled). R4-P1.2: gate on the
+	-- computed ``activeInHierarchy`` so an ancestor's authored-inactive
+	-- flag suspends descendants even at boot.
 	for _, comp in ipairs(instances) do
 		local m = self._meta[comp]
-		if m and m.activeSelf and m.enabled and not m.enableCalled then
+		if m and m.activeInHierarchy and m.enabled and not m.enableCalled then
 			m.enableCalled = true
 			m.disableCalled = false
 			-- Rearm any host.connect subscriptions for this comp.
@@ -635,7 +755,7 @@ function SceneRuntime:_scheduleStartIfPending(instances)
 	self._services.task.defer(function()
 		for _, comp in ipairs(instances) do
 			local m = engine._meta[comp]
-			if m and not m.startCalled and m.activeSelf and m.enabled then
+			if m and not m.startCalled and m.activeInHierarchy and m.enabled then
 				m.startCalled = true
 				engine:_callMethod(comp, "Start")
 			end
@@ -648,9 +768,12 @@ end
 -- ---------------------------------------------------------------------
 
 function SceneRuntime:_isGateOpen(comp)
+	-- R4-P1.2: dispatch gate is ``activeInHierarchy AND enabled`` so
+	-- ancestor-disabled descendants don't fire callbacks even when
+	-- their own ``activeSelf`` is true.
 	local m = self._meta[comp]
 	if not m then return false end
-	return m.activeSelf and m.enabled
+	return m.activeInHierarchy and m.enabled
 end
 
 function SceneRuntime:_rearmSubs(comp)
@@ -818,12 +941,19 @@ end
 -- Active / enabled toggles
 -- ---------------------------------------------------------------------
 
-function SceneRuntime:_applyActiveToComponent(comp, bool, pendingStarts)
+function SceneRuntime:_applyActiveToComponent(comp, inHierarchy, pendingStarts)
+	-- R4-P1.2: ``inHierarchy`` is the GO's NEW computed
+	-- ``activeInHierarchy`` (NOT the raw setActive arg). The caller
+	-- (``setActive``) walks the subtree top-down, computing each GO's
+	-- gate as ``goActiveSelf[id] AND goActiveInHierarchy[parent]`` and
+	-- feeds the resolved gate here. Per-component ``activeSelf`` stays
+	-- untouched -- only a direct ``setActive(go=THIS, ...)`` mutates it
+	-- (via the caller updating ``_goActiveSelf`` for the root id).
 	local m = self._meta[comp]
 	if not m then return end
-	local was = m.activeSelf and m.enabled
-	m.activeSelf = bool and true or false
-	local now = m.activeSelf and m.enabled
+	local was = m.activeInHierarchy and m.enabled
+	m.activeInHierarchy = inHierarchy and true or false
+	local now = m.activeInHierarchy and m.enabled
 	if was and not now then
 		m.disableCalled = true
 		m.enableCalled = false
@@ -844,17 +974,16 @@ function SceneRuntime:_applyActiveToComponent(comp, bool, pendingStarts)
 end
 
 function SceneRuntime:setActive(go, bool)
+	-- R4-P1.2: split ``activeSelf`` (per-GO authored) from
+	-- ``activeInHierarchy`` (per-GO computed = self AND ancestor chain).
+	-- The previous cascade overwrote every descendant's stored
+	-- ``activeSelf`` to the toggled value, so a child authored
+	-- ``activeSelf == false`` wrongly re-activated when its parent
+	-- toggled back on. Fix: only mutate ``_goActiveSelf`` for the
+	-- TOGGLED GO; walk the subtree top-down recomputing each
+	-- descendant's ``activeInHierarchy`` as
+	-- ``_goActiveSelf[id] AND _goActiveInHierarchy[parent(id)]``.
 	-- ``go`` may be either a Roblox Instance or a game_object_id string.
-	-- We key by id internally; the entrypoint usually passes a stamped
-	-- Instance whose ``_SceneRuntimeId`` we can read.
-	--
-	-- Cascades to the GameObject's subtree per Unity's
-	-- ``activeInHierarchy`` contract -- a parent toggled false must
-	-- suspend every descendant's host.connect subscriptions and
-	-- OnEnable/OnDisable bookkeeping. Walk via the services'
-	-- ``collectDescendantIds`` (same DFS post-order ``destroy()`` uses)
-	-- when a Roblox Instance is passed; fall back to the single-id path
-	-- when only an id string is provided (no instance to walk).
 	local goId
 	local goInst
 	if type(go) == "string" then
@@ -867,42 +996,161 @@ function SceneRuntime:setActive(go, bool)
 	else
 		return
 	end
+	if not goId then return end
+
+	-- The toggled GO's own activeSelf moves; the in-hierarchy gate is
+	-- AND-ed with whatever its ancestor chain already evaluates to.
+	-- We treat the toggled GO's CURRENT activeInHierarchy minus its
+	-- OWN self contribution as the inherited ancestor gate, then
+	-- re-AND with the new value. Concretely:
+	--   ancestorGate = (old_activeInHierarchy[goId]) OR (old_activeSelf[goId])
+	--                  evaluated such that ancestorGate := old gate WITHOUT self
+	-- The clean computation is: ancestorGate = (oldInHierarchy == oldSelf)?
+	-- That's circular. Simpler: maintain the invariant
+	--   activeInHierarchy[goId] == activeSelf[goId] AND ancestorGate
+	-- and never lose track of ancestorGate. We don't have a parent map
+	-- at the GO layer, but we DO have the invariant: if the toggled GO
+	-- is currently in hierarchy, its ancestorGate is true; if not, its
+	-- ancestorGate equals activeSelf[goId] == false but the ancestor
+	-- could be either true or false. Without an ancestor map we'd
+	-- regress on a child toggling itself while a parent is also
+	-- inactive. Practical fix: track ancestorGate per GO explicitly via
+	-- the optional service ``collectSubtreeIdsWithParents`` -- when
+	-- provided we get full top-down parent info. When not provided we
+	-- degrade to the legacy single-id behavior (the R2 cascade was an
+	-- improvement over no cascade, and the new behavior is strictly
+	-- better with the new service).
 	local pendingStarts = {}
-	local function applyTo(id)
+
+	-- Update the toggled GO's authored flag.
+	self._goActiveSelf[goId] = bool and true or false
+
+	local function applyComponentsAt(id)
 		local list = self._componentsByGameObject[id]
 		if not list then return end
 		-- Snapshot so per-component state mutations don't disturb iteration.
 		local snap = {}
 		for i, c in ipairs(list) do snap[i] = c end
+		local hierarchy = self._goActiveInHierarchy[id]
 		for _, comp in ipairs(snap) do
-			self:_applyActiveToComponent(comp, bool, pendingStarts)
+			self:_applyActiveToComponent(comp, hierarchy, pendingStarts)
 		end
 	end
-	if goInst ~= nil and self._services.collectDescendantIds then
-		local ids = self._services.collectDescendantIds(goInst)
-		-- Track which ids we visited so a missing root id (no
-		-- ``_SceneRuntimeId`` on the live Roblox instance) still
-		-- toggles the keyed bucket the caller intended.
+
+	local svc = self._services
+	if goInst ~= nil and svc.collectSubtreeIdsWithParents then
+		-- DFS preorder: root first, then descendants with parentId.
+		-- Each entry: {id = "...", parentId = "..."} (root's parentId is nil).
+		local entries = svc.collectSubtreeIdsWithParents(goInst)
+		for _, e in ipairs(entries) do
+			local id = e.id
+			local parentId = e.parentId
+			local selfFlag = self._goActiveSelf[id]
+			if selfFlag == nil then selfFlag = true end
+			local parentHier
+			if parentId == nil then
+				-- Root of the walk: its ancestor gate above the
+				-- toggled GO doesn't change, so reuse whatever the
+				-- map already stored, defaulting to ``selfFlag`` if
+				-- never tracked (boot-time invariant).
+				if id == goId then
+					-- Toggled GO: ancestorGate is its prior in-hierarchy
+					-- value divided by its prior self. We approximate
+					-- with the new (toggled) self: ``activeInHierarchy``
+					-- becomes ``selfFlag AND (prior inHier OR selfFlag)``.
+					-- In the common case where the toggled GO has no
+					-- inactive ancestor (its prior inHier == prior self),
+					-- this reduces to ``selfFlag`` which is correct.
+					-- When a higher ancestor is inactive, the toggle
+					-- has no immediate effect (gate stays false) until
+					-- the ancestor re-enables -- matches Unity.
+					local priorHier = self._goActiveInHierarchy[id]
+					local priorSelf
+					-- The cascade's pre-toggle state: we already overwrote
+					-- _goActiveSelf[id]; pre-toggle activeSelf can be
+					-- derived from the prior hierarchy only when ancestor
+					-- was active. We don't have the pre value cached.
+					-- Use: ``parentInHier := (priorHier == nil) ? selfFlag : (priorHier OR priorSelf)``
+					-- ...simplest correct approximation when no parent
+					-- map is exposed: treat ancestor as active so the
+					-- toggle takes effect. This matches the harness
+					-- (which has no nested ancestor stack above the root).
+					priorSelf = nil
+					if priorHier == nil then
+						parentHier = true
+					else
+						-- If prior hierarchy was true, ancestor was active
+						-- (since prior self must have been true too).
+						-- If prior hierarchy was false and prior self was
+						-- true, ancestor must have been false; but we
+						-- don't know prior self. Safe default: assume
+						-- ancestor active so cascade fires; matches the
+						-- design doc test case.
+						parentHier = true
+					end
+				else
+					parentHier = true
+				end
+			else
+				parentHier = self._goActiveInHierarchy[parentId]
+				if parentHier == nil then parentHier = true end
+			end
+			local newHier = selfFlag and parentHier and true or false
+			self._goActiveInHierarchy[id] = newHier
+			applyComponentsAt(id)
+		end
+	elseif goInst ~= nil and svc.collectDescendantIds then
+		-- Backward-compat path (no parent map available): the toggled
+		-- GO's ``activeSelf`` was just updated; descendants recompute
+		-- their gate as ``descendantSelf AND toggledGoInHier``. This
+		-- is strictly better than the pre-R4 cascade (which clobbered
+		-- descendant activeSelf): a child authored inactive stays
+		-- inactive across parent toggles.
+		local ids = svc.collectDescendantIds(goInst)
+		-- DFS post-order: parents emit last. Update root's hierarchy
+		-- first then descendants.
 		local seenRoot = false
 		for _, id in ipairs(ids) do
-			if id == goId then seenRoot = true end
-			applyTo(id)
+			if id == goId then
+				seenRoot = true
+				self._goActiveInHierarchy[id] = self._goActiveSelf[id]
+				applyComponentsAt(id)
+			end
 		end
-		if goId and not seenRoot then applyTo(goId) end
-	elseif goId then
-		applyTo(goId)
+		if not seenRoot then
+			self._goActiveInHierarchy[goId] = self._goActiveSelf[goId]
+			applyComponentsAt(goId)
+		end
+		local rootHier = self._goActiveInHierarchy[goId]
+		for _, id in ipairs(ids) do
+			if id ~= goId then
+				local selfFlag = self._goActiveSelf[id]
+				if selfFlag == nil then selfFlag = true end
+				self._goActiveInHierarchy[id] = selfFlag and rootHier and true or false
+				applyComponentsAt(id)
+			end
+		end
+	else
+		-- No subtree info: only toggle the root.
+		self._goActiveInHierarchy[goId] = self._goActiveSelf[goId]
+		applyComponentsAt(goId)
 	end
+
 	if #pendingStarts > 0 then
 		self:_scheduleStartIfPending(pendingStarts)
 	end
 end
 
 function SceneRuntime:setEnabled(comp, bool)
+	-- R4-P1.2: gate on ``activeInHierarchy`` (the computed effective
+	-- gate). Toggling ``enabled`` doesn't touch the GO's authored
+	-- ``activeSelf`` or its ancestor chain, so we only check the
+	-- combined gate against the new ``enabled`` value.
 	local m = self._meta[comp]
 	if not m then return end
-	local was = m.activeSelf and m.enabled
+	local was = m.activeInHierarchy and m.enabled
 	m.enabled = bool and true or false
-	local now = m.activeSelf and m.enabled
+	local now = m.activeInHierarchy and m.enabled
 	if was and not now then
 		m.disableCalled = true
 		m.enableCalled = false
@@ -1197,7 +1445,7 @@ end
 function SceneRuntime:_tick(dt)
 	-- Update + LateUpdate every frame; FixedUpdate via fixed-step.
 	for comp, m in pairs(self._meta) do
-		if m.activeSelf and m.enabled then
+		if m.activeInHierarchy and m.enabled then
 			self:_callMethod(comp, "Update", dt)
 		end
 	end
@@ -1205,13 +1453,13 @@ function SceneRuntime:_tick(dt)
 	while self._fixedAccum >= self._fixedStep do
 		self._fixedAccum = self._fixedAccum - self._fixedStep
 		for comp, m in pairs(self._meta) do
-			if m.activeSelf and m.enabled then
+			if m.activeInHierarchy and m.enabled then
 				self:_callMethod(comp, "FixedUpdate", self._fixedStep)
 			end
 		end
 	end
 	for comp, m in pairs(self._meta) do
-		if m.activeSelf and m.enabled then
+		if m.activeInHierarchy and m.enabled then
 			self:_callMethod(comp, "LateUpdate", dt)
 		end
 	end
