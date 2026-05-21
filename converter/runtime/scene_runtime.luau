@@ -193,6 +193,19 @@ function SceneRuntime.new(services, plan)
 	-- a second indirection on every check.
 	self._goActiveSelf = {}          -- goId -> bool (authored)
 	self._goActiveInHierarchy = {}   -- goId -> bool (computed gate)
+	-- R5-P1.2: per-GameObject parent map (goId -> parentGoId). Populated
+	-- at ``start()`` from each planner instance's
+	-- ``parent_game_object_id`` extra. The host walks this map UP when
+	-- computing ``activeInHierarchy`` so a child whose ancestor is
+	-- authored inactive boots dormant (and ``setActive(grandchild,
+	-- true)`` on a deeply-nested GO correctly checks every ancestor).
+	-- A goId absent from this map is treated as a planner-root: the
+	-- upward walk stops and the ancestor chain above it is implicitly
+	-- active. This bounds the fix to GOs the planner walked
+	-- (runtime-bearing ancestors); GOs without a MonoBehaviour aren't
+	-- tracked but default to "active", which matches Unity's
+	-- "no-MB GameObjects can't be inactive without an authored flag" rule.
+	self._goParentId = {}            -- goId -> parentGoId | nil
 
 	-- Global lookups for ``findObjectOfType`` / ``findGameObject`` /
 	-- ``findGameObjectsWithTag``. Built once at start, updated on
@@ -449,6 +462,29 @@ function SceneRuntime:_buildComponent(scriptId, gameObjectInstance, gameObjectId
 	return instance
 end
 
+function SceneRuntime:_computeActiveInHierarchyViaParentMap(goId)
+	-- R5-P1.2: walk the parent map UP, AND-ing each ancestor's
+	-- ``_goActiveSelf``. A GO absent from ``_goActiveSelf`` defaults to
+	-- ``true`` (Unity's "no authored flag means active"); a GO absent
+	-- from ``_goParentId`` is a planner-root -- the upward walk stops
+	-- there. Cycle guard via depth budget: scene/prefab graphs are
+	-- finite trees so a depth of 1024 vastly exceeds practical bounds
+	-- and bails out cleanly on accidental cycles.
+	local selfFlag = self._goActiveSelf[goId]
+	if selfFlag == nil then selfFlag = true end
+	if not selfFlag then return false end
+	local cur = self._goParentId[goId]
+	local depth = 0
+	while cur ~= nil and depth < 1024 do
+		local f = self._goActiveSelf[cur]
+		if f == nil then f = true end
+		if not f then return false end
+		cur = self._goParentId[cur]
+		depth = depth + 1
+	end
+	return true
+end
+
 function SceneRuntime:_injectHostSurface(instance, gameObjectInstance, gameObjectId)
 	-- Surface bound BEFORE Awake, AFTER all new() per the design doc
 	-- (lifecycle order steps 1->2->3). Constructor-purity rule (e) makes
@@ -480,9 +516,17 @@ function SceneRuntime:_injectHostSurface(instance, gameObjectInstance, gameObjec
 		if self._goActiveSelf[gameObjectId] == nil then
 			self._goActiveSelf[gameObjectId] = meta.activeSelf
 		end
-		if self._goActiveInHierarchy[gameObjectId] == nil then
-			self._goActiveInHierarchy[gameObjectId] = self._goActiveSelf[gameObjectId]
-		end
+		-- R5-P1.2: compute the boot-time ``activeInHierarchy`` via the
+		-- planner parent map so an authored-inactive ancestor's GO
+		-- correctly suppresses descendants' boot-time ``OnEnable``.
+		-- ``_computeActiveInHierarchyViaParentMap`` walks UP from
+		-- ``gameObjectId``; the chain terminates at a GO whose
+		-- ``_goParentId`` entry is missing (a planner-root). A GO with
+		-- no entry yet defaults to ``activeSelf`` (the pre-R5
+		-- behaviour) -- safe for ``addComponent``/dynamic instances
+		-- whose parents the planner never saw.
+		self._goActiveInHierarchy[gameObjectId] =
+			self:_computeActiveInHierarchyViaParentMap(gameObjectId)
 		meta.activeInHierarchy = self._goActiveInHierarchy[gameObjectId]
 	else
 		-- No id (e.g. addComponent on an unstamped instance): the
@@ -1038,6 +1082,24 @@ function SceneRuntime:setActive(go, bool)
 	end
 
 	local svc = self._services
+	-- R5-P1.2: the toggled GO's ancestor gate ("is every ancestor's
+	-- activeSelf true?") is the AND over the planner parent map walked
+	-- UP from ``goId``. ``collectSubtreeIdsWithParents`` only gives us
+	-- the DOWNWARD tree from ``goId`` -- the walked root has no parentId
+	-- entry in that list -- so we need the planner map to know whether
+	-- a higher ancestor is inactive.
+	local toggledAncestorGate = true
+	do
+		local cur = self._goParentId[goId]
+		local depth = 0
+		while cur ~= nil and depth < 1024 do
+			local f = self._goActiveSelf[cur]
+			if f == nil then f = true end
+			if not f then toggledAncestorGate = false; break end
+			cur = self._goParentId[cur]
+			depth = depth + 1
+		end
+	end
 	if goInst ~= nil and svc.collectSubtreeIdsWithParents then
 		-- DFS preorder: root first, then descendants with parentId.
 		-- Each entry: {id = "...", parentId = "..."} (root's parentId is nil).
@@ -1049,47 +1111,18 @@ function SceneRuntime:setActive(go, bool)
 			if selfFlag == nil then selfFlag = true end
 			local parentHier
 			if parentId == nil then
-				-- Root of the walk: its ancestor gate above the
-				-- toggled GO doesn't change, so reuse whatever the
-				-- map already stored, defaulting to ``selfFlag`` if
-				-- never tracked (boot-time invariant).
+				-- Root of the walk. For the toggled GO use the
+				-- planner-derived ancestor gate so an inactive
+				-- grandparent suppresses the toggle until the
+				-- grandparent re-enables (matches Unity). For other
+				-- roots (defensive: should only be one root) use the
+				-- previously-stored in-hierarchy if any, else default
+				-- to true.
 				if id == goId then
-					-- Toggled GO: ancestorGate is its prior in-hierarchy
-					-- value divided by its prior self. We approximate
-					-- with the new (toggled) self: ``activeInHierarchy``
-					-- becomes ``selfFlag AND (prior inHier OR selfFlag)``.
-					-- In the common case where the toggled GO has no
-					-- inactive ancestor (its prior inHier == prior self),
-					-- this reduces to ``selfFlag`` which is correct.
-					-- When a higher ancestor is inactive, the toggle
-					-- has no immediate effect (gate stays false) until
-					-- the ancestor re-enables -- matches Unity.
-					local priorHier = self._goActiveInHierarchy[id]
-					local priorSelf
-					-- The cascade's pre-toggle state: we already overwrote
-					-- _goActiveSelf[id]; pre-toggle activeSelf can be
-					-- derived from the prior hierarchy only when ancestor
-					-- was active. We don't have the pre value cached.
-					-- Use: ``parentInHier := (priorHier == nil) ? selfFlag : (priorHier OR priorSelf)``
-					-- ...simplest correct approximation when no parent
-					-- map is exposed: treat ancestor as active so the
-					-- toggle takes effect. This matches the harness
-					-- (which has no nested ancestor stack above the root).
-					priorSelf = nil
-					if priorHier == nil then
-						parentHier = true
-					else
-						-- If prior hierarchy was true, ancestor was active
-						-- (since prior self must have been true too).
-						-- If prior hierarchy was false and prior self was
-						-- true, ancestor must have been false; but we
-						-- don't know prior self. Safe default: assume
-						-- ancestor active so cascade fires; matches the
-						-- design doc test case.
-						parentHier = true
-					end
+					parentHier = toggledAncestorGate
 				else
-					parentHier = true
+					parentHier = self._goActiveInHierarchy[id]
+					if parentHier == nil then parentHier = true end
 				end
 			else
 				parentHier = self._goActiveInHierarchy[parentId]
@@ -1100,28 +1133,20 @@ function SceneRuntime:setActive(go, bool)
 			applyComponentsAt(id)
 		end
 	elseif goInst ~= nil and svc.collectDescendantIds then
-		-- Backward-compat path (no parent map available): the toggled
-		-- GO's ``activeSelf`` was just updated; descendants recompute
-		-- their gate as ``descendantSelf AND toggledGoInHier``. This
-		-- is strictly better than the pre-R4 cascade (which clobbered
-		-- descendant activeSelf): a child authored inactive stays
-		-- inactive across parent toggles.
+		-- Backward-compat path (no Roblox-tree parent map service): the
+		-- toggled GO's ``activeSelf`` was just updated; descendants
+		-- recompute their gate as ``descendantSelf AND toggledGoInHier``.
+		-- R5-P1.2: the toggled GO's own gate is ``activeSelf AND
+		-- toggledAncestorGate`` (planner ancestor walk), not just
+		-- ``activeSelf`` -- an inactive grandparent still suppresses.
 		local ids = svc.collectDescendantIds(goInst)
 		-- DFS post-order: parents emit last. Update root's hierarchy
 		-- first then descendants.
-		local seenRoot = false
-		for _, id in ipairs(ids) do
-			if id == goId then
-				seenRoot = true
-				self._goActiveInHierarchy[id] = self._goActiveSelf[id]
-				applyComponentsAt(id)
-			end
-		end
-		if not seenRoot then
-			self._goActiveInHierarchy[goId] = self._goActiveSelf[goId]
-			applyComponentsAt(goId)
-		end
-		local rootHier = self._goActiveInHierarchy[goId]
+		local rootSelf = self._goActiveSelf[goId]
+		if rootSelf == nil then rootSelf = true end
+		local rootHier = rootSelf and toggledAncestorGate and true or false
+		self._goActiveInHierarchy[goId] = rootHier
+		applyComponentsAt(goId)
 		for _, id in ipairs(ids) do
 			if id ~= goId then
 				local selfFlag = self._goActiveSelf[id]
@@ -1131,8 +1156,12 @@ function SceneRuntime:setActive(go, bool)
 			end
 		end
 	else
-		-- No subtree info: only toggle the root.
-		self._goActiveInHierarchy[goId] = self._goActiveSelf[goId]
+		-- No subtree info: only toggle the root. R5-P1.2: still AND in
+		-- the planner ancestor gate so a setActive on a deeply-nested GO
+		-- can't bypass an inactive ancestor.
+		local rootSelf = self._goActiveSelf[goId]
+		if rootSelf == nil then rootSelf = true end
+		self._goActiveInHierarchy[goId] = rootSelf and toggledAncestorGate and true or false
 		applyComponentsAt(goId)
 	end
 
@@ -1384,6 +1413,30 @@ function SceneRuntime:start(domainFilter)
 		local byInstanceId = {}
 		for _, inst in ipairs(scene.instances or {}) do
 			byInstanceId[inst.instance_id] = inst
+		end
+
+		-- R5-P1.2: pre-pass populates ``_goParentId`` and seeds
+		-- ``_goActiveSelf`` for every GameObject this scene's planner
+		-- artifact knows about. We do this BEFORE constructing any
+		-- instance so ``_injectHostSurface`` can walk the parent map
+		-- upward when computing each component's
+		-- boot-time ``activeInHierarchy``. Multiple components on the
+		-- same GO share the per-GO entries (last writer wins, but the
+		-- planner emits the same ``active`` + ``parent_game_object_id``
+		-- for every component on a GO, so this is a no-op).
+		for _, inst in ipairs(scene.instances or {}) do
+			if includeScriptId[inst.script_id] then
+				local goId = inst.game_object_id
+				if goId then
+					if self._goActiveSelf[goId] == nil then
+						self._goActiveSelf[goId] = inst.active ~= false
+					end
+					local parentId = inst.parent_game_object_id
+					if parentId and self._goParentId[goId] == nil then
+						self._goParentId[goId] = parentId
+					end
+				end
+			end
 		end
 		for _, instId in ipairs(order) do
 			local inst = byInstanceId[instId]

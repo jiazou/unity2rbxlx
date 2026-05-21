@@ -2423,3 +2423,244 @@ class TestSetActiveSubtreeIdsWithParentsHelperEmitted:
                 f"{gen.__name__} subtree helper must emit parentId "
                 f"per entry; got: {src[:400]}"
             )
+
+
+# ---------------------------------------------------------------------------
+# R5-P1.2: deep ancestor semantics. The planner emits
+# ``parent_game_object_id`` on every instance; the host walks the parent
+# map UP when computing ``activeInHierarchy``. Without this fix:
+#   * boot-time: inactive parent + active child still fires child's
+#     OnEnable at boot;
+#   * ``setActive(grandchild, true)`` while a grandparent is inactive
+#     wrongly opens the grandchild's gate.
+# ---------------------------------------------------------------------------
+
+
+class TestDeepAncestorActiveInHierarchy:
+    """R5-P1.2: planner ``parent_game_object_id`` lets the host walk the
+    ancestor chain UP. Previously the runtime could only walk subtree
+    DOWN (via ``collectSubtreeIdsWithParents``), so a deeply-nested GO's
+    own ancestor gate was approximated as "active" -- making
+    ``setActive(grandchild, true)`` wrongly open the gate even when a
+    grandparent was inactive, and a boot-time inactive parent failed to
+    suppress an active child's ``OnEnable``.
+    """
+
+    def test_boot_inactive_parent_suppresses_active_child_on_enable(self):
+        # Parent GO is inactive (active=false), child GO is active.
+        # Child's MB must NOT fire OnEnable at boot because the
+        # ancestor chain is inactive. Pre-fix the runtime ignored the
+        # parent edge and fired OnEnable.
+        scenario = textwrap.dedent("""\
+            local childEnableHits = 0
+            local Parent = {} ; Parent.__index = Parent
+            function Parent.new(_) return setmetatable({}, Parent) end
+            function Parent:OnEnable() error("parent must not enable") end
+            local Child = {} ; Child.__index = Child
+            function Child.new(_) return setmetatable({}, Child) end
+            function Child:OnEnable() childEnableHits = childEnableHits + 1 end
+            local plan = {
+                modules = {
+                    parent = {stem = "Parent", runtime_bearing = true,
+                              module_path = "x"},
+                    child = {stem = "Child", runtime_bearing = true,
+                             module_path = "x"},
+                },
+                scenes = {
+                    A = {
+                        instances = {
+                            {instance_id = "A:p", script_id = "parent",
+                             game_object_id = "parentGo", active = false,
+                             enabled = true, config = {}},
+                            {instance_id = "A:c", script_id = "child",
+                             game_object_id = "childGo",
+                             parent_game_object_id = "parentGo",
+                             active = true, enabled = true, config = {}},
+                        },
+                        references = {},
+                        lifecycle_order = {"A:p", "A:c"},
+                    },
+                },
+                prefabs = {}, domain_overrides = {},
+            }
+            local parent = {Name = "Parent", _sceneRuntimeId = "parentGo",
+                             _children = {}}
+            local child = {Name = "ChildGo", _sceneRuntimeId = "childGo",
+                            _children = {}}
+            parent._children.child = child
+            local services = servicesFor(plan,
+                {parent = Parent, child = Child},
+                {parentGo = parent, childGo = child})
+            local engine = SceneRuntime.new(services, plan)
+            engine:start(nil)
+            runDeferred()
+            print("atBoot=" .. childEnableHits)
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, err
+        assert "atBoot=0" in out, (
+            f"R5-P1.2 regression: inactive parent must suppress active "
+            f"child's OnEnable at boot via the planner parent map; "
+            f"got: {out}"
+        )
+
+    def test_setactive_grandchild_blocked_by_inactive_grandparent(self):
+        # Grandparent inactive at boot; child + grandchild active.
+        # ``setActive(grandchild, true)`` is a no-op because the
+        # ancestor chain is still inactive. Only when the grandparent
+        # re-enables does the gate open. Pre-fix the runtime
+        # approximated the toggled GO's ancestor gate as "true" and
+        # wrongly fired OnEnable.
+        scenario = textwrap.dedent("""\
+            local enables = 0
+            local Grand = {} ; Grand.__index = Grand
+            function Grand.new(_) return setmetatable({}, Grand) end
+            local Mid = {} ; Mid.__index = Mid
+            function Mid.new(_) return setmetatable({}, Mid) end
+            local Child = {} ; Child.__index = Child
+            function Child.new(_) return setmetatable({}, Child) end
+            function Child:OnEnable() enables = enables + 1 end
+            local plan = {
+                modules = {
+                    grand = {stem = "Grand", runtime_bearing = true,
+                             module_path = "x"},
+                    mid = {stem = "Mid", runtime_bearing = true,
+                           module_path = "x"},
+                    child = {stem = "Child", runtime_bearing = true,
+                             module_path = "x"},
+                },
+                scenes = {
+                    A = {
+                        instances = {
+                            {instance_id = "A:g", script_id = "grand",
+                             game_object_id = "grandGo", active = false,
+                             enabled = true, config = {}},
+                            {instance_id = "A:m", script_id = "mid",
+                             game_object_id = "midGo",
+                             parent_game_object_id = "grandGo",
+                             active = true, enabled = true, config = {}},
+                            {instance_id = "A:c", script_id = "child",
+                             game_object_id = "childGo",
+                             parent_game_object_id = "midGo",
+                             active = true, enabled = true, config = {}},
+                        },
+                        references = {},
+                        lifecycle_order = {"A:g", "A:m", "A:c"},
+                    },
+                },
+                prefabs = {}, domain_overrides = {},
+            }
+            local grand = {Name = "Grand", _sceneRuntimeId = "grandGo",
+                            _children = {}}
+            local mid = {Name = "Mid", _sceneRuntimeId = "midGo",
+                          _children = {}}
+            local child = {Name = "ChildGo", _sceneRuntimeId = "childGo",
+                            _children = {}}
+            grand._children.mid = mid
+            mid._children.child = child
+            local services = servicesFor(plan,
+                {grand = Grand, mid = Mid, child = Child},
+                {grandGo = grand, midGo = mid, childGo = child})
+            local engine = SceneRuntime.new(services, plan)
+            engine:start(nil)
+            runDeferred()
+            print("atBoot=" .. enables)
+            -- ``setActive(child, true)`` is a no-op: child is already
+            -- authored active; grandparent is still inactive so the
+            -- ancestor walk keeps the gate shut.
+            engine:setActive(child, true)
+            print("afterChildToggle=" .. enables)
+            -- Re-enabling the grandparent must cascade through the
+            -- intermediate active mid down to the child.
+            engine:setActive(grand, true)
+            print("afterGrandToggle=" .. enables)
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, err
+        assert "atBoot=0" in out, (
+            f"R5-P1.2: boot must keep grandchild dormant when grandparent "
+            f"is inactive; got: {out}"
+        )
+        assert "afterChildToggle=0" in out, (
+            f"R5-P1.2 regression: setActive(child) wrongly opened the "
+            f"gate despite an inactive grandparent; got: {out}"
+        )
+        assert "afterGrandToggle=1" in out, (
+            f"R5-P1.2: grandparent re-enable must cascade through the "
+            f"intermediate active GO and fire the grandchild's OnEnable; "
+            f"got: {out}"
+        )
+
+    def test_planner_emits_parent_game_object_id_on_child_instances(self):
+        """The runtime fix is only useful if the planner actually emits
+        ``parent_game_object_id`` on instances whose Unity GO had a
+        parent. Sanity: child rows carry the parent edge; root rows do
+        not.
+        """
+        from pathlib import Path
+
+        from converter.scene_runtime_planner import _walk_scene
+        from core.unity_types import ComponentData, ParsedScene, SceneNode
+
+        # Two-level scene: root + one child, both with a MonoBehaviour
+        # carrying a resolvable script GUID.
+        mono_props = {
+            "m_Script": {"fileID": 11500000, "guid": "a" * 32, "type": 3},
+            "m_Enabled": 1,
+        }
+        root_node = SceneNode(
+            name="Root",
+            file_id="1",
+            active=True,
+            layer=0,
+            tag="",
+            components=[ComponentData(
+                file_id="11", component_type="MonoBehaviour",
+                properties=mono_props,
+            )],
+            children=[],
+            parent_file_id=None,
+        )
+        child_node = SceneNode(
+            name="Child",
+            file_id="2",
+            active=True,
+            layer=0,
+            tag="",
+            components=[ComponentData(
+                file_id="22", component_type="MonoBehaviour",
+                properties=mono_props,
+            )],
+            children=[],
+            parent_file_id="1",
+        )
+        root_node.children.append(child_node)
+        scene = ParsedScene(
+            scene_path=Path("/tmp/X.unity"),
+            roots=[root_node],
+            all_nodes={"1": root_node, "2": child_node},
+        )
+
+        # Minimal stub for guid_index that returns a .cs path.
+        class _Stub:
+            def resolve(self, guid):
+                from pathlib import Path as _P
+                return _P("/tmp/x.cs") if guid == "a" * 32 else None
+            def guid_for_path(self, path):
+                return None
+
+        result = _walk_scene(
+            scene, "ns", _Stub(), {}, None, set(),
+        )
+        rows = {row["instance_id"]: row for row in result["instances"]}
+        assert "ns:11" in rows and "ns:22" in rows
+        # Root: no parent edge (it's a scene root).
+        assert "parent_game_object_id" not in rows["ns:11"], (
+            f"scene root must not carry parent_game_object_id; got: "
+            f"{rows['ns:11']}"
+        )
+        # Child: parent edge resolves to the namespaced root id.
+        assert rows["ns:22"].get("parent_game_object_id") == "ns:1", (
+            f"child must carry parent_game_object_id = ns:1; got: "
+            f"{rows['ns:22']}"
+        )

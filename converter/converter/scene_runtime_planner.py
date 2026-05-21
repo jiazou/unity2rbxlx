@@ -120,6 +120,18 @@ class SceneRuntimeInstance(TypedDict):
     config: dict[str, object]
 
 
+# Optional fields appended to a SceneRuntimeInstance row. Kept separate from
+# the ``total=True`` shape so PR1-shaped artifacts on disk stay valid; PR4
+# reads ``parent_game_object_id`` to walk ancestors when computing
+# ``activeInHierarchy`` (Unity's "AND every ancestor's activeSelf" gate).
+# Scene roots get NO key here (TypedDict total=False allows missing); the
+# runtime treats a missing key as "this GO has no parent in the planner
+# graph" and stops the upward walk. This mirrors the
+# ``SceneRuntimeReferenceExtra`` pattern.
+class SceneRuntimeInstanceExtra(TypedDict, total=False):
+    parent_game_object_id: str
+
+
 SceneRuntimeReference = TypedDict(
     "SceneRuntimeReference",
     {
@@ -682,14 +694,24 @@ def _walk_scene(
             )
 
             instance_id = f"{namespace}:{comp.file_id}"
-            instances.append({
+            inst_row: SceneRuntimeInstance = {
                 "instance_id": instance_id,
                 "script_id": script_id,
                 "game_object_id": f"{namespace}:{node.file_id}",
                 "active": bool(node.active),
                 "enabled": enabled,
                 "config": config,
-            })
+            }
+            # R5-P1.2: parent edge so the host runtime can walk ancestors
+            # when computing ``activeInHierarchy``. Scene roots get no
+            # key (the SceneRuntimeInstanceExtra TypedDict is total=False,
+            # so a missing key means "no parent in the planner graph"
+            # and the runtime stops the upward walk).
+            if node.parent_file_id is not None:
+                cast(dict[str, object], inst_row)["parent_game_object_id"] = (
+                    f"{namespace}:{node.parent_file_id}"
+                )
+            instances.append(inst_row)
             references.extend(refs)
             lifecycle.append(instance_id)
         for child in node.children:
@@ -757,14 +779,21 @@ def _walk_prefab(
             )
 
             instance_id = f"{prefab_id}:{comp.file_id}"
-            instances.append({
+            inst_row: SceneRuntimeInstance = {
                 "instance_id": instance_id,
                 "script_id": script_id,
                 "game_object_id": f"{prefab_id}:{node.file_id}",
                 "active": bool(node.active),
                 "enabled": enabled,
                 "config": config,
-            })
+            }
+            # R5-P1.2: parent edge for the host runtime's ancestor walk.
+            # Prefab roots get no key (total=False).
+            if node.parent_file_id is not None:
+                cast(dict[str, object], inst_row)["parent_game_object_id"] = (
+                    f"{prefab_id}:{node.parent_file_id}"
+                )
+            instances.append(inst_row)
             references.extend(refs)
             lifecycle.append(instance_id)
         for child in node.children:
