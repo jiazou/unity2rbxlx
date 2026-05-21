@@ -22,6 +22,7 @@ from core.unity_types import (
     AssetManifest,
     GuidIndex,
     ParsedScene,
+    PrefabTemplate,
     SceneNode,
 )
 from converter.material_mapper import MaterialMapping
@@ -175,6 +176,12 @@ class SceneConversionContext:
     material_mappings: dict[str, MaterialMapping] = field(default_factory=dict)
     fbx_bounding_boxes: dict[str, tuple[float, float, float]] = field(default_factory=dict)
     scene_xform_fids: set[str] = field(default_factory=set)
+    # Stable scene identifier (project-relative, forward-slashed path when
+    # computable) prefixed onto `_SceneRuntimeId` attributes so a host
+    # runtime can resolve `<scene>:<fileID>` back to a plan entry. Empty
+    # string means scene-runtime stamping is skipped for this conversion
+    # (no scene_path or no project root available).
+    scene_runtime_namespace: str = ""
 
     # Outputs (accumulated during conversion, consumed before convert_scene returns)
     water_regions: list[RbxWaterRegion] = field(default_factory=list)
@@ -198,6 +205,122 @@ def _ctx() -> SceneConversionContext:
             "SceneConversionContext (called outside convert_scene?)"
         )
     return _current_ctx
+
+
+# ---------------------------------------------------------------------------
+# Scene-runtime ID stamping (Piece 3 of scene-runtime-contract.md)
+# ---------------------------------------------------------------------------
+#
+# The host runtime (PR4) binds plan entries to Roblox instances by reading a
+# ``_SceneRuntimeId`` attribute of the form ``<scene>:<gameobject_fileID>``.
+# PR2 stamps the attribute on the logical GameObject host (the outer
+# RbxPart/Model returned for each SceneNode); the wrapped-geometry inner
+# ``*_Mesh`` child is intentionally NOT stamped — stamping both would make
+# lookup ambiguous. The legacy ``unity_file_id`` constraint-referent path
+# is untouched; ``_SceneRuntimeId`` is purely additive.
+#
+# Scene namespace format matches PR1's ``scene_runtime_planner._scene_namespace``
+# exactly so that ``_SceneRuntimeId`` collides with the plan's
+# ``game_object_id`` (``f"{namespace}:{node.file_id}"``). Mirrored rather than
+# imported because PR2 is independently landable off ``origin/main`` — the
+# two helpers consolidate when both PRs are in.
+
+def _scene_namespace(
+    scene_path: Path | None, unity_project_root: Path | None,
+) -> str:
+    """Project-relative, forward-slashed scene identifier used as the
+    ``_SceneRuntimeId`` prefix.
+
+    Returns the empty string (→ "skip stamping" upstream) whenever a
+    *portable* identifier cannot be produced: no scene path, no project
+    root, or scene path outside the project root. The alternative — an
+    absolute posix path — bakes machine-specific roots into every stamp
+    and on Windows drive-prefixed paths (``C:/.../Scene.unity:42``)
+    introduces a second colon that breaks the ``<scene>:<fileID>``
+    contract PR4 parses.
+
+    Matches the project-relative branch of PR1's
+    ``scene_runtime_planner._scene_namespace``; that helper's absolute
+    fallback exists for the planner's per-scene artifact (where any
+    stable string suffices) but is unsafe here, where stamps land in
+    user-visible Roblox places and have to round-trip through PR4's
+    parser.
+    """
+    if scene_path is None or unity_project_root is None:
+        return ""
+    try:
+        rel = scene_path.resolve().relative_to(unity_project_root.resolve())
+    except ValueError:
+        return ""
+    return rel.as_posix()
+
+
+def _stamp_scene_runtime_id(
+    part: RbxPart, file_id: str, namespace: str | None = None,
+) -> None:
+    """Stamp ``_SceneRuntimeId`` onto a logical GameObject host.
+
+    The ``namespace`` argument lets prefab-conversion callers pass the
+    stable ``prefab_id`` instead of the scene namespace from the
+    active context — under PR1's planner, prefab-internal GameObjects
+    live in a ``<prefab_id>:<file_id>`` namespace, not the scene's, and
+    PR4's lookup keys on the value stamped here. When ``namespace`` is
+    None, falls back to ``_ctx().scene_runtime_namespace`` (the scene
+    path of the in-flight ``convert_scene`` call).
+
+    No-op when the resolved namespace or file_id is empty so callers
+    don't have to gate every stamp site.
+    """
+    ns = namespace if namespace is not None else _ctx().scene_runtime_namespace
+    if not ns or not file_id:
+        return
+    part.attributes["_SceneRuntimeId"] = f"{ns}:{file_id}"
+
+
+def _prefab_stable_id(
+    template: PrefabTemplate,
+    guid_index: GuidIndex | None,
+    by_guid: dict[str, PrefabTemplate],
+    unity_project_root: Path | None,
+) -> str:
+    """Stable ``prefab_id`` = ``"<guid>:<project-relative-path>"``.
+
+    Mirrors ``scene_runtime_planner._prefab_stable_id`` (PR1) so a
+    converter-time stamp produced by ``_convert_prefab_node`` matches
+    the ``game_object_id`` PR1 emits for the same prefab template.
+    Returns the empty string when neither a GUID nor a project-relative
+    path is computable — same conservative "skip stamping" rule as
+    ``_scene_namespace`` (avoids leaking machine-specific absolute
+    paths into Roblox attribute values).
+
+    Tolerant of templates missing ``prefab_path`` (synthetic test
+    fixtures predate this helper); such templates fall through to the
+    empty-string "skip stamping" branch instead of crashing.
+    """
+    prefab_path = getattr(template, "prefab_path", None)
+    if not isinstance(prefab_path, Path):
+        return ""
+    guid = ""
+    if guid_index is not None:
+        guid = guid_index.guid_for_path(prefab_path) or ""
+    if not guid:
+        # Fall back to the library's by_guid index (prefab-variant
+        # templates land there before meta GUIDs are indexed).
+        for g, t in by_guid.items():
+            if t is template:
+                guid = g
+                break
+    if unity_project_root is None:
+        return guid if guid else ""
+    try:
+        rel = prefab_path.resolve().relative_to(
+            unity_project_root.resolve(),
+        ).as_posix()
+    except ValueError:
+        # Prefab outside the project root — same posture as
+        # ``_scene_namespace`` for outside-root scenes.
+        return ""
+    return f"{guid}:{rel}" if guid else rel
 
 
 # Cache for mesh vertical offsets: mesh_guid -> offset_studs.
@@ -363,6 +486,16 @@ def _get_fbx_import_scale(
     if asset_path is None:
         return 0.01
 
+    # ``.prefab``/``.asset`` meshes are embedded as ``!u!43`` documents
+    # whose ``m_LocalAABB.m_Extent`` is already in Unity metres -- not
+    # in FBX file units that need ``globalScale`` correction. Returning
+    # the FBX default 0.01 here would shrink synthesised embedded
+    # meshes 100× and push their Size below the rbxlx writer's 0.05
+    # stud floor (concrete case: SimpleFPS landmines went invisible
+    # because 0.323 m * 0.01 * 3.571 = 0.012 studs ≪ 0.05).
+    if asset_path.suffix.lower() in (".prefab", ".asset"):
+        return 1.0
+
     meta_path = Path(str(asset_path) + ".meta")
     if not meta_path.exists():
         return 0.01
@@ -444,6 +577,168 @@ def _get_fbx_unit_ratio(
     return 1.0
 
 
+# ---------------------------------------------------------------------------
+# Mesh sizing — one input shape, one unit system, one formula
+# ---------------------------------------------------------------------------
+#
+# Before this refactor, sizing had three branches (per-sub-mesh resolved,
+# overall FBX bbox, embedded AABB) each applying its own scale-factor chain
+# to ``size`` values whose units were not commented. Two of the branches
+# treated ``size`` as "FBX vertex units interpreted as studs by Roblox" and
+# multiplied by ``import_scale × unit_ratio × STUDS_PER_METER``; the third
+# treated ``size`` as Unity metres and multiplied by ``STUDS_PER_METER``
+# only. PR #121 shifted embedded meshes from the third branch into the
+# first without changing the data shape, and ``_get_fbx_import_scale``
+# returned its default ``0.01`` for ``.prefab`` paths — Sizes dropped 100×
+# to ~0.029 studs and the writer's 0.05 floor absorbed the underflow.
+# Codex's read: "sizing was dispatched by lookup success, not by geometry
+# provenance".
+#
+# This adapter normalises every source to ``native_meters`` (the mesh's
+# actual real-world extent in metres) before any consumer sees it. Each
+# source kind owns its own conversion math; consumers apply exactly one
+# formula:
+#
+#     Size = unity_scale × native_meters × STUDS_PER_METER
+#
+# Adding a new source kind in the future just means writing another
+# adapter branch that fills ``native_meters`` — there is no path for a
+# downstream caller to pick the wrong scale chain by mistake.
+
+@dataclass(frozen=True)
+class _ResolvedMeshGeometry:
+    """One mesh's normalised dimensions + identifiers.
+
+    ``native_meters`` is the mesh's bounding-box extent in Unity metres,
+    regardless of source (Roblox-resolved FBX, FBX trimesh bbox cache, or
+    Unity ``m_LocalAABB``). ``initial_size_studs`` is the value the caller
+    should set on ``MeshPart.InitialSize`` — for resolved sources this is
+    what Roblox reported; for the embedded-AABB fallback we still use the
+    raw extent (it's what callers historically wrote).
+    """
+    native_meters: tuple[float, float, float]
+    initial_size_studs: tuple[float, float, float]
+    mesh_id: str | None = None
+    texture_id: str | None = None
+    provenance: str = ""   # "resolved_submesh" | "resolved_overall" | "fbx_bbox" | "embedded_aabb"
+
+
+def _native_meters_from_roblox_size(
+    roblox_size: tuple[float, float, float],
+    mesh_guid: str,
+    guid_index: GuidIndex,
+    asset_path: Path,
+) -> tuple[float, float, float]:
+    """Convert a Roblox-reported MeshPart size into Unity metres.
+
+    For ``.fbx``/``.obj`` uploads, Roblox interprets FBX vertex units as
+    studs, so the right conversion is ``size_studs × import_scale ×
+    unit_ratio`` (where import_scale × unit_ratio is the ``.meta``-derived
+    FBX-to-metres ratio). For ``.prefab``/``.asset`` embedded uploads,
+    we synthesise the FBX with vertex coords already in metres and the
+    ``.meta``-style scale doesn't apply — ``_get_fbx_import_scale`` /
+    ``_get_fbx_unit_ratio`` are owned by this adapter, NOT by the
+    callers, so a downstream regression can't reintroduce a 100× error
+    by accident.
+    """
+    if asset_path.suffix.lower() in (".prefab", ".asset"):
+        # Already metres (our synthesised FBX wrote metric vertex coords;
+        # ``_get_fbx_import_scale`` returns 1.0 for this case too, but
+        # short-circuiting here makes the unit invariant explicit).
+        return roblox_size
+    import_scale = _get_fbx_import_scale(mesh_guid, guid_index)
+    unit_ratio = _get_fbx_unit_ratio(mesh_guid, guid_index)
+    return (
+        roblox_size[0] * import_scale * unit_ratio,
+        roblox_size[1] * import_scale * unit_ratio,
+        roblox_size[2] * import_scale * unit_ratio,
+    )
+
+
+def _resolve_mesh_geometry(
+    mesh_guid: str,
+    guid_index: GuidIndex,
+    mesh_native_sizes: dict[str, tuple[float, float, float]],
+    mesh_file_id: str | None = None,
+    mesh_name: str | None = None,
+) -> _ResolvedMeshGeometry | None:
+    """Single dispatch from ``(mesh_guid, file_id)`` to a normalised
+    geometry record. Tries resolved-sub-mesh first, then resolved-overall,
+    then FBX trimesh bbox, then embedded-YAML AABB. Returns None when
+    nothing knows about this mesh.
+    """
+    asset_path = guid_index.resolve(mesh_guid)
+    if asset_path is None:
+        return None
+
+    # 1. Resolved sub-mesh via mesh_hierarchies. Mesh hierarchies that
+    # came from older context files may lack ``size`` (only ``position``
+    # and ``fileID`` were stored historically); skip them so the next
+    # adapter has a chance.
+    if mesh_file_id and _ctx().mesh_hierarchies:
+        sub_mesh = _resolve_sub_mesh(
+            mesh_guid, mesh_file_id, guid_index, mesh_name=mesh_name,
+        )
+        if sub_mesh and isinstance(sub_mesh.get("size"), (list, tuple)) and len(sub_mesh["size"]) >= 3:
+            roblox_size = (
+                float(sub_mesh["size"][0]),
+                float(sub_mesh["size"][1]),
+                float(sub_mesh["size"][2]),
+            )
+            return _ResolvedMeshGeometry(
+                native_meters=_native_meters_from_roblox_size(
+                    roblox_size, mesh_guid, guid_index, asset_path,
+                ),
+                initial_size_studs=roblox_size,
+                mesh_id=sub_mesh.get("meshId"),
+                texture_id=sub_mesh.get("textureId") or None,
+                provenance="resolved_submesh",
+            )
+
+    # 2. Resolved overall mesh via mesh_native_sizes (legacy single-mesh path).
+    relative = guid_index.resolve_relative(mesh_guid)
+    for key in [str(relative), str(asset_path)] if relative else [str(asset_path)]:
+        if key in mesh_native_sizes:
+            roblox_size = tuple(mesh_native_sizes[key])  # type: ignore[assignment]
+            return _ResolvedMeshGeometry(
+                native_meters=_native_meters_from_roblox_size(
+                    roblox_size, mesh_guid, guid_index, asset_path,
+                ),
+                initial_size_studs=roblox_size,
+                provenance="resolved_overall",
+            )
+
+    # 3. FBX bbox from trimesh cache.
+    if _ctx().fbx_bounding_boxes and asset_path.suffix.lower() in (".fbx", ".obj"):
+        bbox = None
+        for key in ([str(relative), str(asset_path)]
+                    if relative else [str(asset_path)]):
+            if key in _ctx().fbx_bounding_boxes:
+                bbox = _ctx().fbx_bounding_boxes[key]
+                break
+        if bbox is not None:
+            roblox_size = (bbox[0], bbox[1], bbox[2])
+            return _ResolvedMeshGeometry(
+                native_meters=_native_meters_from_roblox_size(
+                    roblox_size, mesh_guid, guid_index, asset_path,
+                ),
+                initial_size_studs=roblox_size,
+                provenance="fbx_bbox",
+            )
+
+    # 4. Embedded ``!u!43`` AABB inside a ``.prefab``/``.asset``.
+    if asset_path.suffix.lower() in (".prefab", ".asset"):
+        aabb = _read_embedded_mesh_aabb(asset_path, mesh_file_id)
+        if aabb is not None:
+            return _ResolvedMeshGeometry(
+                native_meters=aabb,                 # already metres
+                initial_size_studs=aabb,            # callers historically wrote this
+                provenance="embedded_aabb",
+            )
+
+    return None
+
+
 def _compute_mesh_size(
     unity_scale: tuple[float, float, float],
     mesh_guid: str,
@@ -452,64 +747,29 @@ def _compute_mesh_size(
     mesh_file_id: str | None = None,
     mesh_name: str | None = None,
 ) -> tuple[tuple[float, float, float], tuple[float, float, float]] | None:
-    """Compute Roblox MeshPart Size and InitialSize from Unity + Roblox data.
+    """Compute Roblox MeshPart Size and InitialSize.
 
-    Requires native sizes from Roblox LoadAsset (populated by the resolve step).
+    All source dispatch lives in ``_resolve_mesh_geometry``; here we apply
+    the single canonical formula::
 
-    When ``mesh_file_id`` is provided and the FBX has multiple sub-meshes in
-    mesh_hierarchies, uses the specific sub-mesh's native dimensions instead
-    of the overall FBX bounding box. Without this, all sub-meshes (frame, door,
-    base) would get the same size, causing overlapping/stretched geometry.
+        Size = abs(unity_scale) × native_meters × STUDS_PER_METER
 
-    InitialSize = native mesh bounding box from Roblox
-    Size = InitialSize × import_scale × unity_scale × STUDS_PER_METER
-    Roblox renders at Size/InitialSize = import_scale × unity_scale × STUDS_PER_METER
-
-    Returns (size, initial_size) or None if the mesh is not in native_sizes.
+    Returns ``(size, initial_size)`` or ``None`` if the mesh is unknown
+    to every source adapter.
     """
-    asset_path = guid_index.resolve(mesh_guid)
-    if not asset_path:
+    geo = _resolve_mesh_geometry(
+        mesh_guid, guid_index, mesh_native_sizes,
+        mesh_file_id=mesh_file_id, mesh_name=mesh_name,
+    )
+    if geo is None:
         return None
-
-    # Try per-sub-mesh sizing via mesh_hierarchies first
-    if mesh_file_id and _ctx().mesh_hierarchies:
-        sub_mesh = _resolve_sub_mesh(mesh_guid, mesh_file_id, guid_index, mesh_name=mesh_name)
-        if sub_mesh:
-            native = (sub_mesh["size"][0], sub_mesh["size"][1], sub_mesh["size"][2])
-            import_scale = _get_fbx_import_scale(mesh_guid, guid_index)
-            unit_ratio = _get_fbx_unit_ratio(mesh_guid, guid_index)
-            scale_factor = import_scale * unit_ratio * config.STUDS_PER_METER
-            size = (
-                abs(unity_scale[0]) * native[0] * scale_factor,
-                abs(unity_scale[1]) * native[1] * scale_factor,
-                abs(unity_scale[2]) * native[2] * scale_factor,
-            )
-            return size, native
-
-    # Fallback: use the overall FBX bounding box from mesh_native_sizes
-    relative = guid_index.resolve_relative(mesh_guid)
-    for key in [str(relative), str(asset_path)] if relative else [str(asset_path)]:
-        if key in mesh_native_sizes:
-            native = mesh_native_sizes[key]
-            import_scale = _get_fbx_import_scale(mesh_guid, guid_index)
-            unit_ratio = _get_fbx_unit_ratio(mesh_guid, guid_index)
-            initial_size = (native[0], native[1], native[2])
-            scale_factor = import_scale * unit_ratio * config.STUDS_PER_METER
-            size = (
-                abs(unity_scale[0]) * initial_size[0] * scale_factor,
-                abs(unity_scale[1]) * initial_size[1] * scale_factor,
-                abs(unity_scale[2]) * initial_size[2] * scale_factor,
-            )
-            return size, initial_size
-
-    # Fallback: meshes embedded directly in a .prefab/.asset (legacy Asset
-    # Store packs) are never uploaded, so they have no native_sizes entry.
-    embedded = _compute_mesh_size_from_embedded_aabb(
-        unity_scale, mesh_guid, guid_index, mesh_file_id)
-    if embedded:
-        return embedded
-
-    return None
+    spm = config.STUDS_PER_METER
+    size = (
+        abs(unity_scale[0]) * geo.native_meters[0] * spm,
+        abs(unity_scale[1]) * geo.native_meters[1] * spm,
+        abs(unity_scale[2]) * geo.native_meters[2] * spm,
+    )
+    return size, geo.initial_size_studs
 
 
 def _compute_mesh_size_from_fbx_bbox(
@@ -518,65 +778,32 @@ def _compute_mesh_size_from_fbx_bbox(
     guid_index: GuidIndex,
     mesh_file_id: str | None = None,
 ) -> tuple[tuple[float, float, float], tuple[float, float, float]] | None:
-    """Estimate Roblox MeshPart Size and InitialSize from FBX bounding box data.
+    """Estimate Roblox MeshPart Size and InitialSize when Studio asset
+    resolution is unavailable.
 
-    When Studio asset resolution is unavailable, we use trimesh-computed bounding
-    boxes as an approximation for InitialSize.  Roblox imports FBX vertex
-    positions directly, so the bounding box of the FBX geometry (in file units)
-    closely matches what Roblox reports as InitialSize (in studs).
+    Just delegates to ``_resolve_mesh_geometry``; the FBX trimesh bbox
+    branch lives there now (post-Commit-B refactor). Kept as a thin
+    wrapper so existing callers that haven't been migrated to the new
+    formula don't break, and so the call-site choice between "with
+    Studio resolution" (``_compute_mesh_size``) and "without"
+    (``_compute_mesh_size_from_fbx_bbox``) is still meaningful at the
+    call sites — the adapter falls through gracefully in both cases.
 
-    The formula mirrors _compute_mesh_size:
-        InitialSize ≈ fbx_bounding_box  (FBX file units ≈ Roblox studs)
-        Size = InitialSize × import_scale × unit_ratio × STUDS_PER_METER × unity_scale
-
-    ``mesh_file_id`` is forwarded to the embedded-mesh fallback so multi-mesh
-    legacy assets resolve to the right sub-mesh.
-
-    Returns (size, initial_size) or None if no bounding box is available.
+    Returns (size, initial_size) or None if no source knows the mesh.
     """
-    # Meshes embedded in a .prefab/.asset are never uploaded and have no FBX
-    # bbox; recover their size from the serialized Mesh AABB instead. This
-    # also covers conversions that resolved no meshes at all (mesh_native_sizes
-    # empty), where _compute_mesh_size is skipped and this is the first stop.
-    embedded = _compute_mesh_size_from_embedded_aabb(
-        unity_scale, mesh_guid, guid_index, mesh_file_id)
-    if embedded:
-        return embedded
-
-    if not _ctx().fbx_bounding_boxes:
-        return None
-
-    asset_path = guid_index.resolve(mesh_guid)
-    if not asset_path:
-        return None
-
-    relative = guid_index.resolve_relative(mesh_guid)
-    bbox = None
-    for key in [str(relative), str(asset_path)] if relative else [str(asset_path)]:
-        if key in _ctx().fbx_bounding_boxes:
-            bbox = _ctx().fbx_bounding_boxes[key]
-            break
-
-    if bbox is None:
-        return None
-
-    import_scale = _get_fbx_import_scale(mesh_guid, guid_index)
-    unit_ratio = _get_fbx_unit_ratio(mesh_guid, guid_index)
-
-    # FBX bbox is in file units.  Roblox's InitialSize for an uploaded FBX
-    # equals the raw vertex bounding box, so bbox ≈ InitialSize in studs.
-    initial_size = (bbox[0], bbox[1], bbox[2])
-
-    # Size = how we want Roblox to render the mesh.
-    # Roblox applies Size/InitialSize as the visual scale factor.
-    # We want: visual_scale = import_scale × unit_ratio × STUDS_PER_METER × unity_scale
-    scale_factor = import_scale * unit_ratio * config.STUDS_PER_METER
-    size = (
-        abs(unity_scale[0]) * initial_size[0] * scale_factor,
-        abs(unity_scale[1]) * initial_size[1] * scale_factor,
-        abs(unity_scale[2]) * initial_size[2] * scale_factor,
+    geo = _resolve_mesh_geometry(
+        mesh_guid, guid_index, mesh_native_sizes={},
+        mesh_file_id=mesh_file_id,
     )
-    return size, initial_size
+    if geo is None:
+        return None
+    spm = config.STUDS_PER_METER
+    size = (
+        abs(unity_scale[0]) * geo.native_meters[0] * spm,
+        abs(unity_scale[1]) * geo.native_meters[1] * spm,
+        abs(unity_scale[2]) * geo.native_meters[2] * spm,
+    )
+    return size, geo.initial_size_studs
 
 
 # Cache of {asset_path: {mesh_fileID: native_size_metres}} for embedded
@@ -761,6 +988,7 @@ def convert_scene(
     mesh_texture_ids: dict[str, str] | None = None,
     mesh_hierarchies: dict[str, list[dict]] | None = None,
     fbx_bounding_boxes: dict[str, tuple[float, float, float]] | None = None,
+    unity_project_root: Path | None = None,
 ) -> RbxPlace:
     """Convert a parsed Unity scene to a Roblox place hierarchy.
 
@@ -790,6 +1018,9 @@ def convert_scene(
     global _current_ctx, _mesh_vertical_offset_cache, _embedded_mesh_aabb_cache
     _mesh_vertical_offset_cache = {}
     _embedded_mesh_aabb_cache = {}
+    _resolved_project_root = unity_project_root
+    if _resolved_project_root is None and guid_index is not None:
+        _resolved_project_root = getattr(guid_index, "project_root", None)
     _current_ctx = SceneConversionContext(
         mesh_native_sizes=mesh_native_sizes or {},
         mesh_texture_ids=mesh_texture_ids or {},
@@ -800,6 +1031,10 @@ def convert_scene(
             set(parsed_scene.transform_fid_to_go_fid.keys())
             if hasattr(parsed_scene, 'transform_fid_to_go_fid')
             else set()
+        ),
+        scene_runtime_namespace=_scene_namespace(
+            getattr(parsed_scene, "scene_path", None),
+            _resolved_project_root,
         ),
     )
     if not _ctx().mesh_native_sizes:
@@ -1137,11 +1372,16 @@ def convert_scene(
     if camera_config is not None:
         place.camera = camera_config
 
-    # Convert Unity Canvas UI elements to Roblox ScreenGuis.
+    # Convert Unity Canvas UI elements to Roblox ScreenGuis. Pass the
+    # scene namespace so UI hosts get ``_SceneRuntimeId`` stamps under the
+    # same ``<scene>:<fileID>`` scheme as workspace parts (PR2, Piece 3).
     from converter.ui_translator import find_canvas_nodes, convert_canvas
     canvas_nodes = find_canvas_nodes(parsed_scene.roots)
     if canvas_nodes:
-        place.screen_guis = convert_canvas(canvas_nodes)
+        place.screen_guis = convert_canvas(
+            canvas_nodes,
+            scene_namespace=_ctx().scene_runtime_namespace,
+        )
         log.info("Converted %d Canvas nodes to ScreenGuis", len(place.screen_guis))
 
     # Detect terrain components and convert them to terrain ground parts.
@@ -1335,6 +1575,13 @@ def _convert_node(
         size=size,
         unity_file_id=node.file_id,
     )
+
+    # Scene-runtime ID: stamp the logical GameObject host with
+    # ``_SceneRuntimeId = "<scene>:<file_id>"``. When this node's geometry
+    # is later wrapped under a Model (``_wrap_geometry_with_children_into_model``),
+    # the outer Model keeps this stamp; the synthetic ``*_Mesh`` child does
+    # NOT — see the duplication note in scene-runtime-contract.md Piece 3.
+    _stamp_scene_runtime_id(part, node.file_id)
 
     # -- Primitive shape --
     if _builtin_shape:
@@ -1604,7 +1851,10 @@ def _wrap_geometry_with_children_into_model(part: "RbxPart", node_name: str) -> 
     inner.collision_fidelity = part.collision_fidelity
     # Move geometry-specific attributes to inner. Other attributes (script
     # class hints, prefab markers, gameplay tags) stay on the outer Model
-    # so scripts that walk by name still find them.
+    # so scripts that walk by name still find them. ``_SceneRuntimeId`` is
+    # *intentionally* one of the "stay on outer" keys — stamping the same
+    # ID on both outer Model and inner ``*_Mesh`` would make host-runtime
+    # lookup ambiguous (scene-runtime-contract.md Piece 3).
     for _attr_key in list(part.attributes.keys()):
         if _attr_key.startswith("_Scale") or _attr_key in (
             "_MeshId", "_MeshFileId", "_TextureId", "_FbxImportScale",
@@ -1620,6 +1870,19 @@ def _wrap_geometry_with_children_into_model(part: "RbxPart", node_name: str) -> 
     # Append inner LAST so the original children's iteration order
     # (relied on by name-based hierarchy walks) is preserved.
     part.children.append(inner)
+    # Structural invariant: the synthetic ``*_Mesh`` inner child must
+    # NEVER carry ``_SceneRuntimeId`` — duplicating the outer Model's
+    # stamp would make PR4's host-runtime lookup ambiguous (Piece 3).
+    # Comments alone don't survive a future migration that adds a new
+    # key to the "move to inner" list; assert at the structural boundary
+    # so any drift fails loud at conversion time instead of silently
+    # producing wrong binds at runtime.
+    if "_SceneRuntimeId" in inner.attributes:
+        raise AssertionError(
+            f"scene-runtime invariant: synthetic inner '{inner.name}' must "
+            f"not carry _SceneRuntimeId (outer Model is the only logical "
+            f"host); attribute-migration table likely drifted."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2217,6 +2480,26 @@ def _process_components(
 # Mesh resolution
 # ---------------------------------------------------------------------------
 
+def _embedded_key_candidates(relative: str, file_id: str) -> list[str]:
+    """Generate synthetic-key variants for an embedded-mesh lookup.
+
+    The canonical key is ``{relative}#{file_id}``. Windows produces
+    relative paths with backslashes; POSIX uses forward slashes. A
+    ``conversion_context.json`` cached on Windows would otherwise miss
+    every lookup on macOS/Linux when reused -- the ordinary FBX/OBJ
+    lookup below this branch already builds both slash directions, so
+    do the same for synthetic keys. Codex review [P3].
+    """
+    keys = []
+    seen: set[str] = set()
+    for variant in (relative, relative.replace("\\", "/"), relative.replace("/", "\\")):
+        k = f"{variant}#{file_id}"
+        if k not in seen:
+            keys.append(k)
+            seen.add(k)
+    return keys
+
+
 def _resolve_sub_mesh(
     mesh_guid: str,
     mesh_file_id: str | None,
@@ -2237,6 +2520,29 @@ def _resolve_sub_mesh(
         return None
 
     relative = guid_index.resolve_relative(mesh_guid)
+
+    # Meshes embedded in legacy .prefab/.asset files are uploaded
+    # under a synthetic key ``<rel_path>#<file_id>`` (see
+    # ``unity.embedded_mesh_extractor`` + ``pipeline._upload_embedded_meshes``).
+    # Resolve them here before falling through to the FBX/OBJ path so
+    # the per-sub-mesh lookup never sees an empty hierarchies dict
+    # for them.
+    #
+    # Normalise slash directions: a Windows-keyed context (``Assets\
+    # Foo.prefab#123``) reused on macOS/Linux would otherwise miss the
+    # uploaded entry. Codex review [P3].
+    if (mesh_file_id and asset_path.suffix.lower() in (".prefab", ".asset")
+            and relative is not None):
+        for embedded_key in _embedded_key_candidates(str(relative), str(mesh_file_id)):
+            if embedded_key in _ctx().mesh_hierarchies:
+                sub_meshes = _ctx().mesh_hierarchies[embedded_key]
+                if sub_meshes:
+                    # Synthesised embedded meshes carry exactly one
+                    # sub-mesh (the OBJ we uploaded), so the first
+                    # entry is always the right one — no
+                    # file_id-to-index math needed.
+                    return sub_meshes[0]
+
     for key in ([str(relative), str(asset_path)] if relative else [str(asset_path)]):
         if key in _ctx().mesh_hierarchies:
             sub_meshes = _ctx().mesh_hierarchies[key]
@@ -2295,6 +2601,19 @@ def _resolve_mesh_id(
 
     # Check uploaded_assets with multiple key formats (absolute, relative, forward/back slashes)
     relative = guid_index.resolve_relative(mesh_guid)
+
+    # Embedded-in-.prefab/.asset meshes are uploaded under a synthetic
+    # ``<rel>#<file_id>`` key by ``pipeline._upload_embedded_meshes``. Check
+    # that first so the regular path-string lookup never falls back to a
+    # cube-decal render when the synthesised OBJ has been uploaded.
+    # Normalised slash variants so a context cached on Windows still
+    # matches when loaded on macOS/Linux. Codex review [P3].
+    if (mesh_file_id and asset_path.suffix.lower() in (".prefab", ".asset")
+            and relative is not None):
+        for embedded_key in _embedded_key_candidates(str(relative), str(mesh_file_id)):
+            if embedded_key in uploaded_assets:
+                return uploaded_assets[embedded_key]
+
     candidates = [str(asset_path)]
     if relative:
         candidates.append(str(relative))
@@ -3702,6 +4021,16 @@ def _convert_prefab_instance(
             return _convert_fbx_prefab_instance(pi, resolved, guid_index, material_mappings, uploaded_assets)
         return []
 
+    # Stable prefab namespace for ``_SceneRuntimeId`` stamping (PR2,
+    # Piece 3). Computed once and threaded through ``_convert_prefab_node``
+    # so every descendant Roblox instance carries the same
+    # ``<prefab_id>:<file_id>`` value that PR1's prefab subplan keys on.
+    # Empty when no project root is available — same conservative
+    # "skip stamping" rule as the scene namespace.
+    by_guid = getattr(prefab_lib, "by_guid", {}) or {}
+    project_root = getattr(guid_index, "project_root", None) if guid_index else None
+    prefab_namespace = _prefab_stable_id(template, guid_index, by_guid, project_root)
+
     # Check for removed components -- these should not be instantiated
     removed_component_ids: set[str] = set()
     if hasattr(pi, "removed_components") and pi.removed_components:
@@ -4046,6 +4375,12 @@ def _convert_prefab_instance(
                 class_name="Model",
                 cframe=cframe,
             )
+        # NOTE: the prefab-root ``_SceneRuntimeId`` stamp lives at the
+        # convergence point below (after the has_children/else branches
+        # rejoin). Without that lift, the ``else`` branch -- which
+        # handles single-node prefab instances -- emitted root parts
+        # with no stamp at all, so PR4 couldn't bind plan rows for the
+        # most common prefab shape (codex P1 review).
         for child in root.children:
             # Convert child prefab nodes with parent world transform
             # so positions are in world space (Roblox Models don't
@@ -4056,6 +4391,7 @@ def _convert_prefab_instance(
                 child_modifications=child_modifications,
                 disabled_components=disabled_components,
                 parent_mesh_guid=root.mesh_guid if hasattr(root, 'mesh_guid') else None,
+                runtime_namespace=prefab_namespace,
             )
             if child_part:
                 part.children.append(child_part)
@@ -4190,6 +4526,18 @@ def _convert_prefab_instance(
         if hasattr(root, 'components') and root.components:
             _process_components(root, part, guid_index=guid_index, uploaded_assets=uploaded_assets)
 
+    # Stamp the prefab root with its ``<prefab_id>:<file_id>`` — PR4
+    # binds prefab subplan entries to converter-instantiated prefab
+    # roots via this attribute. Descendant nodes get the same stamp
+    # inside ``_convert_prefab_node``; this site catches BOTH the
+    # has-children branch (multi-node prefabs) AND the else branch
+    # (single-node prefabs) — see codex P1: the previous, in-branch
+    # placement silently skipped single-node prefab roots, leaving
+    # PR4 with no way to bind their plan entries.
+    _stamp_scene_runtime_id(
+        part, getattr(root, "file_id", ""), prefab_namespace,
+    )
+
     # Apply additional modification properties to the part
     if is_static:
         part.anchored = True
@@ -4240,6 +4588,7 @@ def _convert_prefab_node(
     child_modifications: dict[str, list[dict]] | None = None,
     disabled_components: set[str] | None = None,
     parent_mesh_guid: str | None = None,
+    runtime_namespace: str = "",
 ) -> RbxPart | None:
     """Convert a PrefabNode to an RbxPart.
 
@@ -4417,6 +4766,15 @@ def _convert_prefab_node(
         anchored=True,
     )
 
+    # Scene-runtime ID for prefab-instantiated GameObjects.
+    # ``runtime_namespace`` here is the prefab's stable ``<guid>:<path>``
+    # id (computed once by ``_convert_prefab_instance``), matching the
+    # prefab subplan PR1 emits — so PR4's host runtime can resolve
+    # `<prefab_id>:<file_id>` to this instance regardless of whether
+    # the prefab was pre-instantiated by the converter or spawned at
+    # runtime from the ReplicatedStorage template.
+    _stamp_scene_runtime_id(part, getattr(node, "file_id", ""), runtime_namespace)
+
     # -- Main-camera rig marker --
     # The main camera (and its weapon-slot / viewmodel children) is
     # usually authored inside a prefab — e.g. SimpleFPS's Player.prefab.
@@ -4539,6 +4897,7 @@ def _convert_prefab_node(
             child_modifications=child_modifications,
             disabled_components=disabled_components,
             parent_mesh_guid=node.mesh_guid if hasattr(node, 'mesh_guid') else None,
+            runtime_namespace=runtime_namespace,
         )
         if child_part:
             part.children.append(child_part)
@@ -4710,6 +5069,15 @@ def _flatten_single_child_models(parts: list[RbxPart]) -> int:
     Model with the child, keeping the Model's name.
 
     Recurses into the tree.  Returns the total number of flattened Models.
+
+    PR2 interaction: every GameObject host carries a ``_SceneRuntimeId``
+    attribute in production (any scene with a project root). The
+    ``not part.attributes`` guard therefore inhibits flattening in
+    production — that's the correct outcome: a serialized field on
+    another MonoBehaviour can reference the parent GameObject, and
+    flattening it away would leave PR4's host runtime with no instance
+    to resolve. Pre-PR2 or no-namespace callers (no project root → no
+    stamp → empty attributes) still flatten as before.
     """
     count = 0
     for i, part in enumerate(parts):
