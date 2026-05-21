@@ -137,7 +137,75 @@ surfaces in the upload phase, which is recoverable.
 
 ## 5. Codex P2/P3 absorptions
 
-(Filled in once codex review runs against PR4.)
+### Codex review round 1 (2026-05-21)
+
+**P1 absorbed in-line** (all 7 fixed in PR4 head; regression tests at
+`converter/tests/test_scene_runtime_host_behavior.py::Test...`):
+
+- **P1.1** `_injectHostSurface` overwrote planner `enabled`/`active`
+  + no `self.enabled` proxy. Fix preserves planner flags; installs a
+  per-instance metatable that re-routes `self.enabled = ...` through
+  `setEnabled` (regression tests:
+  `TestPlannerDormantFlagsPreserved`, `TestSelfEnabledProxy`).
+- **P1.2** `index == 0` treated as scalar in `_assignFieldOnComponent`.
+  Fix: only `nil` is scalar; any integer index goes through the
+  `+1` Lua-bridge branch (`TestArrayIndexZeroIsArrayNotScalar`).
+- **P1.3** `host.connect` only supported dotted form; rule-(f) reprompt
+  teaches the colon form. Fix: every host method detects whether
+  `arg1 == hostTable` (colon sugar) and defaults `comp` to the
+  per-instance `owner` captured at `_makeHostSurface(owner)`
+  (`TestHostConnectColonForm`).
+- **P1.4** Cross-domain log only fired when target was locally
+  constructed; production runs one partition per process. Fix:
+  resolve target domain from `plan.modules[target.script_id]` via a
+  new `instanceById` parameter to `_wireReferences`
+  (`TestCrossDomainLogPlanResolved`).
+- **P1.5** `_byName`/`_byTag` seeded with components instead of
+  Roblox GameObject instances; `tag` never plumbed. Fix:
+  index `_byName`/`_byTag` by GameObject Instance (dedup'd
+  per-GO); read `inst.tag` from the planner row at `start()`.
+  Tag emission in the planner artifact remains a follow-up (see
+  carry-over below).
+- **P1.6** `instantiatePrefab` reinjected with `m.gameObjectInstance`
+  but `_register` never stored it. Fix: `_buildComponent` stores
+  `gameObjectInstance` in meta so prefab reinjection finds the
+  cloned child (`TestPrefabComponentReceivesGameObject`).
+- **P1.7** Client autogen resolved UI IDs from `StarterGui` (template,
+  not interactive); `collectDescendantIds` reversed BFS instead of
+  doing DFS post-order. Fix: client uses
+  `LocalPlayer:WaitForChild("PlayerGui")` for UI; both entrypoints'
+  `collectDescendantIds` walks `GetChildren` recursively in
+  post-order (`TestAutogenClientEntrypointUsesPlayerGui`,
+  `TestAutogenCollectDescendantIdsIsDfsPostOrder`).
+
+**P2 deferred:**
+
+- **`target_component_type` ignored for `gameobject` refs**
+  (`luau:340`). When a ref's `target_kind == "gameobject"` and the
+  planner emitted a `target_component_type` extra, the runtime
+  should look up the built-in component on the GameObject via the
+  same mechanism as `GetComponent` fallback. PR4 leaves it injecting
+  the raw GameObject. Wire-up requires (a) `target_component_type`
+  to actually appear in planner output (not yet emitted by PR1),
+  (b) runtime reading it after `_resolveReferenceTarget` returns the
+  GameObject and calling `findFirstChildWhichIsA(go, target_component_type)`.
+  Out of scope for PR4's host-runtime contract; tracked as
+  carry-over below.
+
+- **Coexistence with legacy emit-side autogen** (`pipeline.py:2413`).
+  PR4 knowingly leaves `_subphase_inject_autogen_scripts()` running
+  under generic so `ClientBootstrap` (side-effect-module require
+  loop) coexists with `SceneRuntimeClient` (runtime-bearing modules).
+  They target disjoint script sets and don't fight at runtime. The
+  design doc's "all legacy repair passes off, incl. write_output
+  emit-time subphases under generic" line is the longer-term goal;
+  PR4 documents the current contract as **coexistence**. Tracked
+  under item 3 above. **Decision:** leave the design doc statement
+  as the aspirational end state; followup PR will gate the legacy
+  emit-side autogen path per-script as their generic equivalents
+  land (FPS rig, collision groups, etc.).
+
+**P3:** none in round 1.
 
 ## Carry-over markers
 
@@ -151,3 +219,13 @@ surfaces in the upload phase, which is recoverable.
       implement sharding if any place overflows the publish budget.
 - [ ] PR5: remove the legacy `scene` alias on
       `SceneRuntimeDisplacedInstance` after one release cycle.
+- [ ] PR5-followup: plumb `tag` from Unity `m_TagString` into the
+      planner instance rows so
+      `host.findGameObjectsWithTag(tag)` is non-empty under
+      generic. PR4's runtime already reads `inst.tag` and registers
+      it in `_byTag`; the planner just needs to emit it.
+- [ ] PR5-followup: honor `target_component_type` for
+      `target_kind: gameobject` refs (planner emits the extra; host
+      converts the resolved GameObject Instance to its built-in
+      component via `findFirstChildWhichIsA`). Today such refs
+      arrive as the owning GameObject.

@@ -153,36 +153,58 @@ function SceneRuntime:_register(componentInstance, meta)
 		if not list then list = {}; self._byClass[stem] = list end
 		table.insert(list, componentInstance)
 	end
-	local name = meta.gameObjectName or ""
-	if name ~= "" then
-		local list = self._byName[name]
-		if not list then list = {}; self._byName[name] = list end
-		table.insert(list, componentInstance)
-	end
-	local tag = meta.tag or ""
-	if tag ~= "" then
-		local list = self._byTag[tag]
-		if not list then list = {}; self._byTag[tag] = list end
-		table.insert(list, componentInstance)
+	-- ``findGameObject`` / ``findGameObjectsWithTag`` index by the
+	-- Roblox GameObject Instance (per the Unity contract --
+	-- ``GameObject.Find`` returns a GameObject, not a component). One
+	-- GameObject may host several components; dedupe via _goByName /
+	-- _goByTag so a GameObject is listed once per name+tag.
+	local goInst = meta.gameObjectInstance
+	if goInst ~= nil then
+		local name = meta.gameObjectName or ""
+		if name ~= "" then
+			local list = self._byName[name]
+			if not list then list = {}; self._byName[name] = list end
+			local present = false
+			for _, x in ipairs(list) do if x == goInst then present = true; break end end
+			if not present then table.insert(list, goInst) end
+		end
+		local tag = meta.tag or ""
+		if tag ~= "" then
+			local list = self._byTag[tag]
+			if not list then list = {}; self._byTag[tag] = list end
+			local present = false
+			for _, x in ipairs(list) do if x == goInst then present = true; break end end
+			if not present then table.insert(list, goInst) end
+		end
 	end
 end
 
 function SceneRuntime:_unregister(componentInstance)
 	local meta = self._meta[componentInstance]
 	if not meta then return end
-	local function rip(t, key)
+	local function ripValue(t, key, value)
 		local list = t[key]
 		if not list then return end
 		for i = #list, 1, -1 do
-			if list[i] == componentInstance then
+			if list[i] == value then
 				table.remove(list, i)
 			end
 		end
 	end
-	rip(self._componentsByGameObject, meta.gameObjectId)
-	rip(self._byClass, meta.stem or "")
-	rip(self._byName, meta.gameObjectName or "")
-	rip(self._byTag, meta.tag or "")
+	ripValue(self._componentsByGameObject, meta.gameObjectId, componentInstance)
+	ripValue(self._byClass, meta.stem or "", componentInstance)
+	-- ``_byName`` / ``_byTag`` are keyed by GameObject Instance; only
+	-- drop the GO when the LAST component on that GO unregisters
+	-- (multiple components can share the same GameObject).
+	local goId = meta.gameObjectId
+	local remaining = self._componentsByGameObject[goId]
+	if not remaining or #remaining == 0 then
+		local goInst = meta.gameObjectInstance
+		if goInst ~= nil then
+			ripValue(self._byName, meta.gameObjectName or "", goInst)
+			ripValue(self._byTag, meta.tag or "", goInst)
+		end
+	end
 	self._meta[componentInstance] = nil
 end
 
@@ -190,43 +212,92 @@ end
 -- Host surface bound onto each component as ``self.host``
 -- ---------------------------------------------------------------------
 
-function SceneRuntime:_makeHostSurface()
-	-- Capture ``self`` (the SceneRuntime instance) once; every method
-	-- below is dispatched as ``host.X(...)``, NOT ``host:X(...)``, per
-	-- the design doc (Piece 1 lists them all as dotted calls).
+function SceneRuntime:_makeHostSurface(owner)
+	-- Capture ``self`` (the SceneRuntime instance) once. Each component's
+	-- ``self.host`` is its own per-instance table -- the closures below
+	-- can default ``comp`` to ``owner`` when colon-form sugar is used
+	-- (e.g. ``self.host:connect(signal, fn)`` per rule (f)). Dotted form
+	-- (``self.host.connect(self, signal, fn)`` per the design doc) also
+	-- works since ``arg1 ~= host`` selects the dotted-form branch.
 	local engine = self
-	return {
+	local host
+	host = {
 		instantiatePrefab = function(prefab_id, parent, cframe, externalRefs)
+			-- Strip the colon-form receiver if present.
+			if prefab_id == host then
+				return engine:instantiatePrefab(parent, cframe, externalRefs, nil)
+			end
 			return engine:instantiatePrefab(prefab_id, parent, cframe, externalRefs)
 		end,
-		addComponent = function(go, scriptId, config)
-			return engine:addComponent(go, scriptId, config)
+		addComponent = function(arg1, arg2, arg3, arg4)
+			-- Dotted: addComponent(go, scriptId, config)
+			-- Colon:  host:addComponent(go, scriptId, config)
+			if arg1 == host then
+				return engine:addComponent(arg2, arg3, arg4)
+			end
+			return engine:addComponent(arg1, arg2, arg3)
 		end,
-		destroy = function(target)
-			return engine:destroy(target)
+		destroy = function(arg1, arg2)
+			if arg1 == host then
+				return engine:destroy(arg2)
+			end
+			return engine:destroy(arg1)
 		end,
-		setActive = function(go, bool)
-			return engine:setActive(go, bool)
+		setActive = function(arg1, arg2, arg3)
+			if arg1 == host then
+				return engine:setActive(arg2, arg3)
+			end
+			return engine:setActive(arg1, arg2)
 		end,
-		findObjectOfType = function(name) return engine:findObjectOfType(name) end,
-		findGameObject = function(name) return engine:findGameObject(name) end,
-		findGameObjectsWithTag = function(tag) return engine:findGameObjectsWithTag(tag) end,
-		invoke = function(comp, method, delay)
-			return engine:invoke(comp, method, delay)
+		findObjectOfType = function(arg1, arg2)
+			if arg1 == host then return engine:findObjectOfType(arg2) end
+			return engine:findObjectOfType(arg1)
 		end,
-		invokeRepeating = function(comp, method, delay, every)
-			return engine:invokeRepeating(comp, method, delay, every)
+		findGameObject = function(arg1, arg2)
+			if arg1 == host then return engine:findGameObject(arg2) end
+			return engine:findGameObject(arg1)
 		end,
-		cancelInvoke = function(comp, method)
-			return engine:cancelInvoke(comp, method)
+		findGameObjectsWithTag = function(arg1, arg2)
+			if arg1 == host then return engine:findGameObjectsWithTag(arg2) end
+			return engine:findGameObjectsWithTag(arg1)
 		end,
-		startCoroutine = function(comp, fn)
-			return engine:startCoroutine(comp, fn)
+		invoke = function(arg1, arg2, arg3, arg4)
+			-- Dotted: invoke(comp, method, delay); colon: host:invoke(method, delay)
+			if arg1 == host then
+				return engine:invoke(owner, arg2, arg3)
+			end
+			return engine:invoke(arg1, arg2, arg3)
 		end,
-		connect = function(comp, signal, fn)
-			return engine:connect(comp, signal, fn)
+		invokeRepeating = function(arg1, arg2, arg3, arg4, arg5)
+			if arg1 == host then
+				return engine:invokeRepeating(owner, arg2, arg3, arg4)
+			end
+			return engine:invokeRepeating(arg1, arg2, arg3, arg4)
+		end,
+		cancelInvoke = function(arg1, arg2, arg3)
+			if arg1 == host then
+				return engine:cancelInvoke(owner, arg2)
+			end
+			return engine:cancelInvoke(arg1, arg2)
+		end,
+		startCoroutine = function(arg1, arg2, arg3)
+			if arg1 == host then
+				return engine:startCoroutine(owner, arg2)
+			end
+			return engine:startCoroutine(arg1, arg2)
+		end,
+		connect = function(arg1, arg2, arg3)
+			-- Two calling forms (the contract+verifier+prompt teach the
+			-- colon form per rule (f)):
+			--   host.connect(comp, signal, fn)   -- dotted
+			--   host:connect(signal, fn)         -- colon (arg1 = host)
+			if arg1 == host then
+				return engine:connect(owner, arg2, arg3)
+			end
+			return engine:connect(arg1, arg2, arg3)
 		end,
 	}
+	return host
 end
 
 -- ---------------------------------------------------------------------
@@ -273,6 +344,7 @@ function SceneRuntime:_buildComponent(scriptId, gameObjectInstance, gameObjectId
 		scriptId = scriptId,
 		stem = moduleRow.stem or scriptId,
 		gameObjectId = gameObjectId,
+		gameObjectInstance = gameObjectInstance,
 		gameObjectName = gameObjectName,
 		ownerKind = ownerKind,
 		ownerRef = ownerRef,
@@ -298,10 +370,20 @@ function SceneRuntime:_injectHostSurface(instance, gameObjectInstance, gameObjec
 	-- via a metatable proxy so OnEnable/OnDisable fire on transitions.
 	-- We track the underlying value in _meta so the metatable
 	-- intercepts can do the gate work without a global key collision.
+	-- IMPORTANT: planner-supplied ``active`` / ``enabled`` flags are
+	-- copied into meta during _buildComponent's caller (step 1 of
+	-- ``start``). Do NOT overwrite them here -- dormant components must
+	-- stay dormant until ``setActive`` / ``setEnabled`` (or
+	-- ``self.enabled = ...``) wakes them.
 	local meta = self._meta[instance]
-	meta.enabled = true   -- default; planner instance row may override
-	meta.activeSelf = true
-	instance.host = self:_makeHostSurface()
+	if meta.enabled == nil then meta.enabled = true end
+	if meta.activeSelf == nil then meta.activeSelf = true end
+	-- Remember GameObject Instance + id on meta so other services
+	-- (instantiatePrefab reinjection, findGameObject) can rediscover
+	-- the live Roblox instance.
+	meta.gameObjectInstance = gameObjectInstance
+	meta.gameObjectId = gameObjectId or meta.gameObjectId
+	instance.host = self:_makeHostSurface(instance)
 
 	-- Install a GetComponent(name) method on the instance. Resolution
 	-- order: peer MonoBehaviour by stem -> Roblox built-in via
@@ -326,6 +408,50 @@ function SceneRuntime:_injectHostSurface(instance, gameObjectInstance, gameObjec
 		end
 		return nil
 	end
+
+	-- Per-instance ``self.enabled`` proxy. Writes to ``self.enabled``
+	-- (rule-(c) / contract compliance) re-route through ``setEnabled``
+	-- so ``OnEnable`` / ``OnDisable`` fire and host.connect subscriptions
+	-- arm/disarm. Reads return the current gated value from meta.
+	-- We install a per-instance metatable that wraps the original class
+	-- metatable (preserves ``__index = Foo`` method lookup, ``__tostring``
+	-- etc.) and intercepts only ``enabled``.
+	local origMt = getmetatable(instance)
+	-- Remove any pre-existing direct ``enabled`` so __newindex fires on
+	-- subsequent writes. (Constructor-purity rule (e) means new() should
+	-- not set it; we strip defensively.)
+	rawset(instance, "enabled", nil)
+	local newMt = {
+		__index = function(t, k)
+			if k == "enabled" then
+				local m = engine._meta[t]
+				return m and m.enabled
+			end
+			if origMt ~= nil then
+				local idx = origMt.__index
+				if type(idx) == "table" then return idx[k] end
+				if type(idx) == "function" then return idx(t, k) end
+			end
+			return nil
+		end,
+		__newindex = function(t, k, v)
+			if k == "enabled" then
+				engine:setEnabled(t, v and true or false)
+			else
+				rawset(t, k, v)
+			end
+		end,
+	}
+	-- Preserve other commonly-used metamethods from the original class
+	-- metatable (e.g. __tostring) without forwarding __index/__newindex.
+	if type(origMt) == "table" then
+		for k, v in pairs(origMt) do
+			if k ~= "__index" and k ~= "__newindex" and newMt[k] == nil then
+				newMt[k] = v
+			end
+		end
+	end
+	setmetatable(instance, newMt)
 end
 
 -- ---------------------------------------------------------------------
@@ -355,7 +481,12 @@ function SceneRuntime:_resolveReferenceTarget(refRow, componentByInstanceId)
 end
 
 function SceneRuntime:_assignFieldOnComponent(instance, field, index, value)
-	if index == nil or index == 0 then
+	-- Per the planner contract: ``index = nil`` means scalar field;
+	-- ``index >= 0`` means array element. The planner emits 0-based
+	-- indexes (Unity convention); we bridge to Lua's 1-based arrays
+	-- with ``+1``. Treating ``index == 0`` as scalar would corrupt the
+	-- first element of every serialized array ref.
+	if index == nil then
 		instance[field] = value
 		return
 	end
@@ -364,39 +495,55 @@ function SceneRuntime:_assignFieldOnComponent(instance, field, index, value)
 		arr = {}
 		instance[field] = arr
 	end
-	-- 1-based array per Lua convention; planner emits 0-based indexes
-	-- (Unity convention). +1 to bridge.
 	arr[index + 1] = value
 end
 
-function SceneRuntime:_wireReferences(refs, componentByInstanceId, crossDomainEdges)
+function SceneRuntime:_wireReferences(refs, componentByInstanceId,
+                                       crossDomainEdges, instanceById)
+	-- ``instanceById`` is the planner's per-scene/prefab
+	-- instance_id -> instance row map, used to resolve a target's
+	-- ``script_id`` (and therefore its domain via plan.modules) even
+	-- when the target component was never constructed in the current
+	-- partition. Production entrypoints start ONE partition per
+	-- process ("client" or "server"), so the opposite-side component
+	-- never exists locally -- the cross-domain log + edge tracking
+	-- must be plan-based, not registry-based.
+	local modules = self._plan.modules or {}
 	for _, ref in ipairs(refs) do
 		local sourceComp = componentByInstanceId[ref["from"]]
 		if sourceComp ~= nil then
 			local target = self:_resolveReferenceTarget(ref, componentByInstanceId)
-			-- Cross-domain policy: if both source and target are
-			-- modules with assigned domains and they differ, inject
-			-- ``nil`` and surface the edge.
-			if ref.target_kind == "component" and target ~= nil then
+			-- Cross-domain policy: if both source module and target
+			-- module have assigned non-legacy domains and they differ,
+			-- inject ``nil`` and surface the edge. Resolve via the plan
+			-- so the policy fires even when the target isn't locally
+			-- constructed (real boots only run one partition).
+			if ref.target_kind == "component" then
 				local srcMeta = self._meta[sourceComp]
-				local tgtMeta = self._meta[target]
-				if srcMeta and tgtMeta
-				   and srcMeta.domain and tgtMeta.domain
+				local tgtRow = instanceById and instanceById[ref.target_ref]
+				local tgtDomain
+				local tgtScriptId
+				if tgtRow then
+					tgtScriptId = tgtRow.script_id
+					local tgtModule = modules[tgtScriptId]
+					tgtDomain = tgtModule and tgtModule.domain
+				end
+				if srcMeta and srcMeta.domain and tgtDomain
 				   and srcMeta.domain ~= "legacy"
-				   and tgtMeta.domain ~= "legacy"
-				   and srcMeta.domain ~= tgtMeta.domain then
+				   and tgtDomain ~= "legacy"
+				   and srcMeta.domain ~= tgtDomain then
 					self._warn(string.format(
 						"[scene_runtime] cross-domain ref %s(%s).%s -> %s(%s) -> injecting nil",
 						srcMeta.scriptId, srcMeta.domain, ref.field,
-						tgtMeta.scriptId, tgtMeta.domain))
+						tostring(tgtScriptId), tgtDomain))
 					target = nil
 					if crossDomainEdges then
 						table.insert(crossDomainEdges, {
 							from_script = srcMeta.scriptId,
-							to_script = tgtMeta.scriptId,
+							to_script = tgtScriptId,
 							field = ref.field,
 							from_domain = srcMeta.domain,
-							to_domain = tgtMeta.domain,
+							to_domain = tgtDomain,
 						})
 					end
 				end
@@ -795,7 +942,9 @@ function SceneRuntime:instantiatePrefab(prefab_id, parent, cframe, externalRefs)
 	-- prefab-local so the same logic applies as for scenes.
 	local componentByInstanceId = {}
 	local componentList = {}
+	local instanceById = {}
 	for _, inst in ipairs(prefab.instances or {}) do
+		instanceById[inst.instance_id] = inst
 		-- Map intra-prefab game_object_id to the actual Roblox child via
 		-- the services helper (production: walk by _SceneRuntimeId
 		-- under the clone; harness: pass-through).
@@ -813,7 +962,8 @@ function SceneRuntime:instantiatePrefab(prefab_id, parent, cframe, externalRefs)
 		local m = self._meta[comp]
 		self:_injectHostSurface(comp, m and m.gameObjectInstance, m and m.gameObjectId)
 	end
-	self:_wireReferences(prefab.references or {}, componentByInstanceId, nil)
+	self:_wireReferences(prefab.references or {}, componentByInstanceId, nil,
+		instanceById)
 	-- Caller-supplied externals override matching wired refs.
 	if type(externalRefs) == "table" then
 		for instId, fields in pairs(externalRefs) do
@@ -883,10 +1033,23 @@ function SceneRuntime:start(domainFilter)
 				if comp then
 					componentByInstanceId[instId] = comp
 					table.insert(lifecycleList, comp)
-					-- Honor planner-supplied active/enabled.
+					-- Honor planner-supplied active/enabled/tag.
 					local m = self._meta[comp]
 					m.activeSelf = inst.active ~= false
 					m.enabled = inst.enabled ~= false
+					if inst.tag and inst.tag ~= "" then
+						m.tag = inst.tag
+						-- Late-bind the tag into the by-tag index.
+						local list = self._byTag[inst.tag]
+						if not list then list = {}; self._byTag[inst.tag] = list end
+						local present = false
+						for _, x in ipairs(list) do
+							if x == goInst then present = true; break end
+						end
+						if goInst ~= nil and not present then
+							table.insert(list, goInst)
+						end
+					end
 				end
 			end
 		end
@@ -895,11 +1058,10 @@ function SceneRuntime:start(domainFilter)
 		-- step 1 touched no peers per the constructor-purity rule).
 		for _, comp in ipairs(lifecycleList) do
 			local m = self._meta[comp]
-			self:_injectHostSurface(comp,
-				self._services.workspaceFind(m.gameObjectId), m.gameObjectId)
+			self:_injectHostSurface(comp, m.gameObjectInstance, m.gameObjectId)
 		end
 		self:_wireReferences(scene.references or {}, componentByInstanceId,
-			crossDomainEdges)
+			crossDomainEdges, byInstanceId)
 
 		-- Steps 3-5: Awake -> OnEnable -> Start.
 		self:_runAwakeEnableStart(lifecycleList)

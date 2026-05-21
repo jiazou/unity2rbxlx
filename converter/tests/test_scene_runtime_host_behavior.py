@@ -936,3 +936,539 @@ class TestInstantiatePrefab:
         rc, out, err = _run_scenario(scenario)
         assert rc == 0, f"luau failed: {err}\n{out}"
         assert "OK" in out
+
+
+# ---------------------------------------------------------------------------
+# Codex P1 regressions (PR4 review absorption)
+# ---------------------------------------------------------------------------
+
+class TestPlannerDormantFlagsPreserved:
+    """P1.1: ``_injectHostSurface`` must not overwrite planner ``active``
+    / ``enabled`` flags. A component the planner marked dormant must not
+    fire ``OnEnable`` / ``Start``. (Pre-fix, _injectHostSurface forced
+    meta.enabled = true after _buildComponent's caller copied the
+    planner flag, so dormant components booted live.)"""
+
+    def test_dormant_instance_skips_on_enable_and_start(self):
+        scenario = textwrap.dedent("""\
+            local awakeCount = 0
+            local enableCount = 0
+            local startCount = 0
+            local Foo = {} ; Foo.__index = Foo
+            function Foo.new(_) return setmetatable({}, Foo) end
+            function Foo:Awake() awakeCount = awakeCount + 1 end
+            function Foo:OnEnable() enableCount = enableCount + 1 end
+            function Foo:Start() startCount = startCount + 1 end
+            local plan = {
+                modules = {foo = {stem = "Foo", runtime_bearing = true,
+                                  module_path = "x"}},
+                scenes = {
+                    A = {
+                        instances = {{instance_id = "A:1", script_id = "foo",
+                                      game_object_id = "g", active = true,
+                                      enabled = false, config = {}}},
+                        references = {},
+                        lifecycle_order = {"A:1"},
+                    },
+                },
+                prefabs = {}, domain_overrides = {},
+            }
+            local services = servicesFor(plan, {foo = Foo}, {
+                g = {Name = "G", _sceneRuntimeId = "g", _children = {}},
+            })
+            local engine = SceneRuntime.new(services, plan)
+            engine:start(nil)
+            runDeferred()
+            -- Awake fires regardless of enabled (Unity semantics), but
+            -- OnEnable + Start must be suppressed for dormant components.
+            print("A=" .. awakeCount, "E=" .. enableCount, "S=" .. startCount)
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, err
+        assert "A=1" in out, out
+        assert "E=0" in out, out
+        assert "S=0" in out, out
+
+
+class TestSelfEnabledProxy:
+    """P1.1: writing ``self.enabled = false`` from inside a component
+    must suspend host.connect subscriptions; ``self.enabled = true``
+    re-arms them. Pre-fix there was no proxy at all -- the assignment
+    only updated the instance table and never gated dispatch."""
+
+    def test_self_enabled_writes_route_through_set_enabled(self):
+        scenario = textwrap.dedent("""\
+            local sig = mockSignal()
+            local hits = 0
+            local Foo = {} ; Foo.__index = Foo
+            function Foo.new(_) return setmetatable({}, Foo) end
+            function Foo:Awake()
+                self.host.connect(self, sig, function() hits = hits + 1 end)
+            end
+            local plan = {
+                modules = {foo = {stem = "Foo", runtime_bearing = true,
+                                  module_path = "x"}},
+                scenes = {
+                    A = {
+                        instances = {{instance_id = "A:1", script_id = "foo",
+                                      game_object_id = "g", active = true,
+                                      enabled = true, config = {}}},
+                        references = {},
+                        lifecycle_order = {"A:1"},
+                    },
+                },
+                prefabs = {}, domain_overrides = {},
+            }
+            local services = servicesFor(plan, {foo = Foo}, {
+                g = {Name = "G", _sceneRuntimeId = "g", _children = {}},
+            })
+            local engine = SceneRuntime.new(services, plan)
+            engine:start(nil)
+            runDeferred()
+            local comp = engine:findObjectOfType("Foo")
+
+            sig:fire()
+            assert(hits == 1, "initial dispatch should hit")
+            -- User writes self.enabled = false -- must suspend.
+            comp.enabled = false
+            sig:fire()
+            assert(hits == 1, "self.enabled = false must suspend dispatch")
+            -- Read-back must match.
+            assert(comp.enabled == false, "self.enabled read must reflect setter")
+            comp.enabled = true
+            sig:fire()
+            assert(hits == 2, "self.enabled = true must re-arm dispatch")
+            assert(comp.enabled == true, "self.enabled read must reflect re-enable")
+            print("OK")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "OK" in out
+
+
+class TestArrayIndexZeroIsArrayNotScalar:
+    """P1.2: planner emits 0-based array indexes (Unity convention).
+    ``index = 0`` must mean ``self.field[1] = target``, not
+    ``self.field = target``. Only ``index = nil`` means scalar."""
+
+    def test_array_index_zero_targets_first_element_not_scalar_field(self):
+        scenario = textwrap.dedent("""\
+            local Foo = {} ; Foo.__index = Foo
+            function Foo.new(_) return setmetatable({}, Foo) end
+            local Bar = {} ; Bar.__index = Bar
+            function Bar.new(_) return setmetatable({_markerA = true}, Bar) end
+            local Baz = {} ; Baz.__index = Baz
+            function Baz.new(_) return setmetatable({_markerB = true}, Baz) end
+            local plan = {
+                modules = {
+                    foo = {stem = "Foo", runtime_bearing = true, module_path = "x"},
+                    bar = {stem = "Bar", runtime_bearing = true, module_path = "y"},
+                    baz = {stem = "Baz", runtime_bearing = true, module_path = "z"},
+                },
+                scenes = {
+                    A = {
+                        instances = {
+                            {instance_id = "A:1", script_id = "foo",
+                             game_object_id = "g1", active = true,
+                             enabled = true, config = {}},
+                            {instance_id = "A:2", script_id = "bar",
+                             game_object_id = "g2", active = true,
+                             enabled = true, config = {}},
+                            {instance_id = "A:3", script_id = "baz",
+                             game_object_id = "g3", active = true,
+                             enabled = true, config = {}},
+                        },
+                        references = {
+                            {["from"] = "A:1", field = "peers", index = 0,
+                             target_kind = "component", target_ref = "A:2",
+                             target_is_ui = false},
+                            {["from"] = "A:1", field = "peers", index = 1,
+                             target_kind = "component", target_ref = "A:3",
+                             target_is_ui = false},
+                        },
+                        lifecycle_order = {"A:1", "A:2", "A:3"},
+                    },
+                },
+                prefabs = {}, domain_overrides = {},
+            }
+            local services = servicesFor(plan, {foo = Foo, bar = Bar, baz = Baz}, {
+                g1 = {Name = "G1", _sceneRuntimeId = "g1", _children = {}},
+                g2 = {Name = "G2", _sceneRuntimeId = "g2", _children = {}},
+                g3 = {Name = "G3", _sceneRuntimeId = "g3", _children = {}},
+            })
+            local engine = SceneRuntime.new(services, plan)
+            engine:start(nil)
+            local foo = engine:findObjectOfType("Foo")
+            assert(type(foo.peers) == "table", "field must be a table, not scalar; got " .. type(foo.peers))
+            assert(foo.peers[1] ~= nil, "0-based index 0 must populate Lua slot 1")
+            assert(foo.peers[1]._markerA == true, "slot 1 must be Bar")
+            assert(foo.peers[2]._markerB == true, "slot 2 must be Baz")
+            print("OK")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "OK" in out
+
+
+class TestHostConnectColonForm:
+    """P1.3: ``self.host:connect(signal, fn)`` (colon-form) is the
+    contract+verifier+prompt-taught calling convention. Pre-fix, the
+    runtime only handled the dotted form
+    ``self.host.connect(self, signal, fn)``; the colon form silently
+    no-op'd because ``comp`` resolved to the host table itself,
+    ``_isGateOpen`` returned false, and the callback never armed."""
+
+    def test_host_connect_colon_form_dispatches(self):
+        scenario = textwrap.dedent("""\
+            local sig = mockSignal()
+            local hits = 0
+            local Foo = {} ; Foo.__index = Foo
+            function Foo.new(_) return setmetatable({}, Foo) end
+            function Foo:Awake()
+                -- Colon form (rule (f) reprompt teaches this for all
+                -- Unity trigger/collision/mouse callbacks):
+                self.host:connect(sig, function() hits = hits + 1 end)
+            end
+            local plan = {
+                modules = {foo = {stem = "Foo", runtime_bearing = true,
+                                  module_path = "x"}},
+                scenes = {
+                    A = {
+                        instances = {{instance_id = "A:1", script_id = "foo",
+                                      game_object_id = "g", active = true,
+                                      enabled = true, config = {}}},
+                        references = {},
+                        lifecycle_order = {"A:1"},
+                    },
+                },
+                prefabs = {}, domain_overrides = {},
+            }
+            local services = servicesFor(plan, {foo = Foo}, {
+                g = {Name = "G", _sceneRuntimeId = "g", _children = {}},
+            })
+            local engine = SceneRuntime.new(services, plan)
+            engine:start(nil)
+            runDeferred()
+            sig:fire()
+            assert(hits == 1, "host:connect colon form must arm dispatch; hits=" .. hits)
+            print("OK")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "OK" in out
+
+
+class TestCrossDomainLogPlanResolved:
+    """P1.4: cross-domain ref policy must fire on real boots, where the
+    process only constructs ONE partition's components. The host needs
+    to resolve target script/domain from the plan, not the live
+    components map; otherwise the warning + edge record never fire."""
+
+    def test_cross_domain_log_fires_when_target_not_locally_constructed(self):
+        scenario = textwrap.dedent("""\
+            local Foo = {} ; Foo.__index = Foo
+            function Foo.new(_) return setmetatable({}, Foo) end
+            function Foo:Awake()
+                assert(self.peer == nil,
+                    "cross-domain ref must inject nil; got " .. tostring(self.peer))
+            end
+            local Bar = {} ; Bar.__index = Bar
+            function Bar.new(_) return setmetatable({}, Bar) end
+            local plan = {
+                modules = {
+                    foo = {stem = "Foo", runtime_bearing = true,
+                           module_path = "x", domain = "client"},
+                    bar = {stem = "Bar", runtime_bearing = true,
+                           module_path = "y", domain = "server"},
+                },
+                scenes = {
+                    A = {
+                        instances = {
+                            {instance_id = "A:1", script_id = "foo",
+                             game_object_id = "g1", active = true,
+                             enabled = true, config = {}},
+                            {instance_id = "A:2", script_id = "bar",
+                             game_object_id = "g2", active = true,
+                             enabled = true, config = {}},
+                        },
+                        references = {
+                            {["from"] = "A:1", field = "peer", index = nil,
+                             target_kind = "component", target_ref = "A:2",
+                             target_is_ui = false},
+                        },
+                        lifecycle_order = {"A:1", "A:2"},
+                    },
+                },
+                prefabs = {}, domain_overrides = {},
+            }
+            local services = servicesFor(plan, {foo = Foo, bar = Bar}, {
+                g1 = {Name = "G1", _sceneRuntimeId = "g1", _children = {}},
+                g2 = {Name = "G2", _sceneRuntimeId = "g2", _children = {}},
+            })
+            local engine = SceneRuntime.new(services, plan)
+            -- Real production call: only ONE partition runs in this
+            -- process. The opposite-side component is never constructed.
+            local edges = engine:start("client")
+            assert(#edges == 1,
+                "cross-domain edge must surface even when target not " ..
+                "locally constructed; got " .. #edges)
+            assert(edges[1].from_script == "foo")
+            assert(edges[1].to_script == "bar")
+            assert(edges[1].from_domain == "client")
+            assert(edges[1].to_domain == "server")
+            local logged = false
+            for _, line in ipairs(logs) do
+                if string.find(line, "cross%-domain") then logged = true end
+            end
+            assert(logged, "cross-domain ref must log a structured warning")
+            print("OK")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "OK" in out
+
+
+class TestFindGameObjectReturnsGameObjectInstance:
+    """P1.5: ``GameObject.Find(name)`` and
+    ``GameObject.FindGameObjectsWithTag(tag)`` must return Roblox
+    GameObject instances, NOT component module tables. Pre-fix,
+    ``_register`` seeded ``_byName`` / ``_byTag`` with component
+    instances; ``findGameObject()`` returned a component table and
+    ``_byTag`` was never populated at all (no tag plumbing)."""
+
+    def test_find_game_object_returns_roblox_instance_not_component(self):
+        scenario = textwrap.dedent("""\
+            local Foo = {} ; Foo.__index = Foo
+            function Foo.new(_) return setmetatable({_isComponent = true}, Foo) end
+            local plan = {
+                modules = {foo = {stem = "Foo", runtime_bearing = true,
+                                  module_path = "x"}},
+                scenes = {
+                    A = {
+                        instances = {{instance_id = "A:1", script_id = "foo",
+                                      game_object_id = "g_player", active = true,
+                                      enabled = true, config = {}}},
+                        references = {},
+                        lifecycle_order = {"A:1"},
+                    },
+                },
+                prefabs = {}, domain_overrides = {},
+            }
+            local playerGo = {Name = "Player", _sceneRuntimeId = "g_player",
+                              _children = {}, _isRobloxInstance = true}
+            local services = servicesFor(plan, {foo = Foo}, {g_player = playerGo})
+            local engine = SceneRuntime.new(services, plan)
+            engine:start(nil)
+            local found = engine:findGameObject("Player")
+            assert(found == playerGo,
+                "findGameObject must return the GameObject instance, not the component")
+            assert(found._isRobloxInstance == true,
+                "must be Roblox instance, got: " .. tostring(found))
+            assert(found._isComponent == nil,
+                "must NOT be the component table")
+            print("OK")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "OK" in out
+
+    def test_find_game_objects_with_tag_returns_roblox_instances(self):
+        scenario = textwrap.dedent("""\
+            local Foo = {} ; Foo.__index = Foo
+            function Foo.new(_) return setmetatable({_isComponent = true}, Foo) end
+            local plan = {
+                modules = {foo = {stem = "Foo", runtime_bearing = true,
+                                  module_path = "x"}},
+                scenes = {
+                    A = {
+                        instances = {
+                            {instance_id = "A:1", script_id = "foo",
+                             game_object_id = "g1", active = true,
+                             enabled = true, tag = "Enemy", config = {}},
+                            {instance_id = "A:2", script_id = "foo",
+                             game_object_id = "g2", active = true,
+                             enabled = true, tag = "Enemy", config = {}},
+                            {instance_id = "A:3", script_id = "foo",
+                             game_object_id = "g3", active = true,
+                             enabled = true, tag = "Friend", config = {}},
+                        },
+                        references = {},
+                        lifecycle_order = {"A:1", "A:2", "A:3"},
+                    },
+                },
+                prefabs = {}, domain_overrides = {},
+            }
+            local g1 = {Name = "E1", _sceneRuntimeId = "g1", _children = {}, _isRobloxInstance = true}
+            local g2 = {Name = "E2", _sceneRuntimeId = "g2", _children = {}, _isRobloxInstance = true}
+            local g3 = {Name = "F1", _sceneRuntimeId = "g3", _children = {}, _isRobloxInstance = true}
+            local services = servicesFor(plan, {foo = Foo}, {g1 = g1, g2 = g2, g3 = g3})
+            local engine = SceneRuntime.new(services, plan)
+            engine:start(nil)
+            local enemies = engine:findGameObjectsWithTag("Enemy")
+            assert(#enemies == 2, "expected 2 enemy GameObjects, got " .. #enemies)
+            for _, found in ipairs(enemies) do
+                assert(found._isRobloxInstance == true,
+                    "findGameObjectsWithTag must return GameObject instances; got " ..
+                    tostring(found))
+                assert(found._isComponent == nil,
+                    "must NOT be a component table")
+            end
+            local friends = engine:findGameObjectsWithTag("Friend")
+            assert(#friends == 1, "expected 1 friend, got " .. #friends)
+            print("OK")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "OK" in out
+
+
+class TestPrefabComponentReceivesGameObject:
+    """P1.6: prefab-spawned component must have non-nil
+    ``self.gameObject`` after Awake. Pre-fix, ``instantiatePrefab``
+    reinjected with ``m.gameObjectInstance``, but ``_register`` never
+    stored ``gameObjectInstance`` -- prefab components booted with
+    ``self.gameObject = nil`` and built-in GetComponent fallback lost
+    its search root."""
+
+    def test_prefab_component_self_gameobject_non_nil_after_awake(self):
+        scenario = textwrap.dedent("""\
+            local capturedGo = nil
+            local capturedTransform = nil
+            local capturedInstance = nil
+            local Foo = {} ; Foo.__index = Foo
+            function Foo.new(_) return setmetatable({}, Foo) end
+            function Foo:Awake()
+                capturedGo = self.gameObject
+                capturedTransform = self.transform
+                capturedInstance = self.instance
+            end
+            local plan = {
+                modules = {foo = {stem = "Foo", runtime_bearing = true,
+                                  module_path = "x"}},
+                scenes = {},
+                prefabs = {
+                    ["pfb1"] = {
+                        name = "MyPrefab",
+                        instances = {{instance_id = "pfb1:1", script_id = "foo",
+                                      game_object_id = "pfb1:1", active = true,
+                                      enabled = true, config = {}}},
+                        references = {},
+                        lifecycle_order = {"pfb1:1"},
+                    },
+                },
+                domain_overrides = {},
+            }
+            local childGo = {Name = "ClonedChild", _sceneRuntimeId = "pfb1:1", _children = {}}
+            local cloneInstance = {
+                Name = "Clone", _sceneRuntimeId = "clone",
+                _children = {["pfb1:1"] = childGo},
+            }
+            local services = servicesFor(plan, {foo = Foo}, {})
+            services.clonePrefabTemplate = function(prefabId, parent, cframe)
+                return cloneInstance
+            end
+            local engine = SceneRuntime.new(services, plan)
+            engine:instantiatePrefab("pfb1", nil, nil, nil)
+            runDeferred()
+            assert(capturedGo == childGo,
+                "prefab component self.gameObject must point at the cloned child")
+            assert(capturedTransform == childGo,
+                "self.transform must alias the gameObject")
+            assert(capturedInstance == childGo,
+                "self.instance must alias the gameObject")
+            print("OK")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "OK" in out
+
+
+# ---------------------------------------------------------------------------
+# P1.7 -- autogen entrypoint must use PlayerGui + DFS post-order
+# (asserted by inspecting the generated source string, not via the Luau
+# harness, which previously shadowed both with correct helpers).
+# ---------------------------------------------------------------------------
+
+class TestAutogenClientEntrypointUsesPlayerGui:
+    """P1.7: ``SceneRuntimeClient`` must resolve UI ``_SceneRuntimeId``s
+    out of the local player's live ``PlayerGui`` -- ``StarterGui`` is
+    the unconverted template that gets cloned per-player and is not
+    interactive at runtime."""
+
+    def test_client_entrypoint_uses_player_gui(self):
+        from converter.autogen import generate_scene_runtime_client_entrypoint
+        src = generate_scene_runtime_client_entrypoint().source
+        # Must reference PlayerGui via the local player.
+        assert "PlayerGui" in src, "client entrypoint must look up PlayerGui"
+        assert "LocalPlayer" in src, (
+            "client entrypoint must resolve PlayerGui via LocalPlayer "
+            "(StarterGui is the template, not the interactive tree)"
+        )
+        # PlayerGui lookup must happen during workspaceFind/UI resolution.
+        assert "WaitForChild(\"PlayerGui\"" in src, (
+            "must WaitForChild for PlayerGui to handle early-lifecycle race"
+        )
+
+
+class TestAutogenCollectDescendantIdsIsDfsPostOrder:
+    """P1.7: ``collectDescendantIds`` (used by
+    ``host.destroy(parent)``) must walk DFS post-order (children
+    deepest-first, then self) per the design doc's recursive-teardown
+    contract. Reversing ``GetDescendants()`` (BFS) is NOT the same."""
+
+    @staticmethod
+    def _code_only(block: str) -> str:
+        # Strip Luau ``--`` line comments so assertions test on
+        # executed code, not commentary.
+        lines = []
+        for line in block.splitlines():
+            stripped = line.lstrip()
+            if stripped.startswith("--"):
+                continue
+            # Trim trailing inline comment.
+            if " --" in line:
+                line = line.split(" --", 1)[0]
+            lines.append(line)
+        return "\n".join(lines)
+
+    def _collect_block(self, src: str) -> str:
+        assert "collectDescendantIds" in src
+        # Take from the first "collectDescendantIds = function(" to the
+        # closing ",\n" of the function table entry.
+        after = src.split("collectDescendantIds")[1]
+        block = after.split("end,", 1)[0]
+        return self._code_only(block)
+
+    def test_client_entrypoint_collect_descendant_ids_dfs(self):
+        from converter.autogen import generate_scene_runtime_client_entrypoint
+        src = generate_scene_runtime_client_entrypoint().source
+        block = self._collect_block(src)
+        # The fixed implementation defines a recursive walk that
+        # visits children first, then appends self. The pre-fix
+        # implementation called GetDescendants() and used table.insert
+        # at index 1 to reverse it.
+        assert "GetChildren" in block, (
+            "DFS post-order requires walking GetChildren recursively"
+        )
+        assert "GetDescendants" not in block, (
+            "collectDescendantIds must not use GetDescendants (BFS)"
+        )
+        # table.insert at index 1 was the reverse-BFS workaround; the
+        # post-order walker appends to the tail.
+        assert "table.insert(out, 1," not in block, (
+            "reversing GetDescendants is not equivalent to DFS post-order"
+        )
+
+    def test_server_entrypoint_collect_descendant_ids_dfs(self):
+        from converter.autogen import generate_scene_runtime_server_entrypoint
+        src = generate_scene_runtime_server_entrypoint().source
+        block = self._collect_block(src)
+        assert "GetChildren" in block, (
+            "server entrypoint DFS post-order requires GetChildren walk"
+        )
+        assert "GetDescendants" not in block, (
+            "collectDescendantIds must not use GetDescendants (BFS)"
+        )
+        assert "table.insert(out, 1," not in block, (
+            "reversing GetDescendants is not equivalent to DFS post-order"
+        )

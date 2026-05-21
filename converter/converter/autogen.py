@@ -566,6 +566,14 @@ _SCENE_RUNTIME_CLIENT_SOURCE: str = '''\
 
 local RS = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
+
+-- Resolve the live ``PlayerGui`` for the local player so UI-bound
+-- ``_SceneRuntimeId`` lookups hit the interactive UI tree (Players
+-- clone StarterGui into PlayerGui at spawn; runtime components must
+-- attach to the live clone, not the template).
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer and LocalPlayer:WaitForChild("PlayerGui", 10)
 
 local SceneRuntime = require(RS:WaitForChild("SceneRuntime"))
 local Plan = require(RS:WaitForChild("SceneRuntimePlan"))
@@ -579,9 +587,20 @@ local function workspaceFind(sceneRuntimeId)
             return inst
         end
     end
-    for _, gui in game:GetService("StarterGui"):GetDescendants() do
-        if gui:GetAttribute("_SceneRuntimeId") == sceneRuntimeId then
-            return gui
+    -- UI lives under PlayerGui at runtime (StarterGui is the template
+    -- that gets cloned per-player). Fall back to StarterGui only when
+    -- PlayerGui isn't available (edge case during early lifecycle).
+    if PlayerGui then
+        for _, gui in PlayerGui:GetDescendants() do
+            if gui:GetAttribute("_SceneRuntimeId") == sceneRuntimeId then
+                return gui
+            end
+        end
+    else
+        for _, gui in game:GetService("StarterGui"):GetDescendants() do
+            if gui:GetAttribute("_SceneRuntimeId") == sceneRuntimeId then
+                return gui
+            end
         end
     end
     return nil
@@ -639,13 +658,18 @@ local services = {
         return clone
     end,
     collectDescendantIds = function(inst)
+        -- DFS post-order (children deepest-first, then self), per the
+        -- design doc's recursive-teardown contract. Reversing
+        -- ``GetDescendants`` (BFS) is NOT equivalent.
         local out = {}
-        for _, d in inst:GetDescendants() do
-            local id = d:GetAttribute("_SceneRuntimeId")
-            if id then table.insert(out, 1, id) end
+        local function walk(node)
+            for _, child in node:GetChildren() do
+                walk(child)
+            end
+            local id = node:GetAttribute("_SceneRuntimeId")
+            if id then table.insert(out, id) end
         end
-        local id = inst:GetAttribute("_SceneRuntimeId")
-        if id then table.insert(out, 1, id) end
+        walk(inst)
         return out
     end,
     destroyInstance = function(inst)
@@ -728,13 +752,18 @@ local services = {
         return clone
     end,
     collectDescendantIds = function(inst)
+        -- DFS post-order (children deepest-first, then self), per the
+        -- design doc's recursive-teardown contract. Reversing
+        -- ``GetDescendants`` (BFS) is NOT equivalent.
         local out = {}
-        for _, d in inst:GetDescendants() do
-            local id = d:GetAttribute("_SceneRuntimeId")
-            if id then table.insert(out, 1, id) end
+        local function walk(node)
+            for _, child in node:GetChildren() do
+                walk(child)
+            end
+            local id = node:GetAttribute("_SceneRuntimeId")
+            if id then table.insert(out, id) end
         end
-        local id = inst:GetAttribute("_SceneRuntimeId")
-        if id then table.insert(out, 1, id) end
+        walk(inst)
         return out
     end,
     destroyInstance = function(inst)
