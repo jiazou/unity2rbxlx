@@ -4389,6 +4389,15 @@ script.Disabled = true
             )
             return
 
+        # R2-P1.3 (contract resolution): rewrite asset/SO refs before
+        # embedding the plan. Assets become ``rbxassetid://...``;
+        # ScriptableObjects get a ``guid -> dotted module path`` map the
+        # host runtime consults at ref-resolution time. Both mutations
+        # happen in-place on ``scene_runtime`` so the embedded plan
+        # ModuleScript reflects the final shape.
+        self._build_scriptable_object_module_map(scene_runtime)
+        self._rewrite_scene_runtime_asset_refs(scene_runtime)
+
         _replace_or_add(generate_scene_runtime_plan_module(
             cast("dict", scene_runtime),
         ))
@@ -4400,20 +4409,25 @@ script.Disabled = true
         )
         # Stash on ctx so the report writers (and tests) can inspect.
         scene_runtime["cross_domain_edges"] = list(edges)
+        # Idempotency: strip the prior cross-domain marker block on every
+        # re-run, then re-append a fresh one ONLY when edges exist. The
+        # pre-R2 path only stripped when ``edges`` was non-empty, so a
+        # rerun that went from edgeful -> edge-free left a stale block
+        # behind (codex round-2 P2).
+        unconverted_path = self.output_dir / "UNCONVERTED.md"
+        try:
+            existing_md = (
+                unconverted_path.read_text(encoding="utf-8")
+                if unconverted_path.exists() else ""
+            )
+        except OSError:
+            existing_md = ""
+        marker = "## Cross-domain references (scene-runtime v1)"
+        had_marker = marker in existing_md
+        if had_marker:
+            existing_md = existing_md.split(marker, 1)[0].rstrip() + "\n"
         if edges:
             report_md = render_cross_domain_report([dict(e) for e in edges])
-            unconverted_path = self.output_dir / "UNCONVERTED.md"
-            try:
-                existing_md = (
-                    unconverted_path.read_text(encoding="utf-8")
-                    if unconverted_path.exists() else ""
-                )
-            except OSError:
-                existing_md = ""
-            # Strip prior cross-domain block on re-run.
-            marker = "## Cross-domain references (scene-runtime v1)"
-            if marker in existing_md:
-                existing_md = existing_md.split(marker, 1)[0].rstrip() + "\n"
             unconverted_path.write_text(
                 (existing_md.rstrip() + ("\n\n" if existing_md.strip() else ""))
                 + report_md,
@@ -4423,6 +4437,10 @@ script.Disabled = true
                 "[write_output] scene-runtime generic: %d cross-domain "
                 "edges -> UNCONVERTED.md", len(edges),
             )
+        elif had_marker:
+            # Edge-free rerun: write back the marker-stripped body so the
+            # stale block doesn't linger (R2-P2 idempotency fix).
+            unconverted_path.write_text(existing_md, encoding="utf-8")
         injected_total = 4
         if "SceneRuntime" in existing_names:
             injected_total -= 0  # we always replace, so count remains
@@ -4431,6 +4449,151 @@ script.Disabled = true
             "plan, and entrypoints (%d runtime-bearing modules)",
             len(runtime_bearing),
         )
+
+    def _build_scriptable_object_module_map(
+        self, scene_runtime: dict[str, object],
+    ) -> None:
+        """R2-P1.3: build ``scene_runtime.scriptable_objects`` -- a
+        ``guid -> dotted DataModel path`` map covering every emitted SO
+        ModuleScript. The host runtime resolves ``scriptable_object``
+        ref rows by looking the persisted GUID up in this map and
+        requiring the resulting module path.
+
+        Source of truth: ``self.state.scriptable_objects`` (the SO
+        converter result) + ``self.state.guid_index`` (path -> GUID).
+        Container resolves via the SO RbxScript's ``parent_path`` -- the
+        same shape ``_stamp_container_and_path`` writes for runtime-
+        bearing modules.
+
+        Idempotent: rebuilds the map every run; legacy plans that lacked
+        the map still resolve via the runtime's fallback passthrough
+        (returns ``nil`` rather than crashing).
+        """
+        from converter.scriptable_object_converter import (
+            AssetConversionResult,
+            resolve_unique_asset_names,
+        )
+        so_state = getattr(self.state, "scriptable_objects", None)
+        if not isinstance(so_state, AssetConversionResult):
+            return
+        if not so_state.assets:
+            return
+        guid_index = getattr(self.state, "guid_index", None)
+        if guid_index is None:
+            return
+        unique = resolve_unique_asset_names(so_state.assets)
+        # Reverse-lookup: source_path -> guid. Resolved paths in the
+        # GuidIndex may be absolute; the SO converter records the absolute
+        # path too, so reuse ``guid_for_path`` (which normalises via
+        # ``Path.resolve()``) where possible. Build the explicit reverse
+        # map here so a single absolute-vs-relative skew doesn't drop the
+        # entire scriptable_objects map.
+        path_to_guid: dict[Path, str] = {}
+        for guid, entry in guid_index.guid_to_entry.items():
+            path_to_guid[entry.asset_path] = guid
+            try:
+                path_to_guid[entry.asset_path.resolve()] = guid
+            except (OSError, RuntimeError):
+                pass
+        # rbx_place.scripts carries the final parent_path each SO was
+        # routed to by storage_classifier. Build a stem -> parent_path
+        # lookup keyed by the unique-asset-name resolver's stems.
+        place_scripts_by_name: dict[str, str] = {}
+        for script in self.state.rbx_place.scripts:
+            container = getattr(script, "parent_path", None) or "ReplicatedStorage"
+            place_scripts_by_name[script.name] = container
+        so_map: dict[str, str] = {}
+        for asset in so_state.assets:
+            stem = unique.get(id(asset))
+            if not stem:
+                continue
+            guid = path_to_guid.get(asset.source_path)
+            if not guid:
+                try:
+                    guid = path_to_guid.get(asset.source_path.resolve())
+                except (OSError, RuntimeError):
+                    guid = None
+            if not guid:
+                continue
+            container = place_scripts_by_name.get(stem, "ReplicatedStorage")
+            so_map[guid] = f"{container}.{stem}"
+        if so_map:
+            scene_runtime["scriptable_objects"] = so_map
+            log.info(
+                "[write_output] scene-runtime generic: emitted %d "
+                "scriptable_object refs in plan map", len(so_map),
+            )
+
+    def _rewrite_scene_runtime_asset_refs(
+        self, scene_runtime: dict[str, object],
+    ) -> None:
+        """R2-P1.3: rewrite every ``target_kind == "asset"`` reference's
+        ``target_ref`` from raw Unity GUID to ``rbxassetid://...`` using
+        ``ctx.uploaded_assets`` as the source of truth. The contract
+        states asset refs arrive at the runtime in rbxassetid form;
+        pre-fix the planner persisted the GUID and no later pass
+        rewrote it, so module fields backed by sprites/sounds got the
+        literal GUID string instead of a usable asset id.
+
+        Idempotent: refs already in ``rbxassetid://`` form are left
+        untouched. Unresolvable GUIDs (no entry in uploaded_assets) keep
+        the raw GUID so the operator sees the unresolved reference
+        rather than silently dropping the ref.
+        """
+        from core.unity_types import GuidIndex
+        uploaded = self.ctx.uploaded_assets or {}
+        guid_index = getattr(self.state, "guid_index", None)
+        if not uploaded or not isinstance(guid_index, GuidIndex):
+            return
+
+        def _resolve(guid: str) -> str | None:
+            path = guid_index.resolve(guid)
+            if path is None:
+                return None
+            # uploaded_assets is keyed by string (project-relative or
+            # absolute path, depending on the producer). Try the resolved
+            # path string first, then a string-cast pass.
+            for key in (str(path), path.as_posix()):
+                if key in uploaded:
+                    return uploaded[key]
+            return None
+
+        def _rewrite_ref_list(refs: list) -> int:
+            n = 0
+            for ref in refs:
+                if not isinstance(ref, dict):
+                    continue
+                if ref.get("target_kind") != "asset":
+                    continue
+                target = ref.get("target_ref", "")
+                if not isinstance(target, str) or target.startswith("rbxassetid://"):
+                    continue
+                asset_url = _resolve(target)
+                if asset_url:
+                    ref["target_ref"] = asset_url
+                    n += 1
+            return n
+
+        total = 0
+        scenes = scene_runtime.get("scenes", {})
+        if isinstance(scenes, dict):
+            for scene in scenes.values():
+                if isinstance(scene, dict):
+                    refs = scene.get("references", [])
+                    if isinstance(refs, list):
+                        total += _rewrite_ref_list(refs)
+        prefabs = scene_runtime.get("prefabs", {})
+        if isinstance(prefabs, dict):
+            for prefab in prefabs.values():
+                if isinstance(prefab, dict):
+                    refs = prefab.get("references", [])
+                    if isinstance(refs, list):
+                        total += _rewrite_ref_list(refs)
+        if total:
+            log.info(
+                "[write_output] scene-runtime generic: rewrote %d asset "
+                "refs to rbxassetid form", total,
+            )
 
     def _run_phase(self, phase: str) -> None:
         """Execute a single phase with logging and context tracking."""

@@ -219,6 +219,13 @@ class SceneRuntimeArtifact(TypedDict, total=False):
     # Low-confidence verdicts (``script_id``s the operator may want to
     # pin via ``domain_overrides``).
     low_confidence_modules: list[str]
+    # R2-P1.3: Unity GUID -> dotted DataModel path for emitted SO
+    # ModuleScripts. Populated by ``_subphase_inject_scene_runtime`` once
+    # the SO converter has produced its asset list and storage_classifier
+    # has chosen each module's container. The host runtime's
+    # ``scriptable_object`` ref resolver looks the persisted GUID up in
+    # this map and ``require``s the resulting module path.
+    scriptable_objects: dict[str, str]
 
 
 # ---------------------------------------------------------------------------

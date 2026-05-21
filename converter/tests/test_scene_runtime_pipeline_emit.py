@@ -290,3 +290,224 @@ class TestCrossDomainReport:
         assert "## Unrelated" in contents
         assert "this stays" in contents
         assert "## Cross-domain references" in contents
+
+
+# ---------------------------------------------------------------------------
+# R2-P2: cross-domain report idempotency on edgeful->edge-free reruns.
+# ---------------------------------------------------------------------------
+
+class TestCrossDomainReportEdgeFreeRerun:
+    """Codex round-2 P2: when a re-run goes from edgeful to edge-free,
+    the prior cross-domain block must be removed from UNCONVERTED.md.
+    Pre-fix the subphase only stripped when ``edges`` was non-empty, so
+    the stale block lingered forever."""
+
+    def test_edgeful_then_edgefree_rerun_strips_stale_block(self, tmp_path):
+        plan_edgeful = {
+            "modules": {
+                "src": {"stem": "Src", "runtime_bearing": True,
+                        "domain": "client", "module_path": "ReplicatedStorage.Src"},
+                "tgt": {"stem": "Tgt", "runtime_bearing": True,
+                        "domain": "server", "module_path": "ReplicatedStorage.Tgt"},
+            },
+            "scenes": {
+                "A.unity": {
+                    "instances": [
+                        {"instance_id": "A.unity:1", "script_id": "src",
+                         "game_object_id": "A.unity:1", "active": True,
+                         "enabled": True, "config": {}},
+                        {"instance_id": "A.unity:2", "script_id": "tgt",
+                         "game_object_id": "A.unity:2", "active": True,
+                         "enabled": True, "config": {}},
+                    ],
+                    "references": [{
+                        "from": "A.unity:1", "field": "p", "index": None,
+                        "target_kind": "component", "target_ref": "A.unity:2",
+                        "target_is_ui": False,
+                    }],
+                    "lifecycle_order": ["A.unity:1", "A.unity:2"],
+                },
+            },
+            "prefabs": {}, "domain_overrides": {},
+        }
+        p = _make_pipeline_with_ctx(tmp_path, "generic", plan_edgeful)
+        p._subphase_inject_scene_runtime()
+        # First run: marker present.
+        contents = (tmp_path / "UNCONVERTED.md").read_text(encoding="utf-8")
+        assert "## Cross-domain references" in contents
+
+        # Swap to an edge-free plan and re-run.
+        plan_edgefree = dict(plan_edgeful)
+        plan_edgefree["scenes"] = {
+            "A.unity": {
+                "instances": plan_edgefree["scenes"]["A.unity"]["instances"],
+                "references": [],
+                "lifecycle_order": plan_edgefree["scenes"]["A.unity"][
+                    "lifecycle_order"],
+            },
+        }
+        p.ctx.scene_runtime = plan_edgefree
+        p._subphase_inject_scene_runtime()
+        contents_after = (tmp_path / "UNCONVERTED.md").read_text(
+            encoding="utf-8",
+        )
+        assert "## Cross-domain references" not in contents_after, (
+            f"edge-free rerun must strip the stale block; got: "
+            f"{contents_after!r}"
+        )
+
+    def test_edgefree_rerun_preserves_unrelated_blocks(self, tmp_path):
+        (tmp_path / "UNCONVERTED.md").write_text(
+            "## Unrelated\n\nkeepme\n\n"
+            "## Cross-domain references (scene-runtime v1)\n\n"
+            "stale stuff\n",
+            encoding="utf-8",
+        )
+        plan = _runtime_bearing_plan()  # no cross-domain edges
+        p = _make_pipeline_with_ctx(tmp_path, "generic", plan)
+        p._subphase_inject_scene_runtime()
+        contents = (tmp_path / "UNCONVERTED.md").read_text(encoding="utf-8")
+        assert "## Unrelated" in contents
+        assert "keepme" in contents
+        assert "## Cross-domain references" not in contents
+        assert "stale stuff" not in contents
+
+
+# ---------------------------------------------------------------------------
+# R2-P1.3: asset rewrite + scriptable_objects map populated in plan.
+# ---------------------------------------------------------------------------
+
+class TestAssetRefRewriteAndScriptableObjectsMap:
+    """Codex round-2 P1.3 (contract resolution):
+    - ``target_kind == "asset"`` refs persisted as Unity GUIDs must be
+      rewritten to ``rbxassetid://...`` using ``ctx.uploaded_assets``.
+    - ``target_kind == "scriptable_object"`` refs need an auxiliary
+      ``scene_runtime.scriptable_objects`` map (guid -> dotted module
+      path) the host runtime consults to require the live ModuleScript.
+    """
+
+    def test_asset_ref_rewritten_via_uploaded_assets(self, tmp_path):
+        from core.unity_types import GuidEntry, GuidIndex
+        sprite_abs = tmp_path / "Assets" / "Art" / "Diamond.png"
+        sprite_abs.parent.mkdir(parents=True, exist_ok=True)
+        sprite_abs.write_bytes(b"\x89PNG fake")
+        sprite_guid = "ab" + "0" * 30
+        idx = GuidIndex(project_root=tmp_path)
+        idx.guid_to_entry[sprite_guid] = GuidEntry(
+            guid=sprite_guid,
+            asset_path=sprite_abs,
+            relative_path=Path("Assets/Art/Diamond.png"),
+            kind="texture",
+        )
+        idx.path_to_guid[sprite_abs.resolve()] = sprite_guid
+
+        plan = {
+            "modules": {
+                "src": {"stem": "Src", "runtime_bearing": True,
+                        "domain": "client",
+                        "module_path": "ReplicatedStorage.Src"},
+            },
+            "scenes": {
+                "A.unity": {
+                    "instances": [
+                        {"instance_id": "A.unity:1", "script_id": "src",
+                         "game_object_id": "A.unity:1", "active": True,
+                         "enabled": True, "config": {}},
+                    ],
+                    "references": [{
+                        "from": "A.unity:1", "field": "icon", "index": None,
+                        "target_kind": "asset", "target_ref": sprite_guid,
+                        "target_is_ui": False,
+                    }],
+                    "lifecycle_order": ["A.unity:1"],
+                },
+            },
+            "prefabs": {}, "domain_overrides": {},
+        }
+        p = _make_pipeline_with_ctx(tmp_path, "generic", plan)
+        p.state.guid_index = idx
+        p.ctx.uploaded_assets = {str(sprite_abs): "rbxassetid://42424242"}
+        p._subphase_inject_scene_runtime()
+
+        rewritten = (p.ctx.scene_runtime["scenes"]["A.unity"]
+                     ["references"][0]["target_ref"])
+        assert rewritten == "rbxassetid://42424242", (
+            f"asset GUID must rewrite to rbxassetid url; got {rewritten!r}"
+        )
+
+    def test_unresolvable_asset_guid_left_in_place(self, tmp_path):
+        from core.unity_types import GuidIndex
+        idx = GuidIndex(project_root=tmp_path)
+        plan = {
+            "modules": {
+                "src": {"stem": "Src", "runtime_bearing": True,
+                        "domain": "client",
+                        "module_path": "ReplicatedStorage.Src"},
+            },
+            "scenes": {
+                "A.unity": {
+                    "instances": [
+                        {"instance_id": "A.unity:1", "script_id": "src",
+                         "game_object_id": "A.unity:1", "active": True,
+                         "enabled": True, "config": {}},
+                    ],
+                    "references": [{
+                        "from": "A.unity:1", "field": "icon", "index": None,
+                        "target_kind": "asset", "target_ref": "deadbeef" * 4,
+                        "target_is_ui": False,
+                    }],
+                    "lifecycle_order": ["A.unity:1"],
+                },
+            },
+            "prefabs": {}, "domain_overrides": {},
+        }
+        p = _make_pipeline_with_ctx(tmp_path, "generic", plan)
+        p.state.guid_index = idx
+        p.ctx.uploaded_assets = {"unrelated.png": "rbxassetid://1"}
+        p._subphase_inject_scene_runtime()
+        # GUID unchanged -- operator sees the unresolved reference.
+        unchanged = (p.ctx.scene_runtime["scenes"]["A.unity"]
+                     ["references"][0]["target_ref"])
+        assert unchanged == "deadbeef" * 4
+
+    def test_scriptable_object_map_populated_in_plan(self, tmp_path):
+        from core.unity_types import GuidEntry, GuidIndex
+        from converter.scriptable_object_converter import (
+            AssetConversionResult, ConvertedAsset,
+        )
+        so_abs = tmp_path / "Assets" / "Data" / "Settings.asset"
+        so_abs.parent.mkdir(parents=True, exist_ok=True)
+        so_abs.write_text("placeholder", encoding="utf-8")
+        so_guid = "1234" + "0" * 28
+        idx = GuidIndex(project_root=tmp_path)
+        idx.guid_to_entry[so_guid] = GuidEntry(
+            guid=so_guid,
+            asset_path=so_abs,
+            relative_path=Path("Assets/Data/Settings.asset"),
+            kind="data",
+        )
+        idx.path_to_guid[so_abs.resolve()] = so_guid
+
+        so_result = AssetConversionResult()
+        so_result.assets.append(ConvertedAsset(
+            source_path=so_abs,
+            asset_name="Settings",
+            luau_source="return {}",
+        ))
+
+        plan = _runtime_bearing_plan()
+        p = _make_pipeline_with_ctx(tmp_path, "generic", plan)
+        p.state.guid_index = idx
+        p.state.scriptable_objects = so_result
+        # Pre-seed an RbxScript matching what write_output would have
+        # added; storage_classifier would have routed it to RS.
+        p.state.rbx_place.scripts.append(RbxScript(
+            name="Settings", source="return {}",
+            script_type="ModuleScript", parent_path="ReplicatedStorage",
+        ))
+        p._subphase_inject_scene_runtime()
+        so_map = p.ctx.scene_runtime.get("scriptable_objects")
+        assert so_map == {so_guid: "ReplicatedStorage.Settings"}, (
+            f"scriptable_objects map must carry guid -> dotted module path; "
+            f"got {so_map!r}"
+        )

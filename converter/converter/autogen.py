@@ -519,8 +519,13 @@ def _plan_to_luau(plan: dict) -> str:
 # (operator-only diagnostic surfaces like ``low_confidence_modules``) are
 # intentionally elided from the embedded plan -- the host doesn't read
 # them and they bloat the place's plan ModuleScript.
+#
+# ``scriptable_objects`` is the R2-P1.3 guid -> dotted-DataModel-path map
+# the host's ScriptableObject ref resolver consults; populated by
+# ``_subphase_inject_scene_runtime`` before this encoder runs.
 _PLAN_KEYS_FOR_HOST: tuple[str, ...] = (
     "modules", "scenes", "prefabs", "domain_overrides",
+    "scriptable_objects",
 )
 
 

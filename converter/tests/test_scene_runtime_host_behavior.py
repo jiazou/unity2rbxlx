@@ -1640,3 +1640,69 @@ class TestLateReEnableFiresStartOnFirstTransition:
         assert "afterSetActive=1" in out, (
             f"setActive(go, true) must fire Start once; got: {out}"
         )
+
+
+# ---------------------------------------------------------------------------
+# R2-P1.3: ScriptableObject ref resolves via plan.scriptable_objects map.
+# ---------------------------------------------------------------------------
+
+class TestScriptableObjectRefResolvesViaPlanMap:
+    """Codex round-2 P1.3 (contract resolution): the planner persists raw
+    Unity GUIDs for ``target_kind == "scriptable_object"`` refs. The host
+    runtime now reads ``plan.scriptable_objects[guid]`` to get the dotted
+    DataModel module path, then feeds THAT path to ``resolveModule``.
+    Pre-fix the runtime fed the raw GUID straight through, which always
+    resolved nil in production."""
+
+    def test_so_ref_resolves_module_via_plan_map(self):
+        scenario = textwrap.dedent("""\
+            local Foo = {} ; Foo.__index = Foo
+            function Foo.new(_) return setmetatable({}, Foo) end
+            function Foo:Awake()
+                assert(self.cfg ~= nil, "SO field must wire before Awake")
+                assert(self.cfg.value == 42, "SO module table must arrive")
+            end
+            local SettingsModule = {value = 42}
+            local plan = {
+                modules = {foo = {stem = "Foo", runtime_bearing = true,
+                                  module_path = "x"}},
+                scenes = {
+                    A = {
+                        instances = {{instance_id = "A:1", script_id = "foo",
+                                      game_object_id = "g", active = true,
+                                      enabled = true, config = {}}},
+                        references = {{
+                            ["from"] = "A:1", field = "cfg", index = nil,
+                            target_kind = "scriptable_object",
+                            target_ref = "guid-aaaa",
+                            target_is_ui = false,
+                        }},
+                        lifecycle_order = {"A:1"},
+                    },
+                },
+                prefabs = {}, domain_overrides = {},
+                scriptable_objects = {
+                    ["guid-aaaa"] = "ReplicatedStorage.Settings",
+                },
+            }
+            local go = {Name = "G", _sceneRuntimeId = "g", _children = {}}
+            local services = servicesFor(plan, {foo = Foo}, {g = go})
+            -- resolveModule sees scriptId="guid-aaaa" + modulePath=mapped path.
+            services.resolveModule = function(scriptId, modulePath)
+                if scriptId == "foo" then return Foo end
+                if modulePath == "ReplicatedStorage.Settings" then
+                    return SettingsModule
+                end
+                return nil
+            end
+            local engine = SceneRuntime.new(services, plan)
+            engine:start(nil)
+            runDeferred()
+            print("DONE")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}"
+        assert "DONE" in out, (
+            f"SO ref must resolve via scriptable_objects map; got: {out}, "
+            f"err: {err}"
+        )

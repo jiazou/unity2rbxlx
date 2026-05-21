@@ -471,11 +471,25 @@ function SceneRuntime:_resolveReferenceTarget(refRow, componentByInstanceId)
 		-- ``instantiatePrefab``.
 		return target_ref
 	elseif target_kind == "scriptable_object" then
-		-- The SO module table; the services layer is expected to
-		-- ``require`` it during resolveModule fallthrough.
-		return self._services.resolveModule(target_ref, target_ref)
+		-- R2-P1.3 contract: ``target_ref`` is the Unity GUID; the plan
+		-- carries a ``scriptable_objects`` map (guid -> dotted DataModel
+		-- module path) the host uses to resolve the live ModuleScript
+		-- and ``require`` it. Pre-fix the runtime fed the raw GUID to
+		-- ``resolveModule`` which tried to walk
+		-- ``game:FindFirstChild(<guid>)`` -- always nil. Plans persisted
+		-- before R2 won't carry the map; fall back to the legacy passthrough
+		-- so the resolver still attempts the require (preserves the pre-R2
+		-- failure mode rather than upgrading it to a hard crash).
+		local so_map = (self._plan and self._plan.scriptable_objects) or {}
+		local module_path = so_map[target_ref] or target_ref
+		return self._services.resolveModule(target_ref, module_path)
 	elseif target_kind == "asset" then
-		return target_ref   -- ``rbxassetid://...`` string
+		-- R2-P1.3 contract: ``target_ref`` is ``rbxassetid://...`` after
+		-- the pipeline's post-upload rewrite phase. Plans persisted before
+		-- R2 may still carry raw Unity GUIDs; the host can't do anything
+		-- useful with those, so they pass through and surface as broken
+		-- asset refs (matching the pre-R2 behavior).
+		return target_ref
 	end
 	return nil
 end
