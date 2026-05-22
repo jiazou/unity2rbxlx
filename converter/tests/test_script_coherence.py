@@ -39,6 +39,55 @@ class TestRequireReclassification:
         fixes = fix_require_classifications(scripts)
         assert scripts[0].script_type == "ModuleScript"
 
+    def test_multiline_table_return_not_double_returned(self):
+        """A module whose terminal return is a multi-line table literal
+        must NOT get a second ``return <name>`` appended.
+
+        Regression for the PlanarReflection double-return: when a script
+        is reclassified to ModuleScript because another script requires
+        it, ``inject_require_calls`` appends ``return <dep>`` if the
+        module lacks a return. The old check only scanned the last 3
+        lines, so a return like
+
+            return {
+                foo = foo,
+                bar = bar,
+            }
+
+        (whose ``return`` keyword sits >3 lines from the end) was missed
+        and a second top-level return was appended — producing
+        ``SyntaxError: Expected <eof>, got 'return'`` in luau-analyze.
+        """
+        target_src = (
+            'local PlanarReflection = {}\n'
+            'local function WaterTileBeingRendered() end\n'
+            'local function RenderHelpCameras() end\n'
+            'return {\n'
+            '\tWaterTileBeingRendered = WaterTileBeingRendered,\n'
+            '\tRenderHelpCameras = RenderHelpCameras,\n'
+            '}\n'
+        )
+        scripts = [
+            RbxScript(
+                name="Water",
+                source='local pr = PlanarReflection\npr.WaterTileBeingRendered()',
+                script_type="Script",
+            ),
+            RbxScript(name="PlanarReflection", source=target_src, script_type="Script"),
+        ]
+        inject_require_calls(scripts, {"Water": ["PlanarReflection"]})
+
+        pr_src = scripts[1].source
+        # Exactly one top-level (column-0) return — the AI's table return.
+        import re as _re
+        top_level_returns = _re.findall(r'^return\b', pr_src, _re.MULTILINE)
+        assert len(top_level_returns) == 1, (
+            f"expected exactly one top-level return, got "
+            f"{len(top_level_returns)}; source:\n{pr_src}"
+        )
+        # And specifically no appended bare `return PlanarReflection`.
+        assert "\n\nreturn PlanarReflection\n" not in pr_src
+
     def test_return_statement_does_not_demote_fps_controller(self):
         """An FPS controller that exposes a Player table at the top and
         ends with ``return Player`` would otherwise be demoted to a

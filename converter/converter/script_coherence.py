@@ -152,13 +152,26 @@ def inject_require_calls(
                 target.script_type = "ModuleScript"
                 log.info("  Reclassified '%s' from %s to ModuleScript (required by '%s')",
                          dep, old_type, s.name)
-                # Add return statement if missing
+                # Add return statement if missing.
+                #
+                # Detect an existing module return at column 0 (the
+                # terminal `return <expr>` of a Luau module). A previous
+                # implementation only scanned the last 3 lines, which
+                # missed a multi-line table return —
+                #     return {
+                #         foo = foo,
+                #         bar = bar,
+                #     }
+                # pushes the `return` keyword >3 lines from the end, so
+                # the heuristic appended a SECOND `return <dep>` and
+                # produced `Expected <eof>, got 'return'` (a top-level
+                # statement after a return is illegal in Luau). A
+                # column-0 `^return\b` match is robust to table bodies
+                # of any length and won't false-match indented guard
+                # returns inside if-blocks/functions.
                 stripped_source = target.source.rstrip()
-                # Check if already ends with any return statement
-                last_lines = stripped_source.split('\n')
-                has_return = any(
-                    line.strip().startswith('return ')
-                    for line in last_lines[-3:]  # check last 3 lines
+                has_return = bool(
+                    re.search(r'^return\b', stripped_source, re.MULTILINE)
                 )
                 if not has_return:
                     target.source = stripped_source + f"\n\nreturn {dep}\n"

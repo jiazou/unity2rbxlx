@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Literal
 
@@ -45,6 +46,11 @@ _KNOWN_FIXTURE_FIELDS = frozenset({
     "id", "feature", "play_mode", "setup_luau", "input_sequence",
     "wait_seconds", "assert_luau", "expect", "tolerance", "depends_on",
     "evidence_on_fail",
+    # Codex finding #6: polling-assert timeout. Default 0 = legacy one-shot;
+    # positive value re-runs the assertion every poll_interval until it
+    # matches expect or the timeout elapses. Fixes the "wait → assert once"
+    # flakiness identified in dry-run.
+    "assert_timeout_seconds",
 })
 _KNOWN_INPUT_KINDS = frozenset({"keyboard", "mouse_move", "mouse_click"})
 
@@ -117,6 +123,17 @@ def validate_behavior_file(path: Path) -> dict:
                     f"{path.name}[{fid}]: wait action missing wait_time_ms"
                 )
 
+        # assert_timeout_seconds: optional non-negative float. Zero (or
+        # absent) means single-shot assertion preserving legacy behavior;
+        # positive means poll until the value matches expect or the
+        # timeout elapses.
+        ats = f.get("assert_timeout_seconds")
+        if ats is not None:
+            if not isinstance(ats, (int, float)) or isinstance(ats, bool) or ats < 0:
+                raise BehaviorSchemaError(
+                    f"{path.name}[{fid}]: assert_timeout_seconds must be a non-negative number"
+                )
+
         # depends_on must reference earlier ids — forward references would
         # invert the harness's ordering guarantees and produce silently
         # wrong sequencing.
@@ -150,6 +167,14 @@ class Step:
     kind: StepKind
     payload: Any = None
     note: str = ""
+    # Polling-assert metadata (Codex finding #6). Only set on
+    # ``execute_assert`` steps when the fixture declares
+    # ``assert_timeout_seconds > 0``. Zero/None keeps legacy single-shot
+    # behavior; positive means the runner re-executes ``payload`` every
+    # ``poll_interval_seconds`` until the value matches ``expect`` or the
+    # timeout elapses.
+    timeout_seconds: float = 0.0
+    poll_interval_seconds: float = 0.5
 
 
 def plan_for_fixture(fixture: dict, preamble: str) -> list[Step]:
@@ -212,10 +237,12 @@ def plan_for_fixture(fixture: dict, preamble: str) -> list[Step]:
         f"end)\n"
         f"return {{ ok = _ok, value = _val }}"
     )
+    timeout_s = float(fixture.get("assert_timeout_seconds") or 0.0)
     steps.append(Step(
         kind="execute_assert",
         payload=wrapped,
         note=f"expect={fixture['expect']!r}",
+        timeout_seconds=timeout_s,
     ))
 
     return steps
@@ -240,6 +267,15 @@ class FixtureResult:
     step_results: list[StepResult] = field(default_factory=list)
     assertion_value: Any = None
     error: str | None = None
+    # Codex finding #11: timing per fixture so the combined report can
+    # surface durations + so concurrent runs don't lose causality.
+    started_at: str | None = None
+    finished_at: str | None = None
+    duration_seconds: float = 0.0
+    # Codex finding #6: how many times the assertion ran (>1 only when a
+    # polling assert had to retry). Useful for surfacing flakiness signal
+    # in the JSON report.
+    attempts: int = 0
 
 
 # Injection types: the runner calls these to interact with Studio. The
@@ -262,6 +298,56 @@ def _values_match(got: Any, expected: Any, tolerance: float | None) -> bool:
     return got == expected
 
 
+def _run_assert_step(
+    step: Step,
+    fixture: dict,
+    *,
+    execute_luau: ExecuteLuauFn,
+    sleep: SleepFn,
+    monotonic: Callable[[], float],
+) -> tuple[bool, Any, str | None, int]:
+    """Run the assert step, polling if step.timeout_seconds > 0.
+
+    Returns ``(passed, value, error, attempts)``. ``error`` is non-None
+    when the Luau assertion itself raised; mismatches don't go into
+    ``error`` so the caller can report them as ``expected X, got Y``.
+    """
+    tolerance = fixture.get("tolerance")
+    expected = fixture["expect"]
+    deadline = monotonic() + step.timeout_seconds if step.timeout_seconds > 0 else None
+    attempts = 0
+    last_value: Any = None
+    last_error: str | None = None
+
+    while True:
+        attempts += 1
+        out = execute_luau(step.payload)
+        if not isinstance(out, dict):
+            raise RuntimeError(
+                f"assertion returned non-dict {out!r} — "
+                f"execute_luau adapter must return the dict literal "
+                f"from the wrapped script"
+            )
+        if not out.get("ok"):
+            last_error = f"assertion raised: {out.get('value')!r}"
+            last_value = out.get("value")
+        else:
+            last_error = None
+            last_value = out.get("value")
+            if _values_match(last_value, expected, tolerance):
+                return True, last_value, None, attempts
+
+        # No timeout configured: single-shot legacy path. Return what we
+        # got (matched or not).
+        if deadline is None:
+            return False, last_value, last_error, attempts
+
+        if monotonic() >= deadline:
+            return False, last_value, last_error, attempts
+
+        sleep(step.poll_interval_seconds)
+
+
 def run_fixture(
     fixture: dict,
     preamble: str,
@@ -270,81 +356,85 @@ def run_fixture(
     keyboard_input: KeyboardInputFn,
     mouse_input: MouseInputFn,
     sleep: SleepFn = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> FixtureResult:
     """Execute a single fixture and return a structured result.
 
     The three MCP callables are the only side-effect surface. ``sleep``
-    is injected so unit tests can override it with a no-op.
+    and ``monotonic`` are injected so unit tests can drive deterministic
+    timing (zero-sleep + a fake clock) without real wall delays.
     """
     fid = fixture["id"]
     plan = plan_for_fixture(fixture, preamble)
     result = FixtureResult(fixture_id=fid, passed=False)
+    started = monotonic()
+    result.started_at = datetime.now(timezone.utc).isoformat()
 
-    for step in plan:
-        try:
-            if step.kind == "safety_check_studio":
-                # Cheap inline check before any other work touches Studio.
-                guard = (
-                    'assert(game.Name ~= "Agas Map of London", '
-                    '"refusing to run on Agas Map of London Studio")\n'
-                    "return true"
-                )
-                out = execute_luau(guard)
-                result.step_results.append(StepResult(step=step, ok=True, output=out))
-
-            elif step.kind == "execute_setup":
-                out = execute_luau(step.payload)
-                result.step_results.append(StepResult(step=step, ok=True, output=out))
-
-            elif step.kind == "keyboard_input":
-                action = {k: v for k, v in step.payload.items() if k != "kind"}
-                out = keyboard_input([action])
-                result.step_results.append(StepResult(step=step, ok=True, output=out))
-
-            elif step.kind == "mouse_input":
-                action = {k: v for k, v in step.payload.items() if k != "kind"}
-                out = mouse_input([action])
-                result.step_results.append(StepResult(step=step, ok=True, output=out))
-
-            elif step.kind == "wait":
-                sleep(step.payload["seconds"])
-                result.step_results.append(StepResult(step=step, ok=True))
-
-            elif step.kind == "execute_assert":
-                out = execute_luau(step.payload)
-                # Out shape: { "ok": bool, "value": <any> }. ok=false means
-                # the user's assertion raised — surface that distinctly so
-                # the failure message points at the Luau error, not at the
-                # numeric/value mismatch.
-                if not isinstance(out, dict):
-                    raise RuntimeError(
-                        f"assertion returned non-dict {out!r} — "
-                        f"execute_luau adapter must return the dict literal "
-                        f"from the wrapped script"
+    try:
+        for step in plan:
+            try:
+                if step.kind == "safety_check_studio":
+                    # Cheap inline check before any other work touches Studio.
+                    guard = (
+                        'assert(game.Name ~= "Agas Map of London", '
+                        '"refusing to run on Agas Map of London Studio")\n'
+                        "return true"
                     )
-                if not out.get("ok"):
-                    raise RuntimeError(f"assertion raised: {out.get('value')!r}")
-                result.assertion_value = out.get("value")
-                tolerance = fixture.get("tolerance")
-                result.passed = _values_match(
-                    result.assertion_value, fixture["expect"], tolerance,
-                )
+                    out = execute_luau(guard)
+                    result.step_results.append(StepResult(step=step, ok=True, output=out))
+
+                elif step.kind == "execute_setup":
+                    out = execute_luau(step.payload)
+                    result.step_results.append(StepResult(step=step, ok=True, output=out))
+
+                elif step.kind == "keyboard_input":
+                    action = {k: v for k, v in step.payload.items() if k != "kind"}
+                    out = keyboard_input([action])
+                    result.step_results.append(StepResult(step=step, ok=True, output=out))
+
+                elif step.kind == "mouse_input":
+                    action = {k: v for k, v in step.payload.items() if k != "kind"}
+                    out = mouse_input([action])
+                    result.step_results.append(StepResult(step=step, ok=True, output=out))
+
+                elif step.kind == "wait":
+                    sleep(step.payload["seconds"])
+                    result.step_results.append(StepResult(step=step, ok=True))
+
+                elif step.kind == "execute_assert":
+                    passed, value, err, attempts = _run_assert_step(
+                        step, fixture,
+                        execute_luau=execute_luau,
+                        sleep=sleep,
+                        monotonic=monotonic,
+                    )
+                    result.assertion_value = value
+                    result.attempts = attempts
+                    if err is not None:
+                        # Luau-side error — surface distinctly via the same
+                        # RuntimeError path the legacy code used so the
+                        # outer except handler records it on the result.
+                        raise RuntimeError(err)
+                    result.passed = passed
+                    result.step_results.append(StepResult(
+                        step=step, ok=passed, output={"ok": True, "value": value},
+                        error=None if passed else (
+                            f"expected {fixture['expect']!r}, "
+                            f"got {value!r} after {attempts} attempt(s)"
+                        ),
+                    ))
+
+            except Exception as exc:
                 result.step_results.append(StepResult(
-                    step=step, ok=result.passed, output=out,
-                    error=None if result.passed else (
-                        f"expected {fixture['expect']!r}, "
-                        f"got {result.assertion_value!r}"
-                    ),
+                    step=step, ok=False, error=str(exc),
                 ))
+                result.error = str(exc)
+                return result
 
-        except Exception as exc:
-            result.step_results.append(StepResult(
-                step=step, ok=False, error=str(exc),
-            ))
-            result.error = str(exc)
-            return result
-
-    return result
+        return result
+    finally:
+        result.finished_at = datetime.now(timezone.utc).isoformat()
+        result.duration_seconds = round(monotonic() - started, 3)
 
 
 def load_fixtures(behavior_path: Path) -> tuple[str, list[dict]]:
@@ -368,3 +458,117 @@ def iter_fixtures(
     for f in fixtures:
         if f["id"] in keep:
             yield f
+
+
+# ---------------------------------------------------------------------------
+# Reporting (Codex findings #10 + #11)
+# ---------------------------------------------------------------------------
+
+# Schema version for the JSON report shape. Bumped on breaking changes so
+# downstream consumers (nightly diff tools, future report comparators)
+# can fail closed instead of mis-parsing.
+REPORT_SCHEMA_VERSION = 1
+
+# Exit code contract documented in the /e2e-test skill. Cron-friendly:
+# distinct numbers per failure mode so an operator can grep the run log.
+EXIT_OK = 0
+EXIT_CONVERSION_FAILED = 2
+EXIT_STUDIO_NOT_READY = 3
+EXIT_FIXTURE_FAILED = 4
+
+
+def _fixture_to_report(
+    fixture: dict,
+    result: FixtureResult,
+) -> dict:
+    """Render one fixture's result into the JSON report shape."""
+    return {
+        "id": result.fixture_id,
+        "feature": fixture.get("feature", ""),
+        "passed": result.passed,
+        "expected": fixture["expect"],
+        "value": result.assertion_value,
+        "started_at": result.started_at,
+        "finished_at": result.finished_at,
+        "duration_seconds": result.duration_seconds,
+        "attempts": result.attempts,
+        "error": result.error,
+    }
+
+
+def serialize_results(
+    fixtures: list[dict],
+    results: list[FixtureResult],
+    *,
+    project: str,
+    run_id: str,
+    rbxlx_path: str | Path | None = None,
+    conversion: dict | None = None,
+) -> dict:
+    """Produce the canonical combined JSON report.
+
+    ``fixtures`` and ``results`` are paired by index — caller is
+    responsible for keeping them aligned. ``conversion`` is the
+    offline-assembly manifest dict (or None when running fixtures
+    only).
+    """
+    if len(fixtures) != len(results):
+        raise ValueError(
+            f"fixture/result length mismatch: {len(fixtures)} vs {len(results)}"
+        )
+    fixture_reports = [
+        _fixture_to_report(f, r) for f, r in zip(fixtures, results)
+    ]
+    passed = sum(1 for r in results if r.passed)
+    failed = len(results) - passed
+    return {
+        "schema_version": REPORT_SCHEMA_VERSION,
+        "project": project,
+        "run_id": run_id,
+        "rbxlx_path": str(rbxlx_path) if rbxlx_path is not None else None,
+        "conversion": conversion,
+        "gameplay": {
+            "summary": {
+                "total": len(results),
+                "passed": passed,
+                "failed": failed,
+            },
+            "fixtures": fixture_reports,
+        },
+    }
+
+
+def format_summary(
+    results: list[FixtureResult],
+    *,
+    project: str,
+    conversion_passed: bool | None = None,
+    conversion_duration_seconds: float | None = None,
+) -> str:
+    """One-line stdout summary the skill prints after a run.
+
+    Examples:
+      ``[SimpleFPS] Conversion passed (821.4s); 16/16 fixtures passed``
+      ``[SimpleFPS] Conversion passed; 14/16 fixtures (failed: id_a, id_b)``
+      ``[SimpleFPS] Conversion FAILED — fixtures skipped``
+    """
+    parts = [f"[{project}]"]
+    if conversion_passed is True:
+        if conversion_duration_seconds is not None:
+            parts.append(f"Conversion passed ({conversion_duration_seconds:.1f}s)")
+        else:
+            parts.append("Conversion passed")
+    elif conversion_passed is False:
+        parts.append("Conversion FAILED — fixtures skipped")
+        return "; ".join(parts)
+
+    total = len(results)
+    passed = sum(1 for r in results if r.passed)
+    failed_ids = [r.fixture_id for r in results if not r.passed]
+    if failed_ids:
+        parts.append(
+            f"{passed}/{total} fixtures (failed: {', '.join(failed_ids)})"
+        )
+    else:
+        parts.append(f"{passed}/{total} fixtures passed")
+    return "; ".join(parts)

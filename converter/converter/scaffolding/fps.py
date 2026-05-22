@@ -156,6 +156,15 @@ local MAX_PITCH = math.rad(80)
 local camera = workspace.CurrentCamera
 camera.CameraType = Enum.CameraType.Scriptable
 
+-- E2E test input channel. See docs/E2E_INPUT_CHANNEL.md.
+-- Production-safe: when no test is running, the attributes are unset
+-- (nil -> coerced to 0) and updateCamera() behaves identically to
+-- "real mouse delta only". When the /e2e-test skill is driving the
+-- session, it bumps workspace.E2EMouseSeq + sets the delta values
+-- *before* a frame; the next updateCamera() consumes them additively
+-- and advances _lastE2ESeq so each bump fires exactly once.
+local _lastE2ESeq = 0
+
 local function updateCamera()
 	local character = player.Character
 	if not character then return end
@@ -163,6 +172,13 @@ local function updateCamera()
 	if not head then return end
 
 	local delta = UserInputService:GetMouseDelta()
+	local seq = workspace:GetAttribute("E2EMouseSeq") or 0
+	if seq > _lastE2ESeq then
+		_lastE2ESeq = seq
+		local ex = workspace:GetAttribute("E2EMouseDeltaX") or 0
+		local ey = workspace:GetAttribute("E2EMouseDeltaY") or 0
+		delta = Vector2.new(delta.X + ex, delta.Y + ey)
+	end
 	yawAngle = yawAngle - delta.X * SENSITIVITY
 	pitchAngle = math.clamp(pitchAngle - delta.Y * SENSITIVITY, -MAX_PITCH, MAX_PITCH)
 
