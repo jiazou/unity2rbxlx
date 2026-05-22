@@ -161,22 +161,33 @@ def close_running_studio_or_fail(timeout: float = 30) -> None:
         return
 
     system = platform.system()
-    try:
-        if system == "Windows":
-            # ``taskkill /F`` is the only reliable terminate on Windows.
-            subprocess.run(
-                ["taskkill", "/F", "/IM", "RobloxStudioBeta.exe"],
-                capture_output=True, text=True, timeout=10,
-            )
-        else:
-            # ``pkill -f`` matches the same string ``pgrep -f`` would
-            # find, so it terminates every Studio Helper + main process.
-            subprocess.run(
-                ["pkill", "-f", "RobloxStudio"],
-                capture_output=True, text=True, timeout=10,
-            )
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-        raise StudioCloseError(f"close signal failed: {exc}") from exc
+
+    def _send(args: list[str]) -> None:
+        try:
+            subprocess.run(args, capture_output=True, text=True, timeout=10)
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            raise StudioCloseError(f"close signal failed: {exc}") from exc
+
+    if system == "Windows":
+        # ``taskkill /F`` is already a forceful terminate.
+        _send(["taskkill", "/F", "/IM", "RobloxStudioBeta.exe"])
+    else:
+        # ``pkill -f`` matches the same string ``pgrep -f`` would find, so
+        # it signals every Studio Helper + main process. Send SIGTERM
+        # first (graceful), but Studio traps SIGTERM to raise a "save
+        # changes?" dialog and stays alive — so if it survives a short
+        # grace period, escalate to SIGKILL, which a dialog cannot catch.
+        _send(["pkill", "-f", "RobloxStudio"])
+        grace_deadline = time.monotonic() + min(5.0, timeout)
+        while time.monotonic() < grace_deadline:
+            if not is_studio_running():
+                logger.info("close_running_studio_or_fail: Studio exited on SIGTERM")
+                return
+            time.sleep(0.5)
+        logger.warning(
+            "Studio survived SIGTERM (likely a save dialog); escalating to SIGKILL"
+        )
+        _send(["pkill", "-9", "-f", "RobloxStudio"])
 
     # Wait for the process to actually leave the table — kill is
     # asynchronous on macOS especially.
