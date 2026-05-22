@@ -2664,3 +2664,317 @@ class TestDeepAncestorActiveInHierarchy:
             f"child must carry parent_game_object_id = ns:1; got: "
             f"{rows['ns:22']}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Bug B tier 1: start() boots pre-placed prefab instances
+#
+# Root cause: SceneRuntime:start() only walked self._plan.scenes; pre-placed
+# PrefabInstance documents (scene_prefab_placements) were never booted, so a
+# Door/Turret/animation script on a placed prefab never ran. These tests
+# drive the placement-boot path added after the scene loop.
+# ---------------------------------------------------------------------------
+
+class TestScenePrefabPlacementBoot:
+
+    def test_single_placement_boots_lifecycle_and_wires_touched(self):
+        scenario = textwrap.dedent("""\
+            local order = {}
+            local touchedWired = false
+            local Door = {} ; Door.__index = Door
+            function Door.new(_) return setmetatable({}, Door) end
+            function Door:Awake() table.insert(order, "Awake") end
+            function Door:OnEnable() table.insert(order, "OnEnable") end
+            function Door:Start()
+                table.insert(order, "Start")
+                -- Wire a Touched-style connection via the host surface,
+                -- proving the component is fully live (host bound).
+                if self.gameObject and self.gameObject.Touched then
+                    self.host:connect(self.gameObject.Touched, function() end)
+                    touchedWired = true
+                end
+            end
+            local plan = {
+                modules = {door = {stem = "Door", runtime_bearing = true,
+                                   module_path = "x", domain = "server"}},
+                scenes = {},
+                prefabs = {
+                    ["pfb1"] = {
+                        name = "Door",
+                        instances = {{instance_id = "pfb1:1", script_id = "door",
+                                      game_object_id = "pfb1:1", active = true,
+                                      enabled = true, config = {}}},
+                        references = {},
+                        lifecycle_order = {"pfb1:1"},
+                    },
+                },
+                scene_prefab_placements = {
+                    {placement_id = "Lvl:555", prefab_id = "pfb1",
+                     active = true, enabled = true},
+                },
+                domain_overrides = {},
+            }
+            -- The placed clone descendant is stamped with the prefab-local
+            -- id; the boot path resolves it via workspaceFind (clone == nil).
+            local doorTouched = mockSignal()
+            local instances = {
+                ["pfb1:1"] = {Name = "Door", _sceneRuntimeId = "pfb1:1",
+                              _children = {}, Touched = doorTouched},
+            }
+            local services = servicesFor(plan, {door = Door}, instances)
+            local engine = SceneRuntime.new(services, plan)
+            engine:start("server")
+            runDeferred()  -- flush Start
+            assert(order[1] == "Awake", "Awake first; got " .. tostring(order[1]))
+            assert(order[2] == "OnEnable", "OnEnable second")
+            assert(order[3] == "Start", "Start last")
+            assert(touchedWired, "Touched connection must wire in Start")
+            print("OK")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "OK" in out
+
+    def test_domain_filter_boots_server_only_under_server(self):
+        scenario = textwrap.dedent("""\
+            local serverAwakes = 0
+            local clientAwakes = 0
+            local Srv = {} ; Srv.__index = Srv
+            function Srv.new(_) return setmetatable({}, Srv) end
+            function Srv:Awake() serverAwakes = serverAwakes + 1 end
+            local Cli = {} ; Cli.__index = Cli
+            function Cli.new(_) return setmetatable({}, Cli) end
+            function Cli:Awake() clientAwakes = clientAwakes + 1 end
+            local plan = {
+                modules = {
+                    srv = {stem = "Srv", runtime_bearing = true,
+                           module_path = "x", domain = "server"},
+                    cli = {stem = "Cli", runtime_bearing = true,
+                           module_path = "y", domain = "client"},
+                },
+                scenes = {},
+                prefabs = {
+                    ["pfbS"] = {name = "S",
+                        instances = {{instance_id = "pfbS:1", script_id = "srv",
+                            game_object_id = "pfbS:1", active = true,
+                            enabled = true, config = {}}},
+                        references = {}, lifecycle_order = {"pfbS:1"}},
+                    ["pfbC"] = {name = "C",
+                        instances = {{instance_id = "pfbC:1", script_id = "cli",
+                            game_object_id = "pfbC:1", active = true,
+                            enabled = true, config = {}}},
+                        references = {}, lifecycle_order = {"pfbC:1"}},
+                },
+                scene_prefab_placements = {
+                    {placement_id = "Lvl:1", prefab_id = "pfbS",
+                     active = true, enabled = true},
+                    {placement_id = "Lvl:2", prefab_id = "pfbC",
+                     active = true, enabled = true},
+                },
+                domain_overrides = {},
+            }
+            local instances = {
+                ["pfbS:1"] = {Name = "S", _sceneRuntimeId = "pfbS:1", _children = {}},
+                ["pfbC:1"] = {Name = "C", _sceneRuntimeId = "pfbC:1", _children = {}},
+            }
+            -- Server side.
+            local svc1 = servicesFor(plan, {srv = Srv, cli = Cli}, instances)
+            SceneRuntime.new(svc1, plan):start("server")
+            runDeferred()
+            assert(serverAwakes == 1, "server placement boots under server")
+            assert(clientAwakes == 0, "client placement must NOT boot under server")
+            -- Client side (fresh engine).
+            serverAwakes = 0 ; clientAwakes = 0
+            local svc2 = servicesFor(plan, {srv = Srv, cli = Cli}, instances)
+            SceneRuntime.new(svc2, plan):start("client")
+            runDeferred()
+            assert(clientAwakes == 1, "client placement boots under client")
+            assert(serverAwakes == 0, "server placement must NOT boot under client")
+            print("OK")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "OK" in out
+
+    def test_scene_instance_start_observes_placement_awake_already_run(self):
+        # Global Awake-before-Start: the placement boots as an appended
+        # batch; because _runAwakeEnableStart defers Start and start() never
+        # yields, the placement's Awake runs before the scene instance's
+        # Start fires on the deferred flush.
+        scenario = textwrap.dedent("""\
+            local placementAwakeRan = false
+            local sceneStartSawAwake = nil
+            local Placed = {} ; Placed.__index = Placed
+            function Placed.new(_) return setmetatable({}, Placed) end
+            function Placed:Awake() placementAwakeRan = true end
+            local SceneMB = {} ; SceneMB.__index = SceneMB
+            function SceneMB.new(_) return setmetatable({}, SceneMB) end
+            function SceneMB:Start() sceneStartSawAwake = placementAwakeRan end
+            local plan = {
+                modules = {
+                    placed = {stem = "Placed", runtime_bearing = true,
+                              module_path = "x", domain = "server"},
+                    scene = {stem = "SceneMB", runtime_bearing = true,
+                             module_path = "y", domain = "server"},
+                },
+                scenes = {
+                    A = {instances = {{instance_id = "A:1", script_id = "scene",
+                            game_object_id = "g1", active = true,
+                            enabled = true, config = {}}},
+                        references = {}, lifecycle_order = {"A:1"}},
+                },
+                prefabs = {
+                    ["pfb"] = {name = "P",
+                        instances = {{instance_id = "pfb:1", script_id = "placed",
+                            game_object_id = "pfb:1", active = true,
+                            enabled = true, config = {}}},
+                        references = {}, lifecycle_order = {"pfb:1"}},
+                },
+                scene_prefab_placements = {
+                    {placement_id = "A:99", prefab_id = "pfb",
+                     active = true, enabled = true},
+                },
+                domain_overrides = {},
+            }
+            local instances = {
+                g1 = {Name = "G1", _sceneRuntimeId = "g1", _children = {}},
+                ["pfb:1"] = {Name = "P", _sceneRuntimeId = "pfb:1", _children = {}},
+            }
+            local services = servicesFor(plan, {Placed = Placed, SceneMB = SceneMB,
+                placed = Placed, scene = SceneMB}, instances)
+            local engine = SceneRuntime.new(services, plan)
+            engine:start("server")
+            runDeferred()  -- flush all Starts
+            assert(placementAwakeRan, "placement Awake must run")
+            assert(sceneStartSawAwake == true,
+                "scene instance Start must observe placement Awake already run")
+            print("OK")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "OK" in out
+
+    def test_scene_loop_unchanged_when_no_placements(self):
+        # No-op guard: with an empty (or absent) scene_prefab_placements the
+        # scene-instance boot path is untouched — same lifecycle as before.
+        scenario = textwrap.dedent("""\
+            local awakes = 0
+            local Foo = {} ; Foo.__index = Foo
+            function Foo.new(_) return setmetatable({}, Foo) end
+            function Foo:Awake() awakes = awakes + 1 end
+            local plan = {
+                modules = {foo = {stem = "Foo", runtime_bearing = true,
+                                  module_path = "x", domain = "server"}},
+                scenes = {
+                    A = {instances = {{instance_id = "A:1", script_id = "foo",
+                            game_object_id = "g1", active = true,
+                            enabled = true, config = {}}},
+                        references = {}, lifecycle_order = {"A:1"}},
+                },
+                prefabs = {},
+                -- scene_prefab_placements deliberately omitted.
+                domain_overrides = {},
+            }
+            local instances = {g1 = {Name = "G1", _sceneRuntimeId = "g1", _children = {}}}
+            local services = servicesFor(plan, {foo = Foo}, instances)
+            SceneRuntime.new(services, plan):start("server")
+            runDeferred()
+            assert(awakes == 1, "scene instance still boots exactly once")
+            print("OK")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "OK" in out
+
+
+# ---------------------------------------------------------------------------
+# Bug B deferred tiers — documented as xfail/skip (NOT implemented in tier 1).
+# ---------------------------------------------------------------------------
+
+class TestScenePrefabPlacementDeferredTiers:
+
+    @pytest.mark.xfail(
+        reason="Tier 2: two placements of the same prefab share the prefab-"
+        "local _SceneRuntimeId, so workspaceFind/_componentsByGameObject "
+        "alias — setActive/destroy on one affects the other. Identity "
+        "rewrite to globally-unique per-clone ids is tier 2.",
+        strict=True,
+    )
+    def test_duplicate_placements_get_independent_identity(self):
+        # Two placements of pfb both resolve game_object_id "pfb:1" via
+        # workspaceFind, which returns ONE instance — they alias. A correct
+        # tier-2 build would boot two independent component instances bound
+        # to two distinct live clones.
+        scenario = textwrap.dedent("""\
+            local awakes = 0
+            local Foo = {} ; Foo.__index = Foo
+            function Foo.new(_) return setmetatable({}, Foo) end
+            function Foo:Awake() awakes = awakes + 1 end
+            local plan = {
+                modules = {foo = {stem = "Foo", runtime_bearing = true,
+                                  module_path = "x", domain = "server"}},
+                scenes = {},
+                prefabs = {
+                    ["pfb"] = {name = "P",
+                        instances = {{instance_id = "pfb:1", script_id = "foo",
+                            game_object_id = "pfb:1", active = true,
+                            enabled = true, config = {}}},
+                        references = {}, lifecycle_order = {"pfb:1"}},
+                },
+                scene_prefab_placements = {
+                    {placement_id = "A:1", prefab_id = "pfb",
+                     active = true, enabled = true},
+                    {placement_id = "A:2", prefab_id = "pfb",
+                     active = true, enabled = true},
+                },
+                domain_overrides = {},
+            }
+            local instances = {
+                ["pfb:1"] = {Name = "P", _sceneRuntimeId = "pfb:1", _children = {}},
+            }
+            local services = servicesFor(plan, {foo = Foo}, instances)
+            SceneRuntime.new(services, plan):start("server")
+            runDeferred()
+            print("AWAKES=" .. awakes)
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        # Tier 1 boots both placements' components (awakes == 2) BUT they
+        # alias to one live clone, so identity is wrong. The "correct"
+        # tier-2 assertion (two independent, addressable instances) cannot
+        # hold until the identity rewrite. xfail documents the gap.
+        assert "AWAKES=2 (independent identities)" in out
+
+    @pytest.mark.xfail(
+        reason="Tier 3: authored-inactive placements (m_IsActive==0) are "
+        "erased at scene_converter.py:4428 (return []), so no clone exists "
+        "to boot. Tier 3 designs a holder/proxy emit.",
+        strict=True,
+    )
+    def test_authored_inactive_placement_present_and_dormant(self):
+        # The converter drops inactive placements entirely; the planner does
+        # not emit them as bootable, and no live clone exists. A tier-3 build
+        # would emit a dormant holder. There is nothing for tier 1 to boot.
+        assert False, "authored-inactive placements absent (tier 3)"
+
+    @pytest.mark.xfail(
+        reason="Tier 3: per-placement m_Modifications overrides are not "
+        "mapped (scene modification target fileIDs don't match prefab-local "
+        "ids — scene_converter.py:4362). The placement boots with the prefab "
+        "default value, not the overridden one.",
+        strict=True,
+    )
+    def test_placement_modification_override_applied(self):
+        # Tier 1 reads active/enabled defaults and ignores config overrides;
+        # a placement that overrides a serialized field boots with the prefab
+        # template default. Faithful override mapping is tier 3.
+        assert False, "per-placement override mapping unimplemented (tier 3)"
+
+    @pytest.mark.skip(
+        reason="Binary scenes don't populate transform_fid_to_go_fid "
+        "(binary_scene_parser.py:276), so placement parent edges can't be "
+        "resolved. Full binary-scene placement support is out of scope all "
+        "tiers; the planner emits no parent key (see planner skip-test)."
+    )
+    def test_binary_scene_placement_parent_resolution(self):
+        pass

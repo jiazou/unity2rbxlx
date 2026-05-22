@@ -1298,20 +1298,31 @@ end
 -- Prefab instantiation
 -- ---------------------------------------------------------------------
 
-function SceneRuntime:instantiatePrefab(prefab_id, parent, cframe, externalRefs)
-	local prefab = (self._plan.prefabs or {})[prefab_id]
-	if not prefab then
-		self._warn(string.format(
-			"[scene_runtime] instantiatePrefab: no prefab subplan for %q",
-			tostring(prefab_id)))
-		return nil
-	end
-	-- Clone the template via services (production: clone the
-	-- ReplicatedStorage template; harness: synthesize a fake instance).
-	local clone = self._services.clonePrefabTemplate(prefab_id, parent, cframe)
-	if not clone then return nil end
-	self._prefabClones[clone] = prefab_id
-
+-- Construct (but do NOT run the lifecycle for) the components of a prefab
+-- subplan against a live ``clone`` root. Shared by ``instantiatePrefab``
+-- (runtime script-triggered spawn) and ``start()``'s pre-placed-placement
+-- boot (Bug B tier 1). Returns the constructed ``componentList`` ready to
+-- hand to ``_runAwakeEnableStart``; the caller owns the lifecycle batch so
+-- placement boots can append to the global Awake/OnEnable/Start ordering.
+--
+-- ``includeScriptId`` (optional): when a table, only instances whose
+-- ``script_id`` is a key are constructed (domain filtering for the boot
+-- path). When nil, every instance is constructed — ``instantiatePrefab``'s
+-- original unfiltered behavior (a runtime spawn isn't domain-gated).
+--
+-- ``externalRefs`` (optional): caller-supplied per-instance field overrides
+-- applied after intra-prefab references wire (``instantiatePrefab`` only).
+--
+-- ``clone`` resolution: when a clone root Instance is supplied
+-- (``instantiatePrefab``), prefab-local GameObject ids resolve via
+-- ``resolveCloneChild(clone, id)`` scoped under that clone. When ``clone``
+-- is nil (``start()``'s pre-placed-placement boot, Bug B tier 1), the
+-- placement clone already lives in the live tree stamped with its
+-- prefab-local ``_SceneRuntimeId``s, so ids resolve via ``workspaceFind`` —
+-- the same global lookup the scene boot path uses. For a SINGLE placement
+-- this returns the one correct clone descendant (duplicate-placement
+-- identity is tier 2).
+function SceneRuntime:_constructPrefabClone(clone, prefab, prefab_id, includeScriptId, externalRefs)
 	-- Build a per-instance map for the prefab subplan; references are
 	-- prefab-local so the same logic applies as for scenes.
 	local componentByInstanceId = {}
@@ -1319,37 +1330,45 @@ function SceneRuntime:instantiatePrefab(prefab_id, parent, cframe, externalRefs)
 	local instanceById = {}
 	for _, inst in ipairs(prefab.instances or {}) do
 		instanceById[inst.instance_id] = inst
-		-- Map intra-prefab game_object_id to the actual Roblox child via
-		-- the services helper (production: walk by _SceneRuntimeId
-		-- under the clone; harness: pass-through).
-		local goInst = self._services.resolveCloneChild(clone, inst.game_object_id)
-		local comp = self:_buildComponent(
-			inst.script_id, goInst, inst.game_object_id,
-			(goInst and goInst.Name) or "", inst.config or {},
-			"prefab", prefab_id)
-		if comp then
-			componentByInstanceId[inst.instance_id] = comp
-			table.insert(componentList, comp)
-			-- Honor planner-supplied active/enabled/tag for prefab
-			-- instances exactly as the scene boot path does (R3-P1.1).
-			-- ``_injectHostSurface`` reads ``m.activeSelf`` /
-			-- ``m.enabled`` to decide whether to overwrite with
-			-- defaults; mirror the scene path so a prefab instance
-			-- booted dormant (``enabled=false`` / ``active=false``)
-			-- stays dormant until ``setEnabled`` / ``setActive``.
-			local m = self._meta[comp]
-			m.activeSelf = inst.active ~= false
-			m.enabled = inst.enabled ~= false
-			if inst.tag and inst.tag ~= "" then
-				m.tag = inst.tag
-				local list = self._byTag[inst.tag]
-				if not list then list = {}; self._byTag[inst.tag] = list end
-				local present = false
-				for _, x in ipairs(list) do
-					if x == goInst then present = true; break end
-				end
-				if goInst ~= nil and not present then
-					table.insert(list, goInst)
+		if (includeScriptId == nil) or includeScriptId[inst.script_id] then
+			-- Map intra-prefab game_object_id to the actual Roblox child via
+			-- the services helper (production: walk by _SceneRuntimeId
+			-- under the clone; harness: pass-through). With no clone root,
+			-- resolve the live placement clone globally by id.
+			local goInst
+			if clone ~= nil then
+				goInst = self._services.resolveCloneChild(clone, inst.game_object_id)
+			else
+				goInst = self._services.workspaceFind(inst.game_object_id)
+			end
+			local comp = self:_buildComponent(
+				inst.script_id, goInst, inst.game_object_id,
+				(goInst and goInst.Name) or "", inst.config or {},
+				"prefab", prefab_id)
+			if comp then
+				componentByInstanceId[inst.instance_id] = comp
+				table.insert(componentList, comp)
+				-- Honor planner-supplied active/enabled/tag for prefab
+				-- instances exactly as the scene boot path does (R3-P1.1).
+				-- ``_injectHostSurface`` reads ``m.activeSelf`` /
+				-- ``m.enabled`` to decide whether to overwrite with
+				-- defaults; mirror the scene path so a prefab instance
+				-- booted dormant (``enabled=false`` / ``active=false``)
+				-- stays dormant until ``setEnabled`` / ``setActive``.
+				local m = self._meta[comp]
+				m.activeSelf = inst.active ~= false
+				m.enabled = inst.enabled ~= false
+				if inst.tag and inst.tag ~= "" then
+					m.tag = inst.tag
+					local list = self._byTag[inst.tag]
+					if not list then list = {}; self._byTag[inst.tag] = list end
+					local present = false
+					for _, x in ipairs(list) do
+						if x == goInst then present = true; break end
+					end
+					if goInst ~= nil and not present then
+						table.insert(list, goInst)
+					end
 				end
 			end
 		end
@@ -1371,6 +1390,27 @@ function SceneRuntime:instantiatePrefab(prefab_id, parent, cframe, externalRefs)
 			end
 		end
 	end
+	return componentList
+end
+
+function SceneRuntime:instantiatePrefab(prefab_id, parent, cframe, externalRefs)
+	local prefab = (self._plan.prefabs or {})[prefab_id]
+	if not prefab then
+		self._warn(string.format(
+			"[scene_runtime] instantiatePrefab: no prefab subplan for %q",
+			tostring(prefab_id)))
+		return nil
+	end
+	-- Clone the template via services (production: clone the
+	-- ReplicatedStorage template; harness: synthesize a fake instance).
+	local clone = self._services.clonePrefabTemplate(prefab_id, parent, cframe)
+	if not clone then return nil end
+	self._prefabClones[clone] = prefab_id
+
+	-- Unfiltered construction (a runtime spawn isn't domain-gated), then
+	-- run the lifecycle as its own batch.
+	local componentList = self:_constructPrefabClone(
+		clone, prefab, prefab_id, nil, externalRefs)
 	self:_runAwakeEnableStart(componentList)
 	return clone
 end
@@ -1488,6 +1528,69 @@ function SceneRuntime:start(domainFilter)
 
 		-- Steps 3-5: Awake -> OnEnable -> Start.
 		self:_runAwakeEnableStart(lifecycleList)
+	end
+
+	-- Bug B tier 1: boot pre-placed prefab instances. The scene loop only
+	-- walks logical scene GameObjects; PrefabInstance documents authored
+	-- into the scene were never booted, so Door/Turret/animation scripts
+	-- on pre-placed prefabs never ran. Each placement's clone already lives
+	-- in the converted tree (stamped with prefab-local ``_SceneRuntimeId``s
+	-- by ``scene_converter._convert_prefab_instance``); reuse the prefab
+	-- component-construction path scoped to that clone, filtered by
+	-- ``domainFilter`` (same gate as the scene loop), and run them as one
+	-- more ``_runAwakeEnableStart`` batch. Appending a batch preserves the
+	-- global Awake-before-Start ordering: ``_runAwakeEnableStart`` defers
+	-- every ``Start`` via ``task.defer`` and ``start()`` never yields, so
+	-- every batch's Awake/OnEnable runs before any batch's Start.
+	local placements = self._plan.scene_prefab_placements or {}
+	-- Determinism: sort placements by ``placement_id`` so boot order is
+	-- stable across runs (the plan list order is parser-dependent).
+	local placementOrder = {}
+	for idx, placement in ipairs(placements) do
+		table.insert(placementOrder, {idx = idx, id = placement.placement_id or ""})
+	end
+	table.sort(placementOrder, function(a, b)
+		if a.id == b.id then return a.idx < b.idx end
+		return a.id < b.id
+	end)
+
+	for _, entry in ipairs(placementOrder) do
+		local placement = placements[entry.idx]
+		local prefab_id = placement.prefab_id
+		local prefab = (self._plan.prefabs or {})[prefab_id]
+		if prefab then
+			-- Seed ``_goParentId``/``_goActiveSelf`` for the placement's
+			-- GameObjects, parity with the scene boot pre-pass. Prefab
+			-- instances carry prefab-local parent edges; the placement
+			-- ROOT additionally hangs off the scene parent GameObject so
+			-- the activeInHierarchy walk can reach into the scene tree.
+			for _, inst in ipairs(prefab.instances or {}) do
+				if includeScriptId[inst.script_id] then
+					local goId = inst.game_object_id
+					if goId then
+						if self._goActiveSelf[goId] == nil then
+							self._goActiveSelf[goId] = (inst.active ~= false)
+								and (placement.active ~= false)
+						end
+						local parentId = inst.parent_game_object_id
+						if parentId == nil then
+							-- Prefab root: bind it to the scene parent GO so
+							-- the ancestor walk continues upward.
+							parentId = placement.parent_game_object_id
+						end
+						if parentId and self._goParentId[goId] == nil then
+							self._goParentId[goId] = parentId
+						end
+					end
+				end
+			end
+
+			-- Construct the placement's components (domain-filtered, live
+			-- tree resolution) and run them as a single lifecycle batch.
+			local componentList = self:_constructPrefabClone(
+				nil, prefab, prefab_id, includeScriptId, nil)
+			self:_runAwakeEnableStart(componentList)
+		end
 	end
 
 	-- Step 6: update loops via heartbeat + fixed-step accumulator.
