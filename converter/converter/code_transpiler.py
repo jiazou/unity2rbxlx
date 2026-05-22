@@ -21,6 +21,7 @@ from typing import Any, Literal
 from config import (
     ANTHROPIC_MODEL,
     ANTHROPIC_MAX_TOKENS,
+    CLAUDE_CLI_TIMEOUT_SECONDS,
     LLM_CACHE_DIR,
     LLM_CACHE_ENABLED,
     LLM_CACHE_TTL_SECONDS,
@@ -1763,7 +1764,7 @@ def _claude_cli_transpile(
         f"```csharp\n{csharp_source}\n```"
     )
 
-    claude_timeout = 600
+    claude_timeout = CLAUDE_CLI_TIMEOUT_SECONDS
     try:
         result = subprocess.run(
             [claude_path, "-p", prompt, "--output-format", "text"],

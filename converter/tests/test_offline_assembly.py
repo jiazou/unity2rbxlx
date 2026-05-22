@@ -32,8 +32,11 @@ after a real conversion.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -43,6 +46,57 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from tests._project_paths import SIMPLEFPS_PATH, is_populated, resolve_project  # noqa: E402
 
 _FIXTURES = Path(__file__).parent / "fixtures" / "upload_snapshots"
+
+
+def _e2e_output_dir(tmp_path: Path) -> Path:
+    """Resolve where this test's conversion artifacts should land.
+
+    Honours the ``E2E_OUTPUT_DIR`` env var set by the ``/e2e-test`` skill
+    so the produced rbxlx is at a known path the skill can hand to
+    Studio. Falls back to pytest's ``tmp_path`` for normal unit runs.
+    Codex finding #3: skill ↔ pytest contract is a filesystem path, not
+    pytest stdout parsing.
+    """
+    explicit = os.environ.get("E2E_OUTPUT_DIR")
+    if explicit:
+        out = Path(explicit)
+        out.mkdir(parents=True, exist_ok=True)
+        return out
+    return tmp_path
+
+
+def _write_conversion_manifest(
+    output_dir: Path,
+    *,
+    project: str,
+    rbxlx_path: Path,
+    started_at: str,
+    started_monotonic: float,
+) -> None:
+    """Emit the conversion_manifest.json artifact contract.
+
+    Lives at ``<E2E_OUTPUT_DIR>/conversion_manifest.json`` when the env
+    var is set (skill-driven run); skipped silently in normal pytest
+    runs where no consumer would read it. The skill reads this file
+    iff pytest exited 0 and uses ``rbxlx_path`` to open Studio.
+    """
+    if "E2E_OUTPUT_DIR" not in os.environ:
+        return
+    finished_at = datetime.now(timezone.utc).isoformat()
+    duration_seconds = round(time.monotonic() - started_monotonic, 3)
+    manifest = {
+        "schema_version": 1,
+        "project": project,
+        "run_id": os.environ.get("E2E_RUN_ID", "unset"),
+        "rbxlx_path": str(rbxlx_path.resolve()),
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "duration_seconds": duration_seconds,
+    }
+    (output_dir / "conversion_manifest.json").write_text(
+        json.dumps(manifest, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _load_snapshot(name: str) -> dict:
@@ -297,7 +351,7 @@ def _claude_cli_available() -> bool:
 
 @pytest.mark.slow
 class TestOfflineAssembly:
-    """Phase A — full converter end-to-end against cached asset IDs.
+    """Offline assembly — full converter end-to-end against cached asset IDs.
 
     Exercises the entire pipeline (parse → extract → transpile via AI →
     coherence → seam injection → convert_scene → write_output → place
@@ -342,13 +396,19 @@ class TestOfflineAssembly:
     def test_simplefps_assembly_with_cached_ids(self, tmp_path: Path) -> None:
         from converter.pipeline import Pipeline
 
+        # Honour E2E_OUTPUT_DIR when the /e2e-test skill drives the run;
+        # otherwise tmp_path keeps unit-test isolation.
+        output_dir = _e2e_output_dir(tmp_path)
+        started_at = datetime.now(timezone.utc).isoformat()
+        started_monotonic = time.monotonic()
+
         snapshot = _load_snapshot("SimpleFPS")
-        _seed_output_dir(tmp_path, snapshot)
+        _seed_output_dir(output_dir, snapshot)
 
         from core.conversion_context import ConversionContext
         pipeline = Pipeline(
             unity_project_path=SIMPLEFPS_PROJECT,
-            output_dir=tmp_path,
+            output_dir=output_dir,
             skip_upload=True,
         )
         # Pipeline.__init__ always creates a fresh ctx; resume() is the
@@ -365,7 +425,7 @@ class TestOfflineAssembly:
         _assert_snapshot_covers_manifest(manifest.assets, snapshot, "SimpleFPS")
 
         # rbxlx-level assertions
-        rbxlx_files = list(tmp_path.glob("*.rbxlx"))
+        rbxlx_files = list(output_dir.glob("*.rbxlx"))
         assert rbxlx_files, "no rbxlx produced"
         rbxlx = rbxlx_files[0]
         _assert_no_placeholder_ids(rbxlx)
@@ -376,10 +436,20 @@ class TestOfflineAssembly:
         _assert_place_builder_chunks_publishable(rbx_place)
 
         # Luau syntax — soft-skip when luau-analyze isn't installed.
-        passed, failed, fails = _run_luau_analyze(tmp_path / "scripts")
+        passed, failed, fails = _run_luau_analyze(output_dir / "scripts")
         assert failed == 0, (
             f"luau-analyze found {failed} syntax error(s):\n"
             + "\n".join(fails[:10])
+        )
+
+        # Skill-facing artifact contract — silently no-op for normal
+        # pytest runs (no E2E_OUTPUT_DIR set).
+        _write_conversion_manifest(
+            output_dir,
+            project="SimpleFPS",
+            rbxlx_path=rbxlx,
+            started_at=started_at,
+            started_monotonic=started_monotonic,
         )
 
     @pytest.mark.skipif(
@@ -426,3 +496,66 @@ class TestOfflineAssembly:
             f"luau-analyze found {failed} syntax error(s):\n"
             + "\n".join(fails[:10])
         )
+
+
+class TestConversionManifest:
+    """Skill-facing artifact contract (Codex finding #3).
+
+    The /e2e-test skill passes ``E2E_OUTPUT_DIR`` and ``E2E_RUN_ID`` env
+    vars; the offline-assembly test honours them so the produced rbxlx
+    ends up at a path the skill knows. A ``conversion_manifest.json``
+    is written iff ``E2E_OUTPUT_DIR`` is set, so normal pytest runs
+    never touch disk outside ``tmp_path``.
+    """
+
+    def test_e2e_output_dir_honours_env(self, tmp_path: Path, monkeypatch) -> None:
+        target = tmp_path / "skill_chose_this"
+        monkeypatch.setenv("E2E_OUTPUT_DIR", str(target))
+        resolved = _e2e_output_dir(tmp_path / "ignored")
+        assert resolved == target
+        assert resolved.exists(), "must mkdir if absent"
+
+    def test_e2e_output_dir_falls_back_to_tmp_path(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.delenv("E2E_OUTPUT_DIR", raising=False)
+        assert _e2e_output_dir(tmp_path) == tmp_path
+
+    def test_manifest_written_when_env_set(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setenv("E2E_OUTPUT_DIR", str(tmp_path))
+        monkeypatch.setenv("E2E_RUN_ID", "2026-05-21T00-00-00-abcdef")
+        fake_rbxlx = tmp_path / "converted_place.rbxlx"
+        fake_rbxlx.write_text("<roblox/>", encoding="utf-8")
+
+        _write_conversion_manifest(
+            tmp_path,
+            project="SimpleFPS",
+            rbxlx_path=fake_rbxlx,
+            started_at="2026-05-21T00:00:00+00:00",
+            started_monotonic=time.monotonic() - 12.345,
+        )
+
+        manifest_path = tmp_path / "conversion_manifest.json"
+        assert manifest_path.exists()
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        assert manifest["schema_version"] == 1
+        assert manifest["project"] == "SimpleFPS"
+        assert manifest["run_id"] == "2026-05-21T00-00-00-abcdef"
+        assert manifest["rbxlx_path"] == str(fake_rbxlx.resolve())
+        # Duration is recorded — exact value not asserted because clock
+        # round-tripping is noisy in fast tests; sanity-check it's a
+        # non-negative float that matches the elapsed window.
+        assert 10.0 <= manifest["duration_seconds"] <= 20.0
+
+    def test_manifest_silent_no_op_without_env(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.delenv("E2E_OUTPUT_DIR", raising=False)
+        fake_rbxlx = tmp_path / "x.rbxlx"
+        fake_rbxlx.write_text("<roblox/>", encoding="utf-8")
+        _write_conversion_manifest(
+            tmp_path,
+            project="SimpleFPS",
+            rbxlx_path=fake_rbxlx,
+            started_at="2026-05-21T00:00:00+00:00",
+            started_monotonic=time.monotonic(),
+        )
+        # Normal pytest runs: helper must not litter the test's tmp_path
+        # with skill artifacts.
+        assert not (tmp_path / "conversion_manifest.json").exists()
