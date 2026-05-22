@@ -1191,6 +1191,231 @@ def _fix_pickup_visual_target(scripts: list["RbxScript"]) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Pack: unity_transform_child_index
+# ---------------------------------------------------------------------------
+#
+# Unity ``transform.GetChild(n)`` indexes ONLY child GameObjects (Transforms).
+# The transpiler renders it as Roblox ``parent:GetChildren()[n+1]`` — but
+# Roblox ``GetChildren()`` also returns component-derived children the converter
+# injects (Sounds from AudioSources, the Script itself), and ``rbxlx_writer``
+# emits those BEFORE the structural children. So ``GetChildren()[1]`` can return
+# a Sound, and a downstream ``.CFrame`` read raises ``CFrame is not a valid
+# member of Sound`` (SimpleFPS Turret: ``tBase()`` resolved to ``HitSound``,
+# which also left the turret unable to aim/fire/damage).
+#
+# Authored GameObject hosts carry a ``_SceneRuntimeId`` attribute; real Unity
+# transform children are exactly those. Rewrite the unambiguous
+# ``<expr>:GetChildren()[<n>]`` index access (nobody legitimately indexes
+# ``GetChildren()`` by a literal position except transform-child emulation) to
+# a ``_SceneRuntimeId``-filtered helper. ``transform.childCount`` and
+# ``transform.Find`` share this root cause but need evidence-driven handling
+# (absent from the current corpus, and a blanket rewrite risks false hits) —
+# tracked as follow-ups.
+
+_GETCHILDREN_INDEX_RE = re.compile(
+    r"([A-Za-z_][A-Za-z0-9_.]*):GetChildren\(\)\s*\[\s*(\d+)\s*\]"
+)
+
+_UNITY_CHILD_HELPER = """\
+-- _AutoUnityTransformChild: Unity transform.GetChild(n) indexes only child
+-- GameObjects (Transforms); Roblox GetChildren() also returns injected Sounds/
+-- Scripts/etc., so raw GetChildren()[n] grabs the wrong instance. Authored
+-- GameObject hosts carry a _SceneRuntimeId attribute -- index those (1-based,
+-- mirroring the GetChildren()[n] call sites this replaces).
+local function __unityChild(parent, i)
+\tif not parent then return nil end
+\tlocal n = 0
+\tfor _, c in ipairs(parent:GetChildren()) do
+\t\tif c:GetAttribute("_SceneRuntimeId") ~= nil then
+\t\t\tn += 1
+\t\t\tif n == i then return c end
+\t\tend
+\tend
+\t-- Fallback for unstamped/legacy output: nth Model/BasePart child.
+\tn = 0
+\tfor _, c in ipairs(parent:GetChildren()) do
+\t\tif c:IsA("Model") or c:IsA("BasePart") then
+\t\t\tn += 1
+\t\t\tif n == i then return c end
+\t\tend
+\tend
+\treturn nil
+end
+"""
+
+
+def _luau_pos_is_code(source: str, pos: int) -> bool:
+    """True if char index ``pos`` is real code, not inside a string or a
+    ``--`` comment.
+
+    Scans from the start of ``pos``'s line, tracking single/double-quoted
+    strings (with backslash escapes) and ``--`` line comments — the only forms
+    the transpiler emits. Multi-line ``[[ ]]`` strings/comments aren't modeled;
+    they don't occur in transpiled output.
+    """
+    i = source.rfind("\n", 0, pos) + 1
+    quote: str | None = None
+    while i < pos:
+        ch = source[i]
+        if quote is not None:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"'):
+            quote = ch
+        elif ch == "-" and i + 1 < pos and source[i + 1] == "-":
+            return False  # rest of the line (incl. pos) is a comment
+        i += 1
+    return quote is None
+
+
+def _detect_unity_transform_child_index(scripts: list["RbxScript"]) -> bool:
+    return any(
+        _luau_pos_is_code(s.source, m.start())
+        for s in scripts
+        for m in _GETCHILDREN_INDEX_RE.finditer(s.source)
+    )
+
+
+@patch_pack(
+    name="unity_transform_child_index",
+    description="Rewrite raw GetChildren()[n] transform-child indexing to a "
+    "_SceneRuntimeId-filtered helper so it selects authored GameObject hosts, "
+    "not injected Sounds/Scripts (fixes Turret HitSound.CFrame crash).",
+    detect=_detect_unity_transform_child_index,
+)
+def _fix_unity_transform_child_index(scripts: list["RbxScript"]) -> int:
+    fixes = 0
+    for s in scripts:
+        count = 0
+
+        def _repl(m: "re.Match[str]", _src: str = s.source) -> str:
+            nonlocal count
+            # Skip matches inside string literals / comments.
+            if not _luau_pos_is_code(_src, m.start()):
+                return m.group(0)
+            count += 1
+            return f"__unityChild({m.group(1)}, {m.group(2)})"
+
+        new_source = _GETCHILDREN_INDEX_RE.sub(_repl, s.source)
+        if count == 0:
+            continue
+        if "local function __unityChild(" not in new_source:
+            new_source = _UNITY_CHILD_HELPER + "\n" + new_source
+        s.source = new_source
+        fixes += count
+        log.info("  %s: rewrote %d GetChildren()[n] -> __unityChild()", s.name, count)
+    return fixes
+
+
+# ---------------------------------------------------------------------------
+# Pack: door_player_flag_location
+# ---------------------------------------------------------------------------
+#
+# Cross-script attribute-location incoherence. The Pickup pack writes a
+# ``"has"..itemName`` flag onto BOTH the character Model and the Player
+# instance (see ``_add_pickup_remote_listener``). But the AI transpiles
+# Door.cs's key check into a ``playerWithKey()`` that reads the flag from the
+# **HumanoidRootPart** (``model:FindFirstChild("HumanoidRootPart")`` ->
+# ``rootPart:GetAttribute("hasKey")``) — a location the pickup never writes.
+# So a key-holding player standing in the trigger never opens the door.
+#
+# Fix the contract, not the symptom: the Player instance is the canonical
+# store (the pickup already writes it, and it replicates). Replace the whole
+# ``playerWithKey`` function with a canonical version that reads from the
+# player. Detection is identity-gated (``s.name == "Door"`` + coarse substring
+# presence) and the swap is done by locating the function span structurally
+# (string index + column-0 ``end``), NOT by regex-matching the AI's read form.
+# The flag name is extracted from the existing source so nothing game-specific
+# is hardcoded. Also resolves the toucher via ``FindFirstAncestorOfClass`` so
+# accessory/nested-part touches still find the character.
+#
+# (Player.luau separately writes the flag to the HumanoidRootPart from its own
+# client-side path; that client write can't reach a server reader regardless,
+# and is a distinct follow-up — not in scope here.)
+
+_PLAYER_WITH_KEY_SIG = "local function playerWithKey"
+
+
+def _extract_attr_name(func_src: str) -> str | None:
+    """Pull the first ``GetAttribute("<name>")`` literal from a function body."""
+    marker = 'GetAttribute("'
+    i = func_src.find(marker)
+    if i == -1:
+        return None
+    j = i + len(marker)
+    k = func_src.find('"', j)
+    if k == -1:
+        return None
+    return func_src[j:k]
+
+
+def _detect_door_player_flag_location(scripts: list["RbxScript"]) -> bool:
+    for s in scripts:
+        if (
+            s.name == "Door"
+            and _PLAYER_WITH_KEY_SIG in s.source
+            and "HumanoidRootPart" in s.source
+            and "GetAttribute" in s.source
+        ):
+            return True
+    return False
+
+
+@patch_pack(
+    name="door_player_flag_location",
+    description="Rewrite Door.playerWithKey() to read the key flag from the "
+    "Player instance (where the pickup writes it) instead of the "
+    "HumanoidRootPart (which nobody writes), fixing doors that never open.",
+    after=("pickup_remote_event_server",),
+    detect=_detect_door_player_flag_location,
+)
+def _fix_door_player_flag_location(scripts: list["RbxScript"]) -> int:
+    fixes = 0
+    for s in scripts:
+        if s.name != "Door":
+            continue
+        start = s.source.find(_PLAYER_WITH_KEY_SIG)
+        if start == -1:
+            continue
+        # Function span: from the signature to its column-0 ``end``. Inline
+        # guards (``if x then return false end``) keep their ``end`` mid-line,
+        # so the first ``\nend`` is the function's close.
+        close = s.source.find("\nend", start)
+        if close == -1:
+            continue
+        end_idx = close + len("\nend")
+        func_src = s.source[start:end_idx]
+        if "HumanoidRootPart" not in func_src or "GetAttribute" not in func_src:
+            continue
+        # Extract the flag from the HumanoidRootPart read specifically — the
+        # GetAttribute that follows the ``...FindFirstChild("HumanoidRootPart")``
+        # resolution — so an earlier unrelated GetAttribute (e.g. a "Locked"
+        # probe) isn't mistaken for the key flag.
+        flag = _extract_attr_name(func_src[func_src.find("HumanoidRootPart"):])
+        if not flag:
+            continue
+        canonical = (
+            "local function playerWithKey(otherPart)\n"
+            '\tlocal model = otherPart and otherPart:FindFirstAncestorOfClass("Model")\n'
+            "\tif not model then return false end\n"
+            "\tlocal player = Players:GetPlayerFromCharacter(model)\n"
+            "\tif not player then return false end\n"
+            f'\treturn player:GetAttribute("{flag}") == true\n'
+            "end"
+        )
+        s.source = s.source[:start] + canonical + s.source[end_idx:]
+        fixes += 1
+        log.info(
+            "  Door '%s': playerWithKey now reads player flag %r (was HumanoidRootPart)",
+            s.name, flag,
+        )
+    return fixes
+
+
+# ---------------------------------------------------------------------------
 # Pack: door_global_player_to_attribute
 # ---------------------------------------------------------------------------
 #

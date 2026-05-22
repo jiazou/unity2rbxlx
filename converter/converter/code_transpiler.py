@@ -2140,12 +2140,6 @@ def _lint_and_fix(luau_source: str, class_name: str = "",
 # LLM cache
 # ---------------------------------------------------------------------------
 
-def _cache_key(source: str, model: str) -> str:
-    """Generate a SHA-256 cache key for a source + model combination."""
-    content = f"{model}:{source}"
-    return hashlib.sha256(content.encode("utf-8")).hexdigest()
-
-
 def _ai_cache_key(
     *,
     csharp_source: str,

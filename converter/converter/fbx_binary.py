@@ -262,63 +262,18 @@ def _negate_axis(values: list[float], axis: int) -> list[float]:
     return out
 
 
-def _flip_winding(indices: list[int]) -> list[int]:
-    """Flip polygon winding in a PolygonVertexIndex array.
-
-    FBX encodes polygons as sequences of indices where the last index of
-    each polygon is bit-XOR'd with -1 (negated and decremented). Reversing
-    the order within each polygon flips the winding; we preserve the
-    end-of-polygon marker on the new last index.
-    """
-    out: list[int] = []
-    start = 0
-    for i, v in enumerate(indices):
-        if v < 0:  # end-of-polygon marker
-            # Unwrap last index
-            last = -v - 1
-            poly = indices[start:i] + [last]
-            # Reverse, then re-wrap the new last index
-            rev = list(reversed(poly))
-            rev[-1] = -rev[-1] - 1
-            out.extend(rev)
-            start = i + 1
-    return out
-
-
-def _detect_upaxis(roots: list[FbxNode]) -> int:
-    """Detect the UpAxis from FBX GlobalSettings. Returns 1 for Y-up, 2 for Z-up."""
-    for node in roots:
-        if node.name == b"GlobalSettings":
-            props70 = _child(node, b"Properties70")
-            if props70:
-                for prop in props70.children:
-                    if prop.name == b"P" and prop.properties:
-                        name_val = prop.properties[0].value
-                        if isinstance(name_val, bytes) and name_val == b"UpAxis":
-                            # UpAxis value is typically the 5th property
-                            for p in prop.properties[1:]:
-                                if isinstance(p.value, int) and p.value in (1, 2):
-                                    return p.value
-    return 1  # Default Y-up
-
-
 def mirror_fbx_handedness(src_path: str | Path, dst_path: str | Path) -> bool:
     """Negate the appropriate axis to fix left-handed → right-handed handedness.
 
     The FBX format is right-handed. Unity converts to left-handed on import
     by negating one axis. Roblox keeps right-handed. To make Roblox render
-    the mesh the same way Unity does, we apply the same negation Unity does.
-
-    Which FBX axis to negate depends on the file's UpAxis:
-
-    - **Y-up FBX**: axes map directly (FBX X/Y/Z = World X/Y/Z).
-      Negate FBX Z to mirror front/back (World Z). No vertical change.
-
-    - **Z-up FBX**: after -90° X rotation, FBX Y → World -Z.
-      Negate FBX Y to mirror front/back (World Z). No vertical change.
-
-    Also flips polygon winding to keep face normals outward, and negates
-    the same axis in normals arrays.
+    the mesh the same way Unity does, we negate **both X and Y** in the
+    vertices and normals — equivalent to a 180° rotation around the vertical
+    (Z) axis. Because negating two axes has determinant +1, it is a proper
+    rotation rather than a mirror, so triangle winding is preserved and no
+    winding flip is needed. This fixes which side of the mesh shows which
+    texture (e.g. asymmetric door/logo features) without flipping vertical
+    position or making text upside-down.
 
     Writes the modified FBX to ``dst_path``. Preserves sub-mesh structure.
     Returns True on success, False if the file format isn't supported.

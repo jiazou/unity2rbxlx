@@ -798,11 +798,6 @@ def convert_particle_system(properties: dict[str, Any]) -> RbxParticleEmitter | 
     if sim_space == 1:  # Local space
         emitter.locked_to_part = True
 
-    # Light emission from renderer module
-    renderer = main.get("RendererModule", main.get("renderer", {}))
-    if isinstance(renderer, dict):
-        pass
-
     # Max particles -> clamp rate
     max_particles = int(main.get("maxNumParticles", main.get("maxParticles", 1000)))
     if max_particles < 50:

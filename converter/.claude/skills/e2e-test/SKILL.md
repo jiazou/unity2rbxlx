@@ -139,8 +139,13 @@ if not p:
     sys.exit('launch_studio returned None')
 if not wait_for_studio_ready(timeout=120):
     sys.exit('Studio process never appeared within 120s')
+print('STUDIO_PID', p.pid)
 "
 ```
+
+Capture the printed `STUDIO_PID <n>` into `STUDIO_PID` — Step 8 uses it to close
+**only the editor this run launched**, leaving any concurrent Studios (and the
+StudioMCP proxy) alone.
 
 Then the 3-step readiness probe (Codex finding #2):
 
@@ -233,6 +238,26 @@ or
 ```
 
 Exit 0 if all passed; exit 4 if any gameplay fixture failed.
+
+### Step 8: Teardown — close the Studio this run launched
+
+Run this on every path that launched Studio (exit 0 and exit 4) so a run
+never leaves an orphaned Studio process behind. (Skip it for exit 2 —
+Studio never launched — and exit 3 — launch/handshake already failed.)
+
+```bash
+python3 -c "from roblox.studio_launcher import close_running_studio_or_fail; close_running_studio_or_fail(pid=${STUDIO_PID})"
+```
+
+Pass `pid=${STUDIO_PID}` (captured in Step 4) so teardown closes **only the
+editor this run launched** — a concurrent Studio from another project is left
+running. `close_running_studio_or_fail` escalates SIGTERM → SIGKILL, so a
+lingering Play session or a "save changes?" dialog can't keep the process alive.
+Teardown is **best-effort**: do it *after* writing the report and printing
+the summary, and if it raises, log the error but keep the exit code from
+Step 7 — the test verdict stands; a failed cleanup is an environment issue,
+not a test result. This also satisfies the "Fresh Studio only" rule for the
+next run by leaving no process to refuse-attach to.
 
 ## If you skipped a Read
 
