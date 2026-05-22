@@ -18,7 +18,6 @@ import pytest
 
 from converter.fbx_binary import (
     _find_geometry_nodes,
-    _flip_winding,
     _negate_axis,
     mirror_fbx_handedness,
     read_fbx,
@@ -78,34 +77,6 @@ class TestNegateAxis:
         original = [1.0, -2.5, 3.0, 4.0, 5.0, -6.0]
         twice = _negate_axis(_negate_axis(original, 0), 0)
         assert twice == original
-
-
-class TestFlipWinding:
-    """Triangle winding flip is required when negating ONE axis (a mirror
-    operation, det = -1). Negating two axes is a rotation (det = +1) and
-    no winding flip is needed — that's the path mirror_fbx_handedness uses.
-    Either way the helper itself must invert one vertex per triangle."""
-
-    def test_simple_triangle_winding_flips(self) -> None:
-        # FBX face encoding: last index XOR -1 (bitwise NOT) marks face end
-        # Triangle (0, 1, 2) is encoded as [0, 1, ~2] = [0, 1, -3]
-        # Flip reverses the polygon: (2, 1, 0) -> [2, 1, ~0] = [2, 1, -1]
-        flipped = _flip_winding([0, 1, -3])
-        assert flipped == [2, 1, -1]
-
-    def test_quad_winding_flips(self) -> None:
-        # Quad (0, 1, 2, 3) encoded as [0, 1, 2, ~3] = [0, 1, 2, -4]
-        # Reversed: (3, 2, 1, 0) -> [3, 2, 1, ~0] = [3, 2, 1, -1]
-        flipped = _flip_winding([0, 1, 2, -4])
-        assert flipped == [3, 2, 1, -1]
-
-    def test_two_polygons_each_flip_independently(self) -> None:
-        """Two triangles back-to-back: flip preserves the boundary between
-        them and reverses each polygon individually."""
-        # tri1 (0, 1, 2) + tri2 (3, 4, 5) -> [0, 1, -3, 3, 4, -6]
-        # After flip: (2, 1, 0) + (5, 4, 3) -> [2, 1, -1, 5, 4, -4]
-        flipped = _flip_winding([0, 1, -3, 3, 4, -6])
-        assert flipped == [2, 1, -1, 5, 4, -4]
 
 
 @requires_fbx

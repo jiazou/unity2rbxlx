@@ -187,7 +187,15 @@ def run_packs(
 
 @dataclass(frozen=True)
 class WeaponMount:
-    prefab_name: str           # workspace prefab name (camelCase)
+    prefab_name: str           # workspace prefab name (camelCase) — the
+                               # converter materialises the Unity prefab
+                               # at this name in workspace, with the full
+                               # mesh hierarchy (bipod, scope, etc.). The
+                               # pack clones from THIS instance, not from
+                               # ``ReplicatedStorage.Templates``, which
+                               # carries a stripped variant whose smaller
+                               # bbox drops below the camera frustum at
+                               # the authored slot offset.
     equip_function: str        # AI-stubbed function name on the Player controller
     sentinel_var: str          # already-equipped flag, flipped to true on equip
     scale_expr: str            # Lua-source fragment for rifle:ScaleTo(<expr>)
@@ -232,16 +240,24 @@ def _detect_fps_weapon_mount(scripts: list["RbxScript"]) -> bool:
     weapon-mount patterns.
 
     A mount qualifies a script via either the prefab name (case variant
-    included) or the AI-stubbed equip function name. Either marker is
-    enough — Gamekit3D-style scripts contain neither and skip cleanly.
+    included) or any spelling of the equip function name. The Unity
+    source ships PascalCase (``GetRifle``); the AI transpiler emits
+    camelCase (``getRifle``) by Luau convention -- the detector must
+    accept both for ``run_packs`` to actually fire the pack on real
+    transpile output. Pre-fix the detector only checked PascalCase, so
+    the pack silently no-oped on every fresh transpile and the marker
+    on disk only persisted from older PascalCase-era runs.
+    Gamekit3D-style scripts contain none of these markers and skip
+    cleanly.
     """
     for s in scripts:
         src = s.source
         for mount in WEAPON_MOUNTS:
+            equip_variants = _equip_function_variants(mount.equip_function)
             if (
                 mount.prefab_name in src
                 or _prefab_alt_case(mount.prefab_name) in src
-                or mount.equip_function in src
+                or any(v in src for v in equip_variants)
             ):
                 return True
     return False
@@ -474,6 +490,22 @@ def _apply_weapon_mount(s: "RbxScript", mount: WeaponMount) -> bool:
         # no per-weapon follower and no hardcoded offset. Seating order
         # of preference: the Unity "WeaponSlot" object inside the rig →
         # the rig Model itself → (no rig) a one-shot camera placement.
+        #
+        # Source the prefab from ``workspace`` (the scene-placed instance
+        # the converter materialises from Unity's Player.prefab) — NOT
+        # from ``ReplicatedStorage.Templates``. The two are structurally
+        # different on real conversions: the scene placement carries the
+        # full Unity prefab (e.g. SimpleFPS rifle has bipod legs + laser
+        # pointer + pod-support, 14 mesh parts, ~50-stud bbox), while
+        # the Templates entry the prefab-packages writer emits is a
+        # stripped variant (10 parts, ~8-stud bbox). After the same
+        # ``ScaleTo`` factor, the Templates clone is ~6× smaller and
+        # drops below the camera frustum at the authored slot offset.
+        # PR #121's ``c65429b`` introduced a Templates-first lookup that
+        # silently selected the smaller variant and made the held weapon
+        # invisible -- a regression the user surfaced as "I cannot see
+        # the rifle". The fallback case-variant probes the Pascal-case
+        # spelling of the same workspace name.
         new_body = (
             f'{matched_header}\n'
             f'    if {mount.sentinel_var} then return end\n'
@@ -482,8 +514,6 @@ def _apply_weapon_mount(s: "RbxScript", mount: WeaponMount) -> bool:
             f'    if not rp then return end\n'
             f'    local rifle = rp:Clone()\n'
             f'    if rifle:IsA("Model") then rifle:ScaleTo({mount.scale_expr}) end\n'
-            f'    local prim = rifle:FindFirstChildWhichIsA("BasePart")\n'
-            f'    if not prim then rifle:Destroy() return end\n'
             f'    for _, p in rifle:GetDescendants() do\n'
             f'        if p:IsA("BasePart") then\n'
             f'            p.Transparency = 0\n'
@@ -1161,6 +1191,231 @@ def _fix_pickup_visual_target(scripts: list["RbxScript"]) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Pack: unity_transform_child_index
+# ---------------------------------------------------------------------------
+#
+# Unity ``transform.GetChild(n)`` indexes ONLY child GameObjects (Transforms).
+# The transpiler renders it as Roblox ``parent:GetChildren()[n+1]`` — but
+# Roblox ``GetChildren()`` also returns component-derived children the converter
+# injects (Sounds from AudioSources, the Script itself), and ``rbxlx_writer``
+# emits those BEFORE the structural children. So ``GetChildren()[1]`` can return
+# a Sound, and a downstream ``.CFrame`` read raises ``CFrame is not a valid
+# member of Sound`` (SimpleFPS Turret: ``tBase()`` resolved to ``HitSound``,
+# which also left the turret unable to aim/fire/damage).
+#
+# Authored GameObject hosts carry a ``_SceneRuntimeId`` attribute; real Unity
+# transform children are exactly those. Rewrite the unambiguous
+# ``<expr>:GetChildren()[<n>]`` index access (nobody legitimately indexes
+# ``GetChildren()`` by a literal position except transform-child emulation) to
+# a ``_SceneRuntimeId``-filtered helper. ``transform.childCount`` and
+# ``transform.Find`` share this root cause but need evidence-driven handling
+# (absent from the current corpus, and a blanket rewrite risks false hits) —
+# tracked as follow-ups.
+
+_GETCHILDREN_INDEX_RE = re.compile(
+    r"([A-Za-z_][A-Za-z0-9_.]*):GetChildren\(\)\s*\[\s*(\d+)\s*\]"
+)
+
+_UNITY_CHILD_HELPER = """\
+-- _AutoUnityTransformChild: Unity transform.GetChild(n) indexes only child
+-- GameObjects (Transforms); Roblox GetChildren() also returns injected Sounds/
+-- Scripts/etc., so raw GetChildren()[n] grabs the wrong instance. Authored
+-- GameObject hosts carry a _SceneRuntimeId attribute -- index those (1-based,
+-- mirroring the GetChildren()[n] call sites this replaces).
+local function __unityChild(parent, i)
+\tif not parent then return nil end
+\tlocal n = 0
+\tfor _, c in ipairs(parent:GetChildren()) do
+\t\tif c:GetAttribute("_SceneRuntimeId") ~= nil then
+\t\t\tn += 1
+\t\t\tif n == i then return c end
+\t\tend
+\tend
+\t-- Fallback for unstamped/legacy output: nth Model/BasePart child.
+\tn = 0
+\tfor _, c in ipairs(parent:GetChildren()) do
+\t\tif c:IsA("Model") or c:IsA("BasePart") then
+\t\t\tn += 1
+\t\t\tif n == i then return c end
+\t\tend
+\tend
+\treturn nil
+end
+"""
+
+
+def _luau_pos_is_code(source: str, pos: int) -> bool:
+    """True if char index ``pos`` is real code, not inside a string or a
+    ``--`` comment.
+
+    Scans from the start of ``pos``'s line, tracking single/double-quoted
+    strings (with backslash escapes) and ``--`` line comments — the only forms
+    the transpiler emits. Multi-line ``[[ ]]`` strings/comments aren't modeled;
+    they don't occur in transpiled output.
+    """
+    i = source.rfind("\n", 0, pos) + 1
+    quote: str | None = None
+    while i < pos:
+        ch = source[i]
+        if quote is not None:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"'):
+            quote = ch
+        elif ch == "-" and i + 1 < pos and source[i + 1] == "-":
+            return False  # rest of the line (incl. pos) is a comment
+        i += 1
+    return quote is None
+
+
+def _detect_unity_transform_child_index(scripts: list["RbxScript"]) -> bool:
+    return any(
+        _luau_pos_is_code(s.source, m.start())
+        for s in scripts
+        for m in _GETCHILDREN_INDEX_RE.finditer(s.source)
+    )
+
+
+@patch_pack(
+    name="unity_transform_child_index",
+    description="Rewrite raw GetChildren()[n] transform-child indexing to a "
+    "_SceneRuntimeId-filtered helper so it selects authored GameObject hosts, "
+    "not injected Sounds/Scripts (fixes Turret HitSound.CFrame crash).",
+    detect=_detect_unity_transform_child_index,
+)
+def _fix_unity_transform_child_index(scripts: list["RbxScript"]) -> int:
+    fixes = 0
+    for s in scripts:
+        count = 0
+
+        def _repl(m: "re.Match[str]", _src: str = s.source) -> str:
+            nonlocal count
+            # Skip matches inside string literals / comments.
+            if not _luau_pos_is_code(_src, m.start()):
+                return m.group(0)
+            count += 1
+            return f"__unityChild({m.group(1)}, {m.group(2)})"
+
+        new_source = _GETCHILDREN_INDEX_RE.sub(_repl, s.source)
+        if count == 0:
+            continue
+        if "local function __unityChild(" not in new_source:
+            new_source = _UNITY_CHILD_HELPER + "\n" + new_source
+        s.source = new_source
+        fixes += count
+        log.info("  %s: rewrote %d GetChildren()[n] -> __unityChild()", s.name, count)
+    return fixes
+
+
+# ---------------------------------------------------------------------------
+# Pack: door_player_flag_location
+# ---------------------------------------------------------------------------
+#
+# Cross-script attribute-location incoherence. The Pickup pack writes a
+# ``"has"..itemName`` flag onto BOTH the character Model and the Player
+# instance (see ``_add_pickup_remote_listener``). But the AI transpiles
+# Door.cs's key check into a ``playerWithKey()`` that reads the flag from the
+# **HumanoidRootPart** (``model:FindFirstChild("HumanoidRootPart")`` ->
+# ``rootPart:GetAttribute("hasKey")``) — a location the pickup never writes.
+# So a key-holding player standing in the trigger never opens the door.
+#
+# Fix the contract, not the symptom: the Player instance is the canonical
+# store (the pickup already writes it, and it replicates). Replace the whole
+# ``playerWithKey`` function with a canonical version that reads from the
+# player. Detection is identity-gated (``s.name == "Door"`` + coarse substring
+# presence) and the swap is done by locating the function span structurally
+# (string index + column-0 ``end``), NOT by regex-matching the AI's read form.
+# The flag name is extracted from the existing source so nothing game-specific
+# is hardcoded. Also resolves the toucher via ``FindFirstAncestorOfClass`` so
+# accessory/nested-part touches still find the character.
+#
+# (Player.luau separately writes the flag to the HumanoidRootPart from its own
+# client-side path; that client write can't reach a server reader regardless,
+# and is a distinct follow-up — not in scope here.)
+
+_PLAYER_WITH_KEY_SIG = "local function playerWithKey"
+
+
+def _extract_attr_name(func_src: str) -> str | None:
+    """Pull the first ``GetAttribute("<name>")`` literal from a function body."""
+    marker = 'GetAttribute("'
+    i = func_src.find(marker)
+    if i == -1:
+        return None
+    j = i + len(marker)
+    k = func_src.find('"', j)
+    if k == -1:
+        return None
+    return func_src[j:k]
+
+
+def _detect_door_player_flag_location(scripts: list["RbxScript"]) -> bool:
+    for s in scripts:
+        if (
+            s.name == "Door"
+            and _PLAYER_WITH_KEY_SIG in s.source
+            and "HumanoidRootPart" in s.source
+            and "GetAttribute" in s.source
+        ):
+            return True
+    return False
+
+
+@patch_pack(
+    name="door_player_flag_location",
+    description="Rewrite Door.playerWithKey() to read the key flag from the "
+    "Player instance (where the pickup writes it) instead of the "
+    "HumanoidRootPart (which nobody writes), fixing doors that never open.",
+    after=("pickup_remote_event_server",),
+    detect=_detect_door_player_flag_location,
+)
+def _fix_door_player_flag_location(scripts: list["RbxScript"]) -> int:
+    fixes = 0
+    for s in scripts:
+        if s.name != "Door":
+            continue
+        start = s.source.find(_PLAYER_WITH_KEY_SIG)
+        if start == -1:
+            continue
+        # Function span: from the signature to its column-0 ``end``. Inline
+        # guards (``if x then return false end``) keep their ``end`` mid-line,
+        # so the first ``\nend`` is the function's close.
+        close = s.source.find("\nend", start)
+        if close == -1:
+            continue
+        end_idx = close + len("\nend")
+        func_src = s.source[start:end_idx]
+        if "HumanoidRootPart" not in func_src or "GetAttribute" not in func_src:
+            continue
+        # Extract the flag from the HumanoidRootPart read specifically — the
+        # GetAttribute that follows the ``...FindFirstChild("HumanoidRootPart")``
+        # resolution — so an earlier unrelated GetAttribute (e.g. a "Locked"
+        # probe) isn't mistaken for the key flag.
+        flag = _extract_attr_name(func_src[func_src.find("HumanoidRootPart"):])
+        if not flag:
+            continue
+        canonical = (
+            "local function playerWithKey(otherPart)\n"
+            '\tlocal model = otherPart and otherPart:FindFirstAncestorOfClass("Model")\n'
+            "\tif not model then return false end\n"
+            "\tlocal player = Players:GetPlayerFromCharacter(model)\n"
+            "\tif not player then return false end\n"
+            f'\treturn player:GetAttribute("{flag}") == true\n'
+            "end"
+        )
+        s.source = s.source[:start] + canonical + s.source[end_idx:]
+        fixes += 1
+        log.info(
+            "  Door '%s': playerWithKey now reads player flag %r (was HumanoidRootPart)",
+            s.name, flag,
+        )
+    return fixes
+
+
+# ---------------------------------------------------------------------------
 # Pack: door_global_player_to_attribute
 # ---------------------------------------------------------------------------
 #
@@ -1626,14 +1881,18 @@ def _fix_door_global_player_lookup(scripts: list["RbxScript"]) -> int:
 # Rewrite ``local function playerHasX(playerInstance)`` to read directly
 # from the Player-instance attribute that the pickup pack writes.
 
-# Match the ``playerHasX`` helper definition. ``\w*`` (not ``\w+``)
-# tolerates the zero-parameter shape — the AI transpiler emits both
-# ``playerHasKey(playerInstance)`` and, more recently, the bare
-# ``playerHasKey()`` form. The earlier ``\w+`` only matched the former,
-# so the pack silently no-oped on the bare shape and the door bug
-# survived (door never opens).
+# Match the helper definition for any "does the player hold X" probe.
+# The AI transpiler emits at least three variants:
+#   * ``playerHasKey(playerInstance)``  — Unity-style helper, two-arg
+#   * ``playerHasKey()``                — bare/no-arg
+#   * ``getPlayerHasKey()``             — get-prefixed accessor
+# The earlier regex anchored the name at ``player[Hh]as``, which
+# silently rejected the ``getPlayerHas*`` shape and the door bug
+# survived (door never opened in PR #121's fresh-transpile validation).
+# ``(?:get)?[pP]layer[Hh]as\w+`` covers all three; the ``\w*`` for the
+# parameter list still tolerates zero args.
 _DOOR_MODULE_PLAYER_HELPER_RE = re.compile(
-    r"local function (?P<fn>player[Hh]as\w+)\s*\(\s*\w*\s*\)"
+    r"local function (?P<fn>(?:get)?[pP]layer[Hh]as\w+)\s*\(\s*\w*\s*\)"
     r"(?P<body>.*?)"
     r"^end$",
     re.DOTALL | re.MULTILINE,
@@ -1645,9 +1904,27 @@ def _detect_door_module_player_lookup(scripts: list["RbxScript"]) -> bool:
         if s.name != "Door":
             continue
         src = s.source or ""
-        # Cheap detector: the playerHas* helper plus a PlayerScripts
-        # lookup OR a getPlayerMod call. Both are unique to this AI shape.
-        if "playerHas" in src and ("getPlayerMod" in src or 'PlayerScripts' in src):
+        # Cheap detector: any ``playerHas*`` OR ``getPlayerHas*`` helper
+        # paired with one of three Player-resolution shapes the AI
+        # transpiler picks between:
+        #   1. ``getPlayerMod()`` helper
+        #   2. ``PlayerScripts.Player`` lookup
+        #   3. ``script.Parent:FindFirstChild("Player")`` sibling-module
+        #      ``require`` (the third shape the AI emits more recently;
+        #      previously the detector missed it because of the
+        #      ``"playerHas"`` substring being case-sensitive against
+        #      ``getPlayerHasKey``).
+        # ``casefold()`` lets us catch both ``playerHas`` and
+        # ``PlayerHas`` without enumerating every spelling.
+        lower = src.casefold()
+        helper_hit = "playerhas" in lower
+        resolution_hit = (
+            "getplayermod" in lower
+            or "PlayerScripts" in src
+            or 'FindFirstChild("Player")' in src
+            or "FindFirstChild('Player')" in src
+        )
+        if helper_hit and resolution_hit:
             return True
     return False
 
@@ -1683,15 +1960,30 @@ def _fix_door_module_player_lookup(scripts: list["RbxScript"]) -> int:
         def _replace(m: "re.Match[str]") -> str:
             fn_name = m.group("fn")
             body = m.group("body")
-            # Skip helpers that don't reference the module/PlayerScripts
-            # path — they're already correct.
-            if "getPlayerMod" not in body and "PlayerScripts" not in body:
+            # Skip helpers that don't reference one of the three
+            # broken Player-resolution shapes -- they're already correct.
+            if (
+                "getPlayerMod" not in body
+                and "PlayerScripts" not in body
+                and 'FindFirstChild("Player")' not in body
+                and "FindFirstChild('Player')" not in body
+            ):
                 return m.group(0)
             # Derive attribute name from the function name:
-            # ``playerHasKey`` → ``hasKey``. ``len("playerHas")`` == 9
-            # covers both the ``playerHas`` and ``playerhas`` spellings.
-            suffix = fn_name[9:]
-            attr = ("has" + suffix) if suffix else "hasKey"
+            #   ``playerHasKey``    -> ``hasKey``    (strip leading ``player``)
+            #   ``getPlayerHasKey`` -> ``hasKey``    (strip leading ``getPlayer``)
+            # Use a case-insensitive regex so both ``Player`` and
+            # ``player`` spellings are handled without hardcoding offsets.
+            import re as _re
+            suffix_match = _re.match(
+                r"^(?:get)?[pP]layer([Hh]as\w+)$", fn_name,
+            )
+            if suffix_match:
+                suffix = suffix_match.group(1)
+                # ``HasKey`` -> ``hasKey`` (camelCase attr)
+                attr = suffix[0].lower() + suffix[1:]
+            else:
+                attr = "hasKey"
             rewritten[fn_name] = attr
             return (
                 f"local function {fn_name}(_part)\n"
@@ -4664,4 +4956,96 @@ def _fix_fps_camera_pitch_inversion(scripts: list["RbxScript"]) -> int:
                 "  Fixed inverted FPS camera pitch in '%s' (vars: %s)",
                 s.name, sorted(to_flip),
             )
+    return fixes
+
+
+# ---------------------------------------------------------------------------
+# Pack: fps_e2e_mouse_channel
+# ---------------------------------------------------------------------------
+#
+# The /e2e-test skill drives mouse-look through a workspace attribute
+# channel because MCP's user_mouse_input synthesises Delta=(0,0) and so
+# can't exercise UserInputService:GetMouseDelta() polling (the canonical
+# FPS pattern). See docs/E2E_INPUT_CHANNEL.md.
+#
+# This pack injects the channel read into AI-transpiled mouse-look code.
+# It does NOT live in the transpiler prompt: _AI_SYSTEM_PROMPT is a cache
+# key (test_scene_runtime_transpiler.py freezes it byte-for-byte), so
+# editing it would invalidate every legacy project's LLM cache. A
+# coherence pack runs post-transpile and is cache-key-neutral.
+#
+# The injected block is production-safe: workspace attributes default to
+# nil -> 0, so when no test is driving the session the seq guard never
+# fires and behaviour is identical to raw GetMouseDelta(). The client
+# acks via E2EMouseAckSeq (an attribute, not an upvalue) so each test
+# `_pumpMouse` bump is consumed exactly once and the form is reload-safe.
+# The matching scaffolding (scaffolding/fps.py) uses the same shape.
+
+# Matches an assignment of GetMouseDelta() to a local: ``local d =
+# UserInputService:GetMouseDelta()``. Captures indentation + the var so
+# the injected block reuses both. Tolerates an explicit
+# ``game:GetService("UserInputService")`` receiver or a pre-bound local.
+_GET_MOUSE_DELTA_RE = re.compile(
+    r'^(?P<lead>[ \t]*)local\s+(?P<var>[A-Za-z_]\w*)\s*=\s*'
+    r'(?P<recv>[A-Za-z_][\w.:()" ]*?):GetMouseDelta\(\)\s*$',
+    re.MULTILINE,
+)
+
+_E2E_CHANNEL_MARKER = "E2EMouseAckSeq"
+
+
+def _detect_fps_e2e_mouse_channel(scripts: list["RbxScript"]) -> bool:
+    for s in scripts:
+        src = s.source or ""
+        if _GET_MOUSE_DELTA_RE.search(src) and _E2E_CHANNEL_MARKER not in src:
+            return True
+    return False
+
+
+@patch_pack(
+    name="fps_e2e_mouse_channel",
+    description="Inject the workspace E2E mouse-delta input channel after "
+    "each `local <d> = <uis>:GetMouseDelta()` assignment so the /e2e-test "
+    "skill can drive camera yaw/pitch (MCP synthesises Delta=(0,0)). "
+    "Production-safe: attributes default to nil so the block is a no-op in "
+    "normal play. See docs/E2E_INPUT_CHANNEL.md.",
+    # Run AFTER the pitch-inversion fix so the sign-flip operates on the
+    # raw pitch line; both edit different lines, but ordering keeps the
+    # transform deterministic.
+    after=("fps_camera_pitch_inversion",),
+    detect=_detect_fps_e2e_mouse_channel,
+)
+def _fix_fps_e2e_mouse_channel(scripts: list["RbxScript"]) -> int:
+    fixes = 0
+    for s in scripts:
+        src = s.source or ""
+        if _E2E_CHANNEL_MARKER in src:
+            continue  # already injected (idempotent)
+        if not _GET_MOUSE_DELTA_RE.search(src):
+            continue
+
+        def _inject(m: "re.Match[str]") -> str:
+            lead = m.group("lead")
+            var = m.group("var")
+            orig = m.group(0)
+            block = (
+                f'\n{lead}-- E2E test input channel (see docs/E2E_INPUT_CHANNEL.md):'
+                f' additive mouse delta, no-op when unset.'
+                f'\n{lead}local _e2eSeq = workspace:GetAttribute("E2EMouseSeq") or 0'
+                f'\n{lead}if _e2eSeq > (workspace:GetAttribute("E2EMouseAckSeq") or 0) then'
+                f'\n{lead}\tworkspace:SetAttribute("E2EMouseAckSeq", _e2eSeq)'
+                f'\n{lead}\t{var} = Vector2.new('
+                f'{var}.X + (workspace:GetAttribute("E2EMouseDeltaX") or 0), '
+                f'{var}.Y + (workspace:GetAttribute("E2EMouseDeltaY") or 0))'
+                f'\n{lead}end'
+            )
+            return orig + block
+
+        # Only inject at the FIRST GetMouseDelta site — a controller polls
+        # it once per frame; multiple injections would double-apply.
+        new_src, n = _GET_MOUSE_DELTA_RE.subn(_inject, src, count=1)
+        if n and new_src != src:
+            s.source = new_src
+            fixes += 1
+            log.info("  Injected E2E mouse channel into '%s'", s.name)
     return fixes

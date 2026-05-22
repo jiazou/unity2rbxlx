@@ -8,6 +8,8 @@ wait for it to become ready.
 from __future__ import annotations
 
 import logging
+import os
+import signal
 import subprocess
 import time
 from pathlib import Path
@@ -15,6 +17,15 @@ from pathlib import Path
 from config import STUDIO_PATH
 
 logger = logging.getLogger(__name__)
+
+# Match the Studio EDITOR process only. A bare ``RobloxStudio`` pattern also
+# matches ``.../Contents/MacOS/StudioMCP`` (the proxy that bridges the MCP
+# client <-> Studio) and ``.../MacOS/RobloxCrashHandler``, so pgrep/pkill on it
+# reported the proxy as "Studio" and — worse — tore the MCP connection down on
+# every teardown. The editor binary path is ``.../MacOS/RobloxStudio`` while the
+# proxy is ``.../MacOS/StudioMCP``, so this narrower fragment hits the editor
+# alone and leaves the MCP proxy alive across close/relaunch.
+_EDITOR_PROC_PATTERN = "MacOS/RobloxStudio"
 
 
 def launch_studio(
@@ -91,7 +102,7 @@ def is_studio_running() -> bool:
             return "RobloxStudioBeta.exe" in result.stdout
         else:
             result = subprocess.run(
-                ["pgrep", "-f", "RobloxStudio"],
+                ["pgrep", "-f", _EDITOR_PROC_PATTERN],
                 capture_output=True,
                 text=True,
                 timeout=10,
@@ -130,3 +141,130 @@ def wait_for_studio_ready(timeout: float = 60) -> bool:
 
     logger.warning("Timed out waiting for Roblox Studio after %.0fs", timeout)
     return False
+
+
+class StudioCloseError(RuntimeError):
+    """Raised when ``close_running_studio_or_fail`` could not terminate
+    every running Studio process within the allotted timeout."""
+
+
+def _pid_alive(pid: int) -> bool:
+    """True if *pid* is a live process (signal-0 probe)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists but owned by another user
+    return True
+
+
+def _close_pid(pid: int, timeout: float) -> None:
+    """SIGTERM → grace → SIGKILL a single editor PID, within one deadline.
+
+    Used by the e2e teardown so it closes ONLY the editor it launched, leaving
+    concurrent Studio editors from other projects untouched.
+    """
+    if not _pid_alive(pid):
+        logger.info("close: pid %d not running", pid)
+        return
+    deadline = time.monotonic() + timeout
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    grace_deadline = min(time.monotonic() + 5.0, deadline)
+    while time.monotonic() < grace_deadline:
+        if not _pid_alive(pid):
+            logger.info("close: pid %d exited on SIGTERM", pid)
+            return
+        time.sleep(0.5)
+    logger.warning("pid %d survived SIGTERM (save dialog?); escalating to SIGKILL", pid)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    while time.monotonic() < deadline:
+        if not _pid_alive(pid):
+            return
+        time.sleep(0.5)
+    raise StudioCloseError(f"pid {pid} still running after {timeout:.0f}s")
+
+
+def close_running_studio_or_fail(timeout: float = 30, pid: int | None = None) -> None:
+    """Force-close a running Roblox Studio editor.
+
+    Used by the ``/e2e-test`` skill's ``--close-and-relaunch`` flag and its
+    Step-8 teardown (Codex finding #1: re-opening a regenerated rbxlx in an
+    already-running Studio doesn't reload the DataModel; the only honest signal
+    that a fresh rbxlx is loaded is a fresh Studio process). No-op if nothing
+    is running.
+
+    Parameters
+    ----------
+    timeout:
+        Max seconds to wait for the process to exit after the kill signal.
+        Raises ``StudioCloseError`` on timeout.
+    pid:
+        If given, close ONLY this editor process (PID-targeted), so concurrent
+        Studio editors from other projects are left alone — preferred for the
+        teardown, which knows the PID it launched. If ``None``, falls back to a
+        pattern-based kill of every editor (used by ``--close-and-relaunch``,
+        which has no PID for the pre-existing instance). Neither path touches
+        the StudioMCP proxy (see ``_EDITOR_PROC_PATTERN``).
+    """
+    import platform
+
+    if pid is not None:
+        _close_pid(pid, timeout)
+        return
+
+    if not is_studio_running():
+        logger.info("close_running_studio_or_fail: no Studio process detected")
+        return
+
+    system = platform.system()
+
+    def _send(args: list[str]) -> None:
+        try:
+            subprocess.run(args, capture_output=True, text=True, timeout=10)
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            raise StudioCloseError(f"close signal failed: {exc}") from exc
+
+    # One overall budget. The SIGTERM grace and the post-kill wait are both
+    # carved out of this single deadline (not charged the full timeout twice).
+    deadline = time.monotonic() + timeout
+
+    if system == "Windows":
+        # ``taskkill /F`` is already a forceful terminate.
+        _send(["taskkill", "/F", "/IM", "RobloxStudioBeta.exe"])
+    else:
+        # ``pkill -f`` matches the same editor pattern ``pgrep -f`` finds —
+        # crucially NOT the StudioMCP proxy (see ``_EDITOR_PROC_PATTERN``), so
+        # closing Studio no longer severs the MCP connection. Send SIGTERM
+        # first (graceful), but Studio traps SIGTERM to raise a "save
+        # changes?" dialog and stays alive — so if it survives a short
+        # grace period, escalate to SIGKILL, which a dialog cannot catch.
+        _send(["pkill", "-f", _EDITOR_PROC_PATTERN])
+        grace_deadline = min(time.monotonic() + 5.0, deadline)
+        while time.monotonic() < grace_deadline:
+            if not is_studio_running():
+                logger.info("close_running_studio_or_fail: Studio exited on SIGTERM")
+                return
+            time.sleep(0.5)
+        logger.warning(
+            "Studio survived SIGTERM (likely a save dialog); escalating to SIGKILL"
+        )
+        _send(["pkill", "-9", "-f", _EDITOR_PROC_PATTERN])
+
+    # Wait for the process to actually leave the table — kill is
+    # asynchronous on macOS especially.
+    while time.monotonic() < deadline:
+        if not is_studio_running():
+            logger.info("close_running_studio_or_fail: Studio process exited")
+            return
+        time.sleep(0.5)
+
+    raise StudioCloseError(
+        f"Studio still running after {timeout:.0f}s — terminate manually and retry"
+    )

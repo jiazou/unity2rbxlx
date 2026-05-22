@@ -265,20 +265,3 @@ def read_fbx_vertex_bounds(
         "bounds_min": min_pt,
         "bounds_max": max_pt,
     }
-
-
-def compute_bounding_box(mesh_path: str | Path) -> tuple[float, float, float]:
-    """Compute the axis-aligned bounding box size of a mesh.
-
-    Args:
-        mesh_path: Path to the mesh file.
-
-    Returns:
-        Tuple of (width, height, depth) in mesh units.
-        Returns (1.0, 1.0, 1.0) on failure.
-    """
-    info = get_mesh_info(mesh_path)
-    bbox = info.get("bounding_box")
-    if bbox is not None and isinstance(bbox, tuple) and len(bbox) == 3:
-        return bbox
-    return (1.0, 1.0, 1.0)

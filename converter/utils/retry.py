@@ -39,8 +39,10 @@ def exponential_backoff_retry(
         The return value of *func*.
     """
     delay = base_delay
-    last_result = None
 
+    # range(1, max_retries + 2) gives one initial attempt plus max_retries retries.
+    # The final attempt always returns its result or re-raises, so the loop never
+    # falls through.
     for attempt in range(1, max_retries + 2):
         try:
             result = func()
@@ -56,9 +58,6 @@ def exponential_backoff_retry(
             logger.warning("Attempt %d: retry_on triggered, retrying in %.1fs...", attempt, delay)
             time.sleep(delay)
             delay = min(delay * 2, max_delay)
-            last_result = result
             continue
 
         return result
-
-    return last_result
