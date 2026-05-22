@@ -2687,11 +2687,13 @@ class TestScenePrefabPlacementBoot:
             function Door:OnEnable() table.insert(order, "OnEnable") end
             function Door:Start()
                 table.insert(order, "Start")
-                -- Wire a Touched-style connection via the host surface,
+                -- Wire a Touched connection via the host helper (the
+                -- contract idiom -- ``self.gameObject`` may be a Model),
                 -- proving the component is fully live (host bound).
-                if self.gameObject and self.gameObject.Touched then
-                    self.host:connect(self.gameObject.Touched, function() end)
-                    touchedWired = true
+                if self.gameObject then
+                    local conn = self.host:connectGameObjectSignal(
+                        self.gameObject, "Touched", function() end)
+                    touchedWired = conn ~= nil
                 end
             end
             local plan = {
@@ -2719,7 +2721,11 @@ class TestScenePrefabPlacementBoot:
             local doorTouched = mockSignal()
             local instances = {
                 ["pfb1:1"] = {Name = "Door", _sceneRuntimeId = "pfb1:1",
-                              _children = {}, Touched = doorTouched},
+                              _children = {}, Touched = doorTouched,
+                              -- BasePart so getTouchPart returns it directly.
+                              IsA = function(self, class)
+                                  return class == "BasePart" or class == "Part"
+                              end},
             }
             local services = servicesFor(plan, {door = Door}, instances)
             local engine = SceneRuntime.new(services, plan)

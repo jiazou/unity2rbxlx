@@ -686,6 +686,7 @@ local services = {
     heartbeat = RunService.Heartbeat,
     fixedStep = 0.02,
     now = function() return os.clock() end,
+    players = Players,
     getInstanceId = function(inst)
         return inst and inst:GetAttribute("_SceneRuntimeId")
     end,
@@ -760,6 +761,7 @@ _SCENE_RUNTIME_SERVER_SOURCE: str = '''\
 
 local RS = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
 
 local SceneRuntime = require(RS:WaitForChild("SceneRuntime"))
 local Plan = require(RS:WaitForChild("SceneRuntimePlan"))
@@ -825,6 +827,7 @@ local services = {
     heartbeat = RunService.Heartbeat,
     fixedStep = 0.02,
     now = function() return os.clock() end,
+    players = Players,
     getInstanceId = function(inst)
         return inst and inst:GetAttribute("_SceneRuntimeId")
     end,

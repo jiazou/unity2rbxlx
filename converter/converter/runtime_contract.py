@@ -102,6 +102,7 @@ def verify_module(source: str) -> VerificationResult:
     violations.extend(_check_lifecycle_assignments(statements, stripped))
     violations.extend(_check_constructor_purity(stripped, source))
     violations.extend(_check_unity_message_callbacks(statements, stripped, source))
+    violations.extend(_check_gameobject_touch(stripped, source))
 
     # Source order for reprompt readability. Tie-break on rule letter so
     # output is deterministic across runs.
@@ -778,4 +779,44 @@ def _check_returned_table_literal(statements, stripped: str, source: str, seen: 
                     f"``self.host:connect(...)`` inside ``Awake`` instead."
                 ),
             ))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Rule (g) -- GameObject ``.Touched`` / ``.TouchEnded`` on a raw GameObject.
+#
+# ``self.gameObject`` is frequently a Roblox ``Model`` (prefab placement);
+# ``.Touched`` / ``.TouchEnded`` are ``BasePart``-only signals and throw on
+# a Model (``Touched is not a valid member of Model``). The contract-
+# compliant shape resolves a touch part through the host:
+#
+#   self.host:connectGameObjectSignal(self.gameObject, "Touched", fn)
+#
+# Flag any ``<expr>.gameObject.Touched`` / ``.TouchEnded`` member access
+# (the broken idiom passed straight to ``host:connect``). The host helper
+# uses a string signal name, so the compliant shape never names ``.Touched``
+# as a member access -- this fires only on the broken pattern.
+# ---------------------------------------------------------------------------
+
+_RE_G_GAMEOBJECT_TOUCH = re.compile(
+    r"\.\s*gameObject\s*\.\s*(Touched|TouchEnded)\b",
+)
+
+
+def _check_gameobject_touch(stripped: str, source: str) -> list[Violation]:
+    out: list[Violation] = []
+    for m in _RE_G_GAMEOBJECT_TOUCH.finditer(stripped):
+        signal = m.group(1)
+        line = source.count("\n", 0, m.start()) + 1
+        out.append(Violation(
+            rule="g",
+            line=line,
+            message=(
+                f"``self.gameObject.{signal}`` accesses a BasePart-only "
+                f"signal on a GameObject that may be a Model (it throws on "
+                f"a Model). Use "
+                f"``self.host:connectGameObjectSignal(self.gameObject, "
+                f"\"{signal}\", fn)`` instead, which resolves a touch part."
+            ),
+        ))
     return out

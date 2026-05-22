@@ -1128,19 +1128,40 @@ Roblox does NOT dispatch by name. The following Unity callbacks must **never** a
 
 `OnTriggerEnter`, `OnTriggerExit`, `OnTriggerStay`, `OnCollisionEnter`, `OnCollisionExit`, `OnCollisionStay`, `OnMouseDown`, `OnMouseUp`, `OnMouseEnter`, `OnMouseExit`, `OnMouseOver`, `OnMouseDrag`.
 
-The contract-compliant replacement is `self.host:connect(signal, fn)` wired **in `Awake`**:
+The contract-compliant replacement for a **GameObject touch** is
+`self.host:connectGameObjectSignal(self.gameObject, "Touched", fn)` wired
+**in `Awake`** (NOT `self.host:connect(self.gameObject.Touched, ...)`):
 
 ```luau
 function Class:Awake()
-    self.host:connect(self.gameObject.Touched, function(other)
-        -- the body that used to live in OnTriggerEnter(other)
+    self.host:connectGameObjectSignal(self.gameObject, "Touched", function(other)
+        -- the body that used to live in OnTriggerEnter(other).
+        local plr = self.host.playerFromTouch(other)
+        if not plr then return end  -- ignore non-player touches
+        -- ... use plr / plr.Character ...
     end)
 end
 ```
 
+- `self.gameObject` may be a **Model** (prefab placement) or a BasePart.
+  `.Touched` is a BasePart-only signal and THROWS on a Model. NEVER write
+  `self.host:connect(self.gameObject.Touched, ...)`. Always go through
+  `self.host:connectGameObjectSignal(self.gameObject, "Touched", fn)` (and
+  `"TouchEnded"` for OnTriggerExit) — the host resolves a representative
+  touch part on the Model for you.
 - Call site is `Awake` ONLY. The host's `connect` wrapper handles the `enable`/`disable` cycling, so re-registering in `OnEnable` would double-subscribe.
 - Dispatch is gated on `active && enabled` (same condition as `OnEnable`). The host disconnects on the gate's true→false transition and rearms on false→true. On `OnDestroy` every subscription is disconnected.
-- Use `self.gameObject.Touched` for OnTriggerEnter/OnCollisionEnter (Roblox unifies trigger + collision into one event; gate on `CanTouch` / collision group if you need to distinguish).
+- `connectGameObjectSignal(self.gameObject, "Touched", fn)` covers both
+  OnTriggerEnter and OnCollisionEnter (Roblox unifies trigger + collision
+  into one event; gate on `CanTouch` / collision group if you need to
+  distinguish).
+- **Detecting the player inside a touch callback**: the `other` argument is
+  the raw touched BasePart (a character limb/accessory), NOT the character
+  Model — so `CollectionService:HasTag(other, "Player")` and
+  `other.tag == "Player"` NEVER match. Use the host normalization helper:
+  `local plr = self.host.playerFromTouch(other); if plr then ... end`, or the
+  boolean form `if self.host.isPlayerTouch(other) then ... end`. It walks
+  ancestors to the character Model and returns the owning Player.
 - Raw `signal:Connect(fn)` is still legal for cases that want connection-survives-disable semantics, but NOT for the twelve names above.
 
 ## Cross-script requires
@@ -1191,9 +1212,10 @@ The Unity → Roblox API mapping below covers patterns inside method bodies. Mod
 - `CancelInvoke()` → `self.host.cancelInvoke(self)`.
 - `StartCoroutine(Routine())` → `self.host.startCoroutine(self, function() ... end)`.
 
-### Trigger / collision / mouse (host:connect, never name-dispatch)
-- `OnTriggerEnter / Exit / Stay` → `self.host:connect(self.gameObject.Touched, function(other) ... end)` in `Awake`.
+### Trigger / collision / mouse (host:connectGameObjectSignal, never name-dispatch)
+- `OnTriggerEnter / Exit / Stay` → `self.host:connectGameObjectSignal(self.gameObject, "Touched", function(other) ... end)` in `Awake` (use `"TouchEnded"` for Exit). NEVER `self.host:connect(self.gameObject.Touched, ...)` — `self.gameObject` may be a Model and `.Touched` throws on a Model.
 - `OnCollisionEnter / Exit / Stay` → same shape; Roblox `.Touched` covers both unless code distinguishes by impulse.
+- Player gate inside the callback: `local plr = self.host.playerFromTouch(other); if plr then ... end` (or `if self.host.isPlayerTouch(other) then`). NEVER `CollectionService:HasTag(other, "Player")` or `other.tag == "Player"` — `other` is a raw character limb, not the tagged character Model.
 - `OnMouse*` → `self.host:connect(self.gameObject.MouseClick / MouseEnter / MouseLeave, ...)` if the GameObject has a `ClickDetector`; otherwise log unsupported.
 
 ### Component access

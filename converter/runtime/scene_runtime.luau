@@ -139,6 +139,11 @@ end
 --   fixedStep      -- number (seconds) for FixedUpdate accumulator
 --                     (Unity's default is 0.02).
 --   now            -- ``function() -> number`` (monotonic seconds).
+--   players        -- the ``Players`` service (or a stub exposing
+--                     ``GetPlayerFromCharacter``). Used by
+--                     ``playerFromTouch`` / ``isPlayerTouch`` to
+--                     normalize a touched BasePart to its owning Player.
+--                     Optional: nil -> ``playerFromTouch`` returns nil.
 -- ---------------------------------------------------------------------
 
 -- ---------------------------------------------------------------------
@@ -306,6 +311,166 @@ function SceneRuntime:_unregister(componentInstance)
 end
 
 -- ---------------------------------------------------------------------
+-- Touch / collision helpers (Piece 6 -- generic touch contract)
+--
+-- A prefab-placement component's ``self.gameObject`` is a Roblox
+-- ``Model`` (the resolved Instance is the placed prefab root), but the
+-- contract taught ``self.host:connect(self.gameObject.Touched, ...)`` --
+-- and ``.Touched`` is a ``BasePart``-only signal. On a Model it threw
+-- ``Touched is not a valid member of Model`` and every Pickup / Door /
+-- Turret died in ``Awake``. ``getTouchPart`` resolves a representative
+-- BasePart to host the signal; ``connectGameObjectSignal`` wires it
+-- through the lifecycle-tracked ``connect`` machinery so the
+-- subscription is gated / disarmed / cleaned up exactly like
+-- ``self.host:connect``.
+--
+-- Selection logic mirrors the legacy (non-generic) trigger-part finder
+-- the generic contract regressed (code_transpiler.py findTriggerPart).
+-- PrimaryPart is deliberately NOT used as the key: it carries pivot
+-- semantics and PrimaryPart emission is documented unsupported.
+-- ---------------------------------------------------------------------
+
+-- Synthetic / authored trigger-child names the converter (or a Unity
+-- prefab author) emits for proximity volumes. ``TriggerZone`` is the
+-- synthetic child scene_converter emits for a Unity Collider-with-trigger.
+local _TRIGGER_CHILD_NAMES: {string} = {
+	"TriggerZone", "Trigger", "Collider", "Colliders", "Detector",
+	"Sensor", "Hitbox", "Range", "ProximityVolume", "PickupTouchDetector",
+}
+
+local function _isBasePart(inst): boolean
+	return inst ~= nil
+		and type(inst.IsA) == "function"
+		and inst:IsA("BasePart")
+end
+
+-- Returns true when ``inst`` looks like an explicitly-named trigger
+-- volume (matches a known name OR has ``*TouchDetector*`` / ``*Trigger*``
+-- in its name) that can actually receive touches.
+local function _looksLikeNamedTrigger(inst): boolean
+	if not _isBasePart(inst) then return false end
+	if inst.CanTouch == false then return false end
+	local name = inst.Name
+	for _, n in ipairs(_TRIGGER_CHILD_NAMES) do
+		if name == n then return true end
+	end
+	if string.find(name, "TouchDetector") or string.find(name, "Trigger") then
+		return true
+	end
+	return false
+end
+
+-- ``getTouchPart(go) -> BasePart?``: resolve a representative part to
+-- host a Touched/TouchEnded signal for a GameObject.
+--   * BasePart  -> itself.
+--   * Model     -> tiered descendant search:
+--       (1) a named trigger child (TriggerZone / *TouchDetector* /
+--           *Trigger* ...) with CanTouch;
+--       (2) the first invisible (Transparency>=0.99) non-MeshPart
+--           BasePart with CanTouch;
+--       (3) the first BasePart descendant.
+--     PrimaryPart is never the primary key.
+--   * anything else / no part -> nil.
+function SceneRuntime:getTouchPart(go)
+	if go == nil then return nil end
+	if _isBasePart(go) then
+		return go
+	end
+	if type(go.IsA) ~= "function" or not go:IsA("Model") then
+		return nil
+	end
+	local descendants = go:GetDescendants()
+	-- Tier 1: an explicitly-named trigger child.
+	for _, d in ipairs(descendants) do
+		if _looksLikeNamedTrigger(d) then
+			return d
+		end
+	end
+	-- Tier 2: an invisible non-mesh trigger volume with CanTouch.
+	for _, d in ipairs(descendants) do
+		if _isBasePart(d)
+			and d.CanTouch ~= false
+			and (d.Transparency or 0) >= 0.99
+			and not d:IsA("MeshPart")
+		then
+			return d
+		end
+	end
+	-- Tier 3: any BasePart descendant.
+	for _, d in ipairs(descendants) do
+		if _isBasePart(d) then
+			return d
+		end
+	end
+	return nil
+end
+
+-- ``connectGameObjectSignal(comp, go, signalName, fn) -> connection?``:
+-- resolve the touch part via ``getTouchPart`` and connect
+-- ``part[signalName]`` (e.g. "Touched" / "TouchEnded") through the
+-- lifecycle-tracked ``connect`` machinery. Fails soft (warns + returns
+-- nil) when no part resolves -- never throws.
+function SceneRuntime:connectGameObjectSignal(comp, go, signalName, fn)
+	assert(type(fn) == "function",
+		"connectGameObjectSignal: fn must be function")
+	assert(type(signalName) == "string" and signalName ~= "",
+		"connectGameObjectSignal: signalName required")
+	local part = self:getTouchPart(go)
+	if part == nil then
+		self._warn(string.format(
+			"[scene_runtime] connectGameObjectSignal: no touch part on %s",
+			tostring(go)))
+		return nil
+	end
+	local signal = part[signalName]
+	if signal == nil then
+		self._warn(string.format(
+			"[scene_runtime] connectGameObjectSignal: %s has no %s signal",
+			tostring(part), tostring(signalName)))
+		return nil
+	end
+	return self:connect(comp, signal, fn)
+end
+
+-- ``playerFromTouch(other) -> Player?``: given the BasePart that fired a
+-- Touched signal, walk ancestors to the character Model and return the
+-- owning Player. R15 / accessory parts have the Accessory model as their
+-- immediate parent, so a flat ``other.Parent`` lookup misses them --
+-- ``FindFirstAncestorWhichIsA("Model")`` resolves both. Mirrors the
+-- working pattern in pickup_runtime.luau + the script_coherence rewrite.
+function SceneRuntime:playerFromTouch(other)
+	if other == nil then return nil end
+	local players = self._services.players
+	if players == nil then return nil end
+	-- Walk ancestors looking for the character Model -- a Model that
+	-- carries a Humanoid. This handles BOTH the common case (limb whose
+	-- immediate Parent is the character) AND accessory-mounted parts
+	-- (handle -> Accessory model -> character), where a single
+	-- ``other.Parent`` or nearest-ancestor-Model lookup picks the wrong
+	-- Model. Cap the climb so a deep workspace tree can't loop forever.
+	local node = other.Parent
+	local guard = 0
+	while node ~= nil and guard < 16 do
+		guard += 1
+		if type(node.IsA) == "function" and node:IsA("Model")
+			and type(node.FindFirstChildWhichIsA) == "function"
+			and node:FindFirstChildWhichIsA("Humanoid")
+		then
+			return players:GetPlayerFromCharacter(node)
+		end
+		node = node.Parent
+	end
+	return nil
+end
+
+-- ``isPlayerTouch(other) -> boolean``: convenience boolean wrapper around
+-- ``playerFromTouch`` for the common ``if self.host.isPlayerTouch(other)``
+-- gate.
+function SceneRuntime:isPlayerTouch(other)
+	return self:playerFromTouch(other) ~= nil
+end
+
+-- ---------------------------------------------------------------------
 -- Host surface bound onto each component as ``self.host``
 -- ---------------------------------------------------------------------
 
@@ -398,6 +563,38 @@ function SceneRuntime:_makeHostSurface(owner)
 				return engine:connect(owner, arg2, arg3)
 			end
 			return engine:connect(arg1, arg2, arg3)
+		end,
+		getTouchPart = function(arg1, arg2)
+			-- Colon: host:getTouchPart(go) -> arg1=host, arg2=go
+			-- Dotted: host.getTouchPart(go) -> arg1=go
+			if arg1 == host then
+				return engine:getTouchPart(arg2)
+			end
+			return engine:getTouchPart(arg1)
+		end,
+		connectGameObjectSignal = function(arg1, arg2, arg3, arg4)
+			-- Colon: host:connectGameObjectSignal(go, signalName, fn)
+			--   arg1=host, arg2=go, arg3=signalName, arg4=fn
+			-- Dotted: host.connectGameObjectSignal(go, signalName, fn)
+			--   arg1=go, arg2=signalName, arg3=fn
+			-- The contract teaches the colon form; the subscription is
+			-- owned by ``owner`` so it tears down with the component.
+			if arg1 == host then
+				return engine:connectGameObjectSignal(owner, arg2, arg3, arg4)
+			end
+			return engine:connectGameObjectSignal(owner, arg1, arg2, arg3)
+		end,
+		playerFromTouch = function(arg1, arg2)
+			if arg1 == host then
+				return engine:playerFromTouch(arg2)
+			end
+			return engine:playerFromTouch(arg1)
+		end,
+		isPlayerTouch = function(arg1, arg2)
+			if arg1 == host then
+				return engine:isPlayerTouch(arg2)
+			end
+			return engine:isPlayerTouch(arg1)
 		end,
 	}
 	return host

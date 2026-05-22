@@ -283,7 +283,7 @@ class TestRuleE:
             '    return setmetatable({}, Class)\n'
             'end\n'
             'function Class:Awake()\n'
-            '    self.host:connect(self.gameObject.Touched, function() end)\n'
+            '    self.host:connectGameObjectSignal(self.gameObject, "Touched", function() end)\n'
             'end\n'
             'return Class\n'
         )
@@ -341,14 +341,18 @@ class TestRuleF:
         _assert_rule(src, "f")
 
     def test_host_connect_in_awake_passes(self):
-        # The canonical good shape from Piece 6.
+        # The canonical good shape from Piece 6: GameObject touch events go
+        # through the host helper (``self.gameObject`` may be a Model).
         src = (
             'local Class = {}\n'
             'function Class.new(config)\n'
             '    return setmetatable({}, Class)\n'
             'end\n'
             'function Class:Awake()\n'
-            '    self.host:connect(self.gameObject.Touched, function(other) end)\n'
+            '    self.host:connectGameObjectSignal(self.gameObject, "Touched", function(other)\n'
+            '        local plr = self.host.playerFromTouch(other)\n'
+            '        if plr then end\n'
+            '    end)\n'
             'end\n'
             'return Class\n'
         )
@@ -364,6 +368,57 @@ class TestRuleF:
                 'return Class\n'
             )
             _assert_rule(src, "f")
+
+
+# ---------------------------------------------------------------------------
+# Rule (g) -- GameObject ``.Touched`` / ``.TouchEnded`` on a raw GameObject.
+# ``self.gameObject`` may be a Model; ``.Touched`` is BasePart-only and
+# throws. The compliant shape goes through
+# ``self.host:connectGameObjectSignal(self.gameObject, "Touched", fn)``.
+# ---------------------------------------------------------------------------
+
+class TestRuleG:
+
+    def test_gameobject_touched_rejected(self):
+        src = (
+            'local Class = {}\n'
+            'function Class:Awake()\n'
+            '    self.host:connect(self.gameObject.Touched, function(other) end)\n'
+            'end\n'
+            'return Class\n'
+        )
+        _assert_rule(src, "g")
+
+    def test_gameobject_touchended_rejected(self):
+        src = (
+            'local Class = {}\n'
+            'function Class:Awake()\n'
+            '    self.host:connect(self.gameObject.TouchEnded, function(other) end)\n'
+            'end\n'
+            'return Class\n'
+        )
+        _assert_rule(src, "g")
+
+    def test_connect_gameobject_signal_passes(self):
+        src = (
+            'local Class = {}\n'
+            'function Class:Awake()\n'
+            '    self.host:connectGameObjectSignal(self.gameObject, "Touched", function(other) end)\n'
+            'end\n'
+            'return Class\n'
+        )
+        _assert_clean(src)
+
+    def test_message_mentions_helper(self):
+        src = (
+            'local Class = {}\n'
+            'function Class:Awake()\n'
+            '    self.host:connect(self.gameObject.Touched, function(other) end)\n'
+            'end\n'
+            'return Class\n'
+        )
+        v = [x for x in verify_module(src).violations if x.rule == "g"][0]
+        assert "connectGameObjectSignal" in v.message
 
 
 # ---------------------------------------------------------------------------
