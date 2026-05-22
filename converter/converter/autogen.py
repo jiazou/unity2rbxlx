@@ -544,7 +544,7 @@ def _plan_to_luau(plan: dict) -> str:
 # ``_subphase_inject_scene_runtime`` before this encoder runs.
 _PLAN_KEYS_FOR_HOST: tuple[str, ...] = (
     "modules", "scenes", "prefabs", "domain_overrides",
-    "scriptable_objects",
+    "scriptable_objects", "scene_prefab_placements",
 )
 
 
