@@ -1038,7 +1038,7 @@ def _fix_clone_visibility(scripts: list[RbxScript]) -> int:
 
 
 def _remove_stale_player_requires(scripts: list[RbxScript]) -> int:
-    """Rewrite Player-as-module references when Player is actually a LocalScript.
+    r"""Rewrite Player-as-module references when Player is actually a LocalScript.
 
     When the AI transpiler emits something like:
 
