@@ -1248,7 +1248,7 @@ The string is `@scene_runtime/<stem>`, where `<stem>` is the file stem of the de
 
 When a method records a flag that OTHER scripts will read — e.g. the player picked up a Key (Door checks "has the player a Key?"), a HUD value, a "got rifle" flag, a damage marker — write the canonical Roblox **Attribute** mirror alongside your local Lua-field update. An internal field on the MonoBehaviour instance (`self.gotKey = true`) is visible only to THAT instance; cross-script readers can ONLY see Roblox Instance Attributes (which also replicate across server/client). The canonical store is the character Model AND the Player Instance.
 
-When a `MonoBehaviour` records picked-up items in a `GetItem(itemName)`-style method, ALWAYS write the attribute mirror BEFORE the local-field update:
+When a `MonoBehaviour` records picked-up items in a `GetItem(itemName)`-style method, ALWAYS write the attribute mirror BEFORE the local-field update. **AND** mirror server-side via the autogen ``PlayerSetSharedFlag`` RemoteEvent so server-domain readers (Door, etc.) see the change too. Roblox attributes set by the client do NOT replicate to the server; the RemoteEvent makes the write authoritative.
 
 ```luau
 function Player:GetItem(itemName)
@@ -1259,6 +1259,12 @@ function Player:GetItem(itemName)
         if _plr then _plr:SetAttribute(_flag, true) end
         local _char = _plr and _plr.Character
         if _char then _char:SetAttribute(_flag, true) end
+        -- Server-side mirror so cross-domain readers see it. ``PlayerSetSharedFlag``
+        -- is a RemoteEvent created at boot by the autogen server entrypoint; it
+        -- accepts (flagName, value) and writes the canonical Attribute server-side.
+        local _rs = game:GetService("ReplicatedStorage")
+        local _sf = _rs:FindFirstChild("PlayerSetSharedFlag")
+        if _sf then _sf:FireServer(_flag, true) end
     end
     -- ... then your local state update
     if itemName == "Key" then self.gotKey = true end

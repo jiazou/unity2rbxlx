@@ -154,6 +154,28 @@ local getItemRemote = Instance.new("RemoteEvent")
 getItemRemote.Name = "PlayerGetItem"
 getItemRemote.Parent = ReplicatedStorage
 
+-- Canonical shared-flag mirror. Client-side scripts (Player.luau) FireServer
+-- this when they record a player flag (hasKey, hasRifle, ...). The server
+-- sets the Attribute on BOTH the character Model and the Player Instance so
+-- cross-domain readers (server-domain Door, etc.) see the change. Server-set
+-- attributes replicate down to every client, so client-side reads still work.
+local sharedFlagRemote = Instance.new("RemoteEvent")
+sharedFlagRemote.Name = "PlayerSetSharedFlag"
+sharedFlagRemote.Parent = ReplicatedStorage
+
+sharedFlagRemote.OnServerEvent:Connect(function(player, flagName, value)
+    if type(flagName) ~= "string" or flagName == "" then return end
+    -- Whitelist: only "hasX" / "got*" style identifiers, no nested attribute
+    -- chains and nothing past 64 chars to keep the surface small + sane.
+    if #flagName > 64 or not string.match(flagName, "^[%w_]+$") then return end
+    -- Booleans / numbers / strings only -- skip tables/instances/nil-clears.
+    local t = type(value)
+    if t ~= "boolean" and t ~= "number" and t ~= "string" then return end
+    player:SetAttribute(flagName, value)
+    local char = player.Character
+    if char then char:SetAttribute(flagName, value) end
+end)
+
 -- Visual hit feedback
 local function flashHitPart(part)
     local ok, orig = pcall(function() return part.Color end)
