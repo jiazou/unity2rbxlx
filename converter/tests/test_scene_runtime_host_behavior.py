@@ -229,8 +229,17 @@ local function servicesFor(plan, modules, instances)
             return nil
         end,
         resolveCloneChild = function(clone, gameObjectId)
-            return (clone and clone._children
-                    and clone._children[gameObjectId]) or clone
+            -- Matches the production semantics post-R3: check the clone
+            -- root's SRI first, then walk children, then return nil on
+            -- miss. The prior "return clone on miss" sentinel made the
+            -- caller's namespaced/raw-id fallback ambiguous.
+            if clone and clone._sceneRuntimeId == gameObjectId then
+                return clone
+            end
+            if clone and clone._children then
+                return clone._children[gameObjectId]
+            end
+            return nil
         end,
         collectDescendantIds = function(inst)
             local out = {}
@@ -2814,19 +2823,31 @@ class TestScenePrefabPlacementBoot:
         assert "OK" in out
 
     def test_multi_placement_setactive_routes_to_correct_clone(self):
-        # Codex P1 round 2 regression test (behavioural, not shape-only).
-        # Two placements of the same prefab share a prefab-local
-        # ``game_object_id`` ("pfb1:1"). Without per-placement namespacing
-        # on BOTH the write side and the read side, ``setActive`` on
-        # placement-B's clone silently no-ops because the lookup misses
-        # the bucket that was keyed by the bare prefab-local id. After
-        # the per-instance ``_SceneRuntimeId`` re-stamp, each clone gets
-        # its own bucket and ``setActive(B)`` toggles only B's state.
+        # Codex round 3 regression test: actually exercise setActive
+        # on placement-B and assert (a) B's component's OnDisable fires,
+        # (b) A's component stays live -- the round-1/round-2 attempts
+        # both broke this path silently (write side namespaced, read
+        # side resolved by raw id -> setActive lookup missed B's bucket
+        # entirely, no OnDisable, no state flip). The earlier R2 test
+        # claimed behavioural but only asserted bucket shape; this one
+        # actually invokes host.setActive AND host.destroy.
         scenario = textwrap.dedent("""\
             local awakes = 0
+            local disablesA = 0
+            local disablesB = 0
+            local destroysA = 0
+            local destroysB = 0
             local Toggle = {} ; Toggle.__index = Toggle
-            function Toggle.new(_) return setmetatable({}, Toggle) end
+            function Toggle.new(cfg) return setmetatable({tag = cfg.tag}, Toggle) end
             function Toggle:Awake() awakes = awakes + 1 end
+            function Toggle:OnDisable()
+                if self.tag == "A" then disablesA = disablesA + 1
+                elseif self.tag == "B" then disablesB = disablesB + 1 end
+            end
+            function Toggle:OnDestroy()
+                if self.tag == "A" then destroysA = destroysA + 1
+                elseif self.tag == "B" then destroysB = destroysB + 1 end
+            end
             local plan = {
                 modules = {tog = {stem = "Toggle", runtime_bearing = true,
                                   module_path = "x", domain = "server"}},
@@ -2850,11 +2871,11 @@ class TestScenePrefabPlacementBoot:
                 domain_overrides = {},
             }
             -- One instance per placement; both stamped with the
-            -- prefab-local SRI at the start. SetAttribute mirrors into
-            -- _sceneRuntimeId so production stamping is observable in
-            -- the harness (servicesFor installs this for instances in
-            -- its passed-in table, but this test wires workspaceFind
-            -- directly so we install per-instance).
+            -- prefab-local SRI at start. SetAttribute mirrors into
+            -- _sceneRuntimeId so the production stamping mechanism is
+            -- observable in the harness; pass the planner-supplied tag
+            -- ("A" / "B") through the config so the lifecycle counters
+            -- can tell the placements apart.
             local function _mkInst(name)
                 local i = {Name = name, _sceneRuntimeId = "pfb1:1",
                            _children = {}, _builtins = {}}
@@ -2868,47 +2889,92 @@ class TestScenePrefabPlacementBoot:
             end
             local instA = _mkInst("A")
             local instB = _mkInst("B")
-            -- ``workspaceFind`` returns the next un-bound clone whose
-            -- attribute matches the requested raw id. The runtime's
-            -- per-placement stamp re-keys the attribute after binding,
-            -- so the next placement's lookup naturally skips the
-            -- already-stamped clone.
-            local bound = {}
+            -- Inject per-placement config tags so we can distinguish A
+            -- from B in OnDisable / OnDestroy. The planner-supplied
+            -- config table is empty; we patch the prefab subplan to
+            -- send a per-placement tag based on placement_id.
+            local boundOrder = {}
             local services = servicesFor(plan, {tog = Toggle}, {})
             services.workspaceFind = function(rawId)
                 for _, cand in ipairs({instA, instB}) do
-                    if not bound[cand] and cand._sceneRuntimeId == rawId then
-                        bound[cand] = true
+                    if not boundOrder[cand] and cand._sceneRuntimeId == rawId then
+                        boundOrder[cand] = true
                         return cand
                     end
                 end
                 return nil
             end
+            services.collectDescendantIds = function(inst)
+                -- For destroy(): return the instance's own (re-stamped)
+                -- SRI so the cascade looks up _componentsByGameObject
+                -- with the right key. No nested children in this test.
+                return {inst._sceneRuntimeId}
+            end
+            services.getInstanceId = function(inst)
+                return inst and inst._sceneRuntimeId
+            end
+            -- Patch the prefab subplan in-place: when each placement's
+            -- loop builds its component, the config needs to carry the
+            -- placement tag. Since the planner's config is shared per
+            -- prefab (not per-placement), we'd need a runtime hook --
+            -- short of one, use the binding order to tag instances.
+            local function tagFromBindOrder()
+                -- Called inside Toggle.new via the patched plan; the
+                -- ordered placement loop binds A then B, so first call
+                -- = "A", second = "B".
+                local count = 0
+                for _ in pairs(boundOrder) do count = count + 1 end
+                return (count == 1) and "A" or "B"
+            end
+            local orig_new = Toggle.new
+            Toggle.new = function(cfg)
+                return orig_new({tag = tagFromBindOrder()})
+            end
             local engine = SceneRuntime.new(services, plan)
             engine:start("server")
             runDeferred()
-            assert(awakes == 2, "both placements must boot a Toggle (got " ..
+            assert(awakes == 2,
+                "both placements must boot a Toggle (got " ..
                 tostring(awakes) .. ")")
-            -- After binding, each instance carries its own namespaced
-            -- SRI ("PA:pfb1:1" vs "PB:pfb1:1") and the maps are keyed
-            -- on those distinct strings. setActive(instB, false) must
-            -- write to instB's bucket only -- the proof is that the
-            -- meta map for instB's component flips while instA's stays
-            -- live and active.
+            -- Sanity: per-instance re-stamping must rename each clone's
+            -- SRI to ``placement_id:raw_goid`` so getInstanceId returns
+            -- distinct ids for the two clones.
             assert(instA._sceneRuntimeId == "PA:pfb1:1",
-                "instA must be re-stamped with placement A's namespace; got " ..
-                tostring(instA._sceneRuntimeId))
+                "instA's SRI was not re-stamped to placement A's namespace")
             assert(instB._sceneRuntimeId == "PB:pfb1:1",
-                "instB must be re-stamped with placement B's namespace; got " ..
-                tostring(instB._sceneRuntimeId))
-            -- Distinct map buckets prove the read side resolves
-            -- correctly per placement.
-            local listA = engine._componentsByGameObject["PA:pfb1:1"]
-            local listB = engine._componentsByGameObject["PB:pfb1:1"]
-            assert(listA and #listA == 1, "placement A must own its own bucket")
-            assert(listB and #listB == 1, "placement B must own its own bucket")
-            assert(listA[1] ~= listB[1],
-                "placements must have distinct component instances")
+                "instB's SRI was not re-stamped to placement B's namespace")
+            -- Pull each component via the lookup the runtime uses, then
+            -- exercise setActive on instB. The cascade must fire
+            -- OnDisable on B's component ONLY -- A stays live.
+            local compA = engine._componentsByGameObject["PA:pfb1:1"][1]
+            local compB = engine._componentsByGameObject["PB:pfb1:1"][1]
+            assert(compA ~= nil and compB ~= nil,
+                "both placements must own a component")
+            assert(compA ~= compB, "components must be distinct instances")
+            compB.host:setActive(instB, false)
+            runDeferred()
+            assert(disablesB == 1,
+                "setActive(instB, false) must fire OnDisable on B " ..
+                "(got " .. tostring(disablesB) .. ")")
+            assert(disablesA == 0,
+                "setActive(instB, false) must NOT touch A " ..
+                "(got " .. tostring(disablesA) .. ")")
+            -- The per-GO map flips for B's bucket only; A's stays alive.
+            assert(engine._goActiveSelf["PB:pfb1:1"] == false,
+                "_goActiveSelf for placement B must flip false; got " ..
+                tostring(engine._goActiveSelf["PB:pfb1:1"]))
+            assert(engine._goActiveSelf["PA:pfb1:1"] == true,
+                "_goActiveSelf for placement A must stay true; got " ..
+                tostring(engine._goActiveSelf["PA:pfb1:1"]))
+            -- Now destroy B; A must keep living.
+            compB.host:destroy(instB)
+            runDeferred()
+            assert(destroysB == 1,
+                "destroy(instB) must fire OnDestroy on B (got " ..
+                tostring(destroysB) .. ")")
+            assert(destroysA == 0,
+                "destroy(instB) must NOT touch A (got " ..
+                tostring(destroysA) .. ")")
             print("OK")
         """)
         rc, out, err = _run_scenario(scenario)

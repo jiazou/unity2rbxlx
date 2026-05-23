@@ -723,12 +723,20 @@ local services = {
         return clone
     end,
     resolveCloneChild = function(clone, gameObjectId)
+        -- Check the clone root first (its own SRI may match -- the
+        -- per-placement upfront stamp also rewrites the root attribute),
+        -- then descendants. Returns nil on miss so callers can fall back
+        -- to a different lookup id without confusing "miss" with "the
+        -- root IS the match" (the prior sentinel-clone behaviour).
+        if clone:GetAttribute("_SceneRuntimeId") == gameObjectId then
+            return clone
+        end
         for _, d in clone:GetDescendants() do
             if d:GetAttribute("_SceneRuntimeId") == gameObjectId then
                 return d
             end
         end
-        return clone
+        return nil
     end,
     collectDescendantIds = function(inst)
         -- DFS post-order (children deepest-first, then self), per the
@@ -864,12 +872,20 @@ local services = {
         return clone
     end,
     resolveCloneChild = function(clone, gameObjectId)
+        -- Check the clone root first (its own SRI may match -- the
+        -- per-placement upfront stamp also rewrites the root attribute),
+        -- then descendants. Returns nil on miss so callers can fall back
+        -- to a different lookup id without confusing "miss" with "the
+        -- root IS the match" (the prior sentinel-clone behaviour).
+        if clone:GetAttribute("_SceneRuntimeId") == gameObjectId then
+            return clone
+        end
         for _, d in clone:GetDescendants() do
             if d:GetAttribute("_SceneRuntimeId") == gameObjectId then
                 return d
             end
         end
-        return clone
+        return nil
     end,
     collectDescendantIds = function(inst)
         -- DFS post-order (children deepest-first, then self), per the

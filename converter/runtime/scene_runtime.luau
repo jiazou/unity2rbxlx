@@ -833,13 +833,26 @@ end
 -- Reference wiring
 -- ---------------------------------------------------------------------
 
-function SceneRuntime:_resolveReferenceTarget(refRow, componentByInstanceId)
+function SceneRuntime:_resolveReferenceTarget(refRow, componentByInstanceId, placement_id)
 	local target_kind = refRow.target_kind
 	local target_ref = refRow.target_ref
 	if target_kind == "component" then
 		return componentByInstanceId[target_ref]
 	elseif target_kind == "gameobject" then
 		-- Resolve to the Roblox Instance via _SceneRuntimeId attribute.
+		-- Inside a prefab placement (``placement_id`` non-empty), every
+		-- cloned descendant's SRI has been re-stamped to
+		-- ``<placement>:<raw>`` so the workspace lookup must use the same
+		-- namespace; the harness path (with no upfront re-stamp) falls
+		-- back to the raw lookup. Codex round-3: without this branch the
+		-- intra-prefab gameobject refs resolve to nil (production) or to
+		-- the wrong placement's clone (when multiple placements share a
+		-- raw SRI).
+		if placement_id ~= nil and placement_id ~= "" then
+			local ns_ref = placement_id .. ":" .. target_ref
+			local hit = self._services.workspaceFind(ns_ref)
+			if hit ~= nil then return hit end
+		end
 		return self._services.workspaceFind(target_ref)
 	elseif target_kind == "prefab" then
 		-- The host injects the stable prefab_id; modules pass it to
@@ -888,7 +901,8 @@ function SceneRuntime:_assignFieldOnComponent(instance, field, index, value)
 end
 
 function SceneRuntime:_wireReferences(refs, componentByInstanceId,
-                                       crossDomainEdges, instanceById)
+                                       crossDomainEdges, instanceById,
+                                       placement_id)
 	-- ``instanceById`` is the planner's per-scene/prefab
 	-- instance_id -> instance row map, used to resolve a target's
 	-- ``script_id`` (and therefore its domain via plan.modules) even
@@ -897,11 +911,19 @@ function SceneRuntime:_wireReferences(refs, componentByInstanceId,
 	-- process ("client" or "server"), so the opposite-side component
 	-- never exists locally -- the cross-domain log + edge tracking
 	-- must be plan-based, not registry-based.
+	--
+	-- ``placement_id`` (optional): when wiring references for an
+	-- intra-prefab placement, the runtime has re-stamped every cloned
+	-- descendant's ``_SceneRuntimeId`` to ``<placement>:<raw>``. Pass it
+	-- through so ``gameobject`` ref lookups namespace their target_ref
+	-- the same way -- otherwise the ref resolves to nil (or to a
+	-- different placement's clone whose SRI happens to still be raw).
 	local modules = self._plan.modules or {}
 	for _, ref in ipairs(refs) do
 		local sourceComp = componentByInstanceId[ref["from"]]
 		if sourceComp ~= nil then
-			local target = self:_resolveReferenceTarget(ref, componentByInstanceId)
+			local target = self:_resolveReferenceTarget(
+				ref, componentByInstanceId, placement_id)
 			-- Cross-domain policy: if both source module and target
 			-- module have assigned non-legacy domains and they differ,
 			-- inject ``nil`` and surface the edge. Resolve via the plan
@@ -1568,35 +1590,102 @@ function SceneRuntime:_constructPrefabClone(clone, prefab, prefab_id, includeScr
 	local componentByInstanceId = {}
 	local componentList = {}
 	local instanceById = {}
+
+	-- UPFRONT walk: re-stamp every cloned descendant whose ``_SceneRuntimeId``
+	-- starts with this prefab's namespace (``<prefab_id>:``) so the final
+	-- attribute reads ``<placement_id>:<old_sri>``. This covers BOTH MB-
+	-- bearing hosts (which the per-component loop revisits) and unscripted
+	-- ancestors / non-MB descendants that the loop never sees. Skipping the
+	-- non-MB nodes (the round-2 round-1 design) left the parent map keyed
+	-- on ``<placement>:child -> <placement>:root`` while ``root``'s
+	-- ``_SceneRuntimeId`` stayed raw, so ``setActive(root, false)`` wrote
+	-- to the wrong key and ``setActive(child, true)`` cascade missed the
+	-- inactive ancestor (Codex R3). One walk per placement, before the
+	-- per-component loop, means every later lookup (here AND in
+	-- ``_wireReferences``) sees a consistently namespaced view.
+	local function _stamp_descendants_upfront()
+		if clone == nil or placement_id == nil or placement_id == ""
+		   or prefab_id == nil or prefab_id == "" then
+			return
+		end
+		local prefix = prefab_id .. ":"
+		local function _rewrite(node)
+			local sri_ok, sri = pcall(function()
+				return node:GetAttribute("_SceneRuntimeId")
+			end)
+			if sri_ok and type(sri) == "string"
+			   and string.sub(sri, 1, #prefix) == prefix then
+				pcall(function()
+					node:SetAttribute("_SceneRuntimeId",
+						placement_id .. ":" .. sri)
+				end)
+			end
+		end
+		_rewrite(clone)
+		local ok, descs = pcall(function() return clone:GetDescendants() end)
+		if ok and type(descs) == "table" then
+			for _, d in ipairs(descs) do
+				_rewrite(d)
+			end
+		end
+	end
+	_stamp_descendants_upfront()
+
+	-- Cache prefab-local goid -> live Instance: a prefab GameObject can host
+	-- MULTIPLE MonoBehaviours, so the same ``inst.game_object_id`` appears
+	-- multiple times in ``prefab.instances``. Looking up (and especially
+	-- stamping) more than once would either bind later rows to the wrong
+	-- Instance (round-2 bug) or leave them with ``nil`` gameObject.
+	local goInstByGoid = {}
 	for _, inst in ipairs(prefab.instances or {}) do
 		instanceById[inst.instance_id] = inst
 		if (includeScriptId == nil) or includeScriptId[inst.script_id] then
 			local ns_goid = _idWithPlacement(placement_id, inst.game_object_id)
-			-- Map intra-prefab game_object_id to the actual Roblox child via
-			-- the services helper (production: walk by _SceneRuntimeId
-			-- under the clone; harness: pass-through). With no clone root,
-			-- resolve the live placement clone globally by id. Looks up by
-			-- the un-namespaced id since the workspace attribute has not
-			-- yet been re-stamped at this point.
-			local goInst
-			if clone ~= nil then
-				goInst = self._services.resolveCloneChild(clone, inst.game_object_id)
-			else
-				goInst = self._services.workspaceFind(inst.game_object_id)
-			end
-			-- Re-stamp this single instance's _SceneRuntimeId with the
-			-- namespaced id so every downstream read (getInstanceId,
-			-- collectDescendantIds, ...) returns ns_goid. Per-instance
-			-- (not a one-shot walk) so each placement of the same prefab
-			-- gets its own stamps even when the placements share a
-			-- workspace ancestor walk. Best-effort: harness instances
-			-- without ``SetAttribute`` rely on the mirror hook
-			-- ``servicesFor`` installs.
-			if goInst ~= nil and placement_id ~= nil and placement_id ~= ""
-			   and ns_goid ~= inst.game_object_id then
-				pcall(function()
-					goInst:SetAttribute("_SceneRuntimeId", ns_goid)
-				end)
+			-- Resolve the live Roblox child. Try NS first: production
+			-- placements have their cloned descendants' SRIs already re-
+			-- stamped namespaced by the upfront walk, so the ns lookup is
+			-- the universal production hit. Fall back to the RAW id for
+			-- the harness path (synthetic clone without ``GetDescendants``,
+			-- so the upfront walk was a no-op and the SRI is still raw).
+			-- ``resolveCloneChild`` returns nil on miss (the prior sentinel-
+			-- on-miss behaviour was changed in R3 because it made this
+			-- fallback ambiguous).
+			local goInst = goInstByGoid[inst.game_object_id]
+			if goInst == nil then
+				if clone ~= nil then
+					if ns_goid ~= inst.game_object_id then
+						goInst = self._services.resolveCloneChild(clone, ns_goid)
+					end
+					if goInst == nil then
+						goInst = self._services.resolveCloneChild(
+							clone, inst.game_object_id)
+					end
+				else
+					if ns_goid ~= inst.game_object_id then
+						goInst = self._services.workspaceFind(ns_goid)
+					end
+					if goInst == nil then
+						goInst = self._services.workspaceFind(inst.game_object_id)
+					end
+				end
+				goInstByGoid[inst.game_object_id] = goInst
+				-- Best-effort per-instance stamp for the harness path or
+				-- any Instance whose SRI the upfront walk did not touch
+				-- (e.g. found via raw fallback after the walk missed). A
+				-- second SetAttribute on an already-namespaced attribute
+				-- is harmless because the upfront walk only rewrites
+				-- prefab-prefix-matching SRIs.
+				if goInst ~= nil and placement_id ~= nil and placement_id ~= ""
+				   and ns_goid ~= inst.game_object_id then
+					local sri_ok, cur = pcall(function()
+						return goInst:GetAttribute("_SceneRuntimeId")
+					end)
+					if not sri_ok or cur ~= ns_goid then
+						pcall(function()
+							goInst:SetAttribute("_SceneRuntimeId", ns_goid)
+						end)
+					end
+				end
 			end
 			local comp = self:_buildComponent(
 				inst.script_id, goInst, ns_goid,
@@ -1635,7 +1724,7 @@ function SceneRuntime:_constructPrefabClone(clone, prefab, prefab_id, includeScr
 		self:_injectHostSurface(comp, m and m.gameObjectInstance, m and m.gameObjectId)
 	end
 	self:_wireReferences(prefab.references or {}, componentByInstanceId, nil,
-		instanceById)
+		instanceById, placement_id)
 	-- Caller-supplied externals override matching wired refs.
 	if type(externalRefs) == "table" then
 		for instId, fields in pairs(externalRefs) do
