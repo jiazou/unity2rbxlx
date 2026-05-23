@@ -644,6 +644,49 @@ class TestRecursiveDestroy:
                         .split("=")[1])
         assert len_after == len_before
 
+    def test_destroy_accepts_userdata_instance(self):
+        # Regression: ``type(robloxInstance) == "userdata"`` in real Luau,
+        # not ``"table"``. The old guard ``if type(target) ~= "table"``
+        # early-returned on EVERY live Roblox Instance, so
+        # ``host.destroy(self.gameObject)`` was a silent no-op in production
+        # — broke Pickup-on-touch cleanup. Verified by a Studio playtest:
+        # KeyPickup wasn't destroyed despite Touched firing + the handler
+        # reaching destroy(). The harness here uses tables for fake
+        # Instances so the case was never exercised; this test uses
+        # ``newproxy(true)`` to create real userdata and asserts the
+        # services.destroyInstance spy receives it.
+        scenario = textwrap.dedent("""\
+            local plan = { modules = {}, scenes = {}, prefabs = {},
+                           domain_overrides = {} }
+            local destroyed = {}
+            local ud = newproxy(true)
+            getmetatable(ud).__metatable = nil  -- keep introspection
+            local services = {
+                task = task, warn = function(...) end,
+                resolveModule = function(...) return nil end,
+                heartbeat = nil, players = nil,
+                workspaceFind = function(...) return nil end,
+                findFirstChildWhichIsA = function(...) return nil end,
+                findFirstChild = function(...) return nil end,
+                instanceTree = function(...) return {} end,
+                collectDescendantIds = function(_) return {} end,
+                destroyInstance = function(inst)
+                    table.insert(destroyed, type(inst))
+                end,
+            }
+            local engine = SceneRuntime.new(services, plan)
+            engine:destroy(ud)
+            print("type_of_destroyed=" .. (destroyed[1] or "NONE"))
+            print("count=" .. #destroyed)
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, err
+        assert "type_of_destroyed=userdata" in out, (
+            f"destroyInstance never saw the userdata target — destroy() "
+            f"early-returned on a Roblox Instance. Output: {out!r}"
+        )
+        assert "count=1" in out, f"expected exactly one destroyInstance call; got {out!r}"
+
 
 # ---------------------------------------------------------------------------
 # GetComponent peer + Roblox fallback

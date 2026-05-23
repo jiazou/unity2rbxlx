@@ -1442,7 +1442,15 @@ function SceneRuntime:destroy(target)
 		self:_destroyComponent(target)
 		return
 	end
-	if type(target) ~= "table" then return end
+	-- Otherwise target is a Roblox Instance (userdata in real Luau; the test
+	-- harness substitutes a table). ``type()`` distinguishes those: live
+	-- Roblox Models are ``"userdata"`` not ``"table"``, so the old guard
+	-- ``type(target) ~= "table"`` early-returned on EVERY real Instance,
+	-- silently turning ``host.destroy(self.gameObject)`` into a no-op for
+	-- e.g. ``Pickup``'s on-touch cleanup. Accept either shape; reject only
+	-- primitives / nil where the descendant walk has nothing to chew on.
+	local t = type(target)
+	if t ~= "table" and t ~= "userdata" then return end
 	-- Walk the Roblox instance tree deepest-first via the services.
 	if self._services.collectDescendantIds then
 		local ids = self._services.collectDescendantIds(target)
