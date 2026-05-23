@@ -1609,6 +1609,32 @@ function SceneRuntime:_constructPrefabClone(clone, prefab, prefab_id, includeScr
 			return
 		end
 		local prefix = prefab_id .. ":"
+		-- ``clone`` may be a MID-level prefab node: the planner only emits
+		-- MB-bearing rows in ``prefab.instances``, so when no MonoBehaviour
+		-- sits at the authored prefab root, ``_findUnboundClonePerPrefab``
+		-- resolves to a descendant (the first one that DOES carry an MB).
+		-- Walk UP via ``.Parent`` while the parent's _SceneRuntimeId still
+		-- carries this prefab's namespace -- that ancestor IS part of the
+		-- placement and must be stamped or its raw SRI keeps aliasing
+		-- across placements (Codex R4: ``setActive(Root, false)`` on the
+		-- unscripted root writes to the shared raw key and the cascade
+		-- through ``<placement>:child -> <placement>:root`` misses it).
+		-- 128 is a generous depth budget for any realistic prefab.
+		local root = clone
+		local depth = 0
+		while depth < 128 do
+			local p_ok, parent = pcall(function() return root.Parent end)
+			if not p_ok or parent == nil then break end
+			local sri_ok, parent_sri = pcall(function()
+				return parent:GetAttribute("_SceneRuntimeId")
+			end)
+			if not sri_ok or type(parent_sri) ~= "string"
+			   or string.sub(parent_sri, 1, #prefix) ~= prefix then
+				break
+			end
+			root = parent
+			depth = depth + 1
+		end
 		local function _rewrite(node)
 			local sri_ok, sri = pcall(function()
 				return node:GetAttribute("_SceneRuntimeId")
@@ -1621,8 +1647,8 @@ function SceneRuntime:_constructPrefabClone(clone, prefab, prefab_id, includeScr
 				end)
 			end
 		end
-		_rewrite(clone)
-		local ok, descs = pcall(function() return clone:GetDescendants() end)
+		_rewrite(root)
+		local ok, descs = pcall(function() return root:GetDescendants() end)
 		if ok and type(descs) == "table" then
 			for _, d in ipairs(descs) do
 				_rewrite(d)

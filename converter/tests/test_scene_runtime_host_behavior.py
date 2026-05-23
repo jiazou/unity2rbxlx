@@ -2975,6 +2975,144 @@ class TestScenePrefabPlacementBoot:
             assert(destroysA == 0,
                 "destroy(instB) must NOT touch A (got " ..
                 tostring(destroysA) .. ")")
+            -- destroy() must NOT re-fire OnDisable: B was already disabled
+            -- by the prior setActive(false). A regression making destroy
+            -- un-idempotent on disableCalled would silently increment.
+            assert(disablesB == 1,
+                "destroy must not re-fire OnDisable on B (got " ..
+                tostring(disablesB) .. ")")
+            print("OK")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "OK" in out
+
+    def test_upfront_stamp_walks_up_to_unscripted_prefab_root(self):
+        # Codex R4 regression: when `_findUnboundClonePerPrefab` resolves
+        # to a MID-LEVEL prefab node (no MonoBehaviour at the authored
+        # root), the upfront stamp must walk UP through unscripted
+        # ancestors and rewrite their _SceneRuntimeId too. Otherwise
+        # `setActive(root, false)` on the unscripted root writes to the
+        # raw key while the cascade walks `<placement>:child ->
+        # <placement>:root` and misses the inactive ancestor.
+        #
+        # Prefab shape: Root (unscripted) -> Mid (MB). The planner only
+        # emits Mid in prefab.instances (Root has no MB). We construct
+        # two placements (PA, PB) and assert:
+        #   1. Each placement's Root SRI is stamped with its placement_id.
+        #   2. setActive on PB's Root does not aliase across placements.
+        scenario = textwrap.dedent("""\
+            local awakes = 0
+            local Mid = {} ; Mid.__index = Mid
+            function Mid.new(_) return setmetatable({}, Mid) end
+            function Mid:Awake() awakes = awakes + 1 end
+            local plan = {
+                modules = {mid = {stem = "Mid", runtime_bearing = true,
+                                  module_path = "x", domain = "server"}},
+                scenes = {},
+                prefabs = {
+                    ["pfb1"] = {
+                        name = "Pf",
+                        -- Only Mid has an MB; Root is unscripted and
+                        -- therefore NOT in prefab.instances.
+                        instances = {{instance_id = "pfb1:mid",
+                                      script_id = "mid",
+                                      game_object_id = "pfb1:mid",
+                                      parent_game_object_id = "pfb1:root",
+                                      active = true, enabled = true,
+                                      config = {}}},
+                        references = {},
+                        lifecycle_order = {"pfb1:mid"},
+                    },
+                },
+                scene_prefab_placements = {
+                    {placement_id = "PA", prefab_id = "pfb1",
+                     active = true, enabled = true},
+                    {placement_id = "PB", prefab_id = "pfb1",
+                     active = true, enabled = true},
+                },
+                domain_overrides = {},
+            }
+            -- Build Root -> Mid for each placement. Mid is the
+            -- runtime-bearing instance; Root is unscripted but stamped
+            -- by the converter with `_SceneRuntimeId = "pfb1:root"`.
+            -- SetAttribute mirrors into _sceneRuntimeId so production
+            -- stamping is observable in the harness.
+            local function _mkNode(name, sri)
+                local n = {Name = name, _sceneRuntimeId = sri,
+                           _children = {}, _builtins = {}, Parent = nil}
+                n.SetAttribute = function(self, k, v)
+                    if k == "_SceneRuntimeId" then self._sceneRuntimeId = v end
+                end
+                n.GetAttribute = function(self, k)
+                    if k == "_SceneRuntimeId" then return self._sceneRuntimeId end
+                end
+                n.GetDescendants = function(self)
+                    local out = {}
+                    local function walk(node)
+                        for _, child in pairs(node._children or {}) do
+                            table.insert(out, child)
+                            walk(child)
+                        end
+                    end
+                    walk(self)
+                    return out
+                end
+                return n
+            end
+            local rootA = _mkNode("RootA", "pfb1:root")
+            local midA  = _mkNode("MidA",  "pfb1:mid")
+            rootA._children["pfb1:mid"] = midA
+            midA.Parent = rootA
+            local rootB = _mkNode("RootB", "pfb1:root")
+            local midB  = _mkNode("MidB",  "pfb1:mid")
+            rootB._children["pfb1:mid"] = midB
+            midB.Parent = rootB
+            -- `_findUnboundClonePerPrefab` searches workspace for an SRI
+            -- matching the inferred root_goid (the Mid since no MB sits
+            -- at the actual root). The runtime then walks UP from Mid to
+            -- find the actual prefab root (which the harness exposes via
+            -- the Parent chain). Without that walk-up, only Mid+below
+            -- get stamped and rootA / rootB stay aliased on "pfb1:root".
+            local bound = {}
+            local services = servicesFor(plan, {mid = Mid}, {})
+            services.workspaceFind = function(rawId)
+                for _, cand in ipairs({midA, midB}) do
+                    if not bound[cand] and cand._sceneRuntimeId == rawId then
+                        bound[cand] = true
+                        return cand
+                    end
+                end
+                return nil
+            end
+            -- `_findUnboundClonePerPrefab` walks workspace:GetDescendants
+            -- and looks for the root_goid. Provide a stub workspace.
+            workspace = {
+                GetDescendants = function(self)
+                    return {rootA, midA, rootB, midB}
+                end,
+            }
+            services.getInstanceId = function(inst)
+                return inst and inst._sceneRuntimeId
+            end
+            local engine = SceneRuntime.new(services, plan)
+            engine:start("server")
+            runDeferred()
+            assert(awakes == 2,
+                "both placements must boot a Mid (got " ..
+                tostring(awakes) .. ")")
+            -- The walk-up rewrote each Root's SRI with its placement id.
+            -- Without the R4 fix, both roots would still read "pfb1:root".
+            assert(rootA._sceneRuntimeId == "PA:pfb1:root",
+                "PA's Root must be re-stamped to PA's namespace; got " ..
+                tostring(rootA._sceneRuntimeId))
+            assert(rootB._sceneRuntimeId == "PB:pfb1:root",
+                "PB's Root must be re-stamped to PB's namespace; got " ..
+                tostring(rootB._sceneRuntimeId))
+            -- Distinct rootSRIs prove `setActive(rootB, false)` writes to
+            -- _goActiveSelf["PB:pfb1:root"] only -- PA's root stays alive.
+            assert(rootA._sceneRuntimeId ~= rootB._sceneRuntimeId,
+                "Roots must carry distinct namespaces post-stamp")
             print("OK")
         """)
         rc, out, err = _run_scenario(scenario)
