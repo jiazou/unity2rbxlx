@@ -152,7 +152,6 @@ def validate_behavior_file(path: Path) -> dict:
 # ---------------------------------------------------------------------------
 
 StepKind = Literal[
-    "safety_check_studio",
     "execute_luau_preamble",
     "execute_setup",
     "keyboard_input",
@@ -185,14 +184,11 @@ def plan_for_fixture(fixture: dict, preamble: str) -> list[Step]:
     """
     steps: list[Step] = []
 
-    # Safety: every plan runs the "is this Agas Map of London?" guard at
-    # the top so the harness refuses to send any work if the active
-    # Studio is the wrong one. Re-checked inline in execute_luau too;
-    # this version makes the failure mode explicit in the plan output.
-    steps.append(Step(
-        kind="safety_check_studio",
-        note="verify game.Name != 'Agas Map of London'",
-    ))
+    # Target Studio is pinned by the /e2e-test skill via set_active_studio on
+    # the newly-launched MCP id (Step 4 of converter/.claude/skills/e2e-test/
+    # SKILL.md). Per-fixture wrong-target guards were removed alongside the
+    # "Agas Map of London" blacklist, which was a placeholder for a project
+    # that doesn't exist on this machine.
 
     setup = fixture.get("setup_luau")
     if setup:
@@ -373,17 +369,7 @@ def run_fixture(
     try:
         for step in plan:
             try:
-                if step.kind == "safety_check_studio":
-                    # Cheap inline check before any other work touches Studio.
-                    guard = (
-                        'assert(game.Name ~= "Agas Map of London", '
-                        '"refusing to run on Agas Map of London Studio")\n'
-                        "return true"
-                    )
-                    out = execute_luau(guard)
-                    result.step_results.append(StepResult(step=step, ok=True, output=out))
-
-                elif step.kind == "execute_setup":
+                if step.kind == "execute_setup":
                     out = execute_luau(step.payload)
                     result.step_results.append(StepResult(step=step, ok=True, output=out))
 

@@ -4,8 +4,6 @@ studio_harness.py -- Test harness for automated Roblox Studio testing.
 Opens rbxlx files in Studio, verifies they load correctly via MCP,
 and closes them. Uses osascript (macOS) for window management.
 
-SAFETY: Never interacts with "Agas Map of London" Studio instance.
-
 Usage:
     from tests.studio_harness import StudioHarness
     harness = StudioHarness()
@@ -22,22 +20,12 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-# SAFETY: Studio instances we must NEVER interact with.
-_PROTECTED_WINDOWS = {"Agas Map", "Agas Map of London"}
-
 
 class StudioHarness:
     """Automated test harness for Roblox Studio."""
 
     def __init__(self):
         pass
-
-    def _is_protected_window(self, window_name: str) -> bool:
-        """Check if a window name matches a protected Studio instance."""
-        for protected in _PROTECTED_WINDOWS:
-            if protected.lower() in window_name.lower():
-                return True
-        return False
 
     def open_file(self, rbxlx_path: str | Path, wait: float = 12.0) -> bool:
         """Open an rbxlx file in Studio via command line.
@@ -47,11 +35,6 @@ class StudioHarness:
         path = Path(rbxlx_path).resolve()
         if not path.exists():
             log.error("File not found: %s", path)
-            return False
-
-        # Safety check: don't open files that could interfere with protected instances
-        if self._is_protected_window(path.stem):
-            log.error("SAFETY: Refusing to open file matching protected window: %s", path.stem)
             return False
 
         log.info("Opening %s in Studio...", path.name)
@@ -68,18 +51,7 @@ class StudioHarness:
         return True
 
     def close_active_tab(self) -> None:
-        """Close the active Studio tab via Cmd+W, then dismiss save dialog.
-
-        SAFETY: Checks that the active window is not a protected instance.
-        """
-        # Safety: check active window before closing
-        windows = self.get_studio_windows()
-        if windows:
-            active = windows[0]  # First window is typically the active one
-            if self._is_protected_window(active):
-                log.error("SAFETY: Active window is protected (%s), refusing to close", active)
-                return
-
+        """Close the active Studio tab via Cmd+W, then dismiss save dialog."""
         try:
             subprocess.run([
                 "osascript",

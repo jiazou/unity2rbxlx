@@ -40,12 +40,16 @@ there is no separate trigger for the gameplay half.
   single exit code. A conversion failure short-circuits the gameplay
   verification with exit 2 (the rbxlx never built; there's nothing to
   play).
-- **Fresh Studio only.** Re-opening a regenerated rbxlx in an
-  already-running Studio does NOT reload the in-memory DataModel (see
-  `/Users/jiazou/.context` notes). The skill refuses to attach to a
-  running Studio unless `--close-and-relaunch` is passed.
-- **Never run on protected instances.** Refuse to send any work to a
-  Studio whose `game.Name == "Agas Map of London"`.
+- **Fresh Studio process for this run.** Re-opening a regenerated
+  rbxlx in an already-running Studio does NOT reload the in-memory
+  DataModel — so this run must own a *newly-launched* Studio process.
+  Other unrelated Studios (different project, different rbxlx) can
+  coexist: the skill snapshots pre-launch Studio IDs (Step 2), picks
+  the new ID after launch and pins it via `set_active_studio` (Step 4),
+  and teardown only kills its own PID (Step 8). Pass
+  `--close-and-relaunch` if you want a clean slate (kill all editors
+  before launching) — not required just because another Studio is
+  open.
 - **No gameplay verification without a clean conversion.** The fixtures
   only run as part of an end-to-end test — there is no standalone
   fixture-runner entry point.
@@ -56,7 +60,7 @@ there is no separate trigger for the gameplay half.
 |---|---|
 | 0 | Conversion passed and all gameplay fixtures passed |
 | 2 | Conversion (offline-assembly pytest) failed; gameplay verification skipped |
-| 3 | Studio liveness/handshake failed (couldn't get a verified Studio in 180s) |
+| 3 | Studio liveness/handshake failed (couldn't get a verified Studio in 180s — includes "no new Studio appeared in `list_roblox_studios` after launch" and "E2ERunId handshake didn't echo back") |
 | 4 | Conversion passed but ≥1 gameplay fixture failed |
 
 ## Workflow
@@ -88,21 +92,29 @@ pytest via env, written into both the conversion manifest and the
 combined report, read back via the Studio handshake to verify the
 plugin is connected to the right place.
 
-### Step 2: Studio safety — refuse to attach to a running instance
+### Step 2: Pre-launch — snapshot existing Studio IDs (no refusal)
 
-Call `mcp__Roblox_Studio__list_roblox_studios`. If it returns ≥1
-candidate AND `--close-and-relaunch` was NOT passed: print
-"Studio is already running; refusing to attach (re-opening a
-regenerated rbxlx does not reload the DataModel). Pass
-`--close-and-relaunch` to force a fresh process." and exit 3.
+Call `mcp__Roblox_Studio__list_roblox_studios` and capture the set of
+existing studio IDs into `PRE_LAUNCH_STUDIO_IDS`. This is how Step 4
+identifies "the Studio this run launched" — any id present in the
+post-launch list but NOT in `PRE_LAUNCH_STUDIO_IDS` is ours. The
+skill does NOT refuse to run because other Studios exist; both the
+launch (separate OS process) and the teardown (PID-scoped, Step 8)
+coexist with them. Step 4 then pins routing via `set_active_studio`
+on the new id, so unrelated Studios are not at risk of receiving
+this run's MCP calls.
 
-If `--close-and-relaunch` was passed: run
+If `--close-and-relaunch` was passed: kill all running editors first
+as a clean-slate option (not required for multi-Studio coexistence —
+use this when you suspect a stale process is interfering):
 
 ```bash
 python3 -c "from roblox.studio_launcher import close_running_studio_or_fail; close_running_studio_or_fail()"
 ```
 
-If that raises, surface the error and exit 3.
+If that raises, surface the error and exit 3. After the close, re-run
+the snapshot above so `PRE_LAUNCH_STUDIO_IDS` reflects the
+post-cleanup state (likely empty).
 
 ### Step 3: Offline AI conversion
 
@@ -147,20 +159,32 @@ Capture the printed `STUDIO_PID <n>` into `STUDIO_PID` — Step 8 uses it to clo
 **only the editor this run launched**, leaving any concurrent Studios (and the
 StudioMCP proxy) alone.
 
-Then the 3-step readiness probe (Codex finding #2):
+Then the 4-step readiness probe (multi-Studio aware):
 
 1. **Process up** — `wait_for_studio_ready` already returned true.
-2. **MCP sees the place** — call `mcp__Roblox_Studio__list_roblox_studios`;
-   if empty or the active instance is `Agas Map of London`, retry up to
-   60s, then exit 3.
-3. **Run-ID handshake** — call `mcp__Roblox_Studio__execute_luau` with:
+2. **New Studio visible to MCP** — poll
+   `mcp__Roblox_Studio__list_roblox_studios` until a Studio with
+   `id ∉ PRE_LAUNCH_STUDIO_IDS` appears (timeout: 60s). If multiple
+   new IDs appear (rare — only if another process launched a Studio
+   during our window), prefer the one whose `name` matches the
+   basename of `${RBXLX_PATH}` (e.g. `converted_place.rbxlx`); if
+   that tiebreak is ambiguous, exit 3. If none appears, exit 3.
+3. **Pin the target** — call `mcp__Roblox_Studio__set_active_studio`
+   with the new id. From this point on, every MCP call routes to
+   the Studio this run launched, regardless of how many other
+   Studios are open.
+4. **Run-ID handshake** — call `mcp__Roblox_Studio__execute_luau`
+   with:
 
 ```lua
 workspace:SetAttribute("E2ERunId", "${RUN_ID}")
 return workspace:GetAttribute("E2ERunId") == "${RUN_ID}"
 ```
 
-If the return value is not `true`, exit 3. Total handshake budget is
+If the return value is not `true`, the active Studio is not ours
+(or `set_active_studio` didn't stick) — exit 3. The handshake is the
+authoritative "we're talking to the right place" check; the new-id
+diff is just how we find the candidate. Total handshake budget is
 180s including launch.
 
 ### Step 5: Walk gameplay fixtures via MCP
@@ -171,9 +195,8 @@ python3 -m tests.studio_behavior_driver emit-plan <project> [--only <ids>] > "${
 
 For each fixture in the emitted JSON array, in order:
 
-1. **Safety check** — `execute_luau`: `assert(game.Name ~= "Agas Map of London"); return true`. If it raises, exit 3.
-2. **Setup** — `execute_luau` with `setup_luau` (already preamble-prepended). Discard return value.
-3. **Inputs** — for each entry in `input_sequence`. The driver has
+1. **Setup** — `execute_luau` with `setup_luau` (already preamble-prepended). Discard return value.
+2. **Inputs** — for each entry in `input_sequence`. The driver has
    already translated each `action` into the MCP tool's vocabulary
    (keyboard: `keyDown`/`keyUp`/`keyPress` + `key_code`; mouse:
    `mouseButtonClick`/`moveTo` + `mouse_button`/`x`/`y`), so pass
@@ -181,11 +204,11 @@ For each fixture in the emitted JSON array, in order:
    - `type == "keyboard"`: `mcp__Roblox_Studio__user_keyboard_input` with `[action]`
    - `type == "mouse"`: `mcp__Roblox_Studio__user_mouse_input` with `[action]`
    - `type == "wait"`: sleep for `seconds`
-4. **Settle** — sleep `wait_seconds` from the fixture.
-5. **Assert** — `execute_luau` with `assert_luau` (wrapped, returns `{ok, value}`).
+3. **Settle** — sleep `wait_seconds` from the fixture.
+4. **Assert** — `execute_luau` with `assert_luau` (wrapped, returns `{ok, value}`).
    - If `assert_timeout_seconds > 0`: poll, re-running the assert every `poll_interval_seconds` until `value` matches `expect` (with `tolerance` for numbers) or the timeout elapses.
    - Record `{passed, value, attempts, duration_seconds, error}` per fixture.
-6. **Evidence on failure** — if `passed == false` and `evidence_on_fail` is non-empty:
+5. **Evidence on failure** — if `passed == false` and `evidence_on_fail` is non-empty:
    - `"screen_capture"` → `mcp__Roblox_Studio__screen_capture` → save under `${OUTPUT_ROOT}/evidence/<fixture_id>.png`
    - `"console_tail"` → `mcp__Roblox_Studio__get_console_output` → save under `${OUTPUT_ROOT}/evidence/<fixture_id>.console.txt`
 
