@@ -1759,6 +1759,56 @@ function SceneRuntime:start(domainFilter)
 		return a.id < b.id
 	end)
 
+	-- Multi-instance prefab placements all share the same template-level
+	-- ``_SceneRuntimeId`` stamp (the converter does NOT mint a per-placement
+	-- unique id today), so a naive ``workspaceFind`` returns the FIRST
+	-- workspace clone for EVERY placement and only that one gets its
+	-- MonoBehaviours wired. Track clones we've already bound and skip them
+	-- on subsequent placements so each scene_prefab_placement binds to a
+	-- DIFFERENT workspace clone. Ordering is workspace-iteration-stable;
+	-- functionally each clone just needs ANY bound MonoBehaviour of the
+	-- right type since per-placement configs from the same prefab are
+	-- identical.
+	local boundClones = {}
+	local function _findUnboundClonePerPrefab(prefab, prefab_id)
+		-- Discover the template's prefab-root file_id: the instance row whose
+		-- parent_game_object_id is nil (or the smallest file_id in the
+		-- subtree if everything has a parent — robust to planner shapes).
+		local root_goid
+		for _, inst in ipairs(prefab.instances or {}) do
+			if inst.parent_game_object_id == nil then
+				root_goid = inst.game_object_id
+				break
+			end
+		end
+		if not root_goid then
+			-- Fallback: any instance's parent_game_object_id; pick one that
+			-- ISN'T present as another instance's game_object_id (i.e. the
+			-- root that hangs off the scene).
+			local present = {}
+			for _, inst in ipairs(prefab.instances or {}) do
+				present[inst.game_object_id] = true
+			end
+			for _, inst in ipairs(prefab.instances or {}) do
+				local p = inst.parent_game_object_id
+				if p and not present[p] then root_goid = p; break end
+			end
+		end
+		if not root_goid then return nil end
+		-- Guard against the unit-test stub workspace, which doesn't
+		-- implement ``GetDescendants`` / ``GetAttribute``.
+		local ok, descs = pcall(function() return workspace:GetDescendants() end)
+		if not ok or type(descs) ~= "table" then return nil end
+		for _, d in ipairs(descs) do
+			local sri_ok, sri = pcall(function() return d:GetAttribute("_SceneRuntimeId") end)
+			if sri_ok and sri == root_goid and not boundClones[d] then
+				boundClones[d] = true
+				return d
+			end
+		end
+		return nil
+	end
+
 	for _, entry in ipairs(placementOrder) do
 		local placement = placements[entry.idx]
 		local prefab_id = placement.prefab_id
@@ -1790,10 +1840,14 @@ function SceneRuntime:start(domainFilter)
 				end
 			end
 
-			-- Construct the placement's components (domain-filtered, live
-			-- tree resolution) and run them as a single lifecycle batch.
+			-- Resolve a workspace clone that no prior placement has bound; the
+			-- scoped ``resolveCloneChild`` walk inside ``_constructPrefabClone``
+			-- then finds the placement's specific sub-Instances. Falls back to
+			-- ``nil`` (workspaceFind path) if no clone is found, preserving
+			-- prior single-instance behaviour.
+			local placement_clone = _findUnboundClonePerPrefab(prefab, prefab_id)
 			local componentList = self:_constructPrefabClone(
-				nil, prefab, prefab_id, includeScriptId, nil)
+				placement_clone, prefab, prefab_id, includeScriptId, nil)
 			self:_runAwakeEnableStart(componentList)
 		end
 	end
