@@ -127,10 +127,10 @@ class TestPlanForFixture:
         base.update(overrides)
         return base
 
-    def test_minimal_fixture_produces_safety_and_assert(self) -> None:
+    def test_minimal_fixture_produces_assert_only(self) -> None:
         plan = plan_for_fixture(self._bare(), preamble="local x = 1")
         kinds = [s.kind for s in plan]
-        assert kinds == ["safety_check_studio", "execute_assert"]
+        assert kinds == ["execute_assert"]
 
     def test_setup_setup_step_emitted(self) -> None:
         plan = plan_for_fixture(

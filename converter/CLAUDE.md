@@ -4,8 +4,11 @@
 
 Non-negotiable for any Studio/MCP operation:
 
-- **Agas Map of London.** **NEVER** connect to, send MCP commands to, or interact with the Studio instance titled "Agas Map of London", and **NEVER** send osascript that could affect it. It is a separate user project that must not be touched under any circumstances.
-- **Verify `game.Name`** before executing ANY MCP command — this is the check that confirms the target is the converter's place, not Agas Map.
+- **Pin the target Studio explicitly.** Any code that issues MCP calls
+  while another Studio may be open must call `set_active_studio` on the
+  id it intends to target — never rely on MCP's active-Studio heuristic.
+  The `/e2e-test` skill snapshots pre-launch ids, picks the new id post-
+  launch, and pins it (Step 4 of `converter/.claude/skills/e2e-test/SKILL.md`).
 - **Stay general-purpose.** No hardcoded, game-specific values: the converter must work for ALL Unity games, not just the bundled test projects.
 
 > Test counts, converter status, and session-by-session history are intentionally
