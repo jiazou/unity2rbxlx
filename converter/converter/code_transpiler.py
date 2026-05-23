@@ -91,6 +91,7 @@ def transpile_scripts(
     *,
     runtime_mode: RuntimeMode = "legacy",
     runtime_bearing_paths: frozenset[Path] | None = None,
+    component_class_paths: frozenset[Path] | None = None,
 ) -> TranspilationResult:
     """Transpile a list of C# scripts to Luau.
 
@@ -114,14 +115,29 @@ def transpile_scripts(
         runtime_bearing_paths: Under ``runtime_mode="generic"`` this is
             the set of ``info.path`` values for MonoBehaviours marked
             ``runtime_bearing=True`` in the planner's ``scene_runtime``
-            artifact. Each one is forced to ``ModuleScript`` target +
-            generic prompt regardless of what ``_classify_script_type``
-            would have inferred. Ignored under ``"legacy"``.
+            artifact (placement-based — what the host boots at start).
+            Ignored under ``"legacy"``.
+        component_class_paths: Under ``runtime_mode="generic"`` the set of
+            ``info.path`` values for ALL component classes (extends
+            MonoBehaviour/NetworkBehaviour, placed or runtime-spawned).
+            This is what actually gates generic treatment: each one is
+            forced to ``ModuleScript`` target + generic prompt + verifier,
+            because a component runs host-bound whether authored or
+            ``Instantiate()``-spawned. Defaults to ``runtime_bearing_paths``
+            when not supplied (legacy callers / direct unit tests).
 
     Returns:
         TranspilationResult with all transpiled scripts and summary counts.
     """
     runtime_bearing_paths = runtime_bearing_paths or frozenset()
+    # The generic mode/target gate keys off component-ness, not placement.
+    # Fall back to runtime_bearing_paths so callers that predate the split
+    # (and direct unit tests) keep their existing behaviour.
+    generic_paths = (
+        component_class_paths
+        if component_class_paths is not None
+        else runtime_bearing_paths
+    )
     result = TranspilationResult()
 
     # Build project context for AI transpilation
@@ -139,16 +155,38 @@ def transpile_scripts(
             result.total_failed += 1
             continue
 
-        # Auto-stub visual/rendering scripts that can't work in Roblox
+        # Auto-stub visual/rendering scripts that can't work in Roblox.
         if _is_visual_only_script(script_path, csharp_source):
+            # A visual-only component class (e.g. a water-shader
+            # MonoBehaviour) is still routed through the generic contract,
+            # so its stub must be a VALID inert ModuleScript: an empty class
+            # table the host can ``require`` + instantiate harmlessly. The
+            # legacy ``print(...)`` form returns nil, which (a) fails the
+            # contract's return rule and (b) throws when the host requires
+            # it. Non-generic / non-component visual scripts keep the plain
+            # legacy stub.
+            is_generic_component = (
+                runtime_mode == "generic" and script_path in generic_paths
+            )
+            if is_generic_component:
+                luau_source = _inert_component_stub(
+                    script_path.stem, "Unity visual/rendering effect (no Roblox equivalent)",
+                )
+                stub_script_type = "ModuleScript"
+            else:
+                luau_source = (
+                    f'-- {script_path.stem}: Unity visual/rendering effect '
+                    f'(no Roblox equivalent)\nprint("{script_path.stem} loaded")'
+                )
+                stub_script_type = "Script"
             result.scripts.append(TranspiledScript(
                 source_path=str(script_path),
                 output_filename=script_path.stem + ".luau",
                 csharp_source=csharp_source,
-                luau_source=f'-- {script_path.stem}: Unity visual/rendering effect (no Roblox equivalent)\nprint("{script_path.stem} loaded")',
+                luau_source=luau_source,
                 strategy="stub",
                 confidence=1.0,
-                script_type="Script",
+                script_type=stub_script_type,
             ))
             result.total_transpiled += 1
             result.total_rule_based += 1
@@ -161,7 +199,7 @@ def transpile_scripts(
         # ``require``s it and instantiates the returned class table. If
         # the prompt said "return a class table" but the user message
         # asked for a Server Script, the AI produces inconsistent output.
-        if runtime_mode == "generic" and info.path in runtime_bearing_paths:
+        if runtime_mode == "generic" and info.path in generic_paths:
             script_type = "ModuleScript"
         pending_scripts.append((info, csharp_source, script_type))
 
@@ -216,20 +254,21 @@ def transpile_scripts(
             if triple is None:
                 return stem, None
             info, csharp_source, script_type = triple
-            # PER-SCRIPT runtime mode: the scene-runtime contract only
-            # applies to host-instantiated MonoBehaviours. A non-runtime-
-            # bearing script (LocalScript, helper module, ScriptableObject
-            # converter target) under ``runtime_mode="generic"`` MUST stay
-            # on the legacy prompt + skip the contract verifier; the
-            # contract was never meant to constrain those modules.
-            # Without this gate the generic prompt tells a LocalScript
-            # "return a class table for the host to instantiate," which
-            # is nonsense for input/UI/audio scripts and produces
-            # mis-transpiled output that the verifier then rejects on
-            # rules the contract never intended for it.
+            # PER-SCRIPT runtime mode: the scene-runtime contract applies to
+            # every component class (``info.path in generic_paths`` — extends
+            # MonoBehaviour/NetworkBehaviour, placed OR runtime-spawned),
+            # because a component always runs host-bound (``self.gameObject``)
+            # in Unity. A non-component script (plain class, ScriptableObject
+            # converter target, editor util) under ``runtime_mode="generic"``
+            # MUST stay on the legacy prompt + skip the contract verifier;
+            # the contract was never meant to constrain those modules.
+            # Without this gate the generic prompt tells a plain helper
+            # "return a class table for the host to instantiate," which is
+            # nonsense and produces mis-transpiled output the verifier then
+            # rejects on rules the contract never intended for it.
             effective_runtime_mode: RuntimeMode = (
                 "generic"
-                if runtime_mode == "generic" and info.path in runtime_bearing_paths
+                if runtime_mode == "generic" and info.path in generic_paths
                 else "legacy"
             )
             scoped = _build_scoped_context(stem, dep_graph, file_sources, transpiled_luau)
@@ -682,6 +721,31 @@ def _is_visual_only_script(script_path: Path, source: str) -> bool:
     return False
 
 
+_RE_NON_IDENT = re.compile(r"\W")
+
+
+def _inert_component_stub(stem: str, reason: str) -> str:
+    """A contract-valid, inert scene-runtime ModuleScript for a component
+    class that has no Roblox equivalent (e.g. a water-shader MonoBehaviour).
+
+    The host still ``require``s + instantiates component classes, so the stub
+    must return a real class table with a no-op ``new`` / ``Awake`` -- a bare
+    ``print(...)`` stub returns nil and both fails the contract's return rule
+    and throws on require. This shape passes every verifier rule (a-h)."""
+    cls = _RE_NON_IDENT.sub("_", stem) or "Stub"
+    return (
+        f"-- {stem}: {reason} -- inert stub (host-instantiable, no-op).\n"
+        f"local {cls} = {{}}\n"
+        f"{cls}.__index = {cls}\n\n"
+        f"function {cls}.new(config)\n"
+        f"    return setmetatable({{ config = config }}, {cls})\n"
+        f"end\n\n"
+        f"function {cls}:Awake()\n"
+        f"end\n\n"
+        f"return {cls}\n"
+    )
+
+
 # ---------------------------------------------------------------------------
 # AI-powered transpilation
 # ---------------------------------------------------------------------------
@@ -1097,6 +1161,12 @@ Set on `self` by the host before `Awake` runs:
 - `self.gameObject` — the Roblox Instance for this component's GameObject.
 - `self.transform` — alias of `self.gameObject` (Roblox has no separate Transform).
 - `self.instance` — alias for raw-Instance code.
+
+NEVER use `script.Parent` (or `script` at all) to reach the GameObject. This
+module is a class table the host requires once and instantiates per GameObject;
+it has no `script.Parent` edge to any instance. Always go through
+`self.gameObject`. `script.Parent` is the legacy idiom and is rejected by the
+contract verifier.
 - `self.enabled` — per-component flag; writes fire `OnEnable`/`OnDisable`.
 - `self:GetComponent(name)` — peer-component lookup. For converted MonoBehaviours returns the peer module instance; for built-in types (`Rigidbody`, `Collider`, `AudioSource`, `Animator`, …) falls through to a Roblox class search on `self.gameObject`.
 - `self.host` — engine handle; see "Host services" below.

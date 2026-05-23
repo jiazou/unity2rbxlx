@@ -664,3 +664,148 @@ class TestLifecycleConstants:
             "OnMouseExit", "OnMouseOver", "OnMouseDrag",
         }
         assert UNITY_MESSAGE_CALLBACKS == expected
+
+
+# ---------------------------------------------------------------------------
+# Rule (h) -- ``script.Parent`` legacy idiom in a host-bound module.
+# (Fix #15: component classes now route through the generic contract, so the
+# verifier must reject the legacy ``script.Parent`` form that throws at boot.)
+# ---------------------------------------------------------------------------
+
+class TestRuleHScriptParent:
+
+    def test_bare_script_parent_flagged(self):
+        src = COMPLIANT.replace(
+            "function Class:Awake()\nend",
+            "function Class:Awake()\n    local p = script.Parent\nend",
+        )
+        _assert_rule(src, "h")
+
+    def test_script_parent_cframe_flagged(self):
+        # The exact crashing shape from the bug report.
+        src = COMPLIANT.replace(
+            "function Class:Start()\nend",
+            "function Class:Start()\n    script.Parent.CFrame = CFrame.new()\nend",
+        )
+        _assert_rule(src, "h")
+
+    def test_script_parent_in_string_not_flagged(self):
+        # Runs on stripped source -- a literal in a string must not fire.
+        src = COMPLIANT.replace(
+            "function Class:Awake()\nend",
+            'function Class:Awake()\n    warn("do not use script.Parent here")\nend',
+        )
+        _assert_clean(src)
+
+    def test_script_parent_in_comment_not_flagged(self):
+        src = COMPLIANT.replace(
+            "function Class:Awake()\nend",
+            "function Class:Awake()\n    -- legacy code used script.Parent\nend",
+        )
+        _assert_clean(src)
+
+    def test_identifier_ending_in_script_not_flagged(self):
+        # ``\bscript\b`` anchors: ``myscript.Parent`` is a different symbol.
+        src = COMPLIANT.replace(
+            "function Class:Awake()\nend",
+            "function Class:Awake()\n    local x = myscript.Parent\nend",
+        )
+        _assert_clean(src)
+
+    def test_self_gameobject_is_the_compliant_shape(self):
+        # The canonical replacement for script.Parent passes clean.
+        src = COMPLIANT.replace(
+            "function Class:Start()\nend",
+            "function Class:Start()\n    self.gameObject.CFrame = CFrame.new()\nend",
+        )
+        _assert_clean(src)
+
+    def test_shadowed_local_script_not_flagged(self):
+        # ``script`` shadowed by a local => ``script.Parent`` is field access
+        # on that local table, not the Roblox global. Biased toward no false
+        # positive because fail-closed now hard-errors the conversion.
+        src = COMPLIANT.replace(
+            "function Class:Awake()\nend",
+            "function Class:Awake()\n    local script = self.config\n"
+            "    local p = script.Parent\nend",
+        )
+        _assert_clean(src)
+
+
+# ---------------------------------------------------------------------------
+# Luau if-EXPRESSION handling in the depth tracker (e2e regression).
+# Turret transpiled clean but rule (d) false-fired because the depth tracker
+# treated ``self.x = if cond then a else b`` (an if-EXPRESSION, no ``end``)
+# as a block-opening if-statement. With Fix A promoting fail-closed to
+# ctx.errors, that turned a silent over-count into a hard failure on any
+# module using idiomatic if-expressions for config defaults.
+# ---------------------------------------------------------------------------
+
+class TestIfExpressionDepthTracking:
+
+    def test_if_expression_in_constructor_does_not_break_return(self):
+        # Module uses if-expression on RHS of an assignment in :Awake().
+        # The depth tracker must NOT count this ``if`` as a block-open, so
+        # the top-level ``return Class`` is still seen at depth 0.
+        src = (
+            'local Class = {}\n'
+            'Class.__index = Class\n'
+            'function Class.new(config)\n'
+            '    local self = setmetatable({}, Class)\n'
+            '    self.rotate = if config.rotate ~= nil then config.rotate else true\n'
+            '    return self\n'
+            'end\n'
+            'function Class:Awake()\n'
+            'end\n'
+            'return Class\n'
+        )
+        _assert_clean(src)
+
+    def test_return_value_if_expression_is_not_a_block(self):
+        # ``return if cond then a else b`` — ``return`` precedes ``if`` in
+        # expression position. Module still has a top-level return.
+        src = (
+            'local Class = {}\n'
+            'Class.__index = Class\n'
+            'function Class.new()\n'
+            '    return if math.random() > 0.5 then 1 else 2\n'
+            'end\n'
+            'function Class:Awake()\n'
+            'end\n'
+            'return Class\n'
+        )
+        _assert_clean(src)
+
+    def test_real_if_statement_still_opens_a_block(self):
+        # Statement-position ``if`` (start of statement, preceded by block
+        # body) MUST still open a block — otherwise rule (d) would no longer
+        # detect a missing end. A module whose constructor's if-statement
+        # never closes should be malformed; here the if-statement is well-
+        # formed so the module is clean.
+        src = (
+            'local Class = {}\n'
+            'Class.__index = Class\n'
+            'function Class.new(config)\n'
+            '    local self = setmetatable({}, Class)\n'
+            '    if config then\n'
+            '        self.config = config\n'
+            '    end\n'
+            '    return self\n'
+            'end\n'
+            'return Class\n'
+        )
+        _assert_clean(src)
+
+    def test_module_missing_return_still_flagged(self):
+        # Sanity: with the if-expression bias toward statement-if, a module
+        # that legitimately lacks a top-level return must still fire rule (d).
+        src = (
+            'local Class = {}\n'
+            'function Class.new()\n'
+            '    local self = {}\n'
+            '    self.x = if true then 1 else 2\n'
+            '    return self\n'
+            'end\n'
+            # no top-level ``return Class``
+        )
+        _assert_rule(src, "d")

@@ -93,6 +93,18 @@ def _scene_needs_collision_recook(parts: list) -> bool:
     return False
 
 
+def _contract_failure_errors(fail_closed: "list") -> list[str]:
+    """Render each scene-runtime ``FailClosed`` row as a conversion-error
+    string. Pure: returns a fresh list, mutates nothing. The caller appends
+    these to ``ctx.errors`` (deduped) so a fail-closed generic conversion
+    reports ``success=False`` instead of shipping a place that throws at
+    boot. See the Fix-#15 Root-A gating in ``transpile_scripts``."""
+    return [
+        f"scene-runtime contract failed closed ({fc.kind}): {fc.detail}"
+        for fc in fail_closed
+    ]
+
+
 @dataclass
 class PipelineState:
     """Intermediate state passed between pipeline phases."""
@@ -1971,6 +1983,19 @@ class Pipeline:
                 {"kind": fc.kind, "detail": fc.detail}
                 for fc in contract_result.fail_closed
             )
+            # Fail-closed gating: a component module that still violates the
+            # contract after reprompt (or fell through to a stub) cannot host
+            # the generic runtime, so the converted place throws at boot.
+            # Promote each fail-closed reason to a real conversion error so
+            # ``conversion_report.success`` reports the truth (it is
+            # ``len(ctx.errors) == 0``) instead of shipping a broken place
+            # green. We deliberately do NOT fall back to legacy: legacy emit
+            # is the ``script.Parent`` form that crashes these MonoBehaviours.
+            # Membership-gated so a resume replay of this phase does not
+            # double-count the same reason.
+            for msg in _contract_failure_errors(contract_result.fail_closed):
+                if msg not in self.ctx.errors:
+                    self.ctx.errors.append(msg)
             # ``runtime_bearing_paths`` is a frozenset[Path]; JSON the
             # ctx serializes through can't carry either type. Store a
             # sorted list of strings so a resume round-trip is stable.

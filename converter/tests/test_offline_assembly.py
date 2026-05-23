@@ -525,6 +525,21 @@ class TestOfflineAssembly:
         # tier-1 prefab placements + boot path. Legacy assertions above
         # still run in both modes.
         if mode == "generic":
+            # Fail-closed gate (Fix #15 Root A): a runtime-bearing module
+            # that survives reprompt still broken promotes a "contract
+            # failed closed" error onto ctx.errors. run_all() does not raise
+            # on it and the rbxlx still gets written, so without this
+            # assertion a structurally-broken place (e.g. a stubbed
+            # Player.luau that throws at boot) would pass the suite green.
+            contract_failures = [
+                e for e in ctx.errors
+                if "scene-runtime contract failed closed" in e
+            ]
+            assert not contract_failures, (
+                "generic conversion shipped with contract fail-closed "
+                "errors — the place will throw at boot:\n  "
+                + "\n  ".join(contract_failures)
+            )
             _assert_generic_scene_runtime(rbxlx)
 
         # Publish-stage artifact (still no cloud)

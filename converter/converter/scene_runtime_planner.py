@@ -69,6 +69,17 @@ class SceneRuntimeModule(TypedDict, total=False):
     stem: str
     class_name: str
     runtime_bearing: bool
+    # ``is_component_class`` is True when the script is a Unity component
+    # (extends MonoBehaviour / NetworkBehaviour directly OR transitively
+    # through a project-local base). It is BROADER than ``runtime_bearing``:
+    # a component spawned only at runtime (Instantiate) is a component class
+    # but is not instance-backed in any walked scene/prefab, so it is NOT
+    # runtime_bearing. The generic transpile contract (ModuleScript target +
+    # generic prompt + verifier) keys off THIS flag, not placement, because
+    # in Unity every component runs host-bound (``self.gameObject``) whether
+    # authored or Instantiate()-spawned. ``runtime_bearing`` stays
+    # placement-based so it still drives only what the host boots at start.
+    is_component_class: bool
     domain: str
     container: str
     module_path: str
@@ -987,28 +998,89 @@ def _build_modules_table(
         return modules
 
     cs_entries = guid_index.filter_by_kind("script")
+    # First pass: analyze every .cs once and remember its immediate base
+    # class so the SECOND pass can resolve component-ness across a project-
+    # local inheritance chain (analyze_script only records the immediate
+    # base). e.g. ``Turret : Weapon`` + ``Weapon : MonoBehaviour`` ⇒ Turret
+    # is a component even though its immediate base is ``Weapon``.
+    # guid -> (stem, class_name, base_class, has_lifecycle_hook)
+    analyzed: dict[str, tuple[str, str, str, bool]] = {}
+    base_by_class: dict[str, str] = {}
     for script_guid, entry in cs_entries.items():
         if entry.asset_path.suffix != ".cs":
             continue
         info = analyze_script(entry.asset_path)
+        analyzed[script_guid] = (
+            entry.asset_path.stem, info.class_name, info.base_class,
+            bool(info.lifecycle_hooks),
+        )
+        if info.class_name:
+            base_by_class[info.class_name] = info.base_class
+
+    for script_guid, (stem, class_name, base_class, has_hook) in analyzed.items():
+        # A class is a component if it extends a Unity component base
+        # (directly or transitively) OR it overrides a Unity lifecycle hook
+        # (Awake/Start/Update/...). The lifecycle-hook signal catches
+        # components whose base class lives in an external package/DLL
+        # (e.g. Photon's ``MonoBehaviourPunCallbacks``) that the
+        # project-local inheritance walk can't see -- without it those would
+        # wrongly fall back to legacy ``script.Parent`` mode.
+        is_component = (
+            _resolves_to_component(class_name, base_class, base_by_class)
+            or has_hook
+        )
         modules[script_guid] = {
-            "stem": entry.asset_path.stem,
-            "class_name": info.class_name,
+            "stem": stem,
+            "class_name": class_name,
             "runtime_bearing": script_guid in runtime_bearing,
+            "is_component_class": is_component,
         }
 
     # Scripts attached at runtime but absent from the guid index (e.g.,
     # outside Assets/, dynamically loaded). Record them with empty stem
-    # so PR3a's resolver fails closed on the stem mismatch.
+    # so PR3a's resolver fails closed on the stem mismatch. They are
+    # instance-backed (in ``runtime_bearing``), so treat them as components.
     for script_id in runtime_bearing:
         if script_id not in modules:
             modules[script_id] = {
                 "stem": "",
                 "class_name": "",
                 "runtime_bearing": True,
+                "is_component_class": True,
             }
 
     return modules
+
+
+# Unity component base classes. A script extending any of these (directly
+# or transitively) is a component and must convert host-bound, never legacy.
+# ``NetworkBehaviour`` covers Mirror / legacy UNet networked components.
+_COMPONENT_BASE_CLASSES = frozenset({"MonoBehaviour", "NetworkBehaviour"})
+
+
+def _resolves_to_component(
+    class_name: str,
+    base_class: str,
+    base_by_class: dict[str, str],
+) -> bool:
+    """True when ``class_name`` extends a Unity component base directly or
+    through a project-local chain.
+
+    Walks ``base_class -> its base -> ...`` using ``base_by_class`` (the
+    project's class->immediate-base map). Stops at a known component base,
+    at an unknown/external base (not in the map), or on a cycle. The chain
+    is project-bounded, so external bases like ``NetworkBehaviour`` (defined
+    in a package, not in ``base_by_class``) are caught by the direct
+    ``_COMPONENT_BASE_CLASSES`` membership check on each hop.
+    """
+    seen: set[str] = set()
+    current = base_class
+    while current and current not in seen:
+        if current in _COMPONENT_BASE_CLASSES:
+            return True
+        seen.add(current)
+        current = base_by_class.get(current, "")
+    return False
 
 
 # ---------------------------------------------------------------------------

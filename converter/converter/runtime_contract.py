@@ -103,6 +103,7 @@ def verify_module(source: str) -> VerificationResult:
     violations.extend(_check_constructor_purity(stripped, source))
     violations.extend(_check_unity_message_callbacks(statements, stripped, source))
     violations.extend(_check_gameobject_touch(stripped, source))
+    violations.extend(_check_script_parent(stripped, source))
 
     # Source order for reprompt readability. Tie-break on rule letter so
     # output is deterministic across runs.
@@ -243,6 +244,49 @@ _TOKEN_RE = re.compile(
 _BLOCK_OPEN = frozenset({"function", "do", "if", "repeat"})
 _BLOCK_CLOSE = frozenset({"end", "until"})
 
+# Luau supports ``if`` as an EXPRESSION (``x = if cond then a else b``)
+# which has NO closing ``end`` -- distinct from the ``if`` STATEMENT
+# (``if cond then ... end``). Treating every ``if`` as a block-opener
+# over-counts depth on every if-expression and corrupts every rule that
+# consumes ``_iter_top_level_statements`` (rule d false-positives the
+# top-level return, etc.). The AI emits if-expressions naturally on config
+# defaults, so without this gate any module with one fails closed.
+#
+# An ``if`` is an EXPRESSION when the previous significant token is in an
+# expression-introducing position: ``=`` / ``(`` / ``,`` / ``{`` / ``[``
+# (RHS, argument, element), an arithmetic / comparison / concat operator,
+# or one of ``return`` / ``and`` / ``or`` / ``not``. Anything else (block
+# boundary, ``then`` / ``else`` / ``do`` keyword body, file start) starts
+# an if-STATEMENT.
+_EXPR_IF_PRECEDING_CHARS = frozenset("=,({[+*/%^<>~|")
+_EXPR_IF_PRECEDING_WORDS = frozenset({"return", "and", "or", "not"})
+
+
+def _is_expression_if(stripped: str, if_pos: int) -> bool:
+    """True iff the ``if`` token at ``if_pos`` introduces a Luau
+    if-EXPRESSION (no closing ``end``) rather than an if-statement."""
+    i = if_pos - 1
+    while i >= 0 and stripped[i].isspace():
+        i -= 1
+    if i < 0:
+        return False
+    ch = stripped[i]
+    if ch in _EXPR_IF_PRECEDING_CHARS:
+        return True
+    # Word: walk back over identifier chars and check membership. ``-`` is
+    # deliberately NOT in the char set: a unary ``-`` precedes an
+    # if-expression but a statement-level binary subtraction can also
+    # precede a fresh ``if`` statement on the next line; biasing toward
+    # statement-if (over-count) on ``-`` matches valid code more often than
+    # biasing toward expression-if (under-count would miss real if-blocks).
+    if ch.isalnum() or ch == "_":
+        j = i
+        while j >= 0 and (stripped[j].isalnum() or stripped[j] == "_"):
+            j -= 1
+        word = stripped[j + 1:i + 1]
+        return word in _EXPR_IF_PRECEDING_WORDS
+    return False
+
 
 @dataclass(frozen=True)
 class _Statement:
@@ -314,7 +358,10 @@ def _iter_top_level_statements(stripped: str, original: str):
         # Track depth changes.
         if kind == "word":
             if tok in _BLOCK_OPEN:
-                block += 1
+                if tok == "if" and _is_expression_if(stripped, m.start()):
+                    pass  # Luau if-EXPRESSION: no ``end`` to match.
+                else:
+                    block += 1
             elif tok in _BLOCK_CLOSE:
                 # ``end`` / ``until`` -- never let it go negative.
                 if block > 0:
@@ -680,6 +727,8 @@ def _extract_function_body(stripped: str, args_start: int):
             continue
         tok = tok_match.group()
         if tok in _BLOCK_OPEN:
+            if tok == "if" and _is_expression_if(stripped, tok_match.start()):
+                continue  # Luau if-expression: no ``end`` to match.
             block += 1
         elif tok in _BLOCK_CLOSE:
             block -= 1
@@ -817,6 +866,55 @@ def _check_gameobject_touch(stripped: str, source: str) -> list[Violation]:
                 f"a Model). Use "
                 f"``self.host:connectGameObjectSignal(self.gameObject, "
                 f"\"{signal}\", fn)`` instead, which resolves a touch part."
+            ),
+        ))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Rule (h) -- ``script.Parent`` (the legacy Roblox idiom) in a host-bound
+# component module.
+#
+# A scene-runtime module is a class table the host ``require``s and
+# instantiates, handing it ``self.gameObject``. It has NO ``script.Parent``
+# relationship to the instance it drives -- a component class is shared by
+# every instance, and (when emitted as a detached ``Script``) ``script.Parent``
+# is whatever container the file landed in, not the GameObject. The legacy
+# transpile mode produces ``script.Parent`` / ``script.Parent.CFrame`` and
+# those throw at runtime (e.g. ``CFrame`` is nil on ServerScriptService).
+# A component MUST reach its instance through ``self.gameObject`` instead.
+#
+# ``\bscript\b`` anchors so identifiers like ``myscript.Parent`` don't match;
+# runs on the stripped source so a ``script.Parent`` in a string/comment is
+# not flagged. This is a BACKSTOP for the common legacy shape, not a complete
+# static guarantee -- the primary enforcement is routing components through
+# the generic prompt (which never emits ``script.Parent``). It is biased
+# toward FEWER false positives (a false fail-closed would sink an otherwise
+# good conversion now that fail-closed promotes to a hard error): if the
+# module shadows ``script`` with a local of the same name, ``script.Parent``
+# is field access on that local, not the Roblox global, so the check is
+# skipped entirely.
+# ---------------------------------------------------------------------------
+
+_RE_H_SCRIPT_PARENT = re.compile(r"\bscript\s*\.\s*Parent\b")
+_RE_H_SCRIPT_SHADOWED = re.compile(r"\blocal\s+script\b")
+
+
+def _check_script_parent(stripped: str, source: str) -> list[Violation]:
+    out: list[Violation] = []
+    if _RE_H_SCRIPT_SHADOWED.search(stripped):
+        return out
+    for m in _RE_H_SCRIPT_PARENT.finditer(stripped):
+        line = source.count("\n", 0, m.start()) + 1
+        out.append(Violation(
+            rule="h",
+            line=line,
+            message=(
+                "``script.Parent`` is the legacy Roblox idiom and does not "
+                "exist for a host-instantiated component module: the class "
+                "table is shared across instances and has no parent edge to "
+                "the GameObject it drives. Reach the instance through "
+                "``self.gameObject`` (and its host helpers) instead."
             ),
         ))
     return out
