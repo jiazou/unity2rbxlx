@@ -1244,6 +1244,29 @@ local Other = require("@scene_runtime/Other")
 
 The string is `@scene_runtime/<stem>`, where `<stem>` is the file stem of the dependency (e.g. `Player` for `Player.cs`). The require resolver fails closed on a missing stem or a stem that collides across folders — your job is just to use the shape.
 
+## Cross-script shared state (canonical Attribute mirror)
+
+When a method records a flag that OTHER scripts will read — e.g. the player picked up a Key (Door checks "has the player a Key?"), a HUD value, a "got rifle" flag, a damage marker — write the canonical Roblox **Attribute** mirror alongside your local Lua-field update. An internal field on the MonoBehaviour instance (`self.gotKey = true`) is visible only to THAT instance; cross-script readers can ONLY see Roblox Instance Attributes (which also replicate across server/client). The canonical store is the character Model AND the Player Instance.
+
+When a `MonoBehaviour` records picked-up items in a `GetItem(itemName)`-style method, ALWAYS write the attribute mirror BEFORE the local-field update:
+
+```luau
+function Player:GetItem(itemName)
+    -- Canonical attribute mirror: cross-script readers (Door, HUD) see ``has<Item>``.
+    if itemName and itemName ~= "" then
+        local _flag = "has" .. itemName  -- "hasKey", "hasRifle", ...
+        local _plr = game:GetService("Players").LocalPlayer
+        if _plr then _plr:SetAttribute(_flag, true) end
+        local _char = _plr and _plr.Character
+        if _char then _char:SetAttribute(_flag, true) end
+    end
+    -- ... then your local state update
+    if itemName == "Key" then self.gotKey = true end
+end
+```
+
+The same pattern applies for any other "shared player flag" mutation (a `RecoverHealth` that should replicate, a `gotWeapon = true` write, etc.). Without this Attribute mirror, gameplay readers in other scripts will silently miss the state change. NEVER skip the mirror just because your local code path also stores the field; the field is for internal use, the Attribute is the cross-script contract.
+
 ## Singleton pattern
 
 `static Instance = this` is supported via the canonical Lua pattern. Do it inside `Awake`, not at module scope:
