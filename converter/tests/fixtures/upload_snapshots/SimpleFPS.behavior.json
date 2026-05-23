@@ -190,6 +190,16 @@
       "wait_seconds": 5.0,
       "assert_luau": "local p = _findVisible(_G._state.t); local hrp_pos = char.Parent and hrp.Position or nil; local aimed = true; if hrp_pos then local dirToMe = (hrp_pos - p.Position).Unit; aimed = p.CFrame.LookVector:Dot(dirToMe) > 0.6 end; local damaged = (char.Parent == nil) or _minHealth() < _G._state.h0; return aimed and damaged",
       "expect": true
+    },
+    {
+      "id": "no_console_errors_during_playthrough",
+      "feature": "10. Console health: across the entire play session (load + spawn + every prior fixture's inputs), LogService:GetLogHistory() contains zero error-level entries. Catches converter-output bugs that surface as runtime errors — module init throws, nil dereferences in input handlers, undefined globals, type errors — independently of whether any single gameplay assertion catches them. Filters to Enum.MessageType.MessageError only (warnings and info are ignored); _reset() doesn't touch LogService, so the log is the full session from Play start. Placed last so it sees every prior fixture's effects. If any earlier fixture failure was caused by an error, that error will appear here too — two independent signals for the same bug is fine.",
+      "play_mode": true,
+      "setup_luau": "_reset()",
+      "wait_seconds": 0.5,
+      "assert_luau": "local errs = {}; for _, entry in ipairs(game:GetService('LogService'):GetLogHistory()) do if entry.messageType == Enum.MessageType.MessageError then table.insert(errs, entry.message) end end; _G._state.console_errors = errs; return #errs == 0",
+      "expect": true,
+      "evidence_on_fail": ["console_tail"]
     }
   ]
 }

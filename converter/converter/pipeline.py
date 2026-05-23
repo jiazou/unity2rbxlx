@@ -11,7 +11,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from typing import Any, cast
 
 import config as _config
@@ -978,6 +978,66 @@ class Pipeline:
             len(artifact["scenes"]), len(artifact["prefabs"]),
         )
 
+        # Strict-classification early gate (PR135 P1.2). The codex review
+        # found that --strict-classification was firing in
+        # ``_classify_storage`` -- which runs INSIDE ``write_output`` AFTER
+        # ``transpile_scripts`` has already emitted Luau to disk. The
+        # design doc requires strict mode to block BEFORE transpile so
+        # the operator never pays the (expensive) AI transpile cost on a
+        # plan that won't ship.
+        #
+        # The classifier verdicts that matter for strict mode (excluded
+        # / low_confidence from Rule 1/4/7) come from C# signals + per-
+        # instance evidence -- both already available at this point.
+        # The Luau channel (post-transpile) hasn't run yet, but it can
+        # only ADD signals; nothing it could add would promote a module
+        # OUT of strict-violations. Helpers and reachability run in
+        # ``_classify_storage`` later -- not gates here.
+        #
+        # We dry-run the classifier on a deep copy of the artifact so
+        # the real run in ``_classify_storage`` (with Luau sources +
+        # dependency_map) is the source of truth.
+        if (
+            self.ctx.scene_runtime_mode != "legacy"
+            and bool(getattr(self.ctx, "strict_classification", False))
+        ):
+            self._enforce_strict_classification_early(artifact)
+
+    def _enforce_strict_classification_early(
+        self, artifact: "Mapping[str, object]",
+    ) -> None:
+        """Run a dry-run domain classification and raise on strict
+        violations. Defense-in-depth duplicate in ``_classify_storage``
+        is left in place; this is the primary gate.
+        """
+        import copy as _copy
+        from converter.scene_runtime_domain import (
+            classify_scene_runtime_domains,
+        )
+
+        # Deep copy so the real run in _classify_storage stays
+        # authoritative. The classifier mutates ``modules`` in place.
+        dry_artifact = _copy.deepcopy(artifact)
+        networking = getattr(self.ctx, "networking_mode", "none")
+        report = classify_scene_runtime_domains(
+            cast("dict", dry_artifact),
+            scripts=[],  # no Luau channel yet (pre-transpile)
+            dependency_map=None,  # reachability runs post-transpile
+            guid_index=self.state.guid_index,
+            networking=networking,
+            strict=True,
+        )
+        if report["strict_violations"]:
+            violations = "\n  - ".join(report["strict_violations"])
+            raise RuntimeError(
+                "--strict-classification: domain classifier left "
+                f"{len(report['strict_violations'])} runtime-bearing "
+                "module(s) unresolved (checked BEFORE transpile). "
+                "Add scene_runtime.domain_overrides entries (or split "
+                "the source class) before re-running:\n  - "
+                + violations
+            )
+
     def _compute_fbx_bounding_boxes(self) -> None:
         """Scan all mesh assets and compute bounding boxes.
 
@@ -1877,13 +1937,57 @@ class Pipeline:
             log.info("[transpile_scripts] Built dependency map: %d scripts with %d cross-references",
                      len(self.state.dependency_map), total_deps)
 
-        self.state.transpilation_result = transpile_scripts(
-            unity_project_path=self.unity_project_path,
-            script_infos=script_infos,
-            use_ai=_config.USE_AI_TRANSPILATION,
-            api_key=_config.ANTHROPIC_API_KEY,
-            serialized_field_refs=self.ctx.serialized_field_refs or None,
-        )
+        if self.ctx.scene_runtime_mode == "generic":
+            # Generic path: route through the contract pipeline so
+            # runtime-bearing MonoBehaviours get the generic prompt,
+            # ModuleScript target flip, verifier + reprompt, and
+            # require-resolution pass. PR3a built the orchestrator;
+            # this wiring completes PR3a's "runtime_mode threaded
+            # through transpiler" deliverable (the legacy entry never
+            # passed ``runtime_mode``, so without this branch every
+            # ``--scene-runtime=generic`` run silently transpiled in
+            # legacy mode and produced non-compliant modules).
+            from converter.contract_pipeline import transpile_with_contract
+            contract_result = transpile_with_contract(
+                unity_project_path=self.unity_project_path,
+                script_infos=script_infos,
+                scene_runtime=self.ctx.scene_runtime,
+                use_ai=_config.USE_AI_TRANSPILATION,
+                api_key=_config.ANTHROPIC_API_KEY,
+                serialized_field_refs=self.ctx.serialized_field_refs or None,
+            )
+            self.state.transpilation_result = contract_result.transpilation
+            # Plumb contract telemetry to ctx so downstream consumers
+            # (PR5 auto-mode fallback decision, post-run reports) can
+            # read it without re-running the orchestrator. ``setdefault``
+            # preserves rows from prior runs in a resume flow; the
+            # generic-mode pipeline only transpiles once per conversion
+            # but resume paths replay the phase.
+            fail_closed_rows = self.ctx.scene_runtime.setdefault(
+                "contract_fail_closed", [],
+            )
+            assert isinstance(fail_closed_rows, list)
+            fail_closed_rows.extend(
+                {"kind": fc.kind, "detail": fc.detail}
+                for fc in contract_result.fail_closed
+            )
+            # ``runtime_bearing_paths`` is a frozenset[Path]; JSON the
+            # ctx serializes through can't carry either type. Store a
+            # sorted list of strings so a resume round-trip is stable.
+            self.ctx.scene_runtime["runtime_bearing_paths"] = sorted(
+                str(p) for p in contract_result.runtime_bearing_paths
+            )
+        else:
+            # Legacy path -- must stay byte-identical to pre-PR3a
+            # behaviour. Do NOT thread ``runtime_mode`` or any other
+            # new kwargs here; legacy emit is a tested invariant.
+            self.state.transpilation_result = transpile_scripts(
+                unity_project_path=self.unity_project_path,
+                script_infos=script_infos,
+                use_ai=_config.USE_AI_TRANSPILATION,
+                api_key=_config.ANTHROPIC_API_KEY,
+                serialized_field_refs=self.ctx.serialized_field_refs or None,
+            )
 
         self.ctx.transpiled_scripts = self.state.transpilation_result.total_transpiled
         log.info(
@@ -2848,11 +2952,40 @@ return table.concat(allData, "\\n")'''
                 for s in self.state.rbx_place.scripts
             )
         )
+        # Generic-runtime mode: PR4's host runtime owns the lifecycle of
+        # every runtime-bearing MonoBehaviour. If the legacy bootstrap
+        # also requires them, their top-level code fires once via the
+        # bootstrap and then ``host.require`` instantiates them again —
+        # double-loading the module AND violating the contract's
+        # "no top-level side effects" rule (the AI emitted side-effect-
+        # free class tables; only the host knows how to wire them).
+        # Under legacy mode ``runtime_bearing_stems`` is empty and this
+        # filter is a no-op, preserving the byte-identical legacy emit
+        # invariant.
+        runtime_bearing_stems: set[str] = set()
+        if self.ctx.scene_runtime_mode == "generic":
+            sr_modules_obj = (self.ctx.scene_runtime or {}).get("modules", {})
+            if isinstance(sr_modules_obj, dict):
+                for module in sr_modules_obj.values():
+                    if not isinstance(module, dict):
+                        continue
+                    if not module.get("runtime_bearing"):
+                        continue
+                    stem = module.get("stem")
+                    if isinstance(stem, str) and stem:
+                        runtime_bearing_stems.add(stem)
         side_effect_modules = []
         for s in self.state.rbx_place.scripts:
             if s.script_type != "ModuleScript":
                 continue
             if not any(_re.search(p, s.source) for p in _side_effect_patterns):
+                continue
+            if s.name in runtime_bearing_stems:
+                log.info(
+                    "[write_output] Skipping bootstrap require of '%s' "
+                    "(runtime-bearing — host runtime owns lifecycle)",
+                    s.name,
+                )
                 continue
             if has_fps_controller and any(
                 _re.search(p, s.source) for p in _anti_fps_patterns
@@ -3810,14 +3943,55 @@ script.Disabled = true
         ):
             from converter.scene_runtime_domain import (
                 classify_scene_runtime_domains,
+                migrate_legacy_domain_values,
             )
+            # Migrate any pre-v2 ``"legacy"`` domain values lurking in the
+            # on-disk plan we just merged (the on-disk plan may have been
+            # produced by an older converter run). Idempotent.
+            migrate_legacy_domain_values(cast("dict", scene_runtime))
+            networking = getattr(self.ctx, "networking_mode", "none")
+            strict = bool(getattr(self.ctx, "strict_classification", False))
             report = classify_scene_runtime_domains(
                 cast("dict", scene_runtime),
                 self.state.rbx_place.scripts,
                 dependency_map=self.state.dependency_map or None,
+                guid_index=self.state.guid_index,
+                networking=networking,
+                strict=strict,
             )
             scene_runtime["displaced_instances"] = report["displaced_instances"]
             scene_runtime["low_confidence_modules"] = report["low_confidence_modules"]
+            scene_runtime["excluded_modules"] = report["excluded_modules"]
+            if report["mirror_adoption_low"]:
+                scene_runtime["mirror_adoption_low"] = True
+                self.ctx.warnings.append(
+                    f"[scene_runtime] --networking={networking} declared "
+                    "but adoption signals are sparse: few netcode annotations "
+                    "and/or zero `using Mirror`/`using Unity.Netcode` imports. "
+                    "Most modules will fall through to the server default. "
+                    "Consider --networking=none or expand annotations. "
+                    "See conversion report for module-level detail."
+                )
+            # Strict mode defense-in-depth (PR135 P1.2). The primary
+            # gate is in ``plan_scene_runtime`` (pre-transpile) so an
+            # operator never pays the AI transpile cost on a plan that
+            # won't ship. This late check should NEVER fire when the
+            # early gate is reachable; it's kept so a code path that
+            # skips ``plan_scene_runtime`` (e.g. a phase resume that
+            # rehydrates ``ctx.scene_runtime`` from disk without re-
+            # planning) still surfaces strict violations rather than
+            # silently writing partial output.
+            if strict and report["strict_violations"]:
+                violations = "\n  - ".join(report["strict_violations"])
+                raise RuntimeError(
+                    "--strict-classification: domain classifier left "
+                    f"{len(report['strict_violations'])} runtime-bearing "
+                    "module(s) unresolved (late check; the primary gate "
+                    "in plan_scene_runtime should have caught this). "
+                    "Add scene_runtime.domain_overrides entries (or "
+                    "split the source class) before re-running:\n  - "
+                    + violations
+                )
 
         plan_path.write_text(
             _json.dumps({
@@ -3882,6 +4056,25 @@ script.Disabled = true
         for key, value in on_disk.items():
             if key not in merged:
                 merged[key] = value
+
+        # Classifier-v2 migration: rewrite pre-v2 ``domain="legacy"`` rows
+        # in the merged modules block. Idempotent. Cheap (dict scan).
+        try:
+            from converter.scene_runtime_domain import (
+                migrate_legacy_domain_values,
+            )
+            migrated = migrate_legacy_domain_values(
+                cast("dict", merged),
+            )
+            if migrated:
+                log.info(
+                    "[classify_storage] migrated %d legacy domain row(s) "
+                    "from on-disk plan to 'excluded'", migrated,
+                )
+        except Exception as exc:
+            log.debug(
+                "[classify_storage] legacy-domain migration skipped: %s", exc,
+            )
 
         return merged
 

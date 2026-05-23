@@ -141,7 +141,6 @@ def _fixture_to_plan(fixture: dict, preamble: str) -> dict[str, Any]:
     action descriptors.
     """
     steps = plan_for_fixture(fixture, preamble)
-    safety_step = next(s for s in steps if s.kind == "safety_check_studio")
     setup_step = next((s for s in steps if s.kind == "execute_setup"), None)
     assert_step = next(s for s in steps if s.kind == "execute_assert")
 
@@ -170,7 +169,6 @@ def _fixture_to_plan(fixture: dict, preamble: str) -> dict[str, Any]:
     return {
         "id": fixture["id"],
         "feature": fixture.get("feature", ""),
-        "safety_check_note": safety_step.note,
         "setup_luau": setup_step.payload if setup_step else None,
         "input_sequence": inputs,
         "wait_seconds": float(fixture.get("wait_seconds") or 0),
