@@ -610,6 +610,168 @@ class TestHostInvokeCancellation:
 
 
 # ---------------------------------------------------------------------------
+# Delayed-Destroy emission shape — pins both the runtime contract
+# (``invoke`` requires a string method, NOT a function literal) AND the
+# correct ``task.delay(delay, function() ... end)`` pattern that the
+# generic prompt teaches as the Unity ``Destroy(target, delay)``
+# translation. See ``_GENERIC_RUNTIME_PROMPT`` in code_transpiler.py.
+#
+# Why raw ``task.delay`` and not ``startCoroutine``: Unity's
+# ``Destroy(target, delay)`` is bound to TARGET's lifetime, not the
+# caller's. ``startCoroutine`` is host-tracked on the caller and gets
+# cancelled in ``_destroyComponent`` -> ``_cancelAllTasks``, which would
+# drop the destroy if the scheduling component itself is destroyed
+# during the delay. Raw ``task.delay`` is intentionally un-tracked.
+# ---------------------------------------------------------------------------
+
+class TestDelayedDestroyPattern:
+
+    def test_task_delay_destroy_fires_after_delay(self):
+        # The taught pattern for ``Destroy(target, delay)``:
+        #   task.delay(delay, function() self.host.destroy(target) end)
+        # Verifies the destroy actually fires after the delay elapses.
+        scenario = textwrap.dedent("""\
+            local destroyed = 0
+            local Foo = {} ; Foo.__index = Foo
+            function Foo.new(_) return setmetatable({}, Foo) end
+            function Foo:OnDestroy() destroyed = destroyed + 1 end
+            local plan = {
+                modules = {foo = {stem = "Foo", runtime_bearing = true,
+                                  module_path = "x"}},
+                scenes = {
+                    A = {
+                        instances = {{instance_id = "A:1", script_id = "foo",
+                                      game_object_id = "g", active = true,
+                                      enabled = true, config = {}}},
+                        references = {},
+                        lifecycle_order = {"A:1"},
+                    },
+                },
+                prefabs = {}, domain_overrides = {},
+            }
+            local services = servicesFor(plan, {foo = Foo}, {
+                g = {Name = "G", _sceneRuntimeId = "g", _children = {}},
+            })
+            local engine = SceneRuntime.new(services, plan)
+            engine:start(nil)
+            runDeferred()
+            local comp = engine:findObjectOfType("Foo")
+            -- Emulate the AI-emitted pattern for ``Destroy(target, delay)``.
+            task.delay(1.0, function() engine:destroy(comp) end)
+            advanceTime(2.0)
+            print("destroyed=" .. destroyed)
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, err
+        assert "destroyed=1" in out, (
+            "task.delay+destroy must fire OnDestroy; got " + out
+        )
+
+    def test_task_delay_destroy_survives_caller_destruction(self):
+        # Critical Unity semantic: ``Destroy(target, delay)`` is bound
+        # to TARGET's lifetime. If the SCHEDULING component is itself
+        # destroyed during the delay, the target's destroy must STILL
+        # fire. This test guards against regressing to a
+        # lifecycle-tracked scheduler (``startCoroutine`` / ``invoke``),
+        # which would cancel the delayed destroy when caller dies first.
+        scenario = textwrap.dedent("""\
+            local destroyed = {}
+            local Foo = {} ; Foo.__index = Foo
+            function Foo.new(_) return setmetatable({}, Foo) end
+            function Foo:OnDestroy() destroyed[self._tag] = (destroyed[self._tag] or 0) + 1 end
+            local plan = {
+                modules = {foo = {stem = "Foo", runtime_bearing = true,
+                                  module_path = "x"}},
+                scenes = {
+                    A = {
+                        instances = {
+                            {instance_id = "A:caller", script_id = "foo",
+                             game_object_id = "gC", active = true,
+                             enabled = true, config = {}},
+                            {instance_id = "A:target", script_id = "foo",
+                             game_object_id = "gT", active = true,
+                             enabled = true, config = {}},
+                        },
+                        references = {},
+                        lifecycle_order = {"A:caller", "A:target"},
+                    },
+                },
+                prefabs = {}, domain_overrides = {},
+            }
+            local services = servicesFor(plan, {foo = Foo}, {
+                gC = {Name = "gC", _sceneRuntimeId = "gC", _children = {}},
+                gT = {Name = "gT", _sceneRuntimeId = "gT", _children = {}},
+            })
+            local engine = SceneRuntime.new(services, plan)
+            engine:start(nil)
+            runDeferred()
+            local comps = {}
+            for comp, m in pairs(engine._meta) do
+                if m.gameObjectId == "gC" then comp._tag = "caller"; comps.caller = comp
+                elseif m.gameObjectId == "gT" then comp._tag = "target"; comps.target = comp end
+            end
+            -- Caller schedules a delayed destroy of TARGET, then is
+            -- destroyed itself before the delay elapses.
+            task.delay(1.0, function() engine:destroy(comps.target) end)
+            engine:destroy(comps.caller)
+            advanceTime(2.0)
+            print("caller=" .. (destroyed.caller or 0) .. " target=" .. (destroyed.target or 0))
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, err
+        assert "caller=1" in out and "target=1" in out, (
+            "task.delay scheduled destroy of target must fire even after "
+            "caller is destroyed first; got " + out
+        )
+
+    def test_invoke_with_function_method_is_silent_no_op(self):
+        # Regression guard against the previous BROKEN prompt teaching:
+        #   self.host.invoke(self, function() ... end, delay)
+        # ``invoke`` uses ``method`` as a STRING key into the class table;
+        # a function literal is not a key, so the scheduled body never
+        # runs (silent no-op). This pins the contract -- if a future
+        # change ever widens ``invoke`` to accept function-typed methods
+        # without an explicit design decision, this test must be
+        # re-evaluated.
+        scenario = textwrap.dedent("""\
+            local destroyed = 0
+            local Foo = {} ; Foo.__index = Foo
+            function Foo.new(_) return setmetatable({}, Foo) end
+            function Foo:OnDestroy() destroyed = destroyed + 1 end
+            local plan = {
+                modules = {foo = {stem = "Foo", runtime_bearing = true,
+                                  module_path = "x"}},
+                scenes = {
+                    A = {
+                        instances = {{instance_id = "A:1", script_id = "foo",
+                                      game_object_id = "g", active = true,
+                                      enabled = true, config = {}}},
+                        references = {},
+                        lifecycle_order = {"A:1"},
+                    },
+                },
+                prefabs = {}, domain_overrides = {},
+            }
+            local services = servicesFor(plan, {foo = Foo}, {
+                g = {Name = "G", _sceneRuntimeId = "g", _children = {}},
+            })
+            local engine = SceneRuntime.new(services, plan)
+            engine:start(nil)
+            runDeferred()
+            local comp = engine:findObjectOfType("Foo")
+            -- The BROKEN AI emission: function-typed method argument.
+            engine:invoke(comp, function() engine:destroy(comp) end, 1.0)
+            advanceTime(2.0)
+            print("destroyed=" .. destroyed)
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, err
+        assert "destroyed=0" in out, (
+            "invoke must NOT dispatch function-typed methods; got " + out
+        )
+
+
+# ---------------------------------------------------------------------------
 # host.destroy DFS deepest-first; idempotent
 # ---------------------------------------------------------------------------
 

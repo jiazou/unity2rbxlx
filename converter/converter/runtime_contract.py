@@ -100,7 +100,7 @@ def verify_module(source: str) -> VerificationResult:
     violations.extend(_check_top_level_statements(statements, stripped))
     violations.extend(_check_module_return(statements, source))
     violations.extend(_check_lifecycle_assignments(statements, stripped))
-    violations.extend(_check_constructor_purity(stripped, source))
+    violations.extend(_check_constructor_purity(stripped, source, statements))
     violations.extend(_check_unity_message_callbacks(statements, stripped, source))
     violations.extend(_check_gameobject_touch(stripped, source))
     violations.extend(_check_script_parent(stripped, source))
@@ -653,14 +653,39 @@ def _check_module_return(statements, source: str) -> list[Violation]:
 # bound until after ``new()`` returns.
 # ---------------------------------------------------------------------------
 
-# Match ``function CLASS:new(...)`` / ``function CLASS.new(self, ...)`` /
-# ``new = function(self, ...)`` (table-literal entry). Capture the body
-# slice up to the matching ``end``.
+# Match ``function CLASS.new(self, ...)`` (canonical dot form per spec) and
+# ``new = function(self, ...)`` (table-literal entry). The host runtime calls
+# ``module_table.new(config)`` (see scene_runtime.luau:_buildComponent); a
+# colon-form ``function CLASS:new(config)`` would bind ``config`` to ``self``
+# and silently lose the real config, so it's rejected as a SHAPE violation
+# (``_RE_CONSTRUCTOR_COLON_FORM`` below) -- but ONLY when ``CLASS`` is the
+# exported module table. Internal helper classes can use colon-form freely
+# because the runtime never calls their ``.new`` as the module constructor.
 _RE_CONSTRUCTOR_METHOD = re.compile(
-    r"function\s+[\w.]+\s*[:.]\s*new\s*\(",
+    r"function\s+([\w.]+)\s*\.\s*new\s*\(",
 )
 _RE_CONSTRUCTOR_LITERAL = re.compile(
     r"\bnew\s*=\s*function\s*\(",
+)
+_RE_CONSTRUCTOR_COLON_FORM = re.compile(
+    r"function\s+([\w.]+)\s*:\s*new\s*\(",
+)
+# Identify the exported class from the module's TERMINAL top-level
+# return statement. Three recognized shapes:
+#   - bare identifier:        ``return X``        / ``return Mod.Sub``
+#   - 2-arg setmetatable OO:  ``return setmetatable(X, mt)`` / ``...(Mod.Sub, mt)``
+#   - 1-arg setmetatable:     ``return setmetatable(X)``    (legal Lua: self-mt)
+# Dotted names: the runtime's ``module_table.new(config)`` call binds on
+# the rightmost segment's table (Lua method-binding semantics), so we
+# strip the dotted prefix in ``_exported_class_name`` and compare against
+# the same suffix produced from each colon-form constructor's class name.
+# Anything else (table literal, factory call, multi-value) yields no
+# name and we fall back to the conservative rule.
+_RE_RETURN_BARE_IDENT = re.compile(
+    r"^\s*return\s+([\w.]+)\s*$",
+)
+_RE_RETURN_SETMETATABLE = re.compile(
+    r"^\s*return\s+setmetatable\s*\(\s*([\w.]+)\s*[,)]",
 )
 
 _FORBIDDEN_IN_NEW = [
@@ -671,9 +696,98 @@ _FORBIDDEN_IN_NEW = [
 ]
 
 
-def _check_constructor_purity(stripped: str, source: str) -> list[Violation]:
+def _exported_class_name(statements) -> str | None:
+    """Return the identifier the module exports via its terminal
+    top-level ``return``, or ``None`` if the return shape doesn't
+    surface a name (table literal, factory call, multi-value, etc.).
+
+    Walks ``statements`` (the parsed top-level statement list, from
+    ``_iter_top_level_statements``) so nested function bodies cannot
+    inject a misleading ``return Helper`` that re-binds the export.
+
+    For dotted names (``return Mod.Sub`` /
+    ``return setmetatable(Mod.Sub, mt)``), returns the rightmost
+    segment (``"Sub"``) -- that's what Lua binds the colon-form
+    method on, and what the runtime's ``module_table.new(config)``
+    call effectively addresses.
+    """
+    last_return_text: str | None = None
+    for stmt in statements:
+        if _RE_RETURN.match(stmt.text):
+            last_return_text = stmt.text
+    if last_return_text is None:
+        return None
+    m = _RE_RETURN_BARE_IDENT.match(last_return_text)
+    if m:
+        return m.group(1).rsplit(".", 1)[-1]
+    m = _RE_RETURN_SETMETATABLE.match(last_return_text)
+    if m:
+        return m.group(1).rsplit(".", 1)[-1]
+    return None
+
+
+def _check_constructor_purity(stripped: str, source: str, statements) -> list[Violation]:
     out: list[Violation] = []
-    for pat in (_RE_CONSTRUCTOR_METHOD, _RE_CONSTRUCTOR_LITERAL):
+
+    # Identify the exported class from the module's TERMINAL top-level
+    # return -- inspected via the parsed statement list so a nested
+    # function's own ``return Helper`` can't misanchor the check.
+    exported_class = _exported_class_name(statements)
+
+    # Conservative fallback used when the export is a shape we can't
+    # name-anchor on (table literal, factory call, multi-value return).
+    has_canonical_constructor = (
+        _RE_CONSTRUCTOR_METHOD.search(stripped) is not None
+        or _RE_CONSTRUCTOR_LITERAL.search(stripped) is not None
+    )
+
+    # Shape violation: colon-form constructors break the runtime's
+    # ``module_table.new(config)`` call (config becomes self).
+    for m in _RE_CONSTRUCTOR_COLON_FORM.finditer(stripped):
+        cls_name = m.group(1)
+        # Strip any dotted prefix (``Foo.Bar:new`` -> ``Bar``); colon-form
+        # ``function A.B:new(...)`` is sugar for ``A.B.new(self, ...)``
+        # which binds the method on the rightmost segment's table.
+        cls_tail = cls_name.rsplit(".", 1)[-1]
+
+        if exported_class is not None:
+            # We know which class is exported. Flag ONLY when this
+            # constructor IS the exported one. Helper classes with
+            # colon-form constructors are intentional and never reached
+            # by the runtime's ``module_table.new(config)`` call.
+            if cls_tail != exported_class:
+                continue
+            # Edge case kept rejected: a module that declares BOTH
+            # ``function X.new(config)`` AND ``function X:new(config)``
+            # still has the colon-form OVERWRITE the dot-form on the
+            # class table (Lua's later-write-wins). The runtime then
+            # calls ``X.new(config)`` and ``config`` binds to ``self``
+            # anyway. Fall through to emit the violation.
+        else:
+            # No name on the return -- fall back to the conservative
+            # rule: allow colon-form when any canonical dot-form /
+            # literal constructor exists (it may be the exported one).
+            # Reject when colon-form is the only shape in sight.
+            if has_canonical_constructor:
+                continue
+
+        line = source.count("\n", 0, m.start()) + 1
+        out.append(Violation(
+            rule="e",
+            line=line,
+            message=(
+                "constructor declared with colon form ``Class:new(...)``. "
+                "The host calls ``module_table.new(config)`` (dot form); "
+                "a colon-form constructor receives ``config`` as ``self`` "
+                "and silently drops the real config. Use "
+                "``function Class.new(config)`` instead."
+            ),
+        ))
+    # Purity violation: host surface isn't bound until after new() returns.
+    # ALL three constructor shapes get the sweep -- a helper class's
+    # colon-form ``Helper:new()`` can still read ``self.host`` (which is
+    # nil at construction time) and crash at boot.
+    for pat in (_RE_CONSTRUCTOR_METHOD, _RE_CONSTRUCTOR_LITERAL, _RE_CONSTRUCTOR_COLON_FORM):
         for m in pat.finditer(stripped):
             body, body_start = _extract_function_body(stripped, m.end())
             if body is None:

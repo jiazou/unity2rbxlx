@@ -304,6 +304,333 @@ class TestRuleE:
         )
         _assert_rule(src, "e")
 
+    def test_colon_form_constructor_rejected(self):
+        # Shape violation: ``function Class:new(config)`` is sugar for
+        # ``function Class.new(self, config)``, but the host runtime calls
+        # ``module_table.new(config)`` (one arg). Under colon form,
+        # ``config`` binds to ``self`` and the real config is dropped --
+        # silent gameplay corruption. The verifier rejects the form so
+        # the reprompt teaches the correct dot form.
+        src = (
+            'local Class = {}\n'
+            'Class.__index = Class\n'
+            'function Class:new(config)\n'
+            '    local self = setmetatable({}, Class)\n'
+            '    self.speed = config.speed or 12\n'
+            '    return self\n'
+            'end\n'
+            'return Class\n'
+        )
+        _assert_rule(src, "e")
+
+    def test_dot_form_constructor_with_pure_body_passes(self):
+        # Spec form: ``function Class.new(config) ... end``. No host
+        # access, just config reads. Must NOT trip the new shape check.
+        src = (
+            'local Class = {}\n'
+            'Class.__index = Class\n'
+            'function Class.new(config)\n'
+            '    local self = setmetatable({}, Class)\n'
+            '    self.speed = config.speed or 12\n'
+            '    return self\n'
+            'end\n'
+            'return Class\n'
+        )
+        _assert_clean(src)
+
+    def test_dot_form_exported_with_internal_colon_helper_passes(self):
+        # The exported class uses dot-form (correct), and an internal
+        # helper class uses colon-form. The host calls ONLY the exported
+        # ``.new`` (it never sees ``Pool:new``), so the colon helper is
+        # harmless and must not trip the shape check. Regression guard
+        # against narrowing this rule too far.
+        src = (
+            'local Pool = {}\n'
+            'Pool.__index = Pool\n'
+            'function Pool:new()\n'  # internal helper — colon form OK
+            '    return setmetatable({items = {}}, Pool)\n'
+            'end\n'
+            'function Pool:add(x) table.insert(self.items, x) end\n'
+            '\n'
+            'local Class = {}\n'
+            'Class.__index = Class\n'
+            'function Class.new(config)\n'  # exported — dot form required
+            '    local self = setmetatable({}, Class)\n'
+            '    self.pool = Pool:new()\n'
+            '    self.speed = config.speed or 12\n'
+            '    return self\n'
+            'end\n'
+            'return Class\n'
+        )
+        _assert_clean(src)
+
+    def test_helper_dot_form_does_not_mask_exported_colon_form(self):
+        # Codex P1 regression guard: previously, an internal helper class
+        # using dot-form (``Helper.new()``) satisfied the module-wide
+        # "any canonical constructor exists" check, which made the colon-
+        # form check skip the EXPORTED class's ``Class:new(...)``. The
+        # runtime then called ``Class.new(config)`` (the colon-form
+        # overwrites the dot via Lua's later-write-wins) and ``config``
+        # bound to ``self`` -- silent gameplay corruption.
+        #
+        # The fix anchors the colon-form check on the exported class name
+        # taken from the module's ``return X`` statement.
+        src = (
+            'local Helper = {}\n'
+            'function Helper.new() return setmetatable({}, Helper) end\n'  # dot — internal
+            '\n'
+            'local Class = {}\n'
+            'Class.__index = Class\n'
+            'function Class:new(config)\n'  # COLON form on EXPORTED — bug shape
+            '    local self = setmetatable({}, Class)\n'
+            '    self.speed = config.speed or 12\n'
+            '    return self\n'
+            'end\n'
+            'return Class\n'
+        )
+        _assert_rule(src, "e")
+
+    def test_helper_colon_form_with_exported_dot_form_passes(self):
+        # The mirror case (already covered indirectly above, but pinned
+        # explicitly): helper uses colon-form (``Helper:new()``), exported
+        # class uses dot-form (``Class.new(config)``). Helper colon-form
+        # is harmless because the runtime never touches it; exported
+        # dot-form is canonical. Must pass clean.
+        src = (
+            'local Helper = {}\n'
+            'Helper.__index = Helper\n'
+            'function Helper:new() return setmetatable({}, Helper) end\n'  # colon — internal
+            '\n'
+            'local Class = {}\n'
+            'Class.__index = Class\n'
+            'function Class.new(config)\n'  # exported — dot form
+            '    local self = setmetatable({}, Class)\n'
+            '    self.helper = Helper:new()\n'
+            '    return self\n'
+            'end\n'
+            'return Class\n'
+        )
+        _assert_clean(src)
+
+    def test_unanchored_export_falls_back_to_conservative_rule(self):
+        # Module returns a table literal directly (no name to anchor on).
+        # The verifier falls back to the conservative rule: any canonical
+        # constructor anywhere in the module allows colon-form elsewhere.
+        # If colon-form is the only ``new`` shape in sight, it IS rejected.
+        clean = (
+            'local Helper = {}\n'
+            'function Helper.new() return setmetatable({}, Helper) end\n'  # canonical dot
+            '\n'
+            'local Class = {}\n'
+            'function Class:helper_method() return self end\n'  # not new(); irrelevant
+            'return { entry = function(config)\n'
+            '    return setmetatable({}, Class)\n'
+            'end }\n'
+        )
+        _assert_clean(clean)
+
+        bad = (
+            'local Class = {}\n'
+            'function Class:new(config)\n'  # only constructor; colon-only
+            '    return setmetatable({}, Class)\n'
+            'end\n'
+            'return { wrapper = Class }\n'  # complex return -> no anchor
+        )
+        _assert_rule(bad, "e")
+
+    def test_nested_return_inside_function_does_not_misanchor_export(self):
+        # R2 P1 regression: previously the export-name detection scanned
+        # the WHOLE stripped source with a MULTILINE regex and took
+        # "last match wins". A nested function body containing
+        # ``return Helper`` placed AFTER the module's real ``return Class``
+        # would misanchor ``exported_class`` to ``"Helper"``, then skip the
+        # colon-form check on the exported ``function Class:new(config)``.
+        #
+        # The fix walks the parsed top-level statement list so only the
+        # module's TERMINAL top-level return counts.
+        src = (
+            'local Helper = {}\n'
+            'function Helper.new() return setmetatable({}, Helper) end\n'
+            '\n'
+            'local Class = {}\n'
+            'Class.__index = Class\n'
+            'function Class:new(config)\n'  # EXPORTED colon-form — must reject
+            '    local self = setmetatable({}, Class)\n'
+            '    self.speed = config.speed or 12\n'
+            '    return self\n'
+            'end\n'
+            '\n'
+            '-- Nested function that ALSO contains ``return Helper`` --\n'
+            '-- in the OLD regex this would misanchor exported_class\n'
+            '-- to "Helper", so the colon-form check on Class:new would\n'
+            '-- skip and the bug would slip through.\n'
+            'function Class:get_helper()\n'
+            '    return Helper\n'  # nested return, NOT module export
+            'end\n'
+            '\n'
+            'return Class\n'  # real module export
+        )
+        _assert_rule(src, "e")
+
+    def test_setmetatable_export_anchors_correctly(self):
+        # R2 P1 regression: ``return setmetatable(Class, mt)`` is the
+        # most common Luau OO export idiom but is not a bare identifier.
+        # Previously the export-name detection missed it, fell back to
+        # the conservative "any canonical constructor allows colon-form"
+        # rule, and allowed an exported colon-form constructor when an
+        # internal helper had a dot-form one. Identical symptom to the
+        # original R1 P1 bug, just hidden behind setmetatable.
+        bug_shape = (
+            'local Helper = {}\n'
+            'function Helper.new() return setmetatable({}, Helper) end\n'  # helper dot
+            '\n'
+            'local Class = {}\n'
+            'Class.__index = Class\n'
+            'function Class:new(config)\n'  # EXPORTED colon-form — must reject
+            '    local self = setmetatable({}, Class)\n'
+            '    self.speed = config.speed or 12\n'
+            '    return self\n'
+            'end\n'
+            '\n'
+            'return setmetatable(Class, {__call = function(_, c) return Class.new(c) end})\n'
+        )
+        _assert_rule(bug_shape, "e")
+
+        # Mirror case: helper colon-form + exported dot-form via setmetatable
+        # should pass clean.
+        clean = (
+            'local Helper = {}\n'
+            'Helper.__index = Helper\n'
+            'function Helper:new() return setmetatable({}, Helper) end\n'  # helper colon
+            '\n'
+            'local Class = {}\n'
+            'Class.__index = Class\n'
+            'function Class.new(config)\n'  # exported dot — correct
+            '    local self = setmetatable({}, Class)\n'
+            '    self.helper = Helper:new()\n'
+            '    return self\n'
+            'end\n'
+            '\n'
+            'return setmetatable(Class, {__call = function(_, c) return Class.new(c) end})\n'
+        )
+        _assert_clean(clean)
+
+    def test_colon_form_helper_with_host_access_still_rejected(self):
+        # R2 P2 regression guard: the previous narrowing dropped colon-form
+        # from the purity sweep, so a helper class's ``Helper:new()`` body
+        # could read ``self.host`` without being flagged -- crashes at boot
+        # because ``self.host`` is nil at construction time.
+        #
+        # The exported class's colon-form is intentionally not the test
+        # subject here -- it gets caught by the SHAPE check above. This
+        # test pins that PURITY violations are still emitted on helper
+        # colon-form constructors.
+        src = (
+            'local Helper = {}\n'
+            'Helper.__index = Helper\n'
+            'function Helper:new()\n'
+            '    local self = setmetatable({}, Helper)\n'
+            '    self.host.invoke(self, "Tick", 1)\n'  # rule (e) violation
+            '    return self\n'
+            'end\n'
+            '\n'
+            'local Class = {}\n'
+            'function Class.new(config)\n'  # exported, canonical
+            '    local self = setmetatable({}, Class)\n'
+            '    self.helper = Helper:new()\n'
+            '    return self\n'
+            'end\n'
+            '\n'
+            'return Class\n'
+        )
+        _assert_rule(src, "e")
+
+    def test_dotted_export_bare_return_anchors_correctly(self):
+        # R3 P1 regression: ``return Mod.Sub`` (dotted bare-identifier
+        # export) previously didn't match _RE_RETURN_BARE_IDENT, so
+        # _exported_class_name returned None, fell back to the
+        # conservative rule, and a helper Helper.new() would mask an
+        # exported function Mod.Sub:new(config) -- same bug-class as R1,
+        # just on a dotted name.
+        #
+        # The fix extends the regex to [\w.]+ and rsplits to take the
+        # rightmost segment.
+        bug_shape = (
+            'local Mod = {}\n'
+            'Mod.Sub = {}\n'
+            'Mod.Sub.__index = Mod.Sub\n'
+            'local Helper = {}\n'
+            'function Helper.new() return setmetatable({}, Helper) end\n'  # helper dot
+            '\n'
+            'function Mod.Sub:new(config)\n'  # EXPORTED dotted colon-form -- must reject
+            '    local self = setmetatable({}, Mod.Sub)\n'
+            '    self.speed = config.speed or 12\n'
+            '    return self\n'
+            'end\n'
+            '\n'
+            'return Mod.Sub\n'  # dotted export
+        )
+        _assert_rule(bug_shape, "e")
+
+        # Mirror: helper colon-form + exported dotted dot-form must pass.
+        clean = (
+            'local Mod = {}\n'
+            'Mod.Sub = {}\n'
+            'Mod.Sub.__index = Mod.Sub\n'
+            'local Helper = {}\n'
+            'Helper.__index = Helper\n'
+            'function Helper:new() return setmetatable({}, Helper) end\n'  # helper colon
+            '\n'
+            'function Mod.Sub.new(config)\n'  # exported dotted dot -- correct
+            '    local self = setmetatable({}, Mod.Sub)\n'
+            '    self.helper = Helper:new()\n'
+            '    return self\n'
+            'end\n'
+            '\n'
+            'return Mod.Sub\n'
+        )
+        _assert_clean(clean)
+
+    def test_dotted_export_setmetatable_anchors_correctly(self):
+        # R3 P1 regression mirror: ``return setmetatable(Mod.Sub, mt)``
+        # (dotted setmetatable export). Same fix scope.
+        bug_shape = (
+            'local Mod = {}\n'
+            'Mod.Sub = {}\n'
+            'Mod.Sub.__index = Mod.Sub\n'
+            'local Helper = {}\n'
+            'function Helper.new() return setmetatable({}, Helper) end\n'
+            '\n'
+            'function Mod.Sub:new(config)\n'  # EXPORTED via setmeta -- must reject
+            '    local self = setmetatable({}, Mod.Sub)\n'
+            '    self.speed = config.speed or 12\n'
+            '    return self\n'
+            'end\n'
+            '\n'
+            'return setmetatable(Mod.Sub, {__call = function(_, c) return Mod.Sub.new(c) end})\n'
+        )
+        _assert_rule(bug_shape, "e")
+
+    def test_one_arg_setmetatable_export_anchors_correctly(self):
+        # R3 P2 → upgraded to coverage: 1-arg ``setmetatable(X)`` (Lua
+        # legal: the table is its own mt). The regex now matches both
+        # ``,`` and ``)`` as the closing delimiter so this rare-but-legal
+        # idiom anchors correctly instead of falling back to conservative.
+        bug_shape = (
+            'local Helper = {}\n'
+            'function Helper.new() return setmetatable({}, Helper) end\n'
+            '\n'
+            'local Class = {}\n'
+            'Class.__index = Class\n'
+            'function Class:new(config)\n'  # EXPORTED colon -- must reject
+            '    local self = setmetatable({}, Class)\n'
+            '    return self\n'
+            'end\n'
+            '\n'
+            'return setmetatable(Class)\n'  # 1-arg form
+        )
+        _assert_rule(bug_shape, "e")
+
 
 # ---------------------------------------------------------------------------
 # Rule (f) -- Unity message callbacks bound on the class table.
