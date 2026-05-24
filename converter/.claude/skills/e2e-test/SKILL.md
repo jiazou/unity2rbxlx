@@ -92,8 +92,18 @@ once at the top of Step 0 so the rest of the skill is invocation-
 location-agnostic:
 
 ```bash
-cd "$(git rev-parse --show-toplevel)/converter"
+cd "$(git rev-parse --show-toplevel 2>/dev/null)/converter" || {
+    echo "/e2e-test must run inside a unity2rbxlx git checkout with a "\
+         "'converter/' subdirectory. cwd was: $(pwd)" >&2
+    exit 64
+}
 ```
+
+(The `|| {…; exit 64;}` is load-bearing — without it a failed `cd`
+silently leaves the agent in an arbitrary working directory, and
+every later `python3 -c` / `python3 -m tools.…` invocation fails
+with a cryptic `ModuleNotFoundError` instead of the clean
+"must run inside a checkout" message.)
 
 **Argument parsing.** Walk the argv as discrete tokens (a substring
 glob like `*--generic*` would false-match `--generics`, `--no-generic-X`,
@@ -108,7 +118,8 @@ while (( "$#" )); do
     case "$1" in
         --generic)            SCENE_RUNTIME_MODE="generic" ; shift ;;
         --close-and-relaunch) CLOSE_AND_RELAUNCH=1         ; shift ;;
-        --only)               ONLY_FIXTURES="$2"           ; shift 2 ;;
+        --only)               [[ -z "${2:-}" ]] && { echo "--only requires a value (e.g. --only foo,bar)" >&2; exit 64; }
+                              ONLY_FIXTURES="$2"           ; shift 2 ;;
         --*)                  echo "unknown flag: $1" >&2  ; exit 64 ;;
         *)                    if [[ -z "$PROJECT" ]]; then
                                   PROJECT="$1"; shift
