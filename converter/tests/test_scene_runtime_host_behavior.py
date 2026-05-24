@@ -1648,6 +1648,94 @@ class TestPrefabComponentReceivesGameObject:
         assert rc == 0, f"luau failed: {err}\n{out}"
         assert "OK" in out
 
+    def test_prefab_clone_descendant_self_gameobject_after_template_sri(self):
+        """PR2 follow-up §6 regression: a prefab subplan keys instances
+        on ``game_object_id = "<prefab_id>:<file_id>"`` (planner output,
+        ``scene_runtime_planner.py:880``). When
+        ``ReplicatedStorage.Templates`` clones carry matching
+        ``_SceneRuntimeId`` values on their descendants, the runtime
+        resolves the cloned descendant via the per-instance loop and
+        ``self.gameObject`` is non-nil after Awake.
+
+        Pre-fix the template root carried NO ``_SceneRuntimeId`` on any
+        node (``prefab_packages.py`` did not pass ``runtime_namespace``
+        to ``_convert_prefab_node``). The clone's per-instance
+        ``resolveCloneChild`` call missed every descendant,
+        ``_buildComponent`` was called with ``goInst=nil`` and the
+        component booted with ``self.gameObject = nil`` — fatal for
+        anything that wires ``Touched`` in ``Awake`` (live SimpleFPS:
+        the 1Hz "no touch part on nil" turret-bullet warning).
+
+        This is the regression anchor for the runtime side. The
+        converter-side unit tests in ``test_prefab_packages.py`` lock in
+        the stamping itself; this test locks in the contract that the
+        host runtime uses those stamps to wire ``self.gameObject``.
+
+        NOTE: this test exercises the raw-id fallback in resolveCloneChild
+        (scene_runtime.luau:1673-1676), not the namespaced rewrite path
+        (scene_runtime.luau:1626-1644). The clone table doesn't install
+        GetAttribute/SetAttribute mocks, so the upfront walk no-ops. The
+        test still proves the load-bearing contract: a cloned prefab
+        descendant binds to a non-nil self.gameObject after the
+        converter stamps SRIs on the template tree. A stricter follow-up
+        could install attribute mocks and exercise both paths."""
+        scenario = textwrap.dedent("""\
+            local capturedGo = nil
+            local Foo = {} ; Foo.__index = Foo
+            function Foo.new(_) return setmetatable({}, Foo) end
+            function Foo:Awake()
+                capturedGo = self.gameObject
+            end
+            -- Planner-style namespaced ids (matches the format
+            -- ``scene_runtime_planner.py:880`` emits and the
+            -- ``prefab_packages.py`` stamping produces post-fix).
+            local prefabId = "prefab_X"
+            local rootGoId = "prefab_X:Assets/Foo.prefab:1"
+            local childGoId = "prefab_X:Assets/Foo.prefab:42"
+            local plan = {
+                modules = {foo = {stem = "Foo", runtime_bearing = true,
+                                  module_path = "x"}},
+                scenes = {},
+                prefabs = {
+                    [prefabId] = {
+                        name = "Foo",
+                        instances = {{instance_id = prefabId .. ":i1",
+                                      script_id = "foo",
+                                      game_object_id = childGoId,
+                                      active = true, enabled = true,
+                                      config = {}}},
+                        references = {},
+                        lifecycle_order = {prefabId .. ":i1"},
+                    },
+                },
+                domain_overrides = {},
+            }
+            -- The cloned descendant carries the planner's
+            -- ``game_object_id`` as its ``_SceneRuntimeId`` — this is
+            -- what the post-fix template emits.
+            local clonedChild = {
+                Name = "Muzzle", _sceneRuntimeId = childGoId, _children = {},
+            }
+            local cloneInstance = {
+                Name = "FooClone", _sceneRuntimeId = rootGoId,
+                _children = {[childGoId] = clonedChild},
+            }
+            local services = servicesFor(plan, {foo = Foo}, {})
+            services.clonePrefabTemplate = function(prefab, parent, cframe)
+                return cloneInstance
+            end
+            local engine = SceneRuntime.new(services, plan)
+            engine:instantiatePrefab(prefabId, nil, nil, nil)
+            runDeferred()
+            assert(capturedGo == clonedChild,
+                "namespaced SRI on cloned descendant must wire " ..
+                "self.gameObject; got: " .. tostring(capturedGo))
+            print("OK")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "OK" in out
+
 
 # ---------------------------------------------------------------------------
 # P1.7 -- autogen entrypoint must use PlayerGui + DFS post-order
