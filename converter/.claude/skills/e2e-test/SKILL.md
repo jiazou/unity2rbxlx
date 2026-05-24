@@ -4,6 +4,7 @@ description: End-to-end test for a converted Unity project. Delegates the full c
 argument-hint: <project> [--close-and-relaunch] [--only fixture_ids] [--generic]
 allowed-tools:
   - Bash(python3 -m tests.studio_behavior_driver *)
+  - Bash(python3 -m tools.validate_e2e_conversion *)
   - Bash(python3 convert_interactive.py *)
   - Bash(python3 -c *)
   - Bash(mkdir *)
@@ -161,29 +162,43 @@ Invoke the `/convert-unity` skill with the project's Unity path and
    sub-phase walk. Decide autonomously based on each file's Factors
    block; the design doc rule applies — escalate only on genuine
    ambiguity.
-3. **Phase 4b (Transpile)**: run `convert_interactive.py transpile`
-   then `validate --write`.
+3. **Phase 4b (Transpile)**: run `convert_interactive.py transpile`,
+   then `convert_interactive.py validate` (the validator only reads
+   scripts and reports diagnostics — it does not rewrite files).
 4. **Phase 4c (Reactive fixups)**: agent-driven. Read
    `references/phase-4c-*.md` and apply project-specific post-transpile
    patches.
 5. **Phase 5 (Assemble)**: pre-seed `${CONV_DIR}/conversion_context.json`
    and `${CONV_DIR}/.roblox_ids.json` from
-   `tests/fixtures/upload_snapshots/<project>.snapshot.json` BEFORE
-   running `assemble`, so the upload phase reuses cached IDs instead
-   of touching Open Cloud. The skill exports `_seed_output_dir` for
-   this; the simplest path is:
+   `tests/fixtures/upload_snapshots/<project>.snapshot.json` so any
+   asset whose ID is already in the snapshot is treated as
+   already-uploaded:
    ```bash
    python3 -c "
-   import sys, json
+   import sys
    sys.path.insert(0, 'tests')
    from test_offline_assembly import _seed_output_dir, _load_snapshot
    from pathlib import Path
    _seed_output_dir(Path('${CONV_DIR}'), _load_snapshot('${PROJECT}'))
    "
    ```
-   Then run `assemble` per /convert-unity's SKILL.md. Pass
-   `--universe-id` / `--place-id` from the seeded `.roblox_ids.json`
-   when prompted.
+   Then run `assemble` with `--no-upload`:
+   ```bash
+   python3 convert_interactive.py assemble <unity_project_path> ${CONV_DIR} \
+     --no-upload 2>/dev/null
+   ```
+   The `--no-upload` is **mandatory** for /e2e-test. Without it,
+   `assemble`'s `force_rerun` set re-runs `upload_assets` every
+   invocation (`convert_interactive.py:919`); the per-path dedup
+   against `ctx.uploaded_assets` only suppresses uploads for paths
+   already in the snapshot, so any NEW asset the project has gained
+   since the snapshot would hit Open Cloud. With `--no-upload`,
+   `Pipeline.skip_upload=True` short-circuits `upload_assets` (and
+   `resolve_assets`) before per-path dedup runs — guarantees the
+   "no upload during /e2e-test" contract regardless of snapshot age
+   or new-asset shape. `assemble` is non-interactive; do not pass
+   `--universe-id` / `--place-id` (they're only needed when uploads
+   actually run, which they don't here).
 6. **Phase 6 (Upload)**: **SKIP** — this is a test, no Open Cloud
    round-trip. Done after assemble.
 
@@ -217,6 +232,42 @@ summary line, exit 2.
 Also write a `${CONV_DIR}/conversion_manifest.json` for the report
 schema — same shape as before, the agent fills it in based on the
 /convert-unity run's start/end timestamps and the rbxlx path.
+
+### Step 3.5: Post-conversion artifact validation
+
+The conversion is over; the rbxlx exists. Before handing off to Studio,
+re-run the artifact-level assertions the old pytest harness enforced.
+Without this, a broken conversion (asset resolution gap, mesh ID
+mismatch, scene-runtime contract incomplete, transpile syntax error)
+slips silently into the gameplay half — only surfacing if a fixture
+happens to touch the defect.
+
+```bash
+python3 -m tools.validate_e2e_conversion "${CONV_DIR}" "${PROJECT}" \
+  --mode "${SCENE_RUNTIME_MODE}"
+```
+
+`SCENE_RUNTIME_MODE` is `generic` when /e2e-test was invoked with
+`--generic`, `legacy` otherwise. The validator covers:
+
+  * No `rbxassetid://0` placeholders in the rbxlx.
+  * Mesh IDs in the rbxlx match the snapshot
+    (`tests/fixtures/upload_snapshots/<project>.snapshot.json`).
+  * Generic-mode runtime contract embeds `scene_prefab_placements` +
+    `_constructPrefabClone` (skipped under legacy).
+  * `luau-analyze` clean across `${CONV_DIR}/scripts/` (soft-skipped
+    when `luau-analyze` is not installed).
+
+Not yet covered (need Pipeline in-memory state that isn't persisted
+after `run_all`): snapshot drift gate (asset_manifest vs snapshot)
+and place-builder chunk publishability. Both are deferred and
+documented in `tools/validate_e2e_conversion.py`.
+
+If the validator exits non-zero: write the combined report with
+`conversion.passed = false` + `gameplay = null`, print the validator's
+error output as the conversion failure reason, exit 2. The Studio
+playback half **does not run** when validation fails — there is no
+point exercising fixtures against a broken rbxlx.
 
 ### Step 4: Launch Studio + 3-step readiness probe
 
