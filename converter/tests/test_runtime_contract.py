@@ -364,6 +364,80 @@ class TestRuleE:
         )
         _assert_clean(src)
 
+    def test_helper_dot_form_does_not_mask_exported_colon_form(self):
+        # Codex P1 regression guard: previously, an internal helper class
+        # using dot-form (``Helper.new()``) satisfied the module-wide
+        # "any canonical constructor exists" check, which made the colon-
+        # form check skip the EXPORTED class's ``Class:new(...)``. The
+        # runtime then called ``Class.new(config)`` (the colon-form
+        # overwrites the dot via Lua's later-write-wins) and ``config``
+        # bound to ``self`` -- silent gameplay corruption.
+        #
+        # The fix anchors the colon-form check on the exported class name
+        # taken from the module's ``return X`` statement.
+        src = (
+            'local Helper = {}\n'
+            'function Helper.new() return setmetatable({}, Helper) end\n'  # dot — internal
+            '\n'
+            'local Class = {}\n'
+            'Class.__index = Class\n'
+            'function Class:new(config)\n'  # COLON form on EXPORTED — bug shape
+            '    local self = setmetatable({}, Class)\n'
+            '    self.speed = config.speed or 12\n'
+            '    return self\n'
+            'end\n'
+            'return Class\n'
+        )
+        _assert_rule(src, "e")
+
+    def test_helper_colon_form_with_exported_dot_form_passes(self):
+        # The mirror case (already covered indirectly above, but pinned
+        # explicitly): helper uses colon-form (``Helper:new()``), exported
+        # class uses dot-form (``Class.new(config)``). Helper colon-form
+        # is harmless because the runtime never touches it; exported
+        # dot-form is canonical. Must pass clean.
+        src = (
+            'local Helper = {}\n'
+            'Helper.__index = Helper\n'
+            'function Helper:new() return setmetatable({}, Helper) end\n'  # colon — internal
+            '\n'
+            'local Class = {}\n'
+            'Class.__index = Class\n'
+            'function Class.new(config)\n'  # exported — dot form
+            '    local self = setmetatable({}, Class)\n'
+            '    self.helper = Helper:new()\n'
+            '    return self\n'
+            'end\n'
+            'return Class\n'
+        )
+        _assert_clean(src)
+
+    def test_unanchored_export_falls_back_to_conservative_rule(self):
+        # Module returns a table literal directly (no name to anchor on).
+        # The verifier falls back to the conservative rule: any canonical
+        # constructor anywhere in the module allows colon-form elsewhere.
+        # If colon-form is the only ``new`` shape in sight, it IS rejected.
+        clean = (
+            'local Helper = {}\n'
+            'function Helper.new() return setmetatable({}, Helper) end\n'  # canonical dot
+            '\n'
+            'local Class = {}\n'
+            'function Class:helper_method() return self end\n'  # not new(); irrelevant
+            'return { entry = function(config)\n'
+            '    return setmetatable({}, Class)\n'
+            'end }\n'
+        )
+        _assert_clean(clean)
+
+        bad = (
+            'local Class = {}\n'
+            'function Class:new(config)\n'  # only constructor; colon-only
+            '    return setmetatable({}, Class)\n'
+            'end\n'
+            'return { wrapper = Class }\n'  # complex return -> no anchor
+        )
+        _assert_rule(bad, "e")
+
 
 # ---------------------------------------------------------------------------
 # Rule (f) -- Unity message callbacks bound on the class table.

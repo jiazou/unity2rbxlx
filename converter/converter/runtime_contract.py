@@ -658,15 +658,26 @@ def _check_module_return(statements, source: str) -> list[Violation]:
 # ``module_table.new(config)`` (see scene_runtime.luau:_buildComponent); a
 # colon-form ``function CLASS:new(config)`` would bind ``config`` to ``self``
 # and silently lose the real config, so it's rejected as a SHAPE violation
-# (``_RE_CONSTRUCTOR_COLON_FORM`` below).
+# (``_RE_CONSTRUCTOR_COLON_FORM`` below) -- but ONLY when ``CLASS`` is the
+# exported module table. Internal helper classes can use colon-form freely
+# because the runtime never calls their ``.new`` as the module constructor.
 _RE_CONSTRUCTOR_METHOD = re.compile(
-    r"function\s+[\w.]+\s*\.\s*new\s*\(",
+    r"function\s+([\w.]+)\s*\.\s*new\s*\(",
 )
 _RE_CONSTRUCTOR_LITERAL = re.compile(
     r"\bnew\s*=\s*function\s*\(",
 )
 _RE_CONSTRUCTOR_COLON_FORM = re.compile(
-    r"function\s+[\w.]+\s*:\s*new\s*\(",
+    r"function\s+([\w.]+)\s*:\s*new\s*\(",
+)
+# Bare-identifier ``return X`` at the end of the module identifies the
+# exported class -- ``X`` is what the runtime calls ``.new(config)`` on.
+# Returns of table literals or complex expressions (``return setmetatable(...)``)
+# don't surface a name; we fall back to the conservative
+# "any-canonical-constructor-allows-colon-form-elsewhere" rule in that case.
+_RE_MODULE_RETURN_NAME = re.compile(
+    r"^\s*return\s+([A-Za-z_]\w*)\s*$",
+    re.MULTILINE,
 )
 
 _FORBIDDEN_IN_NEW = [
@@ -679,32 +690,63 @@ _FORBIDDEN_IN_NEW = [
 
 def _check_constructor_purity(stripped: str, source: str) -> list[Violation]:
     out: list[Violation] = []
-    # Shape violation: colon-form constructors break the runtime's
-    # ``module_table.new(config)`` call (config becomes self).
-    # Narrow to the case where NO valid dot-form / literal constructor
-    # exists in the module -- a module that exports ``function Class.new(config)``
-    # but also defines internal helpers like ``function Pool:new(...)`` for
-    # private classes should pass clean; the runtime only ever calls the
-    # exported class's ``.new``. If a colon-form is the only ``new`` in
-    # sight, it IS the exported constructor and runtime will mis-call it.
+
+    # Identify the exported class from ``return X`` at module scope.
+    # Last match wins for modules with multiple top-level returns (rare
+    # but possible via early-exit branches).
+    exported_class: str | None = None
+    for m in _RE_MODULE_RETURN_NAME.finditer(stripped):
+        exported_class = m.group(1)
+
+    # Conservative fallback used when the export is a table literal or a
+    # complex expression and we can't anchor on a name.
     has_canonical_constructor = (
         _RE_CONSTRUCTOR_METHOD.search(stripped) is not None
         or _RE_CONSTRUCTOR_LITERAL.search(stripped) is not None
     )
-    if not has_canonical_constructor:
-        for m in _RE_CONSTRUCTOR_COLON_FORM.finditer(stripped):
-            line = source.count("\n", 0, m.start()) + 1
-            out.append(Violation(
-                rule="e",
-                line=line,
-                message=(
-                    "constructor declared with colon form ``Class:new(...)``. "
-                    "The host calls ``module_table.new(config)`` (dot form); "
-                    "a colon-form constructor receives ``config`` as ``self`` "
-                    "and silently drops the real config. Use "
-                    "``function Class.new(config)`` instead."
-                ),
-            ))
+
+    # Shape violation: colon-form constructors break the runtime's
+    # ``module_table.new(config)`` call (config becomes self).
+    for m in _RE_CONSTRUCTOR_COLON_FORM.finditer(stripped):
+        cls_name = m.group(1)
+        # Strip any dotted prefix (``Foo.Bar:new`` -> ``Bar``); colon-form
+        # ``function A.B:new(...)`` is sugar for ``A.B.new(self, ...)``
+        # which binds the method on the rightmost segment's table.
+        cls_tail = cls_name.rsplit(".", 1)[-1]
+
+        if exported_class is not None:
+            # We know which class is exported. Flag ONLY when this
+            # constructor IS the exported one. Helper classes with
+            # colon-form constructors are intentional and never reached
+            # by the runtime's ``module_table.new(config)`` call.
+            if cls_tail != exported_class:
+                continue
+            # Edge case kept rejected: a module that declares BOTH
+            # ``function X.new(config)`` AND ``function X:new(config)``
+            # still has the colon-form OVERWRITE the dot-form on the
+            # class table (Lua's later-write-wins). The runtime then
+            # calls ``X.new(config)`` and ``config`` binds to ``self``
+            # anyway. Fall through to emit the violation.
+        else:
+            # No name on the return -- fall back to the conservative
+            # rule: allow colon-form when any canonical dot-form /
+            # literal constructor exists (it may be the exported one).
+            # Reject when colon-form is the only shape in sight.
+            if has_canonical_constructor:
+                continue
+
+        line = source.count("\n", 0, m.start()) + 1
+        out.append(Violation(
+            rule="e",
+            line=line,
+            message=(
+                "constructor declared with colon form ``Class:new(...)``. "
+                "The host calls ``module_table.new(config)`` (dot form); "
+                "a colon-form constructor receives ``config`` as ``self`` "
+                "and silently drops the real config. Use "
+                "``function Class.new(config)`` instead."
+            ),
+        ))
     # Purity violation: host surface isn't bound until after new() returns.
     for pat in (_RE_CONSTRUCTOR_METHOD, _RE_CONSTRUCTOR_LITERAL):
         for m in pat.finditer(stripped):
