@@ -93,8 +93,7 @@ location-agnostic:
 
 ```bash
 cd "$(git rev-parse --show-toplevel 2>/dev/null)/converter" || {
-    echo "/e2e-test must run inside a unity2rbxlx git checkout with a "\
-         "'converter/' subdirectory. cwd was: $(pwd)" >&2
+    echo "/e2e-test must run inside a unity2rbxlx git checkout with a 'converter/' subdirectory. cwd was: $(pwd)" >&2
     exit 64
 }
 ```
