@@ -338,6 +338,32 @@ class TestRuleE:
         )
         _assert_clean(src)
 
+    def test_dot_form_exported_with_internal_colon_helper_passes(self):
+        # The exported class uses dot-form (correct), and an internal
+        # helper class uses colon-form. The host calls ONLY the exported
+        # ``.new`` (it never sees ``Pool:new``), so the colon helper is
+        # harmless and must not trip the shape check. Regression guard
+        # against narrowing this rule too far.
+        src = (
+            'local Pool = {}\n'
+            'Pool.__index = Pool\n'
+            'function Pool:new()\n'  # internal helper — colon form OK
+            '    return setmetatable({items = {}}, Pool)\n'
+            'end\n'
+            'function Pool:add(x) table.insert(self.items, x) end\n'
+            '\n'
+            'local Class = {}\n'
+            'Class.__index = Class\n'
+            'function Class.new(config)\n'  # exported — dot form required
+            '    local self = setmetatable({}, Class)\n'
+            '    self.pool = Pool:new()\n'
+            '    self.speed = config.speed or 12\n'
+            '    return self\n'
+            'end\n'
+            'return Class\n'
+        )
+        _assert_clean(src)
+
 
 # ---------------------------------------------------------------------------
 # Rule (f) -- Unity message callbacks bound on the class table.

@@ -118,15 +118,30 @@ class TestGenericPromptDelayedDestroyShape:
             "literal is silently dropped (no-op)."
         )
 
-    def test_prompt_teaches_startCoroutine_for_delayed_destroy(self):
-        # Pin the corrected teaching so future edits don't regress to
-        # ``task.delay`` (uncancelled on teardown -> leaks past destroy)
-        # or back to ``invoke``.
-        good = 'self.host.startCoroutine(self, function() task.wait(delay); self.host.destroy(target) end)'
+    def test_prompt_does_not_teach_startCoroutine_for_delayed_destroy(self):
+        # ``startCoroutine`` is host-tracked on the caller and would
+        # cancel the delayed destroy if the calling component is itself
+        # destroyed during the delay. Unity's ``Destroy(target, delay)``
+        # is bound to TARGET's lifetime, so the right primitive is raw
+        # ``task.delay`` (un-tracked).
+        bad = 'self.host.startCoroutine(self, function() task.wait(delay); self.host.destroy(target) end)'
+        assert bad not in _GENERIC_RUNTIME_PROMPT, (
+            f"Generic prompt teaches caller-lifecycle-tracked "
+            f"{bad!r} for delayed destroy. If the caller is destroyed "
+            "during the delay, ``_cancelAllTasks`` drops the scheduled "
+            "destroy. Use raw ``task.delay`` so the destroy survives "
+            "caller teardown (Unity binds delayed Destroy to TARGET's "
+            "lifetime, not the caller's)."
+        )
+
+    def test_prompt_teaches_task_delay_for_delayed_destroy(self):
+        # Pin the corrected teaching so future edits don't regress.
+        good = 'task.delay(delay, function() self.host.destroy(target) end)'
         assert good in _GENERIC_RUNTIME_PROMPT, (
             f"Generic prompt missing the canonical delayed-destroy "
-            f"shape {good!r}. ``startCoroutine`` is host-tracked and "
-            "cancels on OnDestroy; raw ``task.delay`` leaks past teardown."
+            f"shape {good!r}. Raw ``task.delay`` is intentional: it is "
+            "un-tracked so the destroy survives the scheduling "
+            "component's own destruction during the delay."
         )
 
 

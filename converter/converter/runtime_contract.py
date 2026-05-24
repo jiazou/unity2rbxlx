@@ -681,19 +681,30 @@ def _check_constructor_purity(stripped: str, source: str) -> list[Violation]:
     out: list[Violation] = []
     # Shape violation: colon-form constructors break the runtime's
     # ``module_table.new(config)`` call (config becomes self).
-    for m in _RE_CONSTRUCTOR_COLON_FORM.finditer(stripped):
-        line = source.count("\n", 0, m.start()) + 1
-        out.append(Violation(
-            rule="e",
-            line=line,
-            message=(
-                "constructor declared with colon form ``Class:new(...)``. "
-                "The host calls ``module_table.new(config)`` (dot form); "
-                "a colon-form constructor receives ``config`` as ``self`` "
-                "and silently drops the real config. Use "
-                "``function Class.new(config)`` instead."
-            ),
-        ))
+    # Narrow to the case where NO valid dot-form / literal constructor
+    # exists in the module -- a module that exports ``function Class.new(config)``
+    # but also defines internal helpers like ``function Pool:new(...)`` for
+    # private classes should pass clean; the runtime only ever calls the
+    # exported class's ``.new``. If a colon-form is the only ``new`` in
+    # sight, it IS the exported constructor and runtime will mis-call it.
+    has_canonical_constructor = (
+        _RE_CONSTRUCTOR_METHOD.search(stripped) is not None
+        or _RE_CONSTRUCTOR_LITERAL.search(stripped) is not None
+    )
+    if not has_canonical_constructor:
+        for m in _RE_CONSTRUCTOR_COLON_FORM.finditer(stripped):
+            line = source.count("\n", 0, m.start()) + 1
+            out.append(Violation(
+                rule="e",
+                line=line,
+                message=(
+                    "constructor declared with colon form ``Class:new(...)``. "
+                    "The host calls ``module_table.new(config)`` (dot form); "
+                    "a colon-form constructor receives ``config`` as ``self`` "
+                    "and silently drops the real config. Use "
+                    "``function Class.new(config)`` instead."
+                ),
+            ))
     # Purity violation: host surface isn't bound until after new() returns.
     for pat in (_RE_CONSTRUCTOR_METHOD, _RE_CONSTRUCTOR_LITERAL):
         for m in pat.finditer(stripped):
