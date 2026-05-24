@@ -98,17 +98,38 @@ def main() -> int:
     print(f"OK   rbxlx present: {rbxlx.name}")
 
     # 2) snapshot loads cleanly
-    try:
-        snapshot = _load_snapshot(project_name)
-    except SystemExit as e:
-        # _load_snapshot calls pytest.skip when the snapshot is missing;
-        # outside pytest that surfaces as a SystemExit. Convert to a
-        # real failure so /e2e-test surfaces the problem.
+    # ``_load_snapshot`` calls ``pytest.skip(...)`` on a missing
+    # fixture; outside pytest, ``pytest.skip`` raises
+    # ``_pytest.outcomes.Skipped`` -- NOT ``SystemExit``. Catching
+    # ``SystemExit`` here would have been dead code; catch the
+    # actual outcome class explicitly so a missing snapshot
+    # surfaces as a clean FAIL line, not an unhandled traceback.
+    # The path check up front makes the helper's pytest.skip path
+    # unreachable in practice; the Skipped catch is belt-and-braces
+    # in case the fixture-resolution shape ever changes.
+    snapshot_path = (
+        Path(__file__).resolve().parent.parent
+        / "tests" / "fixtures" / "upload_snapshots"
+        / f"{project_name}.snapshot.json"
+    )
+    if not snapshot_path.exists():
         print(
-            f"FAIL: snapshot missing for {project_name!r}: {e}",
+            f"FAIL: snapshot fixture missing: {snapshot_path}",
             file=sys.stderr,
         )
         return 1
+    try:
+        snapshot = _load_snapshot(project_name)
+    except BaseException as exc:
+        # Pytest's Skipped derives from BaseException, not Exception.
+        # Filter by class name so we don't swallow real bugs (KeyboardInterrupt, etc).
+        if type(exc).__name__ == "Skipped":
+            print(
+                f"FAIL: snapshot fixture missing for {project_name!r}: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+        raise
     print(f"OK   snapshot loaded: {project_name}")
 
     # 3) no rbxassetid://0 placeholders

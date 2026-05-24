@@ -85,11 +85,32 @@ conversion this skill validates.
 ### Step 0: Preflight
 
 Parse `<project>` from arguments (required). Parse `--close-and-relaunch`
-and `--only <ids>` (optional). Validate the behavior fixtures file
-exists and is well-formed:
+and `--only <ids>` (optional). Bind the parsed arguments to shell
+variables that every later step (Step 3 assemble invocation,
+Step 3.5 validator, etc.) references by name:
 
 ```bash
-python3 -m tests.studio_behavior_driver validate <project>
+PROJECT="<project>"                                   # e.g. "SimpleFPS"
+SCENE_RUNTIME_MODE="legacy"                           # default
+[[ "$*" == *--generic* ]] && SCENE_RUNTIME_MODE="generic"
+UNITY_PROJECT_PATH="$(python3 -c "
+import sys
+sys.path.insert(0, 'tests')
+from _project_paths import resolve_project
+print(resolve_project('${PROJECT}'))
+")"
+```
+
+`UNITY_PROJECT_PATH` is the resolved filesystem path /convert-unity's
+phases take as their `<unity_project_path>` argument. The resolver
+honours the snapshot's baked `source_unity_project`, the bundled
+`test_projects/<project>` submodule, and `$UNITY2RBXLX_TEST_PROJECTS_ROOT`
+in that order (see `tests/_project_paths.py:resolve_project`).
+
+Validate the behavior fixtures file exists and is well-formed:
+
+```bash
+python3 -m tests.studio_behavior_driver validate "${PROJECT}"
 ```
 
 If exit non-zero, surface the error and stop. (No conversion run when
@@ -104,10 +125,11 @@ CONV_DIR="${OUTPUT_ROOT}/conversion"
 mkdir -p "${CONV_DIR}"
 ```
 
-The run_id is the cross-context handshake: passed to the conversion
-pytest via env, written into both the conversion manifest and the
-combined report, read back via the Studio handshake to verify the
-plugin is connected to the right place.
+The run_id is the cross-context handshake: stamped into the conversion
+manifest and the combined report, set as a `workspace` attribute via
+the Studio handshake in Step 4, and read back to verify the plugin is
+connected to the place this run produced (not a stale Studio left from
+another run).
 
 ### Step 2: Pre-launch — snapshot existing Studio IDs (no refusal)
 
@@ -182,10 +204,14 @@ Invoke the `/convert-unity` skill with the project's Unity path and
    _seed_output_dir(Path('${CONV_DIR}'), _load_snapshot('${PROJECT}'))
    "
    ```
-   Then run `assemble` with `--no-upload`:
+   Then run `assemble` with `--no-upload`. Template the
+   `--scene-runtime` flag from the mode bound in Step 0 — a missing
+   flag silently defaults to legacy and the Step 3.5 validator's
+   `--mode generic` would trip a false failure:
    ```bash
-   python3 convert_interactive.py assemble <unity_project_path> ${CONV_DIR} \
-     --no-upload 2>/dev/null
+   python3 convert_interactive.py assemble "${UNITY_PROJECT_PATH}" "${CONV_DIR}" \
+     --no-upload \
+     --scene-runtime="${SCENE_RUNTIME_MODE}" 2>/dev/null
    ```
    The `--no-upload` is **mandatory** for /e2e-test. Without it,
    `assemble`'s `force_rerun` set re-runs `upload_assets` every
