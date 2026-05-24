@@ -283,7 +283,23 @@ def generate_prefab_packages(
 
     # Lazy import to keep scene_converter out of this module's top-level
     # import graph (avoids circular-import risk during pipeline setup).
-    from converter.scene_converter import _convert_prefab_node
+    # ``_prefab_stable_id`` produces the same ``<guid>:<rel_path>``
+    # namespace the scene-instantiation path uses, so a runtime-spawned
+    # clone's ``_SceneRuntimeId`` matches the planner's ``game_object_id``
+    # for the same prefab template (PR2 follow-up §6).
+    from converter.scene_converter import (
+        _convert_prefab_node,
+        _prefab_stable_id,
+    )
+
+    # Project root used by ``_prefab_stable_id`` to derive a project-
+    # relative path for the namespace. None when no GUID index is
+    # supplied (e.g. tests) — ``_prefab_stable_id`` then returns an
+    # empty namespace and stamping no-ops, matching the conservative
+    # ``_scene_namespace`` rule.
+    project_root = (
+        getattr(guid_index, "project_root", None) if guid_index else None
+    )
 
     # Build a variant→parent name lookup so variant templates carry a
     # ``VariantParentTemplate`` attribute pointing at their source
@@ -322,12 +338,25 @@ def generate_prefab_packages(
                 "reason": "no root node in parsed prefab",
             })
             continue
+        # Stable prefab namespace for ``_SceneRuntimeId`` stamping —
+        # mirrors ``_convert_prefab_instance``'s ``prefab_namespace`` so
+        # a clone produced by ``host.instantiatePrefab`` carries the same
+        # ``<guid>:<rel_path>:<file_id>`` lookup key the planner emits
+        # for the prefab's instances. Without this, the runtime's
+        # ``resolveCloneChild(clone, ns_goid)`` walk misses every
+        # descendant and components boot with ``self.gameObject = nil``
+        # (PR2 follow-up §6, observed as "no touch part on nil" at the
+        # 1Hz turret-bullet spawn cadence in SimpleFPS).
+        prefab_namespace = _prefab_stable_id(
+            template, guid_index, by_guid, project_root,
+        )
         try:
             part = _convert_prefab_node(
                 root,
                 guid_index=guid_index,
                 material_mappings=material_mappings or {},
                 uploaded_assets=uploaded_assets or {},
+                runtime_namespace=prefab_namespace,
             )
         except Exception as exc:
             result.unconverted.append({

@@ -1079,3 +1079,281 @@ class TestAttachMonoBehaviourScripts:
         )
         # No replicated_templates added.
         pipeline._attach_monobehaviour_scripts_to_templates()  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# PR2 follow-up §6: template `_SceneRuntimeId` stamping
+# ---------------------------------------------------------------------------
+#
+# Without these stamps, ``ReplicatedStorage.Templates`` clones produced by
+# ``host.instantiatePrefab`` carry no ``_SceneRuntimeId`` on any descendant.
+# ``runtime/scene_runtime.luau``'s ``resolveCloneChild(clone, ns_goid)`` walk
+# returns nil, ``_buildComponent`` boots with ``goInst=nil``, and components
+# fail to wire Touched (observed live in SimpleFPS as the 1Hz "no touch part
+# on nil" turret-bullet warning). See ``scene-runtime-pr2-followups.md`` §6.
+
+
+def _real_prefab_template(
+    name: str,
+    *,
+    prefab_path: Path,
+    root_file_id: str = "100100000",
+    children: list[Any] | None = None,
+):
+    """Build a real ``PrefabTemplate`` with a ``PrefabNode`` root so the
+    production ``_convert_prefab_node`` (not a monkeypatched stub) runs and
+    actually performs ``_stamp_scene_runtime_id`` calls.
+
+    Using real dataclasses (rather than ``SimpleNamespace``) is necessary
+    because ``_prefab_stable_id`` does ``isinstance(prefab_path, Path)``.
+    """
+    from core.unity_types import PrefabNode, PrefabTemplate
+    root = PrefabNode(
+        name=name,
+        file_id=root_file_id,
+        active=True,
+        children=list(children or []),
+    )
+    return PrefabTemplate(prefab_path=prefab_path, name=name, root=root)
+
+
+def _real_prefab_node(name: str, file_id: str, children: list[Any] | None = None):
+    """Bare ``PrefabNode`` with no mesh — avoids the ``_ctx()``-gated
+    mesh-hierarchy branches in ``_convert_prefab_node`` so tests don't
+    need an active ``SceneConversionContext``."""
+    from core.unity_types import PrefabNode
+    return PrefabNode(
+        name=name,
+        file_id=file_id,
+        active=True,
+        children=list(children or []),
+    )
+
+
+def _guid_index_for(project_root: Path, prefab_path: Path, guid: str):
+    """Build a ``GuidIndex`` that resolves ``prefab_path`` to ``guid``.
+
+    ``AssetKind`` is a string literal in ``core.unity_types`` — pass the
+    literal value rather than a class attribute.
+    """
+    from core.unity_types import GuidEntry, GuidIndex
+    try:
+        rel = prefab_path.resolve().relative_to(project_root.resolve())
+    except ValueError:
+        rel = prefab_path
+    entry = GuidEntry(
+        guid=guid,
+        asset_path=prefab_path.resolve(),
+        relative_path=rel,
+        kind="prefab",
+    )
+    return GuidIndex(
+        project_root=project_root.resolve(),
+        guid_to_entry={guid: entry},
+        path_to_guid={prefab_path.resolve(): guid},
+    )
+
+
+class TestTemplateSceneRuntimeIdStamping:
+    """PR2 follow-up §6: ``ReplicatedStorage.Templates`` entries carry
+    ``_SceneRuntimeId`` so ``host.instantiatePrefab`` clones can resolve
+    descendants back to the plan's ``game_object_id``."""
+
+    def test_template_root_carries_scene_runtime_id(self, tmp_path):
+        """The emitted template root part stamps
+        ``<guid>:<rel_path>:<root_file_id>`` on its
+        ``_SceneRuntimeId`` attribute — same format the planner emits
+        for the prefab's root in its subplan."""
+        guid = "a" * 32
+        prefab_path = tmp_path / "Assets" / "Prefabs" / "Turret.prefab"
+        prefab_path.parent.mkdir(parents=True)
+        prefab_path.write_text("")
+        template = _real_prefab_template(
+            "Turret", prefab_path=prefab_path, root_file_id="100100000",
+        )
+        from core.unity_types import PrefabLibrary
+        lib = PrefabLibrary(prefabs=[template], by_guid={guid: template})
+        guid_index = _guid_index_for(tmp_path, prefab_path, guid)
+
+        result = generate_prefab_packages(
+            lib, None, guid_index=guid_index, include_all=True,
+        )
+
+        assert len(result.templates) == 1
+        emitted = result.templates[0]
+        assert emitted.attributes["_SceneRuntimeId"] == (
+            f"{guid}:Assets/Prefabs/Turret.prefab:100100000"
+        )
+
+    def test_template_descendants_carry_scene_runtime_id(self, tmp_path):
+        """Multi-node prefab: every descendant emitted by
+        ``_convert_prefab_node`` carries an SRI under the same
+        ``<guid>:<rel_path>:`` namespace prefix."""
+        guid = "b" * 32
+        prefab_path = tmp_path / "Assets" / "Prefabs" / "TurretBullet.prefab"
+        prefab_path.parent.mkdir(parents=True)
+        prefab_path.write_text("")
+        grandchild = _real_prefab_node("Tip", file_id="3")
+        child = _real_prefab_node("Body", file_id="2", children=[grandchild])
+        template = _real_prefab_template(
+            "TurretBullet", prefab_path=prefab_path,
+            root_file_id="1", children=[child],
+        )
+        from core.unity_types import PrefabLibrary
+        lib = PrefabLibrary(prefabs=[template], by_guid={guid: template})
+        guid_index = _guid_index_for(tmp_path, prefab_path, guid)
+
+        result = generate_prefab_packages(
+            lib, None, guid_index=guid_index, include_all=True,
+        )
+
+        assert len(result.templates) == 1
+        root = result.templates[0]
+        ns = f"{guid}:Assets/Prefabs/TurretBullet.prefab"
+        # Walk the whole tree and collect SRI values keyed by part name.
+        sris: dict[str, str] = {}
+
+        def _walk(part):
+            sri = part.attributes.get("_SceneRuntimeId")
+            if sri is not None:
+                sris[part.name] = sri
+            for c in part.children:
+                _walk(c)
+        _walk(root)
+        # Root + both descendants stamped.
+        assert sris.get(root.name) == f"{ns}:1"
+        # Child names are the original GameObject names; SRIs follow file_id.
+        assert any(v == f"{ns}:2" for v in sris.values()), (
+            f"descendant with file_id=2 missing from SRIs: {sris}"
+        )
+        assert any(v == f"{ns}:3" for v in sris.values()), (
+            f"descendant with file_id=3 missing from SRIs: {sris}"
+        )
+        # And every collected SRI lives under the prefab namespace.
+        for name, sri in sris.items():
+            assert sri.startswith(f"{ns}:"), (
+                f"{name} stamped with foreign namespace: {sri}"
+            )
+
+    def test_template_sri_matches_planner_game_object_id(self, tmp_path):
+        """Integration anchor: the planner's prefab subplan emits
+        ``game_object_id = f"{prefab_id}:{node.file_id}"`` (see
+        ``scene_runtime_planner.py:880``). For each id the planner
+        would emit, a descendant of the emitted template must carry an
+        identical ``_SceneRuntimeId``. This is the contract
+        ``runtime/scene_runtime.luau`` relies on to bind components to
+        cloned descendants — if the formats drift, every cloned prefab
+        boots with ``self.gameObject = nil``."""
+        guid = "c" * 32
+        prefab_path = tmp_path / "Assets" / "Prefabs" / "Rifle.prefab"
+        prefab_path.parent.mkdir(parents=True)
+        prefab_path.write_text("")
+        muzzle = _real_prefab_node("Muzzle", file_id="42")
+        template = _real_prefab_template(
+            "Rifle", prefab_path=prefab_path,
+            root_file_id="1", children=[muzzle],
+        )
+        from core.unity_types import PrefabLibrary
+        lib = PrefabLibrary(prefabs=[template], by_guid={guid: template})
+        guid_index = _guid_index_for(tmp_path, prefab_path, guid)
+
+        # Mimic the planner: prefab_id matches ``_prefab_stable_id`` and
+        # ``game_object_id`` = ``f"{prefab_id}:{file_id}"`` per planner:880.
+        from converter.scene_converter import _prefab_stable_id
+        prefab_id = _prefab_stable_id(
+            template, guid_index, lib.by_guid, guid_index.project_root,
+        )
+        planner_ids = {
+            f"{prefab_id}:1",   # root
+            f"{prefab_id}:42",  # muzzle
+        }
+
+        result = generate_prefab_packages(
+            lib, None, guid_index=guid_index, include_all=True,
+        )
+
+        # Collect every SRI emitted on the template tree.
+        emitted_sris: set[str] = set()
+
+        def _walk(part):
+            sri = part.attributes.get("_SceneRuntimeId")
+            if sri is not None:
+                emitted_sris.add(sri)
+            for c in part.children:
+                _walk(c)
+        _walk(result.templates[0])
+
+        # Every planner id has a matching template descendant.
+        missing = planner_ids - emitted_sris
+        assert not missing, (
+            f"planner game_object_ids missing from template: {missing}; "
+            f"emitted: {emitted_sris}"
+        )
+
+    def test_template_no_sri_when_namespace_unresolvable(self, tmp_path):
+        """Graceful degradation: when neither a GUID index nor a
+        ``by_guid`` entry can produce a namespace, ``_prefab_stable_id``
+        returns ``""``, ``_stamp_scene_runtime_id`` no-ops, and NO
+        descendant carries ``_SceneRuntimeId``. Mirrors the
+        ``_scene_namespace`` "skip stamping" rule — better silent than
+        a machine-specific or otherwise unparseable namespace."""
+        prefab_path = tmp_path / "Assets" / "Prefabs" / "Headless.prefab"
+        prefab_path.parent.mkdir(parents=True)
+        prefab_path.write_text("")
+        child = _real_prefab_node("Body", file_id="2")
+        template = _real_prefab_template(
+            "Headless", prefab_path=prefab_path,
+            root_file_id="1", children=[child],
+        )
+        from core.unity_types import PrefabLibrary
+        # by_guid is empty AND guid_index is None → no way to compute a
+        # namespace → _prefab_stable_id returns "" → stamp helper
+        # short-circuits on empty namespace.
+        lib = PrefabLibrary(prefabs=[template], by_guid={})
+
+        result = generate_prefab_packages(
+            lib, None, guid_index=None, include_all=True,
+        )
+
+        assert len(result.templates) == 1
+        root = result.templates[0]
+
+        def _no_sri(part):
+            assert "_SceneRuntimeId" not in part.attributes, (
+                f"{part.name} stamped despite unresolvable namespace"
+            )
+            for c in part.children:
+                _no_sri(c)
+        _no_sri(root)
+
+    def test_template_mbless_prefab_emits_cleanly(self, tmp_path):
+        """Negative-path lock-in (codex follow-up): a prefab whose root
+        has no MonoBehaviour still emits without error, and
+        ``runtime_namespace`` doesn't crash the conversion — stamping
+        is harmless for MB-less prefabs (the runtime simply has no
+        component to bind, but the lookup surface is still consistent
+        with scene-instantiated prefabs)."""
+        guid = "d" * 32
+        prefab_path = tmp_path / "Assets" / "Prefabs" / "Plain.prefab"
+        prefab_path.parent.mkdir(parents=True)
+        prefab_path.write_text("")
+        # No components anywhere in the tree.
+        template = _real_prefab_template(
+            "Plain", prefab_path=prefab_path, root_file_id="1",
+        )
+        from core.unity_types import PrefabLibrary
+        lib = PrefabLibrary(prefabs=[template], by_guid={guid: template})
+        guid_index = _guid_index_for(tmp_path, prefab_path, guid)
+
+        result = generate_prefab_packages(
+            lib, None, guid_index=guid_index, include_all=True,
+        )
+
+        # Conversion succeeded; the template still got stamped.
+        assert len(result.templates) == 1
+        assert not result.unconverted
+        sri = result.templates[0].attributes.get("_SceneRuntimeId")
+        assert sri == f"{guid}:Assets/Prefabs/Plain.prefab:1", (
+            "MB-less prefab template must still carry SRI for lookup parity "
+            "with scene-instantiated prefabs"
+        )

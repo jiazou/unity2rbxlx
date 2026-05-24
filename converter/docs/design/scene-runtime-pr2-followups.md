@@ -120,6 +120,19 @@ to rbxlx pre-PR2 and post-PR2, diff bytes outside the new
 
 ## 6. Runtime-spawned prefab templates emit unstamped (PR4 lookup asymmetry)
 
+**Status:** Landed in `fix/prefab-template-runtime-namespace` —
+`generate_prefab_packages` now computes `_prefab_stable_id(template,
+guid_index, by_guid, project_root)` and threads it through
+`_convert_prefab_node` as `runtime_namespace`, so emitted templates
+carry `_SceneRuntimeId = "<guid>:<rel_path>:<file_id>"` on every node.
+Unit tests in `tests/test_prefab_packages.py::TestTemplateSceneRuntimeIdStamping`
+lock in the stamping; a regression test in
+`tests/test_scene_runtime_host_behavior.py::TestPrefabComponentReceivesGameObject::test_prefab_clone_descendant_self_gameobject_after_template_sri`
+locks in the runtime contract that consumes those stamps. Live evidence
+of the pre-fix break: SimpleFPS turret fired the 1Hz
+`[scene_runtime] connectGameObjectSignal: no touch part on nil` warning
+because the cloned `TurretBullet` template booted with `self.gameObject = nil`.
+
 **Where:** `converter/converter/prefab_packages.py:generate_prefab_packages`
 — call site of `_convert_prefab_node`.
 
