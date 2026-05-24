@@ -545,6 +545,92 @@ class TestRuleE:
         )
         _assert_rule(src, "e")
 
+    def test_dotted_export_bare_return_anchors_correctly(self):
+        # R3 P1 regression: ``return Mod.Sub`` (dotted bare-identifier
+        # export) previously didn't match _RE_RETURN_BARE_IDENT, so
+        # _exported_class_name returned None, fell back to the
+        # conservative rule, and a helper Helper.new() would mask an
+        # exported function Mod.Sub:new(config) -- same bug-class as R1,
+        # just on a dotted name.
+        #
+        # The fix extends the regex to [\w.]+ and rsplits to take the
+        # rightmost segment.
+        bug_shape = (
+            'local Mod = {}\n'
+            'Mod.Sub = {}\n'
+            'Mod.Sub.__index = Mod.Sub\n'
+            'local Helper = {}\n'
+            'function Helper.new() return setmetatable({}, Helper) end\n'  # helper dot
+            '\n'
+            'function Mod.Sub:new(config)\n'  # EXPORTED dotted colon-form -- must reject
+            '    local self = setmetatable({}, Mod.Sub)\n'
+            '    self.speed = config.speed or 12\n'
+            '    return self\n'
+            'end\n'
+            '\n'
+            'return Mod.Sub\n'  # dotted export
+        )
+        _assert_rule(bug_shape, "e")
+
+        # Mirror: helper colon-form + exported dotted dot-form must pass.
+        clean = (
+            'local Mod = {}\n'
+            'Mod.Sub = {}\n'
+            'Mod.Sub.__index = Mod.Sub\n'
+            'local Helper = {}\n'
+            'Helper.__index = Helper\n'
+            'function Helper:new() return setmetatable({}, Helper) end\n'  # helper colon
+            '\n'
+            'function Mod.Sub.new(config)\n'  # exported dotted dot -- correct
+            '    local self = setmetatable({}, Mod.Sub)\n'
+            '    self.helper = Helper:new()\n'
+            '    return self\n'
+            'end\n'
+            '\n'
+            'return Mod.Sub\n'
+        )
+        _assert_clean(clean)
+
+    def test_dotted_export_setmetatable_anchors_correctly(self):
+        # R3 P1 regression mirror: ``return setmetatable(Mod.Sub, mt)``
+        # (dotted setmetatable export). Same fix scope.
+        bug_shape = (
+            'local Mod = {}\n'
+            'Mod.Sub = {}\n'
+            'Mod.Sub.__index = Mod.Sub\n'
+            'local Helper = {}\n'
+            'function Helper.new() return setmetatable({}, Helper) end\n'
+            '\n'
+            'function Mod.Sub:new(config)\n'  # EXPORTED via setmeta -- must reject
+            '    local self = setmetatable({}, Mod.Sub)\n'
+            '    self.speed = config.speed or 12\n'
+            '    return self\n'
+            'end\n'
+            '\n'
+            'return setmetatable(Mod.Sub, {__call = function(_, c) return Mod.Sub.new(c) end})\n'
+        )
+        _assert_rule(bug_shape, "e")
+
+    def test_one_arg_setmetatable_export_anchors_correctly(self):
+        # R3 P2 → upgraded to coverage: 1-arg ``setmetatable(X)`` (Lua
+        # legal: the table is its own mt). The regex now matches both
+        # ``,`` and ``)`` as the closing delimiter so this rare-but-legal
+        # idiom anchors correctly instead of falling back to conservative.
+        bug_shape = (
+            'local Helper = {}\n'
+            'function Helper.new() return setmetatable({}, Helper) end\n'
+            '\n'
+            'local Class = {}\n'
+            'Class.__index = Class\n'
+            'function Class:new(config)\n'  # EXPORTED colon -- must reject
+            '    local self = setmetatable({}, Class)\n'
+            '    return self\n'
+            'end\n'
+            '\n'
+            'return setmetatable(Class)\n'  # 1-arg form
+        )
+        _assert_rule(bug_shape, "e")
+
 
 # ---------------------------------------------------------------------------
 # Rule (f) -- Unity message callbacks bound on the class table.

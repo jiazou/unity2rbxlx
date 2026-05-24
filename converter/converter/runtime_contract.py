@@ -671,16 +671,21 @@ _RE_CONSTRUCTOR_COLON_FORM = re.compile(
     r"function\s+([\w.]+)\s*:\s*new\s*\(",
 )
 # Identify the exported class from the module's TERMINAL top-level
-# return statement. Two recognized shapes:
-#   - bare identifier:  ``return X``
-#   - common Luau OO:   ``return setmetatable(X, mt)``
+# return statement. Three recognized shapes:
+#   - bare identifier:        ``return X``        / ``return Mod.Sub``
+#   - 2-arg setmetatable OO:  ``return setmetatable(X, mt)`` / ``...(Mod.Sub, mt)``
+#   - 1-arg setmetatable:     ``return setmetatable(X)``    (legal Lua: self-mt)
+# Dotted names: the runtime's ``module_table.new(config)`` call binds on
+# the rightmost segment's table (Lua method-binding semantics), so we
+# strip the dotted prefix in ``_exported_class_name`` and compare against
+# the same suffix produced from each colon-form constructor's class name.
 # Anything else (table literal, factory call, multi-value) yields no
 # name and we fall back to the conservative rule.
 _RE_RETURN_BARE_IDENT = re.compile(
-    r"^\s*return\s+([A-Za-z_]\w*)\s*$",
+    r"^\s*return\s+([\w.]+)\s*$",
 )
 _RE_RETURN_SETMETATABLE = re.compile(
-    r"^\s*return\s+setmetatable\s*\(\s*([A-Za-z_]\w*)\s*,",
+    r"^\s*return\s+setmetatable\s*\(\s*([\w.]+)\s*[,)]",
 )
 
 _FORBIDDEN_IN_NEW = [
@@ -699,6 +704,12 @@ def _exported_class_name(statements) -> str | None:
     Walks ``statements`` (the parsed top-level statement list, from
     ``_iter_top_level_statements``) so nested function bodies cannot
     inject a misleading ``return Helper`` that re-binds the export.
+
+    For dotted names (``return Mod.Sub`` /
+    ``return setmetatable(Mod.Sub, mt)``), returns the rightmost
+    segment (``"Sub"``) -- that's what Lua binds the colon-form
+    method on, and what the runtime's ``module_table.new(config)``
+    call effectively addresses.
     """
     last_return_text: str | None = None
     for stmt in statements:
@@ -708,10 +719,10 @@ def _exported_class_name(statements) -> str | None:
         return None
     m = _RE_RETURN_BARE_IDENT.match(last_return_text)
     if m:
-        return m.group(1)
+        return m.group(1).rsplit(".", 1)[-1]
     m = _RE_RETURN_SETMETATABLE.match(last_return_text)
     if m:
-        return m.group(1)
+        return m.group(1).rsplit(".", 1)[-1]
     return None
 
 
