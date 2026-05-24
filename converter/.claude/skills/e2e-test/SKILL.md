@@ -331,6 +331,13 @@ python3 -m tools.validate_e2e_conversion "${CONV_DIR}" "${PROJECT}" \
   * No `rbxassetid://0` placeholders in the rbxlx.
   * Mesh IDs in the rbxlx match the snapshot
     (`tests/fixtures/upload_snapshots/<project>.snapshot.json`).
+  * **Generic-mode fail-closed gate**: reads `ctx.errors` from
+    `${CONV_DIR}/conversion_context.json` and fails if any entry
+    contains the `"scene-runtime contract failed closed"` sentinel.
+    `Pipeline.run_all()` does NOT raise on fail-closed; the rbxlx
+    still gets written, so without this gate a structurally-broken
+    place would pass artifact-level checks and the gameplay-fixture
+    half would surface a confusing cascade. (Fix #15 Root A.)
   * Generic-mode runtime contract embeds `scene_prefab_placements` +
     `_constructPrefabClone` (skipped under legacy).
   * `luau-analyze` clean across `${CONV_DIR}/scripts/` (soft-skipped
@@ -396,8 +403,16 @@ diff is just how we find the candidate. Total handshake budget is
 
 ### Step 5: Walk gameplay fixtures via MCP
 
+Thread `${PROJECT}` (bound in Step 0) and `${ONLY_FIXTURES}` (also
+Step 0, empty when `--only` wasn't passed) into the emit-plan call.
+The `${ONLY_FIXTURES:+--only "${ONLY_FIXTURES}"}` shape expands to
+nothing when `ONLY_FIXTURES` is empty (no `--only` arg) and to
+`--only foo,bar` when it has a value:
+
 ```bash
-python3 -m tests.studio_behavior_driver emit-plan <project> [--only <ids>] > "${OUTPUT_ROOT}/fixtures_plan.json"
+python3 -m tests.studio_behavior_driver emit-plan "${PROJECT}" \
+    ${ONLY_FIXTURES:+--only "${ONLY_FIXTURES}"} \
+    > "${OUTPUT_ROOT}/fixtures_plan.json"
 ```
 
 For each fixture in the emitted JSON array, in order:

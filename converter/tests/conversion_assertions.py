@@ -242,6 +242,40 @@ def _module_script_source(rbxlx_path: Path, module_name: str) -> str:
     return ""
 
 
+def assert_no_contract_failures(output_dir: Path) -> None:
+    """Generic-mode fail-closed gate.
+
+    A runtime-bearing module that survives reprompt still broken
+    promotes a ``"scene-runtime contract failed closed"`` error
+    onto ``ctx.errors``. ``run_all()`` does NOT raise on it, and the
+    rbxlx still gets written -- so without this gate a
+    structurally-broken place (e.g. a stubbed Player.luau that
+    throws at boot) would pass every artifact-level check and the
+    /e2e-test gameplay fixtures would surface a confusing cascade
+    of unrelated failures.
+
+    Reads ``ctx.errors`` from ``conversion_context.json`` (persisted
+    by Pipeline.save) and asserts no entry contains the fail-closed
+    sentinel string. Fix #15 Root A.
+    """
+    ctx_path = output_dir / "conversion_context.json"
+    if not ctx_path.exists():
+        # No ctx -- happens if assemble didn't run. Caller's earlier
+        # rbxlx-existence check should have caught that already.
+        return
+    ctx = json.loads(ctx_path.read_text(encoding="utf-8"))
+    errors = ctx.get("errors", []) or []
+    contract_failures = [
+        e for e in errors
+        if isinstance(e, str) and "scene-runtime contract failed closed" in e
+    ]
+    assert not contract_failures, (
+        "generic conversion shipped with contract fail-closed "
+        "errors -- the place will throw at boot:\n  "
+        + "\n  ".join(contract_failures)
+    )
+
+
 def assert_generic_scene_runtime(rbxlx_path: Path) -> None:
     """Generic-mode assertions: tier-1 prefab placements reach the host.
 

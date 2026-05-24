@@ -48,6 +48,7 @@ from tests.conversion_assertions import (  # noqa: E402
     _FIXTURES,
     assert_generic_scene_runtime,
     assert_mesh_ids_match_snapshot,
+    assert_no_contract_failures,
     assert_no_placeholder_ids,
     assert_place_builder_chunks_publishable,
     assert_snapshot_covers_manifest,

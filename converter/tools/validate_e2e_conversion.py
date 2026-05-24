@@ -16,8 +16,16 @@ the defect.
 Coverage today:
   * no ``rbxassetid://0`` placeholders in the rbxlx
   * mesh IDs in the rbxlx match snapshot
-  * generic-mode (when ``--mode generic``) runtime contract embeds
-    ``scene_prefab_placements`` + ``_constructPrefabClone``
+  * generic-mode (when ``--mode generic``) **fail-closed gate** --
+    reads ``ctx.errors`` from ``conversion_context.json`` and fails
+    if any entry contains the ``"scene-runtime contract failed
+    closed"`` sentinel. ``Pipeline.run_all()`` does NOT raise on
+    fail-closed; the rbxlx still gets written. Without this gate, a
+    structurally-broken place would pass every artifact-level check
+    here and only surface as a confusing cascade in the /e2e-test
+    gameplay-fixture half. (Fix #15 Root A.)
+  * generic-mode runtime contract embeds ``scene_prefab_placements``
+    + ``_constructPrefabClone``
   * ``luau-analyze`` clean across ``<output_dir>/scripts/`` (when
     ``luau-analyze`` is installed; soft-skipped when absent)
 
@@ -86,6 +94,7 @@ def main() -> int:
     from tests.conversion_assertions import (
         assert_generic_scene_runtime,
         assert_mesh_ids_match_snapshot,
+        assert_no_contract_failures,
         assert_no_placeholder_ids,
         load_snapshot,
         run_luau_analyze,
@@ -148,7 +157,24 @@ def main() -> int:
         return 1
     print("OK   mesh IDs match snapshot")
 
-    # 5) generic-mode runtime contract embedded
+    # 5) generic-mode fail-closed gate (Fix #15 Root A)
+    #    Pipeline.run_all() does NOT raise when a runtime-bearing
+    #    module survives reprompt still broken -- it stamps
+    #    "scene-runtime contract failed closed" onto ctx.errors and
+    #    writes the rbxlx anyway. Without this gate, /e2e-test would
+    #    only surface the breakage as a confusing cascade in the
+    #    gameplay-fixture half. The old pytest harness enforced this
+    #    via ``ctx.errors`` inspection; the validator reads the same
+    #    list from ``conversion_context.json``.
+    if mode == "generic":
+        try:
+            assert_no_contract_failures(output_dir)
+        except AssertionError as e:
+            print(f"FAIL: {e}", file=sys.stderr)
+            return 1
+        print("OK   no scene-runtime contract failures")
+
+    # 6) generic-mode runtime contract embedded
     if mode == "generic":
         try:
             assert_generic_scene_runtime(rbxlx)
