@@ -1,9 +1,18 @@
-"""scene_runtime_domain.py -- v2 execution-domain classifier for the
-contract pipeline.
+"""module_domain — per-module execution-domain classification.
 
-Runs after Phase 4a's storage classifier and after the PR1 planner has
-seeded ``scene_runtime.modules``. For every runtime-bearing module
-this assigns one of:
+Relocated in Phase 1 from ``converter/scene_runtime_domain.py``. The
+classifier guts are byte-identical with the pre-Phase-1 source; only
+the file's home + docstring + ``__all__`` shape changed.
+
+Phase 2a will refactor this module SLICE BY SLICE (storage mutations
+move out to ``script_storage``, signal tables consolidate, etc.). For
+Phase 1 the goal is structural: the topology package owns domain
+classification.
+
+Public entry point: ``classify_scene_runtime_domains``. Runs after the
+storage classifier seeds ``scene_runtime.modules`` and after the
+planner has populated instance / reference rows. Assigns each
+runtime-bearing module one of:
 
   - ``"client"``   -- per the design doc rule table.
   - ``"server"``   -- per the rule table.
@@ -657,22 +666,6 @@ def classify_scene_runtime_domains(
         mirror_adoption_low=mirror_low,
         strict_violations=strict_violations,
     )
-
-
-# ---------------------------------------------------------------------------
-# Cross-domain edge enumeration — relocated to
-# ``scene_runtime_topology.cross_domain_edges`` in Phase 1. This module
-# re-exports the public surface (``CrossDomainEdge``,
-# ``compute_cross_domain_edges``) for back-compat with pipeline.py + tests
-# that import from here. Phase 2a will update those importers and remove
-# this re-export.
-# ---------------------------------------------------------------------------
-
-from converter.scene_runtime_topology.cross_domain_edges import (  # noqa: E402
-    NON_RUNTIME_DOMAINS as _NON_RUNTIME_DOMAINS,
-    CrossDomainEdge,
-    compute_cross_domain_edges,
-)
 
 
 # ---------------------------------------------------------------------------
@@ -1448,10 +1441,8 @@ def _check_mirror_adoption(
 
 __all__ = (
     "classify_scene_runtime_domains",
-    "compute_cross_domain_edges",
     "migrate_legacy_domain_values",
     "DomainClassifierReport",
-    "CrossDomainEdge",
     "NetworkingMode",
     "NETWORKING_MODES",
     "DEFAULT_NETWORKING_MODE",
