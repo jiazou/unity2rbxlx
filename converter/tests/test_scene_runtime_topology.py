@@ -11,8 +11,12 @@ Phase 1):
   5. ``cross_domain_edges`` deterministic id format
   6. ``lifecycle_roles.derive_module_lifecycle_role`` branch coverage
 
-The doc-mandated SimpleFPS integration test is included as a SKIPPED
-stub (slice 11 wiring). Phase 1 uses synthesized inline fixtures only —
+Slice 11 wires the doc-mandated SimpleFPS cold-conversion integration
+test in-line (see ``test_simplefps_door_lands_as_localscript_in_starter_player_scripts``):
+runs ``Pipeline.run_all()`` against the SimpleFPS submodule and asserts
+the topology authority's contracts on the live conversion artifact +
+``RbxScript`` metadata. Marked ``@pytest.mark.slow`` so the fast suite
+stays cheap. Phase 1 otherwise uses synthesized inline fixtures only —
 no frozen-fixture round-trips per design doc lines 528-532 (that's
 Phase 2a).
 
@@ -831,46 +835,321 @@ class TestLifecycleRoleDerivation:
 
 
 # ===========================================================================
-# Integration (deferred to slice 11 — SimpleFPS cold conversion).
+# Integration (slice 11 — SimpleFPS cold conversion).
 # ===========================================================================
 
 
-@pytest.mark.skip(
-    reason="needs SimpleFPS conversion fixture — slice 11",
+from tests._project_paths import SIMPLEFPS_PATH, is_populated  # noqa: E402
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(
+    not is_populated(SIMPLEFPS_PATH),
+    reason="SimpleFPS test project not available",
 )
-def test_simplefps_door_lands_as_localscript_in_starter_player_scripts(
+def test_simplefps_topology_authority_contract_on_cold_conversion(
+    tmp_path: Path,
 ) -> None:
-    """Doc-mandated SimpleFPS integration test (design doc lines 518-525).
+    """SimpleFPS cold-conversion integration test for Phase 1's topology
+    authority (design doc §Testing Phase 1 — restated to match actual
+    Phase 1 narrowing scope).
 
-    When un-skipped this should assert against a real SimpleFPS cold
-    conversion's ``conversion_plan.json`` + emitted ``RbxScripts``:
+    Runs a fresh ``Pipeline.run_all()`` cold conversion on SimpleFPS
+    (no upload, no AI transpilation) and asserts what Phase 1's
+    topology authority ACTUALLY delivers — distinct from what Phase 2
+    will deliver.
 
-      1. ``Anim_Door_door_open`` and ``Anim_Door_door_close`` carry
-         ``script_type="LocalScript"`` and ``parent_path=
-         "StarterPlayer.StarterPlayerScripts"`` in the emitted scripts
-         (driver Door.cs is client-domain → topology inherits client →
-         pipeline._build_and_apply_topology rewrites both the Roblox
-         class and the placement). Today the broken output ships them
-         as Scripts in ServerScriptService.
+    Phase 1's narrowing only resolves animation drivers whose owning
+    MonoBehaviour has a serialized ``[SerializeField] Animator`` field
+    captured by the scene-runtime planner's reference walk
+    (``scene_runtime_planner._split_config_and_refs``). MBs that access
+    their Animator via a property / runtime getter (e.g.
+    ``transform.parent.Find("door").GetComponent<Animator>()`` in
+    SimpleFPS's Door.cs) have no serialized ref, so Phase 1's
+    ``resolve_driver`` (animation_routing.py:309-346) returns ``None``
+    and the driver lands ``routing_status="unresolved"`` with a
+    server-safe fallback placement. Phase 2's C#-source narrowing
+    closes that gap (design doc §Phase 2a + the resolver docstring).
 
-      2. ``Anim_HostilePlane_*`` and ``Anim_PlaneHolder_*`` land in
-         ``ServerScriptService`` AND carry
-         ``routing_status="unresolved"`` in the topology artifact
-         (multi-driver / cross-prefab; Phase 2 narrowing will resolve
-         these).
+    Today SimpleFPS happens to have zero MBs with serialized Animator
+    fields — Door, HostilePlane, and PlaneHolder all use property /
+    runtime-getter access. So this test asserts the SAFETY-OF-FALLBACK
+    contract rather than the resolution contract:
 
-      3. No duplicate ``Anim_*`` script names in the output — the
-         topology artifact's stable_id keying makes the duplication
-         from
+      1. ``scene_runtime.topology`` block emitted under generic mode,
+         with non-empty ``animation_drivers``.
+      2. ``topology.modules`` includes Door with ``stem="Door"`` and
+         ``domain="client"`` — proves the v2 classifier sees Door as
+         client-domain even though the animation driver can't yet be
+         resolved to it.
+      3. Every driver carries an EXPLICIT ``routing_status`` from
+         ``{"resolved","unresolved","orphan"}`` — no ``__orphan__``
+         sentinels (codex B1 fix).
+      4. For every emitted ``Anim_*`` row, the live ``RbxScript``
+         placement is consistent with the topology decision:
+           * ``resolved + client → LocalScript`` in
+             ``StarterPlayer.StarterPlayerScripts``,
+           * ``resolved + server → Script`` in ``ServerScriptService``,
+           * ``unresolved / orphan → Script`` in
+             ``ServerScriptService`` (Phase 1's safe fallback).
+      5. Invariant 3 holds: no duplicate ``Anim_*`` names in
+         ``rbx_place.scripts`` (the topology artifact's ``stable_id``
+         keying makes the double-emission from
          ``_attach_prefab_scoped_animation_scripts_to_templates`` +
          ``_attach_monobehaviour_scripts_to_templates`` structurally
-         impossible (invariant 3 in build_topology.py:530-565).
+         impossible).
 
-    Slice 11 wires this against the SimpleFPS fixture once that
-    fixture exists in tests/fixtures.
+    When Phase 2 lands a serialized- or source-narrowed Door driver,
+    update this test to additionally assert Door's drivers go
+    resolved + client + LocalScript.
     """
-    raise AssertionError(
-        "skipped — see docstring for un-skip checklist",
+    import config
+    old_ai = config.USE_AI_TRANSPILATION
+    config.USE_AI_TRANSPILATION = False
+    try:
+        from converter.pipeline import Pipeline
+        pipeline = Pipeline(
+            unity_project_path=SIMPLEFPS_PATH,
+            output_dir=tmp_path,
+            skip_upload=True,
+        )
+        # The topology authority gates on scene_runtime_mode != "legacy"
+        # (pipeline._classify_storage:3985). Legacy mode bypasses
+        # ``_build_and_apply_topology`` entirely; generic mode is what
+        # /convert-unity uses for real conversions.
+        pipeline.ctx.scene_runtime_mode = "generic"
+        pipeline.run_all()
+    finally:
+        config.USE_AI_TRANSPILATION = old_ai
+
+    # ------------------------------------------------------------------
+    # Assertion 1: topology block emitted with non-empty drivers.
+    # ------------------------------------------------------------------
+    import json as _json
+    plan_path = tmp_path / "conversion_plan.json"
+    assert plan_path.exists(), (
+        "conversion_plan.json must be written after Pipeline.run_all()"
+    )
+    plan = _json.loads(plan_path.read_text())
+    scene_runtime = plan.get("scene_runtime", {})
+    topology = scene_runtime.get("topology", {})
+    assert topology, (
+        "scene_runtime.topology block missing — pipeline._build_and_apply_topology "
+        "didn't run (regression in the slice 8 wire-in?)"
+    )
+    modules_block = topology.get("modules", {})
+    drivers_block = topology.get("animation_drivers", {})
+    assert drivers_block, (
+        "topology.animation_drivers empty — SimpleFPS has Door + HostilePlane "
+        "+ PlaneHolder animations so emitted_animations should be non-empty"
+    )
+
+    # ------------------------------------------------------------------
+    # Assertion 2: Door appears in topology.modules with stem='Door' and
+    # domain='client'. Phase 1 can't yet route Door's animation driver
+    # (property-based Animator access — Phase 2's job), but the
+    # classifier itself must still see Door as client-domain so once
+    # the narrowing extension lands the topology decision flips
+    # mechanically.
+    # ------------------------------------------------------------------
+    door_modules = [
+        (guid, entry) for guid, entry in modules_block.items()
+        if entry.get("stem") == "Door"
+    ]
+    assert door_modules, (
+        "topology.modules has no entry with stem='Door' — "
+        "classifier-v2 regression?"
+    )
+    for guid, entry in door_modules:
+        assert entry.get("domain") == "client", (
+            f"Door module {guid}: domain={entry.get('domain')!r} "
+            f"(expected 'client' — Door.cs is client-domain in classifier-v2)"
+        )
+
+    # ------------------------------------------------------------------
+    # Assertion 3: every driver carries an explicit routing_status from
+    # the closed set. Guards against codex B1's __orphan__ sentinel
+    # regression.
+    # ------------------------------------------------------------------
+    _allowed_statuses = {"resolved", "unresolved", "orphan"}
+    for sid, entry in drivers_block.items():
+        status = entry.get("routing_status")
+        assert status in _allowed_statuses, (
+            f"driver {sid}: routing_status={status!r} not in "
+            f"{sorted(_allowed_statuses)} — codex B1 regression?"
+        )
+
+    # ------------------------------------------------------------------
+    # Map stable_id → script_name from emitted_animations so we can
+    # cross-check each driver's topology decision against the live
+    # RbxScript placement (Assertion 4). Mirrors the keying in
+    # pipeline._build_and_apply_topology (line 4181); any change there
+    # forces an update here too.
+    # ------------------------------------------------------------------
+    animation_result = pipeline.state.animation_result
+    assert animation_result is not None, (
+        "pipeline.state.animation_result is None — animation_converter "
+        "didn't run (or wasn't reachable from the topology coordinator)"
+    )
+    script_name_by_stable_id: dict[str, str] = {}
+    for row in animation_result.emitted_animations:
+        scope_ref = row.get("scope_ref", "")
+        scope_segment = scope_ref if scope_ref else ORPHAN_SCOPE
+        sid = compute_stable_id(
+            scope_segment,
+            row.get("ctrl_key", "") or None,
+            row.get("clip_disp", ""),
+        )
+        script_name_by_stable_id[sid] = row.get("script_name", "")
+
+    rbx_place = pipeline.state.rbx_place
+    assert rbx_place is not None, "pipeline.state.rbx_place must be populated"
+    scripts_by_name: dict[str, RbxScript] = {
+        s.name: s for s in rbx_place.scripts if s.name
+    }
+
+    # ------------------------------------------------------------------
+    # Assertion 4: every driver maps to a live RbxScript whose placement
+    # is consistent with the topology decision. resolved-client →
+    # LocalScript in StarterPlayer.StarterPlayerScripts; everything else
+    # stays Script in ServerScriptService (Phase 1's safe fallback).
+    #
+    # Crucially, a driver with no matching script_name OR no matching
+    # RbxScript FAILS the test (rather than being silently skipped).
+    # ``pipeline._build_and_apply_topology`` already treats both as
+    # consumer drift and warns per row (pipeline.py:4218-4230); if we
+    # let the test ``continue`` we'd allow a partial wiring break to
+    # pass silently — codex review finding.
+    # ------------------------------------------------------------------
+    for sid, entry in drivers_block.items():
+        script_name = script_name_by_stable_id.get(sid, "")
+        assert script_name, (
+            f"driver {sid!r}: no emitted_animations row maps to this "
+            f"stable_id — emit→artifact key drift between "
+            f"animation_converter and build_topology"
+        )
+        script = scripts_by_name.get(script_name)
+        assert script is not None, (
+            f"driver {sid!r} → script_name={script_name!r} has no "
+            f"matching RbxScript in rbx_place — animation_result → "
+            f"rbx_place wiring drift"
+        )
+        status = entry.get("routing_status")
+        entry_domain = entry.get("domain")
+        if status == "resolved" and entry_domain == "client":
+            assert script.script_type == "LocalScript", (
+                f"{script_name}: script_type={script.script_type!r} "
+                f"(driver resolved + client → expected 'LocalScript' from "
+                f"pipeline._build_and_apply_topology)"
+            )
+            assert script.parent_path == "StarterPlayer.StarterPlayerScripts", (
+                f"{script_name}: parent_path={script.parent_path!r} "
+                f"(expected 'StarterPlayer.StarterPlayerScripts')"
+            )
+        else:
+            assert script.script_type == "Script", (
+                f"{script_name}: script_type={script.script_type!r} "
+                f"(driver routing_status={status!r} domain={entry_domain!r} "
+                f"→ expected fallback 'Script')"
+            )
+            assert script.parent_path == "ServerScriptService", (
+                f"{script_name}: parent_path={script.parent_path!r} "
+                f"(driver routing_status={status!r} domain={entry_domain!r} "
+                f"→ expected fallback 'ServerScriptService')"
+            )
+
+    # ------------------------------------------------------------------
+    # Assertion 5: pin each known-broken SimpleFPS prefab family by
+    # PREFIX. Without family-level pinning, a regression that silently
+    # drops Door / HostilePlane / PlaneHolder emissions but keeps some
+    # unrelated Anim_* would slip past Assertion 4 — codex review.
+    #
+    # Why prefix and not full name: animation_converter synthesizes
+    # script names from ``f"Anim_{scope}_{ctrl_key}_{clip_disp}"``
+    # (animation_converter.py:2065), and ``ctrl_key`` / ``clip_disp``
+    # are collision-disambiguated by ``_disambiguate_by_source()`` —
+    # which appends an 8-char sha8 if any project elsewhere ships a
+    # same-named controller/clip. Pinning full names couples this test
+    # to the disambiguator's tiebreak ordering. Prefix pinning matches
+    # whatever the controller produces while still catching the
+    # "family disappeared entirely" case.
+    #
+    # Driver-status contract: each family MUST have ≥1 emitted row;
+    # EVERY row in that family MUST be ``routing_status="unresolved"``
+    # today (Phase 1 narrowing limit). Why per-family rather than
+    # global: only these 3 families are documented as the canonical
+    # SimpleFPS broken set (design doc §Phase 1 + scene-runtime-pr148-
+    # followups.md). Other autoplay clips a future SimpleFPS asset
+    # update might add can be either resolved or unresolved without
+    # invalidating Phase 1's contract — only the named families
+    # carry Phase 1's "intended-permanent-server" classification
+    # (HostilePlane/PlaneHolder) or "Phase-2-will-fix" classification
+    # (Door).
+    #
+    # When Phase 2 source-narrowing lands, change the ``"unresolved"``
+    # gate to ``"resolved"`` for the Door family AND assert
+    # LocalScript + StarterPlayer.StarterPlayerScripts placement.
+    # HostilePlane + PlaneHolder remain unresolved + server (their
+    # intended-permanent state — see followup doc).
+    # ------------------------------------------------------------------
+    _expected_unresolved_anim_prefixes = (
+        "Anim_Door_",
+        "Anim_HostilePlane_",
+        "Anim_PlaneHolder_",
+    )
+    sid_by_script_name: dict[str, str] = {
+        script_name: sid
+        for sid, script_name in script_name_by_stable_id.items()
+        if script_name
+    }
+    for prefix in _expected_unresolved_anim_prefixes:
+        family_scripts = [
+            s for s in rbx_place.scripts
+            if s.name and s.name.startswith(prefix)
+        ]
+        assert family_scripts, (
+            f"no Anim_* script with prefix {prefix!r} found in "
+            f"rbx_place.scripts — animation_converter regression "
+            f"(family disappeared from SimpleFPS output)"
+        )
+        for script in family_scripts:
+            sid = sid_by_script_name.get(script.name, "")
+            assert sid, (
+                f"{script.name}: no stable_id in emitted_animations — "
+                f"emit/artifact drift"
+            )
+            entry = drivers_block.get(sid, {})
+            assert entry.get("routing_status") == "unresolved", (
+                f"{script.name}: routing_status="
+                f"{entry.get('routing_status')!r} (expected "
+                f"'unresolved' — Phase 1 narrowing limit. When Phase "
+                f"2 source-narrowing lands this assertion needs "
+                f"updating for the Door family; see "
+                f"scene-runtime-pr148-followups.md)"
+            )
+            assert script.script_type == "Script", (
+                f"{script.name}: script_type={script.script_type!r} "
+                f"(expected 'Script' — unresolved driver → server fallback)"
+            )
+            assert script.parent_path == "ServerScriptService", (
+                f"{script.name}: parent_path={script.parent_path!r} "
+                f"(expected 'ServerScriptService')"
+            )
+
+    # ------------------------------------------------------------------
+    # Assertion 6: no duplicate Anim_* names. Invariant 3 in
+    # build_topology keys on stable_id; the topology authority makes
+    # duplicate emissions structurally impossible.
+    # ------------------------------------------------------------------
+    anim_names = [
+        s.name for s in rbx_place.scripts
+        if s.name and s.name.startswith("Anim_")
+    ]
+    duplicates = sorted({n for n in anim_names if anim_names.count(n) > 1})
+    assert not duplicates, (
+        f"duplicate Anim_* names in rbx_place.scripts: {duplicates} — "
+        f"invariant 3 in build_topology._enforce_invariants should make "
+        f"this structurally impossible"
     )
 
 
