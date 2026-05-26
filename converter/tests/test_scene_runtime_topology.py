@@ -949,3 +949,339 @@ class TestBuildAnimationDriverEntry:
         )
         assert entry["script_class"] == "Script"
         assert entry["domain"] == "server"
+
+
+# ===========================================================================
+# CATEGORY 7 (added by post-slice-10 review): Slice 9 consumer wiring.
+#
+# These tests prove the load-bearing claim "topology owns RbxScript
+# metadata" by driving Pipeline._build_and_apply_topology directly and
+# asserting:
+#   - resolved client driver flips RbxScript.script_type Script
+#     → LocalScript + stamps parent_path = StarterPlayer.StarterPlayerScripts
+#   - the storage_plan buckets are patched in lockstep (move from
+#     server_scripts → client_scripts) so the on-disk plan can't drift
+#     from the live RbxScript metadata (codex F1 fix)
+#   - resolved server driver stamps parent_path = ServerScriptService
+#     and leaves plan buckets unchanged
+#   - unresolved + orphan rows preserve today's server placement
+#     (routing_status field is the audit trail; invariants skip them)
+#   - mismatched script_name (animation_drivers row has no live
+#     RbxScript) increments the "unmatched" counter, not silently
+#     skipped (codex F4)
+#
+# These exercise the actual pipeline subphase that Phase 1's Door fix
+# depends on — distinct from the skipped SimpleFPS e2e stub at line
+# 841 (which needs a full Unity conversion to PROVE Door's
+# end-to-end flow at runtime).
+# ===========================================================================
+
+class TestApplyTopologyToRbxScripts:
+    """Drive ``Pipeline._build_and_apply_topology`` against synthetic
+    fixtures + assert the RbxScript mutations + plan-bucket patches
+    that the design doc + codex review require.
+    """
+
+    @staticmethod
+    def _mk_pipeline(
+        *,
+        scripts: list[RbxScript],
+        emitted_animations: list[EmittedAnimation],
+        tmp_path: Path,
+    ):
+        """Build the minimum Pipeline + state shape ``_build_and_apply_topology``
+        reads. We avoid invoking the heavy ``__init__`` (which expects a
+        real Unity project + output dir) by constructing in place via
+        ``__new__`` + setting only the attributes the method touches.
+        """
+        from converter.pipeline import Pipeline
+        from core.roblox_types import RbxPlace
+        from converter.animation_converter import AnimationConversionResult
+
+        pipeline = Pipeline.__new__(Pipeline)
+        pipeline.output_dir = tmp_path
+        # The method reads: self.state.rbx_place.scripts +
+        # self.state.animation_result.emitted_animations +
+        # self.state.guid_index. ``state`` is a SimpleNamespace-shaped
+        # bag in the real Pipeline; here we forge it with the same
+        # attribute access pattern.
+        from types import SimpleNamespace
+        rbx_place = RbxPlace()
+        rbx_place.scripts = scripts
+        anim_result = AnimationConversionResult()
+        anim_result.emitted_animations = emitted_animations
+        pipeline.state = SimpleNamespace(
+            rbx_place=rbx_place,
+            animation_result=anim_result,
+            guid_index=None,
+        )
+        return pipeline
+
+    @staticmethod
+    def _mk_plan(*, server_scripts: list[str] | None = None) -> "object":
+        """Return a fresh StoragePlan with the given server bucket.
+
+        Animation scripts default to server_scripts (today's
+        classify_storage behaviour for Anim_* names). The test then
+        asserts topology moves them to client_scripts.
+        """
+        from converter.storage_classifier import StoragePlan
+        return StoragePlan(
+            server_scripts=list(server_scripts or []),
+        )
+
+    def test_resolved_client_driver_flips_script_to_localscript_and_updates_plan(
+        self, tmp_path: Path,
+    ) -> None:
+        """The Door fix: client-driven Animator → Anim_* becomes
+        LocalScript in StarterPlayerScripts, AND the plan buckets move.
+
+        Mirrors the doc's Phase 1 §Testing integration assertion (lines
+        518-523) but at the unit level without needing a full Unity
+        conversion.
+        """
+        artifact, prefab_id, _ = _door_shape_artifact(door_domain="client")
+        scene_runtime = cast("dict[str, object]", artifact)
+
+        emission: EmittedAnimation = {
+            "scope_kind": "prefab",
+            "scope_ref": prefab_id,
+            "scope_display": "Door",
+            "ctrl_key": "door",
+            "clip_disp": "open",
+            "script_name": "Anim_Door_door_open",
+            "observed_attribute": "open",
+            "curve_paths": ["door"],
+            "prefab_scoped": True,
+        }
+        anim_script = _mk_rbx_script("Anim_Door_door_open", "Script")
+        # Some unrelated server script in the plan to verify the patch
+        # is targeted (doesn't accidentally clear the bucket).
+        other_server = _mk_rbx_script("GameManager", "Script")
+        plan = self._mk_plan(server_scripts=[
+            "Anim_Door_door_open", "GameManager",
+        ])
+
+        pipeline = self._mk_pipeline(
+            scripts=[anim_script, other_server],
+            emitted_animations=[emission],
+            tmp_path=tmp_path,
+        )
+        pipeline._build_and_apply_topology(scene_runtime, plan)
+
+        # F1 + the Door fix: in-memory RbxScript flipped.
+        assert anim_script.script_type == "LocalScript"
+        assert getattr(anim_script, "parent_path", "") == (
+            "StarterPlayer.StarterPlayerScripts"
+        )
+        # Unrelated server script untouched.
+        assert other_server.script_type == "Script"
+        # F1: plan buckets patched in lockstep.
+        assert "Anim_Door_door_open" not in plan.server_scripts
+        assert "Anim_Door_door_open" in plan.client_scripts
+        assert "GameManager" in plan.server_scripts  # unchanged
+        # Audit trail recorded.
+        moves = [d for d in plan.decisions if d.get("script") == "Anim_Door_door_open"]
+        assert len(moves) == 1
+        assert moves[0]["from"] == "ServerScriptService"
+        assert moves[0]["to"] == "StarterPlayer.StarterPlayerScripts"
+        assert "topology" in moves[0]["reason"]
+        # The persisted artifact lands at scene_runtime["topology"].
+        assert "topology" in scene_runtime
+        topology = cast("dict[str, object]", scene_runtime["topology"])
+        assert "animation_drivers" in topology
+
+    def test_resolved_server_driver_stamps_parent_path_without_bucket_move(
+        self, tmp_path: Path,
+    ) -> None:
+        """Server-driven Animator → Anim_* stays Script in
+        ServerScriptService; plan buckets unchanged.
+
+        Confirms the "explicit server stamp" path doesn't accidentally
+        flip into client_scripts.
+        """
+        artifact, prefab_id, _ = _door_shape_artifact(door_domain="server")
+        scene_runtime = cast("dict[str, object]", artifact)
+        emission: EmittedAnimation = {
+            "scope_kind": "prefab",
+            "scope_ref": prefab_id,
+            "scope_display": "Door",
+            "ctrl_key": "door",
+            "clip_disp": "open",
+            "script_name": "Anim_Door_door_open",
+            "observed_attribute": "open",
+            "curve_paths": ["door"],
+            "prefab_scoped": True,
+        }
+        anim_script = _mk_rbx_script("Anim_Door_door_open", "Script")
+        plan = self._mk_plan(server_scripts=["Anim_Door_door_open"])
+        pipeline = self._mk_pipeline(
+            scripts=[anim_script],
+            emitted_animations=[emission],
+            tmp_path=tmp_path,
+        )
+        pipeline._build_and_apply_topology(scene_runtime, plan)
+
+        assert anim_script.script_type == "Script"
+        assert getattr(anim_script, "parent_path", "") == "ServerScriptService"
+        # No bucket move for server-resolved.
+        assert "Anim_Door_door_open" in plan.server_scripts
+        assert "Anim_Door_door_open" not in plan.client_scripts
+
+    def test_unresolved_row_preserves_server_placement_no_bucket_move(
+        self, tmp_path: Path,
+    ) -> None:
+        """No driver in scope → routing_status="unresolved" → RbxScript
+        keeps today's Script/ServerScriptService default; plan buckets
+        unchanged. The audit trail lives in scene_runtime.topology
+        (the routing_status field is visible in the artifact).
+        """
+        # Scope with zero Animator-typed refs → resolve_driver returns
+        # None → routing_status="unresolved".
+        artifact = _mk_artifact(
+            modules={"guid-other": _mk_module("Other", "client")},
+            prefabs={
+                "guid-other-prefab:Assets/Prefabs/Other.prefab": {
+                    "name": "Other",
+                    "template_name": "Other",
+                    "instances": [],
+                    "references": [],
+                    "lifecycle_order": [],
+                },
+            },
+        )
+        scene_runtime = cast("dict[str, object]", artifact)
+        emission: EmittedAnimation = {
+            "scope_kind": "prefab",
+            "scope_ref": "guid-other-prefab:Assets/Prefabs/Other.prefab",
+            "scope_display": "Other",
+            "ctrl_key": "ctrl",
+            "clip_disp": "wave",
+            "script_name": "Anim_Other_ctrl_wave",
+            "observed_attribute": "",
+            "curve_paths": ["arm"],
+            "prefab_scoped": True,
+        }
+        anim_script = _mk_rbx_script("Anim_Other_ctrl_wave", "Script")
+        plan = self._mk_plan(server_scripts=["Anim_Other_ctrl_wave"])
+        pipeline = self._mk_pipeline(
+            scripts=[anim_script],
+            emitted_animations=[emission],
+            tmp_path=tmp_path,
+        )
+        pipeline._build_and_apply_topology(scene_runtime, plan)
+
+        assert anim_script.script_type == "Script"  # unchanged
+        assert "Anim_Other_ctrl_wave" in plan.server_scripts  # unchanged
+        assert "Anim_Other_ctrl_wave" not in plan.client_scripts
+        # Audit visibility: the artifact still records the row + status.
+        topology = cast("dict[str, object]", scene_runtime["topology"])
+        drivers = cast("dict[str, dict[str, object]]", topology["animation_drivers"])
+        sid = compute_stable_id(
+            "guid-other-prefab:Assets/Prefabs/Other.prefab",
+            "ctrl", "wave",
+        )
+        assert sid in drivers
+        assert drivers[sid]["routing_status"] == "unresolved"
+
+    def test_orphan_row_preserves_server_placement(
+        self, tmp_path: Path,
+    ) -> None:
+        """Project-wide orphan clip → routing_status="orphan" → RbxScript
+        keeps Script/ServerScriptService; plan buckets unchanged.
+        """
+        artifact = _mk_artifact()
+        scene_runtime = cast("dict[str, object]", artifact)
+        emission: EmittedAnimation = {
+            "scope_kind": "orphan",
+            "scope_ref": "",
+            "scope_display": ORPHAN_SCOPE,
+            "ctrl_key": "",
+            "clip_disp": "FloatingClip",
+            "script_name": "Anim_FloatingClip",
+            "observed_attribute": "",
+            "curve_paths": [""],
+            "prefab_scoped": False,
+        }
+        anim_script = _mk_rbx_script("Anim_FloatingClip", "Script")
+        plan = self._mk_plan(server_scripts=["Anim_FloatingClip"])
+        pipeline = self._mk_pipeline(
+            scripts=[anim_script],
+            emitted_animations=[emission],
+            tmp_path=tmp_path,
+        )
+        pipeline._build_and_apply_topology(scene_runtime, plan)
+
+        assert anim_script.script_type == "Script"
+        assert "Anim_FloatingClip" in plan.server_scripts
+        # Routing status visible in the artifact.
+        topology = cast("dict[str, object]", scene_runtime["topology"])
+        drivers = cast("dict[str, dict[str, object]]", topology["animation_drivers"])
+        sid = compute_stable_id(ORPHAN_SCOPE, None, "FloatingClip")
+        assert drivers[sid]["routing_status"] == "orphan"
+
+    def test_unmatched_script_name_increments_counter_and_warns(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        """Codex F4 fix: when animation_drivers has a row but the
+        named RbxScript isn't in rbx_place (consumer drift),
+        ``_build_and_apply_topology`` LOGS A WARNING per row + records
+        it in the summary log — no silent skip.
+        """
+        artifact, prefab_id, _ = _door_shape_artifact(door_domain="client")
+        scene_runtime = cast("dict[str, object]", artifact)
+        emission: EmittedAnimation = {
+            "scope_kind": "prefab",
+            "scope_ref": prefab_id,
+            "scope_display": "Door",
+            "ctrl_key": "door",
+            "clip_disp": "open",
+            "script_name": "Anim_Door_door_open",
+            "observed_attribute": "open",
+            "curve_paths": ["door"],
+            "prefab_scoped": True,
+        }
+        # NO RbxScript with this name in rbx_place — simulates drift.
+        plan = self._mk_plan()
+        pipeline = self._mk_pipeline(
+            scripts=[],
+            emitted_animations=[emission],
+            tmp_path=tmp_path,
+        )
+
+        import logging
+        with caplog.at_level(logging.INFO, logger="converter.pipeline"):
+            pipeline._build_and_apply_topology(scene_runtime, plan)
+
+        warning_lines = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        # The per-row warning fires for the unmatched stable_id.
+        assert any(
+            "Anim_Door_door_open" in m and "no matching RbxScript" in m
+            for m in warning_lines
+        ), warning_lines
+        # The summary log includes the unmatched count (info level).
+        info_lines = [r.message for r in caplog.records if r.levelno == logging.INFO]
+        assert any(
+            "unmatched" in m and "1 unmatched" in m for m in info_lines
+        ) or any(
+            "1 unmatched" in m for m in caplog.text.splitlines()
+        ), caplog.text
+
+    def test_empty_emitted_animations_skips_topology_build(
+        self, tmp_path: Path,
+    ) -> None:
+        """When ``animation_result.emitted_animations`` is empty, the
+        method short-circuits before calling build_topology. Verifies
+        scene_runtime doesn't get a spurious ``topology`` key written.
+        """
+        artifact = _mk_artifact()
+        scene_runtime = cast("dict[str, object]", artifact)
+        plan = self._mk_plan()
+        pipeline = self._mk_pipeline(
+            scripts=[_mk_rbx_script("X", "Script")],
+            emitted_animations=[],
+            tmp_path=tmp_path,
+        )
+        pipeline._build_and_apply_topology(scene_runtime, plan)
+        # No topology key persisted; no RbxScript mutated.
+        assert "topology" not in scene_runtime

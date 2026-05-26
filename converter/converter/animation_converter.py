@@ -1732,6 +1732,7 @@ def convert_animations(
     # planner's stable-id derivation (a leading-underscore helper there,
     # not imported to avoid coupling on a private surface).
     _topology_prefab_id_by_template_name: dict[str, str] = {}
+    _topology_prefab_name_collisions: dict[str, list[str]] = {}
     if prefab_library is not None:
         for _guid, _template in prefab_library.by_guid.items():
             try:
@@ -1740,13 +1741,40 @@ def convert_animations(
                 ).as_posix()
             except ValueError:
                 _rel = _template.prefab_path.as_posix()
+            _prefab_id = f"{_guid}:{_rel}"
             # Name collisions across prefabs are an existing
-            # animation_converter limitation (prefabs_per_controller keys
-            # off ``prefab.name``) — Phase 1 inherits the limitation. The
-            # first match wins; topology invariants surface collisions
-            # downstream when they cause real misroutes.
-            _topology_prefab_id_by_template_name.setdefault(
-                _template.name, f"{_guid}:{_rel}",
+            # animation_converter limitation: ``prefabs_per_controller``
+            # keys off ``prefab.name``, so when two distinct prefabs
+            # share a Unity-given name the upstream emission collapses
+            # them into one scope before reaching the topology lookup.
+            # Phase 1's lookup inherits this — first-wins on
+            # ``setdefault``. The codex review of slices 8/9/10 flagged
+            # this with empirical evidence (SimpleFPS has 23 "Standard",
+            # 9 "Pickable", 5 "tile" duplicate-named prefabs). The real
+            # fix lives in ``prefabs_per_controller``'s keying (Phase 2
+            # or a follow-up cleanup). Until then, RECORD collisions so
+            # they surface in the log + are debuggable, instead of
+            # vanishing silently.
+            _existing = _topology_prefab_id_by_template_name.get(_template.name)
+            if _existing is None:
+                _topology_prefab_id_by_template_name[_template.name] = _prefab_id
+            elif _existing != _prefab_id:
+                _topology_prefab_name_collisions.setdefault(
+                    _template.name, [_existing],
+                ).append(_prefab_id)
+    if _topology_prefab_name_collisions:
+        # One log line per colliding name. The list ordering is
+        # insertion order (first prefab id is the one the topology
+        # actually uses; the others are recorded for debug).
+        for _name, _ids in _topology_prefab_name_collisions.items():
+            log.warning(
+                "[topology] prefab template name %r appears on %d distinct "
+                "prefabs; topology will resolve animations from this scope "
+                "to the FIRST prefab_id only (%r). Other prefab_ids that "
+                "would have routed to the same scope are invisible to the "
+                "topology resolver: %r. Fixing this requires changing the "
+                "upstream prefabs_per_controller keying.",
+                _name, len(_ids), _ids[0], _ids[1:],
             )
     _topology_scene_namespace_by_stem: dict[str, str] = {}
     for _scene in (parsed_scenes or ()):
