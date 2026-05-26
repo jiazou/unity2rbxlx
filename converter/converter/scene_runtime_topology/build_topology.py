@@ -53,6 +53,7 @@ from converter.scene_runtime_topology.animation_routing import (
     AnimationDriverEntry,
     AnimationObservedTarget,
     AnimationRoutingStatus,
+    ORPHAN_SCOPE,
     build_animation_driver_entry,
     compute_stable_id,
     derive_observed_target,
@@ -84,23 +85,49 @@ class EmittedAnimation(TypedDict, total=False):
     consumption by the topology coordinator. No new analysis required —
     every field is something the existing converter computes per emission.
 
+    Field contract (codex B3 fix — scope_ref vs scope_display):
+
     ``scope_kind``: ``"prefab"`` / ``"scene"`` / ``"orphan"``. Drives
         which slice of ``scene_runtime`` ``resolve_driver`` walks.
-    ``scope_ref``: stable prefab_id (when prefab-scoped), scene
-        namespace (when scene-scoped), or empty string (orphan).
-    ``scope_display``: the scope STRING baked into the script_name +
-        the stable_id. For prefab-scoped: the bare prefab template name.
-        For scene-scoped: the scene namespace. For orphan:
-        ``ORPHAN_SCOPE``.
-    ``ctrl_key``: disambiguated controller name (or empty for orphan).
-        Used in stable_id.
-    ``clip_disp``: disambiguated clip name. Used in stable_id.
-    ``script_name``: the emitted ``generated_scripts`` row key.
+
+    ``scope_ref``: the PLANNER-STABLE scope identifier. MUST be:
+          - for ``scope_kind=="prefab"``: the stable prefab_id
+            (``"<guid>:<project-relative path>"``) used as the key into
+            ``scene_runtime["prefabs"]``,
+          - for ``scope_kind=="scene"``: the scene namespace
+            (``"Assets/Scenes/Main.unity"``) used as the key into
+            ``scene_runtime["scenes"]``,
+          - for ``scope_kind=="orphan"``: empty string.
+        Passing a bare ``prefab.name`` or ``scene_path.stem`` here will
+        NOT resolve through scene_runtime keying — ``resolve_driver``
+        returns ``None`` and the animation lands ``routing_status =
+        "unresolved"``. This is the only acceptable shape.
+
+    ``scope_display``: display-only label kept for diagnostic / report
+        rendering. Today's animation_converter bakes this into the
+        emitted Anim_* script name. NOT used for stable_id keying
+        (codex B4 fix — stable_id must key on stable scope identity,
+        not display labels, otherwise two distinct prefabs with the
+        same bare name collide in animation_drivers).
+
+    ``ctrl_key``: disambiguated controller name from
+        ``_disambiguate_by_source`` in animation_converter. The
+        disambiguator appends a sha8 suffix on Unity-name collisions
+        so two distinct ``.controller`` files with the same ``m_Name``
+        produce distinct ctrl_keys (and distinct stable_ids).
+
+    ``clip_disp``: disambiguated clip name (same disambiguator pass).
+
+    ``script_name``: the emitted ``generated_scripts`` row key. Used
+        for invariant 3's emission-to-driver 1:1 check + log diagnostics.
+
     ``observed_attribute``: the controller's primary parameter name
         (first bool / int / trigger param). Empty when the clip is
         autoplay (no parameters).
+
     ``curve_paths``: union of curve paths in the clip, for
         ``derive_observed_target``.
+
     ``prefab_scoped``: convenience flag for observed_target's
         ``scope`` field ("self.gameObject" vs "workspace").
     """
@@ -346,13 +373,16 @@ def _build_animation_drivers_block(
     out: dict[str, AnimationDriverEntry] = {}
     unresolved_rows: list[str] = []
     for row in emitted_animations:
-        scope_display = row.get("scope_display", "")
         ctrl_key = row.get("ctrl_key", "")
         clip_disp = row.get("clip_disp", "")
-        stable_id = compute_stable_id(scope_display, ctrl_key, clip_disp)
-
         scope_kind = row.get("scope_kind", "")
         scope_ref = row.get("scope_ref", "")
+        # stable_id keys on scope_ref (planner-stable identity), NOT
+        # scope_display, so two prefabs with identical bare names don't
+        # collide in animation_drivers (codex B4 fix). Orphan rows use
+        # the ORPHAN_SCOPE sentinel since scope_ref is empty.
+        scope_segment = scope_ref if scope_ref else ORPHAN_SCOPE
+        stable_id = compute_stable_id(scope_segment, ctrl_key, clip_disp)
 
         routing_status: AnimationRoutingStatus
         driver_module_guid: str
@@ -499,8 +529,13 @@ def _enforce_invariants(
     # from an emission (no spurious entries).
     expected_stable_ids: dict[str, str] = {}
     for row in emitted_animations:
+        # Mirror the keying choice in _build_animation_drivers_block:
+        # scope_ref (planner-stable) for the segment, ORPHAN_SCOPE
+        # sentinel when empty.
+        scope_ref = row.get("scope_ref", "")
+        scope_segment = scope_ref if scope_ref else ORPHAN_SCOPE
         sid = compute_stable_id(
-            row.get("scope_display", ""),
+            scope_segment,
             row.get("ctrl_key", "") or None,
             row.get("clip_disp", ""),
         )

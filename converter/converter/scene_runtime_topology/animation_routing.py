@@ -272,27 +272,39 @@ def resolve_driver(
     scope_kind: str,
     scope_ref: str,
 ) -> tuple[str, str] | None:
-    """Find the first MonoBehaviour in ``scope_ref`` that serializes an
-    Animator reference. Returns ``(driver_module_guid, driver_domain)``
-    or ``None`` when no candidate exists.
+    """Find THE MonoBehaviour in ``scope_ref`` that serializes an
+    Animator reference, when exactly one candidate exists. Returns
+    ``(driver_module_guid, driver_domain)`` or ``None`` (caller marks
+    the animation ``routing_status="unresolved"``).
 
-    Phase 1 minimal logic (per W5-deprioritized, B1-corrected algorithm):
+    Phase 1 narrowing — codex B2 fix:
       - Walk every reference in the scope.
       - Keep refs with ``target_component_type == "Animator"``.
-      - Sort by ``(from_instance, field, target_ref)`` for determinism.
-      - First survivor's owning instance is the driver candidate.
-      - That instance's ``script_id`` IS the driver_module_guid.
-      - Driver domain = ``modules[driver_guid].domain``.
+      - Collapse refs by ``from_instance`` (one MB with two Animator
+        fields counts as a single candidate, not two).
+      - When EXACTLY ONE distinct MB has Animator refs in this scope,
+        it is the driver. Its ``script_id`` is the driver_module_guid;
+        domain comes from ``modules[driver_guid].domain``.
+      - When MULTIPLE distinct MBs have Animator refs, return ``None``
+        — Phase 1 cannot deterministically pick "the right one" without
+        extra animator identity (controller GUID + GO match). Phase 2's
+        C#-source narrowing pass will pick the writer of the clip's
+        parameter names. Until then, an ambiguous scope falls back to
+        today's server placement (consumer sees ``routing_status =
+        "unresolved"``) rather than silently misrouting.
 
-    Phase 2 will narrow candidates by scanning the candidate's C#
-    source for ``Animator.SetBool/SetTrigger/Play`` calls matching the
-    animator clip's parameters — the structurally-right algorithm
-    against today's converter shape (per the subagent + codex review).
+    ``scope_ref`` MUST be the planner-stable scope identifier (a scene
+    namespace like ``Assets/Scenes/Main.unity`` or a stable prefab id
+    like ``<guid>:Assets/Prefabs/Door.prefab``). Bare display names
+    (``"Door"``) will not resolve through scene_runtime's keying. See
+    ``EmittedAnimation`` in build_topology for the upstream contract
+    (codex B3 fix).
 
-    Returns ``None`` (driver-not-found fallback) when:
+    Returns ``None`` when:
       - ``scope_kind == "orphan"`` (no scope to walk),
       - the scope's references don't include any Animator-typed ref,
-      - or the candidate's module has a non-runtime domain
+      - multiple distinct MBs reference Animators (ambiguous; Phase 2),
+      - or the lone candidate's module has a non-runtime domain
         (``"helper"`` / ``"excluded"`` / unresolvable).
     """
     if scope_kind == "orphan":
@@ -305,30 +317,33 @@ def resolve_driver(
     modules = cast(
         dict[str, dict[str, object]], scene_runtime.get("modules", {}),
     )
-    candidates: list[tuple[str, str, str]] = []
+    # Collect distinct candidate MBs (one entry per ``from_instance``)
+    # so a single MB with multiple Animator fields counts ONCE.
+    candidate_mbs: set[str] = set()
     for ref in references:
         target_component_type = cast(
             dict[str, object], ref,
         ).get("target_component_type", "")
         if target_component_type != "Animator":
             continue
-        candidates.append(
-            (ref.get("from", ""), ref.get("field", ""), ref.get("target_ref", "")),
-        )
-    if not candidates:
+        from_instance = ref.get("from", "")
+        if from_instance:
+            candidate_mbs.add(from_instance)
+    if len(candidate_mbs) != 1:
+        # 0 candidates → no driver; 2+ → ambiguous (Phase 2 narrowing
+        # will pick the actual writer). Both return None → caller
+        # stamps ``routing_status="unresolved"``.
         return None
-    candidates.sort()
-    for from_instance, _field, _target_ref in candidates:
-        driver_guid = instance_to_script.get(from_instance, "")
-        if not driver_guid:
-            continue
-        driver_module = modules.get(driver_guid, {})
-        driver_domain_obj = driver_module.get("domain", "")
-        driver_domain = driver_domain_obj if isinstance(driver_domain_obj, str) else ""
-        if driver_domain in ("client", "server"):
-            return driver_guid, driver_domain
-        # Non-runtime domain — skip, try next candidate.
-    return None
+    from_instance = next(iter(candidate_mbs))
+    driver_guid = instance_to_script.get(from_instance, "")
+    if not driver_guid:
+        return None
+    driver_module = modules.get(driver_guid, {})
+    driver_domain_obj = driver_module.get("domain", "")
+    driver_domain = driver_domain_obj if isinstance(driver_domain_obj, str) else ""
+    if driver_domain not in ("client", "server"):
+        return None
+    return driver_guid, driver_domain
 
 
 # ---------------------------------------------------------------------------
