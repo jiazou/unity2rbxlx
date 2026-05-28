@@ -1934,6 +1934,7 @@ class TestApplyTopologyToRbxScripts:
         rbx_place.scripts = scripts
         anim_result = AnimationConversionResult()
         anim_result.emitted_animations = emitted_animations
+        from converter.code_transpiler import TranspilationResult
         pipeline.state = SimpleNamespace(
             rbx_place=rbx_place,
             animation_result=anim_result,
@@ -1944,6 +1945,11 @@ class TestApplyTopologyToRbxScripts:
             # an empty dict (pipeline.py:126); mirror that here so the
             # SimpleNamespace forge matches the prod shape.
             dependency_map={},
+            # Slice 3 round 6 (codex P2): the caller_graph
+            # preservation signal switched from dep_map truthiness to
+            # ``transpilation_result is not None``. Populate it so
+            # these tests' fresh-build path runs as expected.
+            transpilation_result=TranspilationResult(),
         )
         return pipeline
 
@@ -2299,6 +2305,7 @@ class TestApplyTopologyToRbxScripts:
             animation_result=None,  # <-- the resume signature
             guid_index=None,
             dependency_map={},
+            transpilation_result=None,  # transpile didn't run on resume
         )
 
         plan = TestApplyTopologyToRbxScripts._mk_plan()
@@ -2315,6 +2322,115 @@ class TestApplyTopologyToRbxScripts:
             rebuilt["animation_drivers"]  # type: ignore[index]
             == prior_animation_drivers
         )
+
+    def test_retranspile_with_no_edges_overwrites_prior_caller_graph(
+        self, tmp_path: Path,
+    ) -> None:
+        """Slice 3 round 6 (codex P2): a GENUINE retranspile that
+        removed the last cross-script reference ALSO leaves
+        ``state.dependency_map`` empty. Pre-round-6 my dep_map
+        truthiness signal would silently preserve the prior populated
+        caller_graph in that case — carrying forward stale callers
+        that no longer exist in the current source.
+
+        Round 6 fix: use ``state.transpilation_result is not None``
+        as the "did transpile run this invocation?" signal instead.
+        Both transpilation_result + dependency_map are set in the
+        same code path (pipeline.py:1942-1971); a populated
+        transpilation_result with empty dep_map is the legitimate
+        "ran with no edges" case — emit empty caller_graph fresh.
+        """
+        from types import SimpleNamespace
+        from converter.pipeline import Pipeline
+        from converter.animation_converter import AnimationConversionResult
+        from converter.code_transpiler import TranspilationResult
+        from core.roblox_types import RbxPlace
+        artifact = _mk_artifact(modules={
+            "guid-foo": _mk_module("Foo", "client"),
+        })
+        scene_runtime = cast("dict[str, object]", artifact)
+        # Prior conversion produced a populated caller_graph.
+        prior_caller_graph = {"guid-stale": ["guid-stale-caller"]}
+        prior_topology = {
+            "modules": {},
+            "animation_drivers": {},
+            "cross_domain_edges": [],
+            "caller_graph": prior_caller_graph,
+        }
+        scene_runtime["topology"] = prior_topology
+
+        pipeline = Pipeline.__new__(Pipeline)
+        pipeline.output_dir = tmp_path
+        rbx_place = RbxPlace()
+        rbx_place.scripts = [_mk_rbx_script("Foo", "LocalScript")]
+        anim_result = AnimationConversionResult()
+        anim_result.emitted_animations = []
+        # Key: transpilation_result IS populated → transpile ran
+        # this invocation. dep_map is empty because no cross-script
+        # references exist in current source.
+        pipeline.state = SimpleNamespace(
+            rbx_place=rbx_place,
+            animation_result=anim_result,
+            guid_index=None,
+            dependency_map={},
+            transpilation_result=TranspilationResult(),
+        )
+
+        plan = TestApplyTopologyToRbxScripts._mk_plan()
+        pipeline._build_and_apply_topology(scene_runtime, plan)
+
+        # Empty caller_graph (no stale carry-forward).
+        topo = scene_runtime["topology"]
+        assert topo["caller_graph"] == {}  # type: ignore[index]
+
+    def test_invariant_1_catches_stale_preserved_anim_driver_domain(
+        self,
+    ) -> None:
+        """Slice 3 round 6 (codex P1): preserved animation_drivers
+        copy entries verbatim while modules_block is rebuilt fresh.
+        If ``domain_overrides`` / ``networking_mode`` changed between
+        runs, a driver module's domain shifts but the preserved
+        animation driver row keeps the old domain. Invariant 1's
+        equality check (re-added in round 6) catches the
+        self-contradictory pair and aborts with a clear remediation
+        message.
+
+        Refs: build_topology.py invariant 1 equality re-add;
+        Phase 2a slice 3 round 6 review.
+        """
+        # Modules block says driver is server-domain.
+        sr = _mk_artifact(modules={
+            "guid-driver": _mk_module("Driver", "server"),
+        })
+        scripts_by_class = {
+            "Driver": _mk_rbx_script("Driver", "Script"),
+        }
+        # Preserved animation_drivers row says client (stale).
+        stale_drivers = {
+            "scope:Driver:open": {
+                "stable_id": "scope:Driver:open",
+                "routing_status": "resolved",
+                "driver_module_guid": "guid-driver",
+                "domain": "client",  # stale
+                "script_class": "LocalScript",  # stale
+                "lifecycle_role": "auto_run",
+                "observed_attribute": "open",
+                "observed_target": {
+                    "kind": "self", "name": "", "scope": "workspace",
+                },
+                "bridge_group_id": None,
+            },
+        }
+        with pytest.raises(TopologyInvariantError) as excinfo:
+            build_topology(
+                scene_runtime=sr,
+                emitted_animations=[],
+                scripts_by_class=scripts_by_class,
+                preserved_animation_drivers=stale_drivers,
+            )
+        msg = str(excinfo.value)
+        assert "invariant 1" in msg
+        assert "Re-run from convert_animations" in msg
 
     def test_assemble_no_retranspile_preserves_caller_graph(
         self, tmp_path: Path,
@@ -2358,11 +2474,14 @@ class TestApplyTopologyToRbxScripts:
         rbx_place.scripts = [_mk_rbx_script("Foo", "LocalScript")]
         anim_result = AnimationConversionResult()
         anim_result.emitted_animations = []
+        # transpilation_result=None: transpile_scripts didn't run
+        # this invocation (assemble-no-retranspile signature).
         pipeline.state = SimpleNamespace(
             rbx_place=rbx_place,
             animation_result=anim_result,
             guid_index=None,
-            dependency_map={},  # <-- empty (assemble-no-retranspile)
+            dependency_map={},
+            transpilation_result=None,
         )
 
         plan = TestApplyTopologyToRbxScripts._mk_plan()
@@ -2401,11 +2520,13 @@ class TestApplyTopologyToRbxScripts:
         rbx_place.scripts = [_mk_rbx_script("Caller", "LocalScript")]
         anim_result = AnimationConversionResult()
         anim_result.emitted_animations = []  # populated but empty
+        from converter.code_transpiler import TranspilationResult
         pipeline.state = SimpleNamespace(
             rbx_place=rbx_place,
             animation_result=anim_result,  # <-- populated, not None
             guid_index=None,
             dependency_map={"Caller": ["Target"]},
+            transpilation_result=TranspilationResult(),
         )
 
         plan = TestApplyTopologyToRbxScripts._mk_plan()

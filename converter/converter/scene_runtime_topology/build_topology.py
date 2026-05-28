@@ -909,10 +909,20 @@ def _enforce_invariants(
     # Invariant 1 + 6: applied ONLY to resolved entries. Unresolved /
     # orphan entries have empty ``driver_module_guid`` by design (Phase
     # 1 narrowing limitation / deliberate orphan) and skip both checks.
-    # The tautological "anim_domain == driver_domain" check from the
-    # earlier draft is dropped — the entry's domain is built FROM the
-    # driver's domain in ``_build_animation_drivers_block``, so the
-    # equality could never fail by construction (subagent finding #1).
+    # The anim.domain == driver_module.domain equality check was
+    # tautological at fresh-build time (the entry's domain is BUILT
+    # FROM the driver's domain in ``_build_animation_drivers_block``).
+    # Slice 3 round 4 introduced ``preserved_animation_drivers``, which
+    # copies entries verbatim while ``modules_block`` is rebuilt from
+    # current classifier output — that breaks the by-construction
+    # tautology. Codex review slice 3 round 6 P1 flagged the gap: a
+    # ``domain_overrides`` / ``networking`` edit between runs moves a
+    # driver module's domain, but the preserved animation driver row
+    # keeps the old domain. Re-add the equality check so the topology
+    # cannot ship a self-contradictory ``animation_drivers[*].domain``
+    # vs ``modules[driver_guid].domain`` pair. On the fresh-build path
+    # the check remains tautological (no perf cost beyond a dict
+    # lookup).
     for stable_id, anim in animation_drivers.items():
         status = anim.get("routing_status", "")
         if status != "resolved":
@@ -937,6 +947,19 @@ def _enforce_invariants(
                 f"resolved animation driver {stable_id!r}'s module "
                 f"{driver_guid!r} has non-runtime domain {driver_domain!r} "
                 f"(must be client or server)",
+                row=anim,
+            )
+        anim_domain = anim.get("domain", "")
+        if anim_domain != driver_domain:
+            _abort(
+                1,
+                f"resolved animation driver {stable_id!r} has "
+                f"domain={anim_domain!r} but its driver module "
+                f"{driver_guid!r} now has domain={driver_domain!r} "
+                f"— stale preserved animation_drivers on a build "
+                f"whose classifier output changed. Re-run from "
+                f"convert_animations or clear the cached topology "
+                f"to refresh the routing.",
                 row=anim,
             )
 

@@ -4166,15 +4166,24 @@ script.Disabled = true
                 pad if isinstance(pad, dict) and pad else None
             )
 
-        # Phase 2a slice 3 round 5 fix (codex P2): on
+        # Phase 2a slice 3 round 5 (codex P2): on
         # assemble-without-retranspile workflows, ``transpile_scripts``
-        # doesn't rerun and ``state.dependency_map`` stays empty. If
-        # we let build_topology derive caller_graph from the empty
-        # dep_map, the prior populated caller_graph in
-        # ``scene_runtime.topology`` gets overwritten with ``{}``.
-        # Detect this case (empty dependency_map + prior caller_graph
-        # exists) and preserve the prior.
-        if self.state.dependency_map:
+        # doesn't rerun and ``state.dependency_map`` stays empty —
+        # preserve the prior ``caller_graph`` so we don't overwrite
+        # it with ``{}``.
+        #
+        # Round 6 (codex P2): use ``transpilation_result`` rather
+        # than the dep_map's truthiness as the "did transpile run
+        # this invocation?" signal. A genuine retranspile that
+        # removes the last cross-script reference ALSO leaves
+        # dep_map empty — using dep_map alone would silently carry
+        # forward stale callers in that case. ``transpilation_result``
+        # is set IFF transpile_scripts ran this invocation (both are
+        # populated in the same code path, pipeline.py:1942-1971);
+        # an empty dep_map alongside a populated transpilation_result
+        # is the legitimate "ran with no edges" case (use the empty
+        # fresh graph, don't preserve).
+        if self.state.transpilation_result is not None:
             preserved_caller_graph = None
         else:
             pcg = prior_topology.get("caller_graph", {})
