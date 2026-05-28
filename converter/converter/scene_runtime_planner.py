@@ -1107,8 +1107,54 @@ def _build_modules_table(
 
 
 # ---------------------------------------------------------------------------
-# Shared script-by-class-name join (Phase 2a slice 4 round 3).
+# Class-name collision detection + script-by-class-name join
+# (Phase 2a slice 4 rounds 3-5).
 # ---------------------------------------------------------------------------
+
+def compute_class_name_collisions(
+    modules: dict[str, "SceneRuntimeModule | dict[str, object]"],
+) -> frozenset[str]:
+    """Return the set of ``class_name`` values that appear on more
+    than one ``SceneRuntimeModule`` row.
+
+    Phase 2a slice 4 round 5 review (Claude P1.1 + P1.2): the
+    class_name keyspace is degraded whenever two modules share a
+    class_name (e.g. two ``Utils.cs`` files declaring ``class Utils``
+    in different folders). Multiple call sites — the topology's
+    caller_graph collision detection, the planner's reachability
+    rule, the script-by-class-name join — need to make consistent
+    routing decisions for these classes. This helper is the SINGLE
+    canonical source of truth so all sites read the same set.
+
+    Pre-round-5 each consumer had its own collision walk with
+    different policies (caller_graph: fail closed if dep_map
+    touched; scripts_by_class join: unconditional exclude; reach-
+    ability rule: silent first-write-wins). The asymmetry was a
+    drift surface; collapsing it to a single set keeps the
+    contract explicit + maintainable.
+
+    The empty-class_name case is ignored (rows without a
+    class_name have nothing to collide on).
+    """
+    seen: set[str] = set()
+    collisions: set[str] = set()
+    for _script_id, module in modules.items():
+        if not isinstance(module, dict):
+            continue
+        cn_obj = module.get("class_name", "")
+        cn = cn_obj if isinstance(cn_obj, str) else ""
+        if not cn:
+            continue
+        if cn in seen:
+            collisions.add(cn)
+        else:
+            seen.add(cn)
+    return frozenset(collisions)
+
+
+# Legacy heading retained — refactored in round 5 to consume the
+# unified collision helper above. See the helper's docstring for the
+# rationale.
 
 def build_scripts_by_class_name(
     scripts: list[RbxScript],
@@ -1161,23 +1207,10 @@ def build_scripts_by_class_name(
         if s.name:
             script_by_name.setdefault(s.name, s)
 
-    # First pass: detect class_name collisions across module rows
-    # so we can exclude them from the index (slice 3 round 2
-    # degraded-service contract, applied here per slice 4 round 4
-    # review Claude P1.1).
-    seen_class_names: set[str] = set()
-    colliding_class_names: set[str] = set()
-    for _script_id, module in modules.items():
-        if not isinstance(module, dict):
-            continue
-        cn_obj = module.get("class_name", "")
-        cn = cn_obj if isinstance(cn_obj, str) else ""
-        if not cn:
-            continue
-        if cn in seen_class_names:
-            colliding_class_names.add(cn)
-        else:
-            seen_class_names.add(cn)
+    # Phase 2a slice 4 round 5 review (Claude P1.1): consume the
+    # unified class_name collision set so all class-name-keyed
+    # producers share ONE source of truth.
+    colliding_class_names = compute_class_name_collisions(modules)
 
     out: dict[str, RbxScript] = {}
     for _script_id, module in modules.items():

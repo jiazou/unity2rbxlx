@@ -887,9 +887,19 @@ def _detect_caller_graph_collisions(
     modules_in = cast(
         dict[str, dict[str, object]], scene_runtime.get("modules", {}),
     )
-    # Single walk: build class_name → list[script_id] for collision
-    # detection, then derive both the exclusion set AND the dedup'd
-    # translation index from it.
+    # Phase 2a slice 4 round 5 (Claude P1.1): consume the unified
+    # ``compute_class_name_collisions`` set so this site shares one
+    # canonical collision policy with the planner's
+    # ``build_scripts_by_class_name`` and (round 5) the reachability
+    # rule's ``class_to_script_id`` index. The dep_map-touched filter
+    # below is the SUBSET that affects caller_graph — the underlying
+    # collision detection is shared.
+    from converter.scene_runtime_planner import (
+        compute_class_name_collisions,
+    )
+    all_collisions = compute_class_name_collisions(modules_in)
+    # Still build per-class script_id lists so the log message can
+    # name the competing script_ids for operators.
     class_to_script_ids: dict[str, list[str]] = {}
     for script_id, module in modules_in.items():
         cn_obj = module.get("class_name", "")
@@ -906,9 +916,10 @@ def _detect_caller_graph_collisions(
     excluded: set[str] = set()
     class_to_script_id: dict[str, str] = {}
     for cn, sids in class_to_script_ids.items():
-        if len(sids) > 1 and cn in touched_classes:
+        # The dep-map-touched filter is what makes a collision matter
+        # for caller_graph — exclude only those.
+        if cn in all_collisions and cn in touched_classes:
             excluded.add(cn)
-            # Don't add to translation index — degraded-service rule.
             continue
         # Non-colliding (or untouched-collision): keep the first
         # script_id. setdefault preserves first-write semantics,

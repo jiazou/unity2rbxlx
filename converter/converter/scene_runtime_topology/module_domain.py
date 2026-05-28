@@ -1219,12 +1219,28 @@ def _apply_reachability_rule(
     a conflict (same helper required by both sides AND parked in
     ``ServerStorage``) excludes the helper from the runtime plan.
     """
+    # Phase 2a slice 4 round 5 review (Claude P1.2): consume the
+    # unified ``compute_class_name_collisions`` set so the rule's
+    # closure seeds + class_to_script_id index honor the same
+    # exclusion contract as ``build_scripts_by_class_name`` and
+    # ``_detect_caller_graph_collisions``. Pre-round-5 this loop
+    # used silent first-write ``setdefault`` and the closure walked
+    # colliding seeds — the same lossy class_name routing the other
+    # sites now exclude.
+    from converter.scene_runtime_planner import (
+        compute_class_name_collisions,
+    )
+    colliding_class_names = compute_class_name_collisions(modules)
     client_classes: set[str] = set()
     server_classes: set[str] = set()
     class_to_script_id: dict[str, str] = {}
     for script_id, module in modules.items():
         class_name = module.get("class_name", "")
         if not class_name:
+            continue
+        if class_name in colliding_class_names:
+            # Skip colliding class_names — same degraded-service
+            # contract used by the other two sites.
             continue
         class_to_script_id.setdefault(class_name, script_id)
         verdict = module.get("domain")
