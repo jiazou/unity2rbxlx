@@ -1115,7 +1115,8 @@ def build_scripts_by_class_name(
     modules: dict[str, "SceneRuntimeModule | dict[str, object]"],
 ) -> dict[str, RbxScript]:
     """Build a class_name-keyed RbxScript index via primary-then-
-    fallback join.
+    fallback join. EXCLUDES colliding class_names per the slice-3
+    degraded-service contract.
 
     For each ``SceneRuntimeModule`` row's ``class_name``, find the
     matching ``RbxScript`` by:
@@ -1127,15 +1128,25 @@ def build_scripts_by_class_name(
          ``class GameInit``).
 
     Misses on BOTH joins mean we cannot link the script to the
-    module — the entry is omitted from the dict.
+    module — the entry is omitted.
 
-    Phase 2a slice 4 round 2 + round 3 review (Claude P1.B): this
-    helper is the single source of truth for the join used by both
+    **Collision exclusion** (Phase 2a slice 4 round 4 review,
+    Claude P1.1): when two ``SceneRuntimeModule`` rows share a
+    ``class_name``, the class_name-keyed join is fundamentally
+    ambiguous. Following the same degraded-service policy
+    ``_detect_caller_graph_collisions`` uses (slice 3 round 2):
+    exclude the colliding class_name from the index entirely.
+    Both module rows' downstream lookups will fall through to
+    safe defaults (``script_class="ModuleScript"`` in
+    ``_build_modules_block``; orphan-routing in the reachability
+    rule); the alternative (first-write-wins) would stamp the
+    WRONG script's metadata onto the second row.
+
+    Phase 2a slice 4 round 2 + round 3 review (Claude P1.B):
+    single source of truth for the join used by both
     ``module_domain.classify_scene_runtime_domains`` (the planner's
     reachability rule) and ``pipeline._build_and_apply_topology``
-    (the topology orchestrator). Duplicating the logic across the
-    two callers was a drift surface — extracting it here keeps both
-    paths in lock-step.
+    (the topology orchestrator).
 
     Behavior note: scripts with empty ``name`` are skipped (they
     can't be addressed via the join). Scripts present in ``scripts``
@@ -1149,6 +1160,25 @@ def build_scripts_by_class_name(
     for s in scripts:
         if s.name:
             script_by_name.setdefault(s.name, s)
+
+    # First pass: detect class_name collisions across module rows
+    # so we can exclude them from the index (slice 3 round 2
+    # degraded-service contract, applied here per slice 4 round 4
+    # review Claude P1.1).
+    seen_class_names: set[str] = set()
+    colliding_class_names: set[str] = set()
+    for _script_id, module in modules.items():
+        if not isinstance(module, dict):
+            continue
+        cn_obj = module.get("class_name", "")
+        cn = cn_obj if isinstance(cn_obj, str) else ""
+        if not cn:
+            continue
+        if cn in seen_class_names:
+            colliding_class_names.add(cn)
+        else:
+            seen_class_names.add(cn)
+
     out: dict[str, RbxScript] = {}
     for _script_id, module in modules.items():
         if not isinstance(module, dict):
@@ -1156,6 +1186,10 @@ def build_scripts_by_class_name(
         cn_obj = module.get("class_name", "")
         cn = cn_obj if isinstance(cn_obj, str) else ""
         if not cn:
+            continue
+        if cn in colliding_class_names:
+            # Degraded-service exclusion: ambiguous class_name →
+            # consumers fall through to safe defaults.
             continue
         # Primary join: script.name == class_name.
         joined = script_by_name.get(cn)
@@ -1166,7 +1200,7 @@ def build_scripts_by_class_name(
             if stem:
                 joined = script_by_name.get(stem)
         if joined is not None:
-            out.setdefault(cn, joined)
+            out[cn] = joined  # no setdefault — collisions already excluded
     return out
 
 

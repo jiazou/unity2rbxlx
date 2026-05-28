@@ -543,6 +543,48 @@ class TestTopologyEmissionShape:
         signals = helper_module.get("domain_signals", {})
         assert signals.get("reachability_forced_container") == "ReplicatedStorage"
 
+    def test_build_scripts_by_class_name_excludes_collisions(
+        self,
+    ) -> None:
+        """Slice 4 round 4 review (Claude P1.1): when two
+        ``SceneRuntimeModule`` rows share a ``class_name`` (e.g. two
+        ``Utils.cs`` files declaring ``class Utils``), the helper
+        EXCLUDES the colliding name from the index. Both modules'
+        downstream lookups fall through to safe defaults rather than
+        the first-write-wins case silently stamping the WRONG
+        script's metadata onto the second module.
+
+        Mirrors slice 3 round 2's degraded-service contract in
+        ``_detect_caller_graph_collisions``.
+
+        Refs: scene_runtime_planner.build_scripts_by_class_name
+        collision exclusion; Phase 2a slice 4 round 4 review.
+        """
+        from converter.scene_runtime_planner import (
+            build_scripts_by_class_name,
+        )
+        modules: dict[str, dict[str, object]] = {
+            "guid-first": {"stem": "Utils", "class_name": "Utils"},
+            "guid-second": {
+                # Different stem → different file, same class_name.
+                "stem": "Utils2", "class_name": "Utils",
+            },
+            "guid-noconflict": {"stem": "Foo", "class_name": "Foo"},
+        }
+        scripts = [
+            RbxScript(name="Utils", source="", script_type="ModuleScript"),
+            RbxScript(name="Utils2", source="", script_type="LocalScript"),
+            RbxScript(name="Foo", source="", script_type="Script"),
+        ]
+        result = build_scripts_by_class_name(scripts, modules)
+        # Colliding class_name is EXCLUDED entirely (neither
+        # first-write nor last-write wins — both modules fall through
+        # to ModuleScript defaults downstream).
+        assert "Utils" not in result
+        # Non-colliding class_name passes through normally.
+        assert "Foo" in result
+        assert result["Foo"].name == "Foo"
+
     def test_build_scripts_by_class_name_helper(self) -> None:
         """Slice 4 round 3 review (Claude P1.A): the shared
         ``build_scripts_by_class_name`` helper joins modules' class_name
