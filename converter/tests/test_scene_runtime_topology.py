@@ -357,6 +357,206 @@ class TestTopologyEmissionShape:
         assert entry["reachability_forced_container"] == "ReplicatedStorage"
         assert entry["module_path"] == "ReplicatedStorage.Helper"
 
+    def test_planner_rule_end_to_end_satisfies_invariant_10(self) -> None:
+        """Slice 4 round 1 review (Claude P1.3): drive the planner's
+        ``_apply_reachability_rule`` end-to-end (via
+        ``classify_scene_runtime_domains``) on a client-module +
+        server-container-helper + require-edge fixture. Assert the
+        planner produces a triple-write that invariant 10 accepts.
+
+        Without this, a planner regression that splits the
+        triple-write into a non-atomic shape (the exact codex P1.1
+        failure mode) would not be caught by the unit tests — they
+        seed planner-side fields directly and never exercise the
+        rule.
+
+        Refs: module_domain.py:_apply_reachability_rule;
+        build_topology.py invariant 10.
+        """
+        from converter.scene_runtime_domain import (
+            classify_scene_runtime_domains,
+        )
+        # Set up: client module (HudControl) that requires a helper
+        # (HelperLib) — helper starts in ServerStorage (the pre-rule
+        # state), rule should hoist it to ReplicatedStorage.
+        sr = _mk_artifact(modules={
+            "guid-hud": _mk_module("HudControl", "client"),
+            "guid-helper": {
+                "stem": "HelperLib", "class_name": "HelperLib",
+                "runtime_bearing": False,
+                "is_loader": False, "character_attached": False,
+            },
+        })
+        # Helper script lives in ServerStorage pre-rule; rule should
+        # hoist it.
+        helper_script = RbxScript(
+            name="HelperLib", source="-- helper",
+            script_type="ModuleScript",
+            parent_path="ServerStorage",
+        )
+        hud_script = _mk_rbx_script("HudControl", "LocalScript")
+        scripts = [helper_script, hud_script]
+        dependency_map = {"HudControl": ["HelperLib"]}
+
+        # Run the planner's classification (includes
+        # _apply_reachability_rule).
+        classify_scene_runtime_domains(
+            cast("dict", sr),
+            scripts,
+            dependency_map=dependency_map,
+        )
+
+        # Now build topology and assert invariant 10 passes (no abort).
+        artifact = build_topology(
+            scene_runtime=sr,
+            emitted_animations=[],
+            scripts_by_class={
+                "HudControl": hud_script,
+                "HelperLib": helper_script,
+            },
+        )
+        # The rule should have fired on HelperLib.
+        helper_entry = artifact["modules"]["guid-helper"]
+        assert helper_entry["reachability_required_container"] == (
+            "ReplicatedStorage"
+        )
+        assert helper_entry["reachability_forced_container"] == (
+            "ReplicatedStorage"
+        )
+        assert helper_entry["module_path"] == (
+            "ReplicatedStorage.HelperLib"
+        )
+
+    def test_planner_rule_skips_when_script_name_empty(self) -> None:
+        """Slice 4 round 1 review (Claude P1.1): when the rule fires
+        on a helper whose `script.name == ""`, the planner now SKIPS
+        the entire triple-stamp (gated atomically). Result: the
+        helper stays in its pre-rule container without a half-stamped
+        row, and invariant 10 accepts the artifact (all three fields
+        empty).
+
+        Refs: module_domain.py _apply_reachability_rule guard;
+        Phase 2a slice 4 round 1 review.
+        """
+        from converter.scene_runtime_domain import (
+            classify_scene_runtime_domains,
+        )
+        sr = _mk_artifact(modules={
+            "guid-hud": _mk_module("HudControl", "client"),
+            "guid-noname-helper": {
+                "stem": "NoNameHelper", "class_name": "NoNameHelper",
+                "runtime_bearing": False,
+                "is_loader": False, "character_attached": False,
+            },
+        })
+        # Helper script has empty name (synthetic / stub).
+        helper_script = RbxScript(
+            name="", source="-- helper",
+            script_type="ModuleScript",
+            parent_path="ServerStorage",
+        )
+        hud_script = _mk_rbx_script("HudControl", "LocalScript")
+        scripts = [helper_script, hud_script]
+        dependency_map = {"HudControl": ["NoNameHelper"]}
+
+        classify_scene_runtime_domains(
+            cast("dict", sr),
+            scripts,
+            dependency_map=dependency_map,
+        )
+
+        # build_topology should NOT abort — the planner skipped the
+        # stamp, so all three fields are empty (consistent state).
+        artifact = build_topology(
+            scene_runtime=sr,
+            emitted_animations=[],
+            scripts_by_class={
+                "HudControl": hud_script,
+                "NoNameHelper": helper_script,
+            },
+        )
+        helper_entry = artifact["modules"]["guid-noname-helper"]
+        # All three reachability fields empty (rule didn't stamp).
+        assert helper_entry["reachability_required_container"] == ""
+        assert helper_entry["reachability_forced_container"] == ""
+
+    def test_invariant_10_module_path_equals_container_is_legal(
+        self,
+    ) -> None:
+        """Slice 4 round 1 review (Claude P1.2): invariant 10 must
+        accept ``module_path == reachability_required_container``
+        (a top-level container row with no module suffix). The
+        pre-fix ``startswith(f"{required}.")`` check rejected this
+        legitimate shape AND would have false-positively accepted a
+        sibling-container prefix.
+
+        Refs: build_topology.py invariant 10 module_path check;
+        Phase 2a slice 4 round 1 review.
+        """
+        from converter.scene_runtime_topology.build_topology import (
+            _enforce_invariants,
+        )
+        artifact = {
+            "modules": {
+                "guid-helper": {
+                    "stem": "Helper", "domain": "helper",
+                    "script_class": "ModuleScript",
+                    "lifecycle_role": "requireable",
+                    "character_attached": False, "is_loader": False,
+                    "bridge_group_id": None, "provenance": {},
+                    "reachability_required_container": "ReplicatedStorage",
+                    "module_path": "ReplicatedStorage",  # exact match — legal
+                    "reachability_forced_container": "ReplicatedStorage",
+                },
+            },
+            "animation_drivers": {},
+            "cross_domain_edges": [],
+            "caller_graph": {},
+        }
+        # Should not raise.
+        _enforce_invariants(
+            cast("dict", artifact),
+            emitted_animations=[],
+            scene_runtime=_mk_artifact(),
+        )
+
+    def test_invariant_10_rejects_sibling_container_prefix(
+        self,
+    ) -> None:
+        """Slice 4 round 1 review (Claude P1.2): the relaxed
+        ``module_path == required OR startswith(required + ".")`` check
+        must NOT false-positively accept a sibling-container prefix
+        like ``"ReplicatedStorageOther.Helper"`` (which would slip
+        through a bare ``startswith(required)`` without the dot).
+        """
+        from converter.scene_runtime_topology.build_topology import (
+            _enforce_invariants,
+        )
+        artifact = {
+            "modules": {
+                "guid-helper": {
+                    "stem": "Helper", "domain": "helper",
+                    "script_class": "ModuleScript",
+                    "lifecycle_role": "requireable",
+                    "character_attached": False, "is_loader": False,
+                    "bridge_group_id": None, "provenance": {},
+                    "reachability_required_container": "ReplicatedStorage",
+                    "module_path": "ReplicatedStorageOther.Helper",
+                    "reachability_forced_container": "ReplicatedStorage",
+                },
+            },
+            "animation_drivers": {},
+            "cross_domain_edges": [],
+            "caller_graph": {},
+        }
+        with pytest.raises(TopologyInvariantError) as excinfo:
+            _enforce_invariants(
+                cast("dict", artifact),
+                emitted_animations=[],
+                scene_runtime=_mk_artifact(),
+            )
+        assert "invariant 10" in str(excinfo.value)
+
     def test_door_shape_emits_resolved_animation_driver(self) -> None:
         """Door scenario: 1 prefab + 1 MonoBehaviour holding an Animator
         ref + 1 emitted animation → resolved driver + client placement.

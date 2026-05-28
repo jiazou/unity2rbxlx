@@ -1258,6 +1258,27 @@ def _apply_reachability_rule(
                         excluded.append(module_id)
                 continue
             # Client-only-reach: hoist to ReplicatedStorage.
+            # Phase 2a slice 4 round 1 review (Claude P1): the
+            # planner's reachability triple-write — container,
+            # module_path, reachability_forced_container — MUST be
+            # atomic. Previously module_path was gated on
+            # ``script.name`` while container + forced were not,
+            # producing a non-lockstep state that the topology's
+            # invariant 10 then correctly rejected. Gate the
+            # ENTIRE stamp + the parent_path mutation on
+            # ``script.name`` so an empty-name script (rare, but
+            # possible when a synthetic / stub RbxScript reaches the
+            # rule) is left at its pre-rule state instead of
+            # producing a half-stamped row that would fail closed
+            # downstream.
+            if not script.name:
+                # Without a script.name we cannot resolve the
+                # module_path at runtime (host's resolveModule
+                # needs the dotted path). Leave the helper in its
+                # original container — it stays unreachable from
+                # the client require graph but the build doesn't
+                # silently produce a broken triple.
+                continue
             script.parent_path = REPLICATED_STORAGE
             module_id = class_to_script_id.get(helper_class)
             if module_id and module_id in modules:
@@ -1272,10 +1293,9 @@ def _apply_reachability_rule(
                 # still resolved to ``ServerStorage.X`` at runtime and
                 # silently failed. Use the same naming convention as
                 # ``_stamp_container_and_path``.
-                if script.name:
-                    module_row["module_path"] = (
-                        f"{REPLICATED_STORAGE}.{script.name}"
-                    )
+                module_row["module_path"] = (
+                    f"{REPLICATED_STORAGE}.{script.name}"
+                )
                 signals = cast(
                     SceneRuntimeDomainSignals,
                     module_row.get("domain_signals", {}),

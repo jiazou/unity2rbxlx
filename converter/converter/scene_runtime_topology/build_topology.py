@@ -1277,15 +1277,26 @@ def _enforce_invariants(
                 f"— planner stamps both with the same container",
                 row=mod_entry,
             )
-        if required and not module_path_v.startswith(f"{required}."):
+        # Slice 4 round 1 review (Claude P1.2): accept BOTH
+        # ``module_path == required`` (the container itself, no
+        # module suffix — e.g. a top-level container row) AND
+        # ``module_path.startswith(f"{required}.")`` (the strict
+        # child case). The pre-fix `startswith(f"{required}.")`
+        # rejected the legitimate exact-match case AND a bare
+        # `startswith(required)` would false-positive on a
+        # sibling-container prefix like ``ReplicatedStorageOther.X``.
+        if required and module_path_v != required and not (
+            module_path_v.startswith(f"{required}.")
+        ):
             _abort(
                 10,
                 f"module {guid!r} has reachability_required_container="
                 f"{required!r} but module_path={module_path_v!r} does "
-                f"not start with that container — the planner's "
-                f"codex P1.1 fix rewrites module_path together with "
-                f"the rule's container so the host's resolveModule "
-                f"call lands at the actually-hoisted location",
+                f"not equal the container nor start with that "
+                f"container plus a dot — the planner's codex P1.1 fix "
+                f"rewrites module_path together with the rule's "
+                f"container so the host's resolveModule call lands at "
+                f"the actually-hoisted location",
                 row=mod_entry,
             )
 
