@@ -25,7 +25,10 @@
       "domain": "client",
       "is_loader": false,
       "lifecycle_role": "auto_run",
+      "module_path": "",
       "provenance": {},
+      "reachability_forced_container": "",
+      "reachability_required_container": "",
       "script_class": "LocalScript",
       "stem": "AnimatorTarget"
     },
@@ -35,7 +38,10 @@
       "domain": "client",
       "is_loader": false,
       "lifecycle_role": "auto_run",
+      "module_path": "",
       "provenance": {},
+      "reachability_forced_container": "",
+      "reachability_required_container": "",
       "script_class": "LocalScript",
       "stem": "Door"
     },
@@ -45,7 +51,10 @@
       "domain": "client",
       "is_loader": false,
       "lifecycle_role": "auto_run",
+      "module_path": "",
       "provenance": {},
+      "reachability_forced_container": "",
+      "reachability_required_container": "",
       "script_class": "LocalScript",
       "stem": "HudControl"
     },
@@ -55,7 +64,10 @@
       "domain": "server",
       "is_loader": false,
       "lifecycle_role": "auto_run",
+      "module_path": "",
       "provenance": {},
+      "reachability_forced_container": "",
+      "reachability_required_container": "",
       "script_class": "Script",
       "stem": "SpawnManager"
     }

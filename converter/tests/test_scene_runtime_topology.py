@@ -296,6 +296,67 @@ class TestTopologyEmissionShape:
         assert entry["is_loader"] is True
         assert entry["lifecycle_role"] == "loader"
 
+    def test_reachability_triple_empty_when_rule_did_not_fire(self) -> None:
+        """Slice 4: a module with no reachability rule firing has
+        all three reachability fields empty. The planner's
+        ``_apply_reachability_rule`` mutates these atomically only on
+        client-required helpers in server containers; everywhere else
+        the planner leaves them absent and topology mirrors that as
+        empty strings.
+
+        Refs: build_topology.py reachability-triple stamp;
+        Phase 2a slice 4.
+        """
+        sr = _mk_artifact(modules={
+            "guid-x": _mk_module("HudControl", "client"),
+        })
+        scripts_by_class = {
+            "HudControl": _mk_rbx_script("HudControl", "LocalScript"),
+        }
+        artifact = build_topology(
+            scene_runtime=sr,
+            emitted_animations=[],
+            scripts_by_class=scripts_by_class,
+        )
+        entry = artifact["modules"]["guid-x"]
+        assert entry["reachability_required_container"] == ""
+        assert entry["module_path"] == ""
+        assert entry["reachability_forced_container"] == ""
+
+    def test_reachability_triple_populated_when_rule_fired(self) -> None:
+        """Slice 4: when the planner's reachability rule fires on a
+        module, topology mirrors all three coordinated fields. The
+        test seeds the planner-side fields directly (simulating the
+        post-_apply_reachability_rule state) and asserts the
+        TopologyModuleEntry surfaces them.
+
+        Refs: module_domain.py:1261-1284 (planner triple-write);
+        build_topology.py reachability-triple stamp.
+        """
+        sr = _mk_artifact(modules={
+            "guid-helper": {
+                "stem": "Helper", "class_name": "Helper",
+                "runtime_bearing": True,
+                "domain": "helper",
+                "container": "ReplicatedStorage",
+                "module_path": "ReplicatedStorage.Helper",
+                "domain_signals": {
+                    "reachability_forced_container": "ReplicatedStorage",
+                },
+                "character_attached": False,
+                "is_loader": False,
+            },
+        })
+        artifact = build_topology(
+            scene_runtime=sr,
+            emitted_animations=[],
+            scripts_by_class={},
+        )
+        entry = artifact["modules"]["guid-helper"]
+        assert entry["reachability_required_container"] == "ReplicatedStorage"
+        assert entry["reachability_forced_container"] == "ReplicatedStorage"
+        assert entry["module_path"] == "ReplicatedStorage.Helper"
+
     def test_door_shape_emits_resolved_animation_driver(self) -> None:
         """Door scenario: 1 prefab + 1 MonoBehaviour holding an Animator
         ref + 1 emitted animation → resolved driver + client placement.
@@ -663,6 +724,139 @@ class TestTopologyInvariants:
             scene_runtime=sr, emitted_animations=[], scripts_by_class={},
         )
         assert "guid-helper" in artifact["modules"]
+
+    def test_invariant_10_reachability_required_without_forced_aborts(
+        self,
+    ) -> None:
+        """Slice 4: a hand-edited or refactor-split artifact where
+        ``reachability_required_container`` is populated but
+        ``reachability_forced_container`` is empty fails closed —
+        the planner stamps both atomically.
+
+        Refs: build_topology.py invariant 10; Phase 2a slice 4.
+        """
+        sr = _mk_artifact(modules={
+            "guid-helper": {
+                "stem": "Helper", "class_name": "Helper",
+                "runtime_bearing": True,
+                "domain": "helper",
+                "container": "ReplicatedStorage",
+                "module_path": "ReplicatedStorage.Helper",
+                # Hand-edited: required is populated but forced is missing.
+                "domain_signals": {},
+                "character_attached": False,
+                "is_loader": False,
+            },
+        })
+        # _build_modules_block reads from planner -> entry has
+        # required="" and forced="" both empty (consistent). The
+        # invariant 10 mismatch test requires an artifact whose ENTRY
+        # has the mismatch. Test by manually constructing the entry +
+        # invoking _enforce_invariants directly.
+        from converter.scene_runtime_topology.build_topology import (
+            _enforce_invariants,
+        )
+        artifact = {
+            "modules": {
+                "guid-helper": {
+                    "stem": "Helper", "domain": "helper",
+                    "script_class": "ModuleScript",
+                    "lifecycle_role": "requireable",
+                    "character_attached": False, "is_loader": False,
+                    "bridge_group_id": None, "provenance": {},
+                    "reachability_required_container": "ReplicatedStorage",
+                    "module_path": "ReplicatedStorage.Helper",
+                    "reachability_forced_container": "",  # mismatch
+                },
+            },
+            "animation_drivers": {},
+            "cross_domain_edges": [],
+            "caller_graph": {},
+        }
+        with pytest.raises(TopologyInvariantError) as excinfo:
+            _enforce_invariants(
+                cast("dict", artifact),
+                emitted_animations=[],
+                scene_runtime=sr,
+            )
+        msg = str(excinfo.value)
+        assert "invariant 10" in msg
+        assert "mismatched reachability fields" in msg
+
+    def test_invariant_10_reachability_divergent_values_aborts(
+        self,
+    ) -> None:
+        """Slice 4: if the two reachability fields are both populated
+        but point at different containers, invariant 10 catches the
+        divergence (planner always stamps them with the same value)."""
+        from converter.scene_runtime_topology.build_topology import (
+            _enforce_invariants,
+        )
+        artifact = {
+            "modules": {
+                "guid-helper": {
+                    "stem": "Helper", "domain": "helper",
+                    "script_class": "ModuleScript",
+                    "lifecycle_role": "requireable",
+                    "character_attached": False, "is_loader": False,
+                    "bridge_group_id": None, "provenance": {},
+                    "reachability_required_container": "ReplicatedStorage",
+                    "module_path": "ReplicatedStorage.Helper",
+                    "reachability_forced_container": "ServerStorage",  # divergent
+                },
+            },
+            "animation_drivers": {},
+            "cross_domain_edges": [],
+            "caller_graph": {},
+        }
+        with pytest.raises(TopologyInvariantError) as excinfo:
+            _enforce_invariants(
+                cast("dict", artifact),
+                emitted_animations=[],
+                scene_runtime=_mk_artifact(),
+            )
+        msg = str(excinfo.value)
+        assert "invariant 10" in msg
+        assert "divergent" in msg
+
+    def test_invariant_10_module_path_must_start_with_container(
+        self,
+    ) -> None:
+        """Slice 4: when reachability fired, ``module_path`` MUST
+        start with the rule's container value. Pre-slice-4 codex P1.1
+        at module_domain.py:1266-1278 fixed a host-resolve bug where
+        the rule moved the container but left module_path pointing at
+        the old location. Invariant 10 codifies the constraint.
+        """
+        from converter.scene_runtime_topology.build_topology import (
+            _enforce_invariants,
+        )
+        artifact = {
+            "modules": {
+                "guid-helper": {
+                    "stem": "Helper", "domain": "helper",
+                    "script_class": "ModuleScript",
+                    "lifecycle_role": "requireable",
+                    "character_attached": False, "is_loader": False,
+                    "bridge_group_id": None, "provenance": {},
+                    "reachability_required_container": "ReplicatedStorage",
+                    "module_path": "ServerStorage.Helper",  # stale
+                    "reachability_forced_container": "ReplicatedStorage",
+                },
+            },
+            "animation_drivers": {},
+            "cross_domain_edges": [],
+            "caller_graph": {},
+        }
+        with pytest.raises(TopologyInvariantError) as excinfo:
+            _enforce_invariants(
+                cast("dict", artifact),
+                emitted_animations=[],
+                scene_runtime=_mk_artifact(),
+            )
+        msg = str(excinfo.value)
+        assert "invariant 10" in msg
+        assert "module_path" in msg
 
     def test_invariant_8_loader_role_with_false_is_loader_aborts(
         self,
