@@ -4154,6 +4154,12 @@ script.Disabled = true
                 ),
                 scripts_by_class=scripts_by_class,
                 guid_index=self.state.guid_index,
+                # Phase 2a slice 3: pass the planner's class-keyed
+                # dependency_map so build_topology can curate it into
+                # the artifact's `caller_graph` (script_id-keyed
+                # incoming-edge view). `None` is treated as empty
+                # graph — back-compat for callers pre-dating slice 3.
+                dependency_map=self.state.dependency_map or None,
             )
         except Exception as exc:
             # Topology invariants are fail-closed by design, but

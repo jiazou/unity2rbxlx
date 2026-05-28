@@ -16,6 +16,7 @@
       "stable_id": "guid-door-prefab%3AAssets%2FPrefabs%2FDoor.prefab:Door:door_open"
     }
   },
+  "caller_graph": {},
   "cross_domain_edges": [],
   "modules": {
     "guid-animator-target": {

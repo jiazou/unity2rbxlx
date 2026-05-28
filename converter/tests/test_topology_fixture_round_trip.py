@@ -328,6 +328,30 @@ class TestFixtureSchema:
                 f"{sorted(valid_domains)!r}"
             )
 
+    def test_caller_graph_is_dict_of_lists(self) -> None:
+        """The slice-3 ``caller_graph`` block is a dict[str, list[str]].
+        Empty in the SimpleFPS-minimal fixture (none of Door /
+        AnimatorTarget / HudControl / SpawnManager require each other)
+        — slices that exercise inter-module dependencies will populate
+        the field in the same commit they extend the scenario.
+        """
+        loaded = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+        assert "caller_graph" in loaded, (
+            "fixture is missing slice-3 `caller_graph` field — "
+            "regenerate via --regen"
+        )
+        graph = loaded["caller_graph"]
+        assert isinstance(graph, dict), f"caller_graph not a dict: {type(graph)}"
+        for k, v in graph.items():
+            assert isinstance(k, str), f"caller_graph key not str: {k!r}"
+            assert isinstance(v, list), (
+                f"caller_graph[{k!r}] not a list: {type(v)}"
+            )
+            for item in v:
+                assert isinstance(item, str), (
+                    f"caller_graph[{k!r}] item not str: {item!r}"
+                )
+
     def test_script_class_in_closed_set(self) -> None:
         """`script_class` field on modules is one of `Script` /
         `LocalScript` / `ModuleScript`; on animation_drivers it's a

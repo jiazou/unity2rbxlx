@@ -53,6 +53,7 @@ from converter.scene_runtime_topology.build_topology import (  # noqa: E402
     EmittedAnimation,
     TopologyInvariantError,
     build_topology,
+    callers_of,
 )
 from converter.scene_runtime_topology.cross_domain_edges import (  # noqa: E402
     deterministic_edge_id,
@@ -1663,6 +1664,117 @@ class TestBuildAnimationDriverEntry:
 # end-to-end flow at runtime).
 # ===========================================================================
 
+
+# ===========================================================================
+# CATEGORY 7: caller_graph curation (Phase 2a slice 3)
+# ===========================================================================
+
+class TestCallerGraphCuration:
+    """``_build_caller_graph_block`` + the ``callers_of`` accessor.
+
+    Refs: build_topology.py:_build_caller_graph_block, callers_of;
+    Phase 2a slice 3 in the design doc.
+    """
+
+    def test_empty_dependency_map_emits_empty_graph(self) -> None:
+        """``dependency_map=None`` and ``dependency_map={}`` both produce
+        an empty ``caller_graph`` — back-compat for Phase 1 callers and
+        legacy-mode invocations."""
+        sr = _mk_artifact(modules={
+            "guid-foo": _mk_module("Foo", "client"),
+        })
+        artifact_none = build_topology(
+            scene_runtime=sr,
+            emitted_animations=[],
+            scripts_by_class={},
+            dependency_map=None,
+        )
+        artifact_empty = build_topology(
+            scene_runtime=sr,
+            emitted_animations=[],
+            scripts_by_class={},
+            dependency_map={},
+        )
+        assert artifact_none["caller_graph"] == {}
+        assert artifact_empty["caller_graph"] == {}
+
+    def test_inverts_outgoing_to_incoming_edges(self) -> None:
+        """Planner's outgoing form ``{Foo: [Bar]}`` (Foo requires Bar)
+        curates to incoming form ``{guid-bar: [guid-foo]}`` (Bar is
+        required-by Foo). Translation by class_name → script_id index
+        from ``scene_runtime.modules``."""
+        sr = _mk_artifact(modules={
+            "guid-foo": _mk_module("Foo", "client"),
+            "guid-bar": _mk_module("Bar", "client"),
+        })
+        artifact = build_topology(
+            scene_runtime=sr,
+            emitted_animations=[],
+            scripts_by_class={},
+            dependency_map={"Foo": ["Bar"]},
+        )
+        graph = artifact["caller_graph"]
+        assert graph == {"guid-bar": ["guid-foo"]}
+
+    def test_multiple_callers_aggregate_under_one_callee(self) -> None:
+        """Two callers requiring the same callee land in the callee's
+        list. Duplicates from a caller requiring the same callee twice
+        are deduplicated."""
+        sr = _mk_artifact(modules={
+            "guid-foo": _mk_module("Foo", "client"),
+            "guid-baz": _mk_module("Baz", "client"),
+            "guid-bar": _mk_module("Bar", "client"),
+        })
+        # Both Foo and Baz require Bar; Foo also lists Bar twice.
+        dep_map = {"Foo": ["Bar", "Bar"], "Baz": ["Bar"]}
+        artifact = build_topology(
+            scene_runtime=sr,
+            emitted_animations=[],
+            scripts_by_class={},
+            dependency_map=dep_map,
+        )
+        callers = sorted(artifact["caller_graph"]["guid-bar"])
+        assert callers == ["guid-baz", "guid-foo"]
+
+    def test_unknown_class_in_dep_map_skipped(self) -> None:
+        """A class in dependency_map that has no corresponding
+        ``scene_runtime.modules`` row is skipped (no topology row to
+        reference). Skips both caller-side (caller not in modules) and
+        callee-side (callee not in modules)."""
+        sr = _mk_artifact(modules={
+            "guid-foo": _mk_module("Foo", "client"),
+        })
+        # Foo→External: callee not in modules; skipped.
+        # External→Foo: caller not in modules; skipped.
+        dep_map = {"Foo": ["External"], "External": ["Foo"]}
+        artifact = build_topology(
+            scene_runtime=sr,
+            emitted_animations=[],
+            scripts_by_class={},
+            dependency_map=dep_map,
+        )
+        # Neither edge survived translation → empty graph.
+        assert artifact["caller_graph"] == {}
+
+    def test_callers_of_helper_returns_list_for_known_id(self) -> None:
+        """``callers_of(script_id, caller_graph)`` returns the caller
+        list for a known script_id. Empty list for unknown id (orphan
+        module — design doc decision tree treats no-callers same as
+        absent from graph)."""
+        graph = {"guid-bar": ["guid-foo", "guid-baz"]}
+        assert callers_of("guid-bar", graph) == ["guid-foo", "guid-baz"]
+        assert callers_of("guid-unknown", graph) == []
+
+    def test_callers_of_returns_fresh_list(self) -> None:
+        """``callers_of`` returns a fresh list so a consumer can mutate
+        without affecting the artifact."""
+        graph = {"guid-bar": ["guid-foo"]}
+        result = callers_of("guid-bar", graph)
+        result.append("guid-mutated")
+        # Original graph unchanged.
+        assert graph["guid-bar"] == ["guid-foo"]
+
+
 class TestApplyTopologyToRbxScripts:
     """Drive ``Pipeline._build_and_apply_topology`` against synthetic
     fixtures + assert the RbxScript mutations + plan-bucket patches
@@ -1701,6 +1813,12 @@ class TestApplyTopologyToRbxScripts:
             rbx_place=rbx_place,
             animation_result=anim_result,
             guid_index=None,
+            # Phase 2a slice 3 added `dependency_map` to the
+            # _build_and_apply_topology read set so build_topology can
+            # curate the caller_graph. Real PipelineState defaults to
+            # an empty dict (pipeline.py:126); mirror that here so the
+            # SimpleNamespace forge matches the prod shape.
+            dependency_map={},
         )
         return pipeline
 

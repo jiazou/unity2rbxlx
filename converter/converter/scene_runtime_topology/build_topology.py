@@ -248,11 +248,24 @@ class TopologyArtifact(TypedDict, total=False):
     per design doc open-question D4 (option b). A future relocation to
     a sibling file is a one-file change provided consumers go through
     the package's accessor surface (not direct dict indexing).
+
+    ``caller_graph`` (Phase 2a slice 3) is the curated dependency-graph
+    view: for each runtime-bearing module's ``script_id``, the list of
+    script_ids that ``require()`` it. INCOMING edges only — the
+    inverse of ``state.dependency_map``'s outgoing form. Slice 5's
+    ``script_storage`` rewrite reads this to satisfy the design doc's
+    ``callers_of(script, structural_inputs.caller_graph)`` decision-
+    tree term WITHOUT re-deriving graph shape from source. Empty in
+    legacy mode (build_topology is gated on
+    ``scene_runtime_mode != "legacy"`` at the call site); for legacy
+    mode `storage_classifier`'s parallel source-scan path remains the
+    single source of caller info.
     """
 
     modules: dict[str, TopologyModuleEntry]
     animation_drivers: dict[str, AnimationDriverEntry]
     cross_domain_edges: list[CrossDomainEdge]
+    caller_graph: dict[str, list[str]]
 
 
 # ---------------------------------------------------------------------------
@@ -283,6 +296,7 @@ def build_topology(
     emitted_animations: list[EmittedAnimation],
     scripts_by_class: dict[str, RbxScript],
     guid_index: GuidIndex | None = None,
+    dependency_map: dict[str, list[str]] | None = None,
 ) -> TopologyArtifact:
     """Assemble the topology artifact + enforce 6 emit-time invariants.
 
@@ -294,6 +308,15 @@ def build_topology(
     animation_converter produces; for Phase 1 callers that haven't
     migrated yet, pass an empty list and the animation_drivers block
     stays empty (Phase 1 invariant 3 still applies).
+
+    ``dependency_map`` is the planner's class_name → required class_names
+    map (the same source ``classify_storage`` already uses). Phase 2a
+    slice 3 curates it into the ``caller_graph`` artifact field
+    (inverted + class_name → script_id translated) so slice 5's
+    ``script_storage`` rewrite reads a single canonical caller surface.
+    ``None`` (the default) emits an empty ``caller_graph`` — back-compat
+    for Phase 1 callers that pre-date slice 3 and for legacy-mode
+    invocations.
 
     Returns the artifact dict ready to merge into
     ``scene_runtime["topology"]``.
@@ -309,11 +332,15 @@ def build_topology(
     animation_drivers_block = _build_animation_drivers_block(
         scene_runtime, emitted_animations,
     )
+    caller_graph_block = _build_caller_graph_block(
+        scene_runtime, dependency_map,
+    )
 
     artifact: TopologyArtifact = {
         "modules": modules_block,
         "animation_drivers": animation_drivers_block,
         "cross_domain_edges": edges_block,
+        "caller_graph": caller_graph_block,
     }
 
     # Invariants run AFTER assembly so they can cross-reference blocks.
@@ -518,6 +545,87 @@ def _build_animation_drivers_block(
             len(unresolved_rows), unresolved_rows[:5],
         )
     return out
+
+
+def _build_caller_graph_block(
+    scene_runtime: SceneRuntimeArtifact,
+    dependency_map: dict[str, list[str]] | None,
+) -> dict[str, list[str]]:
+    """Curate the planner's outgoing dependency_map into the topology's
+    incoming ``caller_graph`` view.
+
+    Input ``dependency_map`` shape: ``class_name -> [required class_names]``
+    — the same outgoing form ``classify_storage`` consumes today
+    (pipeline.py:1942-1950 builds it during transpile_scripts).
+
+    Output shape: ``script_id -> [list of caller script_ids]`` — INCOMING
+    edges, keyed by canonical id (the planner's GUID-keyed
+    ``scene_runtime.modules`` key). Slice 5's ``_decide_script_container``
+    rewrite reads ``callers_of(script, caller_graph)`` per the design
+    doc decision tree (lines 290-306) — keyed by script_id matches the
+    rest of the topology artifact's canonical id contract.
+
+    Translation step (class_name -> script_id): walk
+    ``scene_runtime.modules.items()`` and build a class_name index
+    (last-write wins when two modules share class_name — same
+    disambiguation policy ``_build_modules_block`` uses for its
+    ``scripts_by_class`` lookup; consistent with the rest of the
+    topology). Modules with empty ``class_name`` are skipped at
+    indexing time — they have no callable identity.
+
+    Returns empty dict when ``dependency_map`` is None or empty
+    (back-compat for Phase 1 callers + legacy-mode invocations).
+    """
+    if not dependency_map:
+        return {}
+
+    modules_in = cast(
+        dict[str, dict[str, object]], scene_runtime.get("modules", {}),
+    )
+    class_to_script_id: dict[str, str] = {}
+    for script_id, module in modules_in.items():
+        class_name_obj = module.get("class_name", "")
+        if isinstance(class_name_obj, str) and class_name_obj:
+            class_to_script_id[class_name_obj] = script_id
+
+    callers_by_script_id: dict[str, list[str]] = {}
+    for caller_class, callee_classes in dependency_map.items():
+        caller_id = class_to_script_id.get(caller_class)
+        if caller_id is None:
+            # Caller class isn't in the planner's modules — it doesn't
+            # have a topology row to reference. Skip; the dependency
+            # is unobservable from the topology's script_id keyspace.
+            continue
+        for callee_class in callee_classes:
+            callee_id = class_to_script_id.get(callee_class)
+            if callee_id is None:
+                continue
+            # Append the caller's script_id to the callee's incoming list.
+            # Determinism: classes are walked in dependency_map's
+            # iteration order (insertion order in Py 3.7+); deduplicate
+            # so a class that requires another twice doesn't appear
+            # twice on the callee's list.
+            existing = callers_by_script_id.setdefault(callee_id, [])
+            if caller_id not in existing:
+                existing.append(caller_id)
+
+    return callers_by_script_id
+
+
+def callers_of(
+    script_id: str, caller_graph: dict[str, list[str]],
+) -> list[str]:
+    """Return the list of script_ids that ``require()`` ``script_id``.
+
+    Public accessor (per design doc decision tree at lines 290-306) so
+    slice 5's ``_decide_script_container`` reads through this function
+    rather than indexing the dict directly — keeps the surface
+    refactorable if the curated view ever moves to a different shape.
+    Returns an empty list when ``script_id`` has no callers (orphan
+    module or absent from the graph entirely — both treated the same
+    by the slice 5 decision tree).
+    """
+    return list(caller_graph.get(script_id, ()))
 
 
 # ---------------------------------------------------------------------------
@@ -783,4 +891,5 @@ __all__ = (
     "TopologyModuleEntry",
     "TopologyProvenance",
     "build_topology",
+    "callers_of",
 )
