@@ -4166,6 +4166,22 @@ script.Disabled = true
                 pad if isinstance(pad, dict) and pad else None
             )
 
+        # Phase 2a slice 3 round 5 fix (codex P2): on
+        # assemble-without-retranspile workflows, ``transpile_scripts``
+        # doesn't rerun and ``state.dependency_map`` stays empty. If
+        # we let build_topology derive caller_graph from the empty
+        # dep_map, the prior populated caller_graph in
+        # ``scene_runtime.topology`` gets overwritten with ``{}``.
+        # Detect this case (empty dependency_map + prior caller_graph
+        # exists) and preserve the prior.
+        if self.state.dependency_map:
+            preserved_caller_graph = None
+        else:
+            pcg = prior_topology.get("caller_graph", {})
+            preserved_caller_graph = (
+                pcg if isinstance(pcg, dict) and pcg else None
+            )
+
         from converter.scene_runtime_topology.build_topology import (
             build_topology,
         )
@@ -4195,6 +4211,12 @@ script.Disabled = true
                 # uses the preserved block verbatim and skips
                 # invariant 3 — see its docstring for the contract.
                 preserved_animation_drivers=preserved_animation_drivers,
+                # Phase 2a slice 3 round 5: preserve prior
+                # caller_graph on assemble-no-retranspile workflows
+                # where state.dependency_map is empty. Without this
+                # the prior populated graph would be overwritten
+                # with {} on every assemble rerun.
+                preserved_caller_graph=preserved_caller_graph,
             )
         except Exception as exc:
             # Topology invariants are fail-closed by design, but

@@ -2316,6 +2316,62 @@ class TestApplyTopologyToRbxScripts:
             == prior_animation_drivers
         )
 
+    def test_assemble_no_retranspile_preserves_caller_graph(
+        self, tmp_path: Path,
+    ) -> None:
+        """Slice 3 round 5 (codex P2): when ``transpile_scripts`` is
+        skipped (assemble-without-retranspile workflow), the planner's
+        ``state.dependency_map`` stays empty for legitimate reasons
+        (the scripts cache is intact; no new edges to learn). Pre-
+        round-5 the empty dep_map caused build_topology to emit
+        ``caller_graph={}`` and silently overwrite the prior populated
+        graph in ``scene_runtime.topology``.
+
+        Round 5 fix: detect the empty-dep_map + prior-caller_graph
+        case and pass the prior block via
+        ``preserved_caller_graph``; build_topology uses it verbatim.
+
+        Refs: pipeline.py:_build_and_apply_topology round 5 fix;
+        build_topology.py ``preserved_caller_graph`` contract.
+        """
+        from types import SimpleNamespace
+        from converter.pipeline import Pipeline
+        from converter.animation_converter import AnimationConversionResult
+        from core.roblox_types import RbxPlace
+        artifact = _mk_artifact(modules={
+            "guid-foo": _mk_module("Foo", "client"),
+        })
+        scene_runtime = cast("dict[str, object]", artifact)
+        # Prior conversion produced a populated caller_graph.
+        prior_caller_graph = {"guid-target": ["guid-caller"]}
+        prior_topology = {
+            "modules": {},
+            "animation_drivers": {},
+            "cross_domain_edges": [],
+            "caller_graph": prior_caller_graph,
+        }
+        scene_runtime["topology"] = prior_topology
+
+        pipeline = Pipeline.__new__(Pipeline)
+        pipeline.output_dir = tmp_path
+        rbx_place = RbxPlace()
+        rbx_place.scripts = [_mk_rbx_script("Foo", "LocalScript")]
+        anim_result = AnimationConversionResult()
+        anim_result.emitted_animations = []
+        pipeline.state = SimpleNamespace(
+            rbx_place=rbx_place,
+            animation_result=anim_result,
+            guid_index=None,
+            dependency_map={},  # <-- empty (assemble-no-retranspile)
+        )
+
+        plan = TestApplyTopologyToRbxScripts._mk_plan()
+        pipeline._build_and_apply_topology(scene_runtime, plan)
+
+        # Topology rebuilt; caller_graph preserved from prior.
+        topo = scene_runtime["topology"]
+        assert topo["caller_graph"] == prior_caller_graph  # type: ignore[index]
+
     def test_fresh_no_animations_still_builds_caller_graph(
         self, tmp_path: Path,
     ) -> None:

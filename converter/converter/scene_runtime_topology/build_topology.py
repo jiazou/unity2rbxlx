@@ -319,6 +319,7 @@ def build_topology(
     guid_index: GuidIndex | None = None,
     dependency_map: dict[str, list[str]] | None = None,
     preserved_animation_drivers: dict[str, AnimationDriverEntry] | None = None,
+    preserved_caller_graph: dict[str, list[str]] | None = None,
 ) -> TopologyArtifact:
     """Assemble the topology artifact + enforce 8 emit-time invariants.
 
@@ -355,6 +356,19 @@ def build_topology(
     ``pipeline._build_and_apply_topology`` when
     ``self.state.animation_result is None``.
 
+    ``preserved_caller_graph`` (Phase 2a slice 3 round 5) supports the
+    assemble-without-retranspile path where ``transpile_scripts`` did
+    NOT run this build (``--no-retranspile`` or cached-script
+    workflows). In that case ``state.dependency_map`` is empty (it's
+    rebuilt only inside ``transpile_scripts``), so re-deriving
+    caller_graph from it would silently emit ``{}`` and overwrite the
+    prior caller_graph that came from a real transpile run (codex
+    review slice 3 round 4 P2). Pass the prior block here and
+    ``dependency_map=None`` (or the empty dict); build_topology uses
+    the preserved graph verbatim. Invariant 9 is skipped (no
+    dependency_map to detect collisions on); the preserved graph's
+    correctness derives from when it was first computed.
+
     Returns the artifact dict ready to merge into
     ``scene_runtime["topology"]``.
 
@@ -362,24 +376,42 @@ def build_topology(
     violation. No warnings, no soft-fails — the design doc commits to
     fail-closed on emit.
     """
-    # Detect class_name collisions in scene_runtime.modules that are
-    # touched by dependency_map BEFORE block-building, AND compute
-    # the dedup'd class_name → script_id translation index in the
-    # SAME walk. _build_caller_graph_block consumes the precomputed
-    # index instead of rebuilding it — round-3 P1.2 flagged the
-    # two-walk design as vulnerable to silent divergence (if filters
-    # diverge in the future, exclusion set ↛ translation set).
-    #
-    # Degraded-service contract: colliding class_names are excluded
-    # from the index; the colliding scripts appear as orphan rows in
-    # caller_graph. Slice 5's storage_classifier rewrite (when it
-    # lands) routes orphans to ReplicatedStorage. Today's
-    # storage_classifier still uses its own lossy class_name routing
-    # — see _detect_caller_graph_collisions docstring for the
-    # forward-looking nature of the promise.
-    colliding_classes, class_to_script_id = (
-        _detect_caller_graph_collisions(scene_runtime, dependency_map)
-    )
+    # caller_graph: build fresh from dependency_map, OR use the
+    # preserved block on assemble-no-retranspile workflows where the
+    # planner's dependency_map is empty for legitimate reasons (codex
+    # round 4 P2). Detection collision runs only in the build-fresh
+    # path; the preserved path skips both the detection and the
+    # translation since both ran when the prior block was first
+    # computed.
+    if preserved_caller_graph is not None:
+        caller_graph_block = preserved_caller_graph
+    else:
+        # Detect class_name collisions in scene_runtime.modules that
+        # are touched by dependency_map BEFORE block-building, AND
+        # compute the dedup'd class_name → script_id translation
+        # index in the SAME walk. _build_caller_graph_block consumes
+        # the precomputed index instead of rebuilding it — round-3
+        # P1.2 flagged the two-walk design as vulnerable to silent
+        # divergence (if filters diverge in the future, exclusion set
+        # ↛ translation set).
+        #
+        # Degraded-service contract: colliding class_names are
+        # excluded from the index; the colliding scripts appear as
+        # orphan rows in caller_graph. Slice 5's storage_classifier
+        # rewrite (when it lands) routes orphans to ReplicatedStorage.
+        # Today's storage_classifier still uses its own lossy
+        # class_name routing — see _detect_caller_graph_collisions
+        # docstring for the forward-looking nature of the promise.
+        colliding_classes, class_to_script_id = (
+            _detect_caller_graph_collisions(
+                scene_runtime, dependency_map,
+            )
+        )
+        caller_graph_block = _build_caller_graph_block(
+            dependency_map,
+            class_to_script_id=class_to_script_id,
+            excluded_class_names=colliding_classes,
+        )
 
     modules_block = _build_modules_block(
         scene_runtime, scripts_by_class, guid_index,
@@ -395,11 +427,6 @@ def build_topology(
         animation_drivers_block = _build_animation_drivers_block(
             scene_runtime, emitted_animations,
         )
-    caller_graph_block = _build_caller_graph_block(
-        dependency_map,
-        class_to_script_id=class_to_script_id,
-        excluded_class_names=colliding_classes,
-    )
 
     artifact: TopologyArtifact = {
         "modules": modules_block,
