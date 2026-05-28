@@ -73,6 +73,11 @@ def two_script_project(tmp_path: Path):
                 "stem": "Enemy",
                 "class_name": "Enemy",
                 "runtime_bearing": True,
+                # Phase 2a slice 2: build_topology invariant 7 requires
+                # both booleans on every runtime_bearing planner row.
+                # Helper rows (runtime_bearing=False) are exempt.
+                "character_attached": False,
+                "is_loader": False,
             },
             "helper-guid-bbbb": {
                 "stem": "Helper",

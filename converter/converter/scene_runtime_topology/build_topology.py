@@ -20,7 +20,7 @@ dict access to the artifact is discouraged (a future relocation to
 ``topology_plan.json`` should be a one-file change).
 
 Phase 1 invariants (per design doc §"topology artifact" + the review's
-6th add):
+6th add) + Phase 2a slice 2's 7th invariant:
 
   1. Every ``animation_drivers[*].driver_module_guid`` resolves to a
      ``modules`` entry; the animation's ``domain`` matches the driver's.
@@ -37,6 +37,12 @@ Phase 1 invariants (per design doc §"topology artifact" + the review's
   6. Every ``animation_drivers[*].driver_module_guid``'s module domain
      is in ``{"client", "server"}`` (helpers / excluded modules cannot
      drive animations).
+  7. Every ``runtime_bearing`` planner row carries both
+     ``character_attached`` and ``is_loader`` booleans (Phase 2a slice
+     2). Catches external-provenance ``scene_runtime`` artifacts that
+     bypass the planner — without it, lifecycle_role derivation
+     silently defaults the missing inputs to False and the topology
+     row misrepresents the underlying script.
 """
 
 from __future__ import annotations
@@ -153,19 +159,24 @@ class TopologyModuleEntry(TypedDict, total=False):
     Distinct from ``SceneRuntimeModule`` (the planner's per-module row
     on ``scene_runtime.modules``): planner row is structural facts about
     the script's instances and dependencies; topology row is the
-    placement decision. They share ``stem`` + ``domain`` but diverge
-    everywhere else.
+    placement decision. They share ``stem`` + ``domain`` +
+    ``character_attached`` + ``is_loader`` (mirrored from planner) and
+    diverge on the derived fields.
 
     Phase 1 populates: ``stem``, ``domain``, ``script_class``,
-    ``lifecycle_role``, ``provenance``. ``bridge_group_id`` is populated
-    when the module participates in a cross-domain edge; otherwise
-    ``None``.
+    ``lifecycle_role``, ``provenance``. Phase 2a slice 2 adds
+    ``character_attached`` + ``is_loader`` (mirrored from planner so
+    slice 5's storage_classifier rewrite reads a single canonical
+    surface). ``bridge_group_id`` is populated when the module
+    participates in a cross-domain edge; otherwise ``None``.
     """
 
     stem: str
     domain: str
     script_class: str
     lifecycle_role: LifecycleRole
+    character_attached: bool
+    is_loader: bool
     bridge_group_id: str | None
     provenance: "TopologyProvenance"
 
@@ -285,10 +296,16 @@ def _build_modules_block(
     didn't synthesize a body) default to ``"ModuleScript"`` — they're
     require-target shape.
 
-    ``lifecycle_role`` derives from domain + script_class via
-    ``derive_module_lifecycle_role``. Phase 1 hint inputs
-    (``character_attached`` / ``is_loader``) are always False — those
-    feed in via script_storage in Phase 2a.
+    ``lifecycle_role`` derives from domain + script_class +
+    character_attached + is_loader via ``derive_module_lifecycle_role``.
+    Phase 2a slice 2 reads ``character_attached`` + ``is_loader`` from
+    the planner row (stamped by `scene_runtime_planner._build_modules`
+    using the public `storage_classifier.REPLICATED_FIRST_HINTS` regex
+    for `is_loader`; `character_attached` defaults False until slice 5
+    plumbs the real signal). Invariant 7 in ``_enforce_invariants``
+    fails closed when a runtime-bearing planner row omits either
+    field — catches external-provenance scene_runtime artifacts that
+    bypass the planner.
     """
     modules_in = cast(
         dict[str, dict[str, object]], scene_runtime.get("modules", {}),
@@ -308,11 +325,18 @@ def _build_modules_block(
         else:
             script_class = "ModuleScript"
 
+        # Phase 2a slice 2: read lifecycle-role inputs from the planner
+        # row. `bool(module.get(..., False))` is defensive against
+        # external-provenance artifacts that bypass the planner (e.g. an
+        # on-disk plan from an earlier converter version); invariant 7
+        # at assembly end is the fail-closed guard for that case.
+        character_attached = bool(module.get("character_attached", False))
+        is_loader = bool(module.get("is_loader", False))
         lifecycle_role = derive_module_lifecycle_role(
             domain=domain,
             script_class=script_class,
-            character_attached=False,
-            is_loader=False,
+            character_attached=character_attached,
+            is_loader=is_loader,
         )
 
         provenance: TopologyProvenance = {}
@@ -341,6 +365,8 @@ def _build_modules_block(
             "domain": domain,
             "script_class": script_class,
             "lifecycle_role": lifecycle_role,
+            "character_attached": character_attached,
+            "is_loader": is_loader,
             "bridge_group_id": None,
             "provenance": provenance,
         }
@@ -607,6 +633,44 @@ def _enforce_invariants(
                 f"animation driver {sid!r} has bridge_group_id {bgid!r} not "
                 f"found in cross_domain_edges ids {sorted(edge_ids)!r}",
                 row=entry,
+            )
+
+    # Invariant 7 (Phase 2a slice 2): every runtime-bearing planner row
+    # must carry both `character_attached` and `is_loader` booleans.
+    # Reads the PLANNER input (scene_runtime["modules"]) rather than the
+    # topology output because the goal is to catch a planner artifact
+    # that came in WITHOUT these fields — _build_modules_block defaults
+    # them to False on read, so a check against the output is
+    # tautological. The fail-closed case is an on-disk plan from a
+    # pre-slice-2 converter version, or a test fixture that hand-rolls
+    # `scene_runtime["modules"]` rows without going through the planner.
+    planner_modules = cast(
+        dict[str, dict[str, object]], scene_runtime.get("modules", {}),
+    )
+    for script_id, planner_module in planner_modules.items():
+        if not bool(planner_module.get("runtime_bearing", False)):
+            # Helpers and non-instance-backed rows don't have a
+            # lifecycle role to derive, so the inputs aren't required.
+            continue
+        ca = planner_module.get("character_attached", None)
+        if not isinstance(ca, bool):
+            _abort(
+                7,
+                f"runtime-bearing module {script_id!r} is missing "
+                f"`character_attached: bool` on the planner row (got "
+                f"{ca!r}); Phase 2a slice 2 requires every runtime_bearing "
+                f"row to carry it",
+                row=planner_module,
+            )
+        il = planner_module.get("is_loader", None)
+        if not isinstance(il, bool):
+            _abort(
+                7,
+                f"runtime-bearing module {script_id!r} is missing "
+                f"`is_loader: bool` on the planner row (got {il!r}); "
+                f"Phase 2a slice 2 requires every runtime_bearing row "
+                f"to carry it",
+                row=planner_module,
             )
 
 

@@ -20,7 +20,9 @@
   "modules": {
     "guid-animator-target": {
       "bridge_group_id": null,
+      "character_attached": false,
       "domain": "client",
+      "is_loader": false,
       "lifecycle_role": "auto_run",
       "provenance": {},
       "script_class": "LocalScript",
@@ -28,7 +30,9 @@
     },
     "guid-door": {
       "bridge_group_id": null,
+      "character_attached": false,
       "domain": "client",
+      "is_loader": false,
       "lifecycle_role": "auto_run",
       "provenance": {},
       "script_class": "LocalScript",
@@ -36,7 +40,9 @@
     },
     "guid-hud": {
       "bridge_group_id": null,
+      "character_attached": false,
       "domain": "client",
+      "is_loader": false,
       "lifecycle_role": "auto_run",
       "provenance": {},
       "script_class": "LocalScript",
@@ -44,7 +50,9 @@
     },
     "guid-spawn": {
       "bridge_group_id": null,
+      "character_attached": false,
       "domain": "server",
+      "is_loader": false,
       "lifecycle_role": "auto_run",
       "provenance": {},
       "script_class": "Script",

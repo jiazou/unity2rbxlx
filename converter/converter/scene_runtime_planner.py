@@ -23,6 +23,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TypedDict, cast
 
+# Loader-name regex is owned by storage_classifier (its original consumer);
+# the planner imports it so the `is_loader` field stamped on each module
+# row stays in lock-step with storage_classifier's parallel decision path.
+# Phase 2a slice 2 promoted the regex from `_REPLICATED_FIRST_HINTS` to
+# the public `REPLICATED_FIRST_HINTS` name to enable this share.
+from converter.storage_classifier import REPLICATED_FIRST_HINTS
+
 from core.unity_types import (
     ComponentData,
     GuidIndex,
@@ -80,6 +87,31 @@ class SceneRuntimeModule(TypedDict, total=False):
     # authored or Instantiate()-spawned. ``runtime_bearing`` stays
     # placement-based so it still drives only what the host boots at start.
     is_component_class: bool
+    # Phase 2a slice 2: lifecycle-role inputs available pre-RbxScript. Both
+    # are REQUIRED on every ``runtime_bearing`` row — build_topology
+    # invariant 7 fails closed when either is absent (catches external-
+    # provenance scene_runtime artifacts that bypass the planner). The
+    # planner stamps both at module-row construction (line ~1045) so
+    # downstream consumers (build_topology, slice 5's storage_classifier
+    # rewrite) read a single canonical surface rather than re-deriving.
+    #
+    # ``character_attached``: True when the script is attached to the
+    # player-character prefab (matches `derive_module_lifecycle_role`'s
+    # ``character_attached`` param exactly). Slice 2 stamps False
+    # everywhere; slice 5 plumbs the real signal from scene_converter's
+    # player-character-prefab walk into the planner. False default is
+    # behavior-neutral because storage_classifier's parallel
+    # `character_script_names` parameter still supplies the same signal
+    # to the legacy decision path.
+    #
+    # ``is_loader``: True when the script's stem matches the
+    # ``REPLICATED_FIRST_HINTS`` regex (loaders / splash / boot scripts
+    # destined for `ReplicatedFirst`). The planner imports the regex
+    # from `storage_classifier` so both producers share a single source
+    # of truth. Slice 5 will read this field instead of re-deriving the
+    # regex in storage_classifier's decision tree.
+    character_attached: bool
+    is_loader: bool
     domain: str
     container: str
     module_path: str
@@ -1044,6 +1076,14 @@ def _build_modules_table(
             "class_name": class_name,
             "runtime_bearing": script_guid in runtime_bearing,
             "is_component_class": is_component,
+            # Phase 2a slice 2: stamp lifecycle-role inputs at planner
+            # construction. `is_loader` derives from the public
+            # `REPLICATED_FIRST_HINTS` regex (single source — owned by
+            # storage_classifier, read here). `character_attached` is
+            # always False today; slice 5 wires the real signal from
+            # scene_converter's player-character walk.
+            "is_loader": bool(REPLICATED_FIRST_HINTS.search(stem)),
+            "character_attached": False,
         }
 
     # Scripts attached at runtime but absent from the guid index (e.g.,
@@ -1057,6 +1097,9 @@ def _build_modules_table(
                 "class_name": "",
                 "runtime_bearing": True,
                 "is_component_class": True,
+                # Empty stem can't match the loader regex.
+                "is_loader": False,
+                "character_attached": False,
             }
 
     return modules

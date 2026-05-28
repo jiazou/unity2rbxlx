@@ -72,13 +72,24 @@ from core.roblox_types import RbxScript  # noqa: E402
 
 def _mk_module(
     stem: str, domain: str, *, class_name: str | None = None,
+    character_attached: bool = False, is_loader: bool = False,
 ) -> dict[str, object]:
-    """Return one ``scene_runtime.modules`` row."""
+    """Return one ``scene_runtime.modules`` row.
+
+    Phase 2a slice 2: every runtime_bearing row must carry
+    ``character_attached`` + ``is_loader`` booleans (build_topology
+    invariant 7). Defaults are False so most tests don't have to
+    plumb them; tests that exercise the
+    ``character_attached==True`` / ``is_loader==True`` branches pass
+    the kwargs explicitly.
+    """
     return {
         "stem": stem,
         "class_name": class_name if class_name is not None else stem,
         "runtime_bearing": True,
         "domain": domain,
+        "character_attached": character_attached,
+        "is_loader": is_loader,
     }
 
 
@@ -213,6 +224,76 @@ class TestTopologyEmissionShape:
         # LocalScript + non-character/loader → auto_run per
         # ``derive_module_lifecycle_role`` (lifecycle_roles.py:65).
         assert entry["lifecycle_role"] == "auto_run"
+        # Phase 2a slice 2: both bool inputs mirrored on the topology
+        # entry so slice 5's storage_classifier consumer reads a single
+        # canonical surface.
+        assert entry["character_attached"] is False
+        assert entry["is_loader"] is False
+
+    def test_character_attached_planner_input_drives_lifecycle_role(
+        self,
+    ) -> None:
+        """When the planner row carries ``character_attached=True``,
+        build_topology's `_build_modules_block` reads it (NOT
+        hardcoded False) and the derived ``lifecycle_role`` becomes
+        ``"character_attached"``.
+
+        Phase 2a slice 2 — the regression this guards: pre-slice-2
+        the inputs were always False at the call site
+        (build_topology.py:314-315), so this output was unreachable.
+
+        Refs: build_topology.py `_build_modules_block` post-slice-2;
+        lifecycle_roles.py:105-106 (priority branch).
+        """
+        sr = _mk_artifact(modules={
+            "guid-pchar": _mk_module(
+                "PlayerCharScript", "client",
+                character_attached=True,
+            ),
+        })
+        scripts_by_class = {
+            "PlayerCharScript": _mk_rbx_script(
+                "PlayerCharScript", "LocalScript",
+            ),
+        }
+        artifact = build_topology(
+            scene_runtime=sr,
+            emitted_animations=[],
+            scripts_by_class=scripts_by_class,
+        )
+        entry = artifact["modules"]["guid-pchar"]
+        assert entry["character_attached"] is True
+        assert entry["is_loader"] is False
+        assert entry["lifecycle_role"] == "character_attached"
+
+    def test_is_loader_planner_input_drives_lifecycle_role(self) -> None:
+        """When the planner row carries ``is_loader=True``,
+        build_topology's `_build_modules_block` reads it and the
+        derived ``lifecycle_role`` becomes ``"loader"``.
+
+        Phase 2a slice 2 — pre-slice-2 the input was hardcoded False
+        so this output was unreachable.
+
+        Refs: build_topology.py `_build_modules_block` post-slice-2;
+        lifecycle_roles.py:107-108 (priority branch).
+        """
+        sr = _mk_artifact(modules={
+            "guid-boot": _mk_module(
+                "BootSplash", "client", is_loader=True,
+            ),
+        })
+        scripts_by_class = {
+            "BootSplash": _mk_rbx_script("BootSplash", "LocalScript"),
+        }
+        artifact = build_topology(
+            scene_runtime=sr,
+            emitted_animations=[],
+            scripts_by_class=scripts_by_class,
+        )
+        entry = artifact["modules"]["guid-boot"]
+        assert entry["character_attached"] is False
+        assert entry["is_loader"] is True
+        assert entry["lifecycle_role"] == "loader"
 
     def test_door_shape_emits_resolved_animation_driver(self) -> None:
         """Door scenario: 1 prefab + 1 MonoBehaviour holding an Animator
@@ -511,6 +592,76 @@ class TestTopologyInvariants:
                 scene_runtime=_mk_artifact(),
             )
         assert "invariant 6" in str(excinfo.value)
+
+    def test_invariant_7_missing_character_attached_field(self) -> None:
+        """Runtime-bearing planner row lacking `character_attached` fails
+        closed. Reads scene_runtime["modules"] (planner input), not the
+        topology output — the check exists because _build_modules_block
+        defaults missing values to False, which would silently produce a
+        wrong lifecycle_role.
+
+        Refs: build_topology.py invariant 7 block; Phase 2a slice 2.
+        """
+        sr = _mk_artifact(modules={
+            "guid-x": {
+                "stem": "Foo", "class_name": "Foo", "runtime_bearing": True,
+                "domain": "client",
+                # `character_attached` deliberately omitted; `is_loader`
+                # present so the test exercises ONLY the
+                # character_attached branch.
+                "is_loader": False,
+            },
+        })
+        with pytest.raises(TopologyInvariantError) as excinfo:
+            build_topology(
+                scene_runtime=sr, emitted_animations=[], scripts_by_class={},
+            )
+        msg = str(excinfo.value)
+        assert "invariant 7" in msg
+        assert "character_attached" in msg
+
+    def test_invariant_7_missing_is_loader_field(self) -> None:
+        """Runtime-bearing planner row lacking `is_loader` fails closed.
+
+        Refs: build_topology.py invariant 7 block.
+        """
+        sr = _mk_artifact(modules={
+            "guid-x": {
+                "stem": "Foo", "class_name": "Foo", "runtime_bearing": True,
+                "domain": "client",
+                "character_attached": False,
+                # `is_loader` deliberately omitted.
+            },
+        })
+        with pytest.raises(TopologyInvariantError) as excinfo:
+            build_topology(
+                scene_runtime=sr, emitted_animations=[], scripts_by_class={},
+            )
+        msg = str(excinfo.value)
+        assert "invariant 7" in msg
+        assert "is_loader" in msg
+
+    def test_invariant_7_skips_non_runtime_bearing_rows(self) -> None:
+        """Helper rows (runtime_bearing=False) are exempt from invariant
+        7 — they have no lifecycle role to derive, so the inputs aren't
+        required. This is the migration-discipline path for legacy
+        helper artifacts that pre-date slice 2.
+
+        Refs: build_topology.py invariant 7 block (guarded on
+        ``runtime_bearing``).
+        """
+        sr = _mk_artifact(modules={
+            "guid-helper": {
+                "stem": "Helper", "class_name": "Helper",
+                "runtime_bearing": False,
+                # No character_attached, no is_loader; should be allowed.
+            },
+        })
+        # Should not raise.
+        artifact = build_topology(
+            scene_runtime=sr, emitted_animations=[], scripts_by_class={},
+        )
+        assert "guid-helper" in artifact["modules"]
 
 
 # ===========================================================================

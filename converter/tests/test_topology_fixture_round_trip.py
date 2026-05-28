@@ -101,6 +101,12 @@ def _build_simplefps_minimal_scene_runtime() -> SceneRuntimeArtifact:
     cross_domain_edges row; the empty edges list is the fixture's
     invariant 2 anchor).
     """
+    # Phase 2a slice 2: every runtime_bearing row carries
+    # `character_attached` + `is_loader` (build_topology invariant 7).
+    # All four modules: character_attached=False (none are bound to the
+    # player-character prefab in this minimal scenario), is_loader=False
+    # (none of the stems — Door / AnimatorTarget / HudControl /
+    # SpawnManager — match REPLICATED_FIRST_HINTS).
     return cast(SceneRuntimeArtifact, {
         "modules": {
             _DOOR_SCRIPT_ID: {
@@ -108,24 +114,32 @@ def _build_simplefps_minimal_scene_runtime() -> SceneRuntimeArtifact:
                 "class_name": "Door",
                 "runtime_bearing": True,
                 "domain": "client",
+                "character_attached": False,
+                "is_loader": False,
             },
             _ANIMATOR_SCRIPT_ID: {
                 "stem": "AnimatorTarget",
                 "class_name": "AnimatorTarget",
                 "runtime_bearing": True,
                 "domain": "client",
+                "character_attached": False,
+                "is_loader": False,
             },
             _HUD_SCRIPT_ID: {
                 "stem": "HudControl",
                 "class_name": "HudControl",
                 "runtime_bearing": True,
                 "domain": "client",
+                "character_attached": False,
+                "is_loader": False,
             },
             _SPAWN_SCRIPT_ID: {
                 "stem": "SpawnManager",
                 "class_name": "SpawnManager",
                 "runtime_bearing": True,
                 "domain": "server",
+                "character_attached": False,
+                "is_loader": False,
             },
         },
         "scenes": {},
