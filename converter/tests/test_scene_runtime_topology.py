@@ -427,16 +427,25 @@ class TestTopologyEmissionShape:
             "ReplicatedStorage.HelperLib"
         )
 
-    def test_planner_rule_skips_when_script_name_empty(self) -> None:
-        """Slice 4 round 1 review (Claude P1.1): when the rule fires
-        on a helper whose `script.name == ""`, the planner now SKIPS
-        the entire triple-stamp (gated atomically). Result: the
-        helper stays in its pre-rule container without a half-stamped
-        row, and invariant 10 accepts the artifact (all three fields
-        empty).
+    def test_planner_rule_invisible_to_empty_name_scripts(self) -> None:
+        """Slice 4 round 2 review (Claude P1.A investigation):
+        empty-name RbxScripts are filtered out at
+        ``script_by_name`` construction (the ``if script.name:``
+        guard) so they cannot reach ``_apply_reachability_rule``.
+        Result: a helper module whose corresponding script has empty
+        name is invisible to the rule — the module stays in its
+        pre-rule state.
 
-        Refs: module_domain.py _apply_reachability_rule guard;
-        Phase 2a slice 4 round 1 review.
+        This pins the property that round 2 verified: the rule's
+        atomic triple-write below the upstream filter does NOT need
+        an additional empty-name gate inside the loop body. The
+        invariant 10 atomicity check codified at the topology layer
+        is the catch-all for any future regression that lets empty-
+        name scripts through (the half-stamped row would fail
+        closed there).
+
+        Refs: module_domain.py script_by_name filter (line 574);
+        Phase 2a slice 4 round 2 review.
         """
         from converter.scene_runtime_domain import (
             classify_scene_runtime_domains,
@@ -465,20 +474,74 @@ class TestTopologyEmissionShape:
             dependency_map=dependency_map,
         )
 
-        # build_topology should NOT abort — the planner skipped the
-        # stamp, so all three fields are empty (consistent state).
-        artifact = build_topology(
-            scene_runtime=sr,
-            emitted_animations=[],
-            scripts_by_class={
-                "HudControl": hud_script,
-                "NoNameHelper": helper_script,
-            },
+        # The helper stays in its pre-rule state — rule never fired
+        # because the empty-name script was filtered upstream.
+        helper_module = sr["modules"]["guid-noname-helper"]  # type: ignore[index]
+        # Domain stays "helper" (initial state for non-runtime-bearing
+        # modules per _classify_module's helper short-circuit).
+        assert helper_module.get("domain") == "helper"
+        # No reachability stamp — fields absent / empty.
+        signals = helper_module.get("domain_signals", {})
+        assert signals.get("reachability_forced_container", "") == ""
+
+    def test_planner_rule_fires_when_class_name_differs_from_file_stem(
+        self,
+    ) -> None:
+        """Slice 4 round 2 review (Claude P1.B): the planner's
+        ``scripts_by_class`` index conflated ``script.name`` (file
+        stem) with ``class_name`` (C# class declaration). When the
+        two differ (file ``Bootstrap.cs`` containing ``class
+        GameInit``), the rule's lookup silently missed and the
+        helper was never hoisted even though client modules required
+        it.
+
+        Round 2 fix: build ``scripts_by_class`` from the modules
+        dict, joining on ``class_name`` with fallback to ``stem``.
+        This test pins the fix by setting up a helper whose module
+        row has ``class_name="GameInit"`` while the corresponding
+        RbxScript has ``name="Bootstrap"`` (the file stem).
+
+        Refs: module_domain.py scripts_by_class join logic;
+        Phase 2a slice 4 round 2 review (Claude P1.B).
+        """
+        from converter.scene_runtime_domain import (
+            classify_scene_runtime_domains,
         )
-        helper_entry = artifact["modules"]["guid-noname-helper"]
-        # All three reachability fields empty (rule didn't stamp).
-        assert helper_entry["reachability_required_container"] == ""
-        assert helper_entry["reachability_forced_container"] == ""
+        sr = _mk_artifact(modules={
+            "guid-hud": _mk_module("HudControl", "client"),
+            "guid-bootstrap": {
+                "stem": "Bootstrap",        # file stem
+                "class_name": "GameInit",   # C# class name
+                "runtime_bearing": False,
+                "is_loader": False, "character_attached": False,
+            },
+        })
+        # RbxScript with name == file stem (NOT == class_name).
+        helper_script = RbxScript(
+            name="Bootstrap",
+            source="-- bootstrap",
+            script_type="ModuleScript",
+            parent_path="ServerStorage",
+        )
+        hud_script = _mk_rbx_script("HudControl", "LocalScript")
+        scripts = [helper_script, hud_script]
+        # dependency_map keys by class_name (the C# analyzer view).
+        dependency_map = {"HudControl": ["GameInit"]}
+
+        classify_scene_runtime_domains(
+            cast("dict", sr),
+            scripts,
+            dependency_map=dependency_map,
+        )
+
+        # Rule should have fired: helper hoisted to ReplicatedStorage,
+        # module_path uses script.name (file stem), and the triple is
+        # consistent for invariant 10.
+        helper_module = sr["modules"]["guid-bootstrap"]  # type: ignore[index]
+        assert helper_module.get("container") == "ReplicatedStorage"
+        assert helper_module.get("module_path") == "ReplicatedStorage.Bootstrap"
+        signals = helper_module.get("domain_signals", {})
+        assert signals.get("reachability_forced_container") == "ReplicatedStorage"
 
     def test_invariant_10_module_path_equals_container_is_legal(
         self,

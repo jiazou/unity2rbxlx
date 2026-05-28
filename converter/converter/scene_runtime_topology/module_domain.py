@@ -569,10 +569,44 @@ def classify_scene_runtime_domains(
     prefabs = scene_runtime.get("prefabs", {})
     overrides = scene_runtime.get("domain_overrides", {})
 
-    scripts_by_class: dict[str, RbxScript] = {}
+    # Phase 2a slice 4 round 2 review (Claude P1.B): the dict named
+    # ``scripts_by_class`` was historically keyed by ``script.name``
+    # (the file stem), but downstream consumers (``_apply_reachability_rule``
+    # at line 1228+, ``_stamp_container_and_path`` at line 1188) USE
+    # the key as a class_name — looking up via module rows'
+    # ``class_name`` field. When a C# file's stem differs from its
+    # declared class name (e.g. ``Bootstrap.cs`` containing
+    # ``class GameInit``), that join failed silently → the rule never
+    # fired on the right helper. Build the dict keyed by class_name
+    # via a name-fallback-to-stem join: for each module row's
+    # class_name, find the script whose name matches the class_name
+    # first; if that misses, fall back to matching the module row's
+    # ``stem`` (which is the file stem === ``RbxScript.name`` in the
+    # output_filename-derived case). Misses on BOTH paths mean we
+    # genuinely cannot link script ↔ module — leave the entry out
+    # of the dict (the reachability rule will skip; equivalent to
+    # today's behavior for the join-missed case).
+    script_by_name: dict[str, RbxScript] = {}
     for script in scripts:
         if script.name:
-            scripts_by_class.setdefault(script.name, script)
+            script_by_name.setdefault(script.name, script)
+    scripts_by_class: dict[str, RbxScript] = {}
+    for _script_id, module in modules.items():
+        cn_obj = module.get("class_name", "")
+        cn = cn_obj if isinstance(cn_obj, str) else ""
+        if not cn:
+            continue
+        # Primary join: script.name == class_name.
+        s = script_by_name.get(cn)
+        if s is None:
+            # Fallback join: script.name == module.stem (file stem
+            # — the case where class_name differs from file name).
+            stem_obj = module.get("stem", "")
+            stem = stem_obj if isinstance(stem_obj, str) else ""
+            if stem:
+                s = script_by_name.get(stem)
+        if s is not None:
+            scripts_by_class.setdefault(cn, s)
 
     per_instance_evidence = _gather_per_instance_evidence(scenes, prefabs)
 
@@ -1258,27 +1292,14 @@ def _apply_reachability_rule(
                         excluded.append(module_id)
                 continue
             # Client-only-reach: hoist to ReplicatedStorage.
-            # Phase 2a slice 4 round 1 review (Claude P1): the
-            # planner's reachability triple-write — container,
-            # module_path, reachability_forced_container — MUST be
-            # atomic. Previously module_path was gated on
-            # ``script.name`` while container + forced were not,
-            # producing a non-lockstep state that the topology's
-            # invariant 10 then correctly rejected. Gate the
-            # ENTIRE stamp + the parent_path mutation on
-            # ``script.name`` so an empty-name script (rare, but
-            # possible when a synthetic / stub RbxScript reaches the
-            # rule) is left at its pre-rule state instead of
-            # producing a half-stamped row that would fail closed
-            # downstream.
-            if not script.name:
-                # Without a script.name we cannot resolve the
-                # module_path at runtime (host's resolveModule
-                # needs the dotted path). Leave the helper in its
-                # original container — it stays unreachable from
-                # the client require graph but the build doesn't
-                # silently produce a broken triple.
-                continue
+            # Note (Phase 2a slice 4 round 2 review): empty-name
+            # scripts cannot reach this loop body — they're filtered
+            # out at ``script_by_name`` construction (line 574, the
+            # ``if script.name:`` guard upstream). The atomic
+            # triple-write below is therefore correct without an
+            # empty-name gate. If a future change relaxes the
+            # upstream filter, the triple-write atomicity codified
+            # by invariant 10 would catch any half-stamped row.
             script.parent_path = REPLICATED_STORAGE
             module_id = class_to_script_id.get(helper_class)
             if module_id and module_id in modules:
