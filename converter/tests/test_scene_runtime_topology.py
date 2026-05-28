@@ -1774,6 +1774,93 @@ class TestCallerGraphCuration:
         # Original graph unchanged.
         assert graph["guid-bar"] == ["guid-foo"]
 
+    def test_invariant_9_class_name_collision_in_dependency_map_aborts(
+        self,
+    ) -> None:
+        """When two modules share a class_name AND that name IS
+        touched by dependency_map (caller or callee), invariant 9
+        fails closed — caller_graph translation would be lossy and
+        slice 5's consumer would under-route the loser's placement.
+
+        Slice 3 round 1 — Claude P1-1: surfaces the underlying defect
+        (dependency_map's keyspace is class_name, not script_id)
+        rather than silently mis-routing edges.
+
+        Refs: build_topology.py invariant 9 block; Phase 2a slice 3
+        round 1 review.
+        """
+        sr = _mk_artifact(modules={
+            "guid-first": _mk_module("Utils", "client"),
+            "guid-second": _mk_module(
+                "Utils", "client", class_name="Utils",
+            ),
+            "guid-caller": _mk_module("Caller", "client"),
+        })
+        # Utils now in dep_map as a callee — the collision matters.
+        with pytest.raises(TopologyInvariantError) as excinfo:
+            build_topology(
+                scene_runtime=sr,
+                emitted_animations=[],
+                scripts_by_class={},
+                dependency_map={"Caller": ["Utils"]},
+            )
+        msg = str(excinfo.value)
+        assert "invariant 9" in msg
+        assert "Utils" in msg
+
+    def test_invariant_9_collision_not_in_dep_map_does_not_abort(
+        self,
+    ) -> None:
+        """Collision that doesn't affect dependency_map is harmless and
+        does NOT trip invariant 9 — the lossy translation only matters
+        when the colliding name is actually used as a caller or
+        callee."""
+        sr = _mk_artifact(modules={
+            "guid-first": _mk_module("Utils", "client"),
+            "guid-second": _mk_module(
+                "Utils", "client", class_name="Utils",
+            ),
+            "guid-caller": _mk_module("Caller", "client"),
+            "guid-target": _mk_module("Target", "client"),
+        })
+        # `Utils` is colliding but not in dep_map — invariant 9 lets it
+        # pass; caller_graph just doesn't reference Utils.
+        artifact = build_topology(
+            scene_runtime=sr,
+            emitted_animations=[],
+            scripts_by_class={},
+            dependency_map={"Caller": ["Target"]},
+        )
+        assert artifact["caller_graph"] == {
+            "guid-target": ["guid-caller"],
+        }
+
+    def test_helper_module_included_in_caller_graph(self) -> None:
+        """Slice 3 round 1 contract: non-runtime-bearing helpers ARE
+        included in caller_graph (keys and values). A helper required
+        by a runtime-bearing client script is a real edge slice 5's
+        decision tree needs (the helper's domain stays "helper" but
+        its placement is still informed by who requires it)."""
+        sr = _mk_artifact(modules={
+            "guid-caller": _mk_module("Caller", "client"),
+            "guid-helper": {
+                "stem": "Helper", "class_name": "Helper",
+                "runtime_bearing": False,
+                # Non-runtime-bearing rows are exempt from invariant 7;
+                # they CAN omit character_attached / is_loader.
+            },
+        })
+        artifact = build_topology(
+            scene_runtime=sr,
+            emitted_animations=[],
+            scripts_by_class={},
+            dependency_map={"Caller": ["Helper"]},
+        )
+        # The helper is keyed in caller_graph despite runtime_bearing=False.
+        assert artifact["caller_graph"] == {
+            "guid-helper": ["guid-caller"],
+        }
+
 
 class TestApplyTopologyToRbxScripts:
     """Drive ``Pipeline._build_and_apply_topology`` against synthetic
@@ -2077,12 +2164,19 @@ class TestApplyTopologyToRbxScripts:
             "1 unmatched" in m for m in caplog.text.splitlines()
         ), caplog.text
 
-    def test_empty_emitted_animations_skips_topology_build(
+    def test_empty_emitted_animations_still_builds_topology(
         self, tmp_path: Path,
     ) -> None:
-        """When ``animation_result.emitted_animations`` is empty, the
-        method short-circuits before calling build_topology. Verifies
-        scene_runtime doesn't get a spurious ``topology`` key written.
+        """Slice 3 round 1 review (codex P2): when
+        ``animation_result.emitted_animations`` is empty, the method
+        STILL builds the topology artifact — caller_graph (slice 3),
+        modules block, and cross_domain_edges are independent of
+        animations. Pre-slice-3-round-1 the method short-circuited
+        here, which silently dropped the caller_graph for any
+        no-animation project.
+
+        Refs: pipeline.py:_build_and_apply_topology slice 3 round 1
+        fix; design doc Phase 2a slice 3.
         """
         artifact = _mk_artifact()
         scene_runtime = cast("dict[str, object]", artifact)
@@ -2093,5 +2187,12 @@ class TestApplyTopologyToRbxScripts:
             tmp_path=tmp_path,
         )
         pipeline._build_and_apply_topology(scene_runtime, plan)
-        # No topology key persisted; no RbxScript mutated.
-        assert "topology" not in scene_runtime
+        # Topology block IS now written (with empty animation_drivers
+        # + caller_graph). scene_runtime has the empty modules
+        # scenario from _mk_artifact() so all blocks are empty too,
+        # but the KEY exists.
+        assert "topology" in scene_runtime
+        topo = cast(dict, scene_runtime["topology"])
+        assert topo.get("animation_drivers") == {}
+        assert topo.get("modules") == {}
+        assert topo.get("caller_graph") == {}

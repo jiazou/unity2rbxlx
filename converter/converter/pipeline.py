@@ -4124,16 +4124,25 @@ script.Disabled = true
         """
         if self.state.rbx_place is None:
             return
-        if (
-            self.state.animation_result is None
-            or not getattr(
-                self.state.animation_result, "emitted_animations", None,
-            )
+
+        # Phase 2a slice 3 (round 1 review fix): build_topology is now
+        # invoked even when there are no animation emissions. Pre-slice-3
+        # the early-return at "if not emitted_animations" skipped
+        # topology entirely, which silently dropped the caller_graph
+        # block for any generic-mode project without Anim_* scripts
+        # (codex review of slice 3 P2). The empty-emitted_animations
+        # path is already covered by build_topology's design (slice 1
+        # spike) — it produces empty animation_drivers + populated
+        # modules + caller_graph + edges. Defaulting to `[]` when
+        # animation_result is None matches the same shape.
+        if self.state.animation_result is None or not getattr(
+            self.state.animation_result, "emitted_animations", None,
         ):
-            # No animation emissions → nothing to route. Skip the
-            # build_topology call to keep test fixtures that omit
-            # animation_result green.
-            return
+            emitted_animations: list = []
+        else:
+            emitted_animations = list(
+                self.state.animation_result.emitted_animations,
+            )
 
         from converter.scene_runtime_topology.build_topology import (
             build_topology,
@@ -4149,9 +4158,7 @@ script.Disabled = true
                 scene_runtime=cast(
                     "SceneRuntimeArtifact", scene_runtime,
                 ),
-                emitted_animations=list(
-                    self.state.animation_result.emitted_animations,
-                ),
+                emitted_animations=emitted_animations,
                 scripts_by_class=scripts_by_class,
                 guid_index=self.state.guid_index,
                 # Phase 2a slice 3: pass the planner's class-keyed
