@@ -4125,24 +4125,37 @@ script.Disabled = true
         if self.state.rbx_place is None:
             return
 
-        # Phase 2a slice 3 (round 1 review fix): build_topology is now
-        # invoked even when there are no animation emissions. Pre-slice-3
-        # the early-return at "if not emitted_animations" skipped
-        # topology entirely, which silently dropped the caller_graph
-        # block for any generic-mode project without Anim_* scripts
-        # (codex review of slice 3 P2). The empty-emitted_animations
-        # path is already covered by build_topology's design (slice 1
-        # spike) — it produces empty animation_drivers + populated
-        # modules + caller_graph + edges. Defaulting to `[]` when
-        # animation_result is None matches the same shape.
-        if self.state.animation_result is None or not getattr(
-            self.state.animation_result, "emitted_animations", None,
-        ):
-            emitted_animations: list = []
-        else:
-            emitted_animations = list(
-                self.state.animation_result.emitted_animations,
-            )
+        # Phase 2a slice 3 round 3 fix (codex P1 — resume erases
+        # animation_drivers): distinguish three cases:
+        #
+        #   (a) animation_result is None  → resume path; convert_animations
+        #       didn't run. The persisted scene_runtime.topology block
+        #       (if any) holds animation routing from a prior conversion
+        #       that we MUST NOT overwrite with `animation_drivers={}`.
+        #       Skip the rebuild entirely; preserve persisted topology.
+        #   (b) animation_result is populated, emitted_animations == []
+        #       → fresh conversion with no animations. caller_graph
+        #       still needs to be built (slice 3 round 1 goal). Pass
+        #       empty list; build_topology returns artifact with empty
+        #       animation_drivers + populated modules + caller_graph.
+        #   (c) animation_result has emissions → normal path. Build
+        #       fresh with the emissions.
+        #
+        # The pre-round-3 fallback "defaulted both (a) and (b) to []"
+        # caused codex's regression: case (a) silently dropped prior
+        # animation_drivers from the persisted plan.
+        if self.state.animation_result is None:
+            # Case (a): resume. Don't rebuild — let the persisted
+            # topology stand. caller_graph may be stale on resume;
+            # slice 5+ that consumes it must either force-rerun
+            # convert_animations or accept the staleness.
+            return
+
+        emitted_animations: list = list(
+            getattr(
+                self.state.animation_result, "emitted_animations", [],
+            ) or [],
+        )
 
         from converter.scene_runtime_topology.build_topology import (
             build_topology,

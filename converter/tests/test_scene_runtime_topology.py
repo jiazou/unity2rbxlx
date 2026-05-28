@@ -2234,3 +2234,72 @@ class TestApplyTopologyToRbxScripts:
         assert topo.get("animation_drivers") == {}
         assert topo.get("modules") == {}
         assert topo.get("caller_graph") == {}
+
+    def test_resume_with_animation_result_none_preserves_topology(
+        self, tmp_path: Path,
+    ) -> None:
+        """Slice 3 round 3 (codex P1): on resume where
+        convert_animations didn't run, ``state.animation_result``
+        is None but the persisted ``scene_runtime.topology`` block
+        already has animation_drivers from a prior conversion.
+        Pre-round-3 my "default emitted_animations to []" change
+        rebuilt the artifact and silently overwrote the prior
+        animation_drivers with ``{}``. The round-3 fix detects the
+        resume signature (``animation_result is None``) and SKIPS
+        the rebuild — preserving the persisted topology.
+
+        Refs: pipeline.py:_build_and_apply_topology resume guard;
+        codex review of slice 3 round 3 P1.
+        """
+        from types import SimpleNamespace
+        from converter.pipeline import Pipeline
+        from core.roblox_types import RbxPlace
+        artifact = _mk_artifact()
+        scene_runtime = cast("dict[str, object]", artifact)
+        # Pre-existing topology block from a prior conversion run.
+        # Simulate a populated animation_drivers block that the
+        # resume path must NOT erase.
+        prior_topology = {
+            "modules": {},
+            "animation_drivers": {
+                "guid-prior:Door:open": {
+                    "stable_id": "guid-prior:Door:open",
+                    "routing_status": "resolved",
+                    "driver_module_guid": "guid-prior-door",
+                    "domain": "client",
+                    "script_class": "LocalScript",
+                    "lifecycle_role": "auto_run",
+                    "observed_attribute": "Open",
+                    "observed_target": {
+                        "kind": "self", "name": "", "scope": "workspace",
+                    },
+                    "bridge_group_id": None,
+                },
+            },
+            "cross_domain_edges": [],
+            "caller_graph": {},
+        }
+        scene_runtime["topology"] = prior_topology
+
+        # Mock pipeline shape with animation_result=None — the resume
+        # signal.
+        pipeline = Pipeline.__new__(Pipeline)
+        pipeline.output_dir = tmp_path
+        rbx_place = RbxPlace()
+        rbx_place.scripts = [_mk_rbx_script("X", "Script")]
+        pipeline.state = SimpleNamespace(
+            rbx_place=rbx_place,
+            animation_result=None,  # <-- the resume signature
+            guid_index=None,
+            dependency_map={},
+        )
+
+        plan = TestApplyTopologyToRbxScripts._mk_plan()
+        pipeline._build_and_apply_topology(scene_runtime, plan)
+
+        # Prior topology preserved untouched.
+        assert scene_runtime["topology"] is prior_topology
+        assert (
+            scene_runtime["topology"]["animation_drivers"]  # type: ignore[index]
+            == prior_topology["animation_drivers"]
+        )
