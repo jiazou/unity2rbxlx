@@ -985,6 +985,54 @@ class TestLifecycleRoleDerivation:
         )
         assert role == "loader"
 
+    def test_is_loader_with_server_domain_falls_through_to_auto_run(
+        self,
+    ) -> None:
+        """``is_loader=True`` is honored ONLY when ``domain="client"``.
+
+        ``loader`` routes to ReplicatedFirst, a client-only container —
+        the role docstring declares it "always client-domain." A
+        runtime-bearing server module whose name happens to match the
+        loader regex (e.g. a server-side ``BootstrapServer.cs``) must
+        fall through to ``"auto_run"`` (its Script default), NOT
+        ``"loader"``.
+
+        Without this gate the topology emits self-contradictory rows
+        (``domain="server", lifecycle_role="loader"``) that any
+        downstream consumer trusting ``lifecycle_role`` would route to
+        the wrong container (codex review 2026-05-28 P2 on slice 2
+        round 1).
+
+        Refs: lifecycle_roles.py loader branch domain gate.
+        """
+        role = derive_module_lifecycle_role(
+            domain="server", script_class="Script",
+            character_attached=False, is_loader=True,
+        )
+        assert role == "auto_run"
+
+    def test_character_attached_with_server_domain_falls_through(
+        self,
+    ) -> None:
+        """``character_attached=True`` is honored ONLY when
+        ``domain="client"``.
+
+        ``character_attached`` routes to StarterCharacterScripts, a
+        client-only container — the role docstring declares it "always
+        client-domain." A runtime-bearing server module flagged
+        character_attached (shouldn't happen in production, but could
+        appear in a malformed external artifact) must fall through to
+        its class-driven default, NOT silently emit a
+        client-only-container role on a server module.
+
+        Refs: lifecycle_roles.py character_attached branch domain gate.
+        """
+        role = derive_module_lifecycle_role(
+            domain="server", script_class="Script",
+            character_attached=True, is_loader=False,
+        )
+        assert role == "auto_run"
+
     def test_is_loader_with_module_script_falls_through_to_requireable(
         self,
     ) -> None:
