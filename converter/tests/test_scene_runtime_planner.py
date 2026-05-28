@@ -34,8 +34,11 @@ from core.unity_types import (
 )
 from converter.scene_runtime_planner import (
     build_require_graph,
+    build_script_id_by_name,
+    derive_intrinsic_script_class,
     plan_scene_runtime,
 )
+from core.roblox_types import RbxScript
 
 
 # ---------------------------------------------------------------------------
@@ -1137,3 +1140,259 @@ class TestScenePrefabPlacements:
         placements = artifact["scene_prefab_placements"]
         assert len(placements) == 1
         assert "parent_game_object_id" not in placements[0]
+
+
+# ---------------------------------------------------------------------------
+# Phase 2a slice 5 step 1: intrinsic script_class helper
+# ---------------------------------------------------------------------------
+
+class TestDeriveIntrinsicScriptClass:
+    """``derive_intrinsic_script_class`` returns the C# code-analysis
+    signal stamped by ``code_transpiler._classify_script_type``. Callers
+    must pass an ``RbxScript`` whose ``script_type`` is still the
+    pre-classifier value (the pipeline reorder in slice 5 step 2
+    guarantees this at the build_topology call site).
+    """
+
+    def test_script_type_is_returned_as_is(self) -> None:
+        s = RbxScript(name="Foo", source="return 1", script_type="LocalScript")
+        assert derive_intrinsic_script_class(s) == "LocalScript"
+
+    def test_module_script_returned_for_module(self) -> None:
+        s = RbxScript(name="Foo", source="return 1", script_type="ModuleScript")
+        assert derive_intrinsic_script_class(s) == "ModuleScript"
+
+    def test_server_script_returned_for_script(self) -> None:
+        s = RbxScript(name="Foo", source="return 1", script_type="Script")
+        assert derive_intrinsic_script_class(s) == "Script"
+
+    def test_none_script_defaults_to_module_script(self) -> None:
+        # The orphan-row case at build_topology — no emitted script
+        # matches the module's class_name. ModuleScript is the safe
+        # require-target default.
+        assert derive_intrinsic_script_class(None) == "ModuleScript"
+
+    def test_empty_script_type_defaults_to_module_script(self) -> None:
+        s = RbxScript(name="Foo", source="return 1", script_type="")
+        assert derive_intrinsic_script_class(s) == "ModuleScript"
+
+
+# ---------------------------------------------------------------------------
+# Phase 2a slice 5 step 3: RbxScript → script_id accessor
+# ---------------------------------------------------------------------------
+
+class TestBuildScriptIdByName:
+    """``build_script_id_by_name`` mirrors ``build_scripts_by_class_name``
+    in reverse: ``RbxScript.name → SceneRuntimeModule script_id``. Slice
+    6's ``_decide_script_container_from_topology`` will use this for the
+    ``TopologyModuleEntry`` lookup.
+
+    Contract:
+      - Primary join: ``script.name == module.class_name``.
+      - Fallback join: ``script.name == module.stem`` (file-stem differs
+        from declared class name).
+      - Colliding class_names are excluded per the slice-3 degraded-
+        service contract (same as ``build_scripts_by_class_name``).
+    """
+
+    def test_primary_join_by_class_name(self) -> None:
+        modules: dict[str, object] = {
+            "guid-a": {"stem": "Foo", "class_name": "Foo"},
+            "guid-b": {"stem": "Bar", "class_name": "Bar"},
+        }
+        scripts = [
+            RbxScript(name="Foo", source="", script_type="Script"),
+            RbxScript(name="Bar", source="", script_type="LocalScript"),
+        ]
+        idx = build_script_id_by_name(scripts, modules)
+        assert idx == {"Foo": "guid-a", "Bar": "guid-b"}
+
+    def test_fallback_join_by_stem(self) -> None:
+        # Bootstrap.cs declares class GameInit — script name matches
+        # stem ("Bootstrap") but module's class_name is "GameInit".
+        modules: dict[str, object] = {
+            "guid-a": {"stem": "Bootstrap", "class_name": "GameInit"},
+        }
+        scripts = [RbxScript(name="Bootstrap", source="", script_type="Script")]
+        idx = build_script_id_by_name(scripts, modules)
+        assert idx == {"Bootstrap": "guid-a"}
+
+    def test_colliding_class_names_excluded_degraded_service(self) -> None:
+        # Two modules share class_name "Utils" (e.g. Utils.cs in two
+        # different folders). Both rows excluded from the index per the
+        # canonical ``compute_class_name_collisions`` contract — the
+        # consumer falls through to orphan-routing.
+        modules: dict[str, object] = {
+            "guid-a": {"stem": "UtilsA", "class_name": "Utils"},
+            "guid-b": {"stem": "UtilsB", "class_name": "Utils"},
+            "guid-other": {"stem": "Other", "class_name": "Other"},
+        }
+        scripts = [
+            RbxScript(name="Utils", source="", script_type="ModuleScript"),
+            RbxScript(name="Other", source="", script_type="Script"),
+        ]
+        idx = build_script_id_by_name(scripts, modules)
+        # "Utils" → excluded; "Other" → resolved.
+        assert "Utils" not in idx
+        assert idx == {"Other": "guid-other"}
+
+    def test_empty_script_names_skipped(self) -> None:
+        modules: dict[str, object] = {
+            "guid-a": {"stem": "Foo", "class_name": "Foo"},
+        }
+        scripts = [
+            RbxScript(name="", source="", script_type=""),  # skipped
+            RbxScript(name="Foo", source="", script_type="Script"),
+        ]
+        idx = build_script_id_by_name(scripts, modules)
+        assert idx == {"Foo": "guid-a"}
+
+    def test_scripts_without_module_row_omitted(self) -> None:
+        # Script present but no corresponding module — the consumer
+        # treats it as an orphan (slice 6's fallthrough branch).
+        modules: dict[str, object] = {}
+        scripts = [RbxScript(name="OrphanScript", source="", script_type="Script")]
+        idx = build_script_id_by_name(scripts, modules)
+        assert idx == {}
+
+    def test_modules_without_matching_script_omitted(self) -> None:
+        # Module row exists but no RbxScript synthesized for it (e.g.
+        # AI-only helper or unwalkable extern base). Not in the index;
+        # consumer falls through.
+        modules: dict[str, object] = {
+            "guid-a": {"stem": "Foo", "class_name": "Foo"},
+        }
+        idx = build_script_id_by_name([], modules)
+        assert idx == {}
+
+
+# ---------------------------------------------------------------------------
+# Phase 2a slice 5 step 2: pipeline ordering invariant
+# ---------------------------------------------------------------------------
+
+class TestTopologyBuildOrderInvariant:
+    """The slice-5 pipeline reorder: ``_build_topology`` MUST run BEFORE
+    ``classify_storage`` inside ``_classify_storage``. This breaks the
+    pre-slice-5 cycle where ``build_topology`` derived ``script_class``
+    from the already-mutated ``RbxScript.script_type``.
+
+    The invariant is asserted by monkey-patching the pipeline's calls
+    and recording the order they fired.
+    """
+
+    def test_build_topology_runs_before_classify_storage(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from converter.pipeline import Pipeline
+        from core.roblox_types import RbxPlace, RbxScript as _RbxScript
+
+        unity_project = tmp_path / "unity"
+        unity_project.mkdir()
+        (unity_project / "Assets").mkdir()
+        output = tmp_path / "out"
+        output.mkdir()
+
+        pipeline = Pipeline(str(unity_project), str(output))
+        pipeline.state.rbx_place = RbxPlace()
+        pipeline.state.rbx_place.scripts.append(
+            _RbxScript(name="Foo", source="return 1", script_type="Script"),
+        )
+        # Generic mode so the topology gate fires.
+        pipeline.ctx.scene_runtime_mode = "generic"
+        pipeline.ctx.scene_runtime = {
+            "modules": {
+                "guid-a": {
+                    "stem": "Foo", "class_name": "Foo",
+                    "runtime_bearing": True,
+                    "character_attached": False, "is_loader": False,
+                },
+            },
+            "scenes": {},
+            "prefabs": {},
+            "domain_overrides": {},
+        }
+
+        # Record the order of build_topology and classify_storage calls.
+        order: list[str] = []
+
+        original_build = Pipeline._build_topology
+        original_classify = None
+
+        def _spy_build(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            order.append("build_topology")
+            return original_build(self, *args, **kwargs)
+
+        monkeypatch.setattr(Pipeline, "_build_topology", _spy_build)
+
+        # Wrap classify_storage at import time so the spy captures the
+        # call site inside _classify_storage.
+        import converter.storage_classifier as _sc
+        original_classify = _sc.classify_storage
+
+        def _spy_classify(*args, **kwargs):  # type: ignore[no-untyped-def]
+            order.append("classify_storage")
+            return original_classify(*args, **kwargs)
+
+        monkeypatch.setattr(_sc, "classify_storage", _spy_classify)
+
+        pipeline._classify_storage()
+
+        # The cycle break: build_topology must fire BEFORE
+        # classify_storage so RbxScript.script_type is still intrinsic.
+        assert order[:2] == ["build_topology", "classify_storage"], (
+            f"slice 5 step 2 pipeline reorder broken: expected "
+            f"['build_topology', 'classify_storage', ...] but got {order!r}"
+        )
+
+    def test_topology_artifact_persisted_under_scene_runtime(
+        self, tmp_path: Path,
+    ) -> None:
+        """After ``_classify_storage`` runs, ``scene_runtime["topology"]``
+        carries an artifact with the intrinsic ``script_class`` reading
+        (slice 5 step 1's helper). The artifact is overwritten by the
+        post-classifier rebuild (step 5 of the ordering), but the
+        intrinsic-script_class contract holds across both builds — they
+        read through the same helper.
+        """
+        from converter.pipeline import Pipeline
+        from core.roblox_types import RbxPlace, RbxScript as _RbxScript
+
+        unity_project = tmp_path / "unity"
+        unity_project.mkdir()
+        (unity_project / "Assets").mkdir()
+        output = tmp_path / "out"
+        output.mkdir()
+
+        pipeline = Pipeline(str(unity_project), str(output))
+        pipeline.state.rbx_place = RbxPlace()
+        pipeline.state.rbx_place.scripts.append(
+            _RbxScript(name="Foo", source="return 1", script_type="ModuleScript"),
+        )
+        pipeline.ctx.scene_runtime_mode = "generic"
+        pipeline.ctx.scene_runtime = {
+            "modules": {
+                "guid-a": {
+                    "stem": "Foo", "class_name": "Foo",
+                    "runtime_bearing": True,
+                    "character_attached": False, "is_loader": False,
+                },
+            },
+            "scenes": {},
+            "prefabs": {},
+            "domain_overrides": {},
+        }
+
+        pipeline._classify_storage()
+
+        # After classify_storage completes, the artifact lives at
+        # scene_runtime["topology"]. The merged scene_runtime is
+        # serialized to conversion_plan.json — read it back to verify.
+        import json as _json
+        plan_path = output / "conversion_plan.json"
+        raw = _json.loads(plan_path.read_text(encoding="utf-8"))
+        topology = raw["scene_runtime"]["topology"]
+        assert "modules" in topology
+        assert "guid-a" in topology["modules"]
+        # script_class flows through derive_intrinsic_script_class —
+        # the ModuleScript intrinsic value survives.
+        assert topology["modules"]["guid-a"]["script_class"] == "ModuleScript"
