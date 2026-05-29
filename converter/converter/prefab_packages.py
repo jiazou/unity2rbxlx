@@ -443,10 +443,19 @@ def generate_prefab_packages(
         result.templates.append(part)
 
     if result.templates:
+        # Phase 2a slice 5 round 3: stamp ``intrinsic_script_type`` at
+        # construction. ``_generate_prefab_packages`` runs AFTER
+        # ``_classify_storage``, but ``classify_storage`` only coerces
+        # ``Script→LocalScript`` — never touches ModuleScript — so the
+        # ``ModuleScript`` literal here remains the intrinsic value
+        # regardless of phase order. Stamp it explicitly so resume
+        # rehydration doesn't fall back to the heuristic for a known
+        # value.
         result.spawner_script = RbxScript(
             name="PrefabSpawner",
             source=_SPAWNER_LUAU,
             script_type="ModuleScript",
+            intrinsic_script_type="ModuleScript",
             parent_path="ReplicatedStorage",
             source_path="packages/PrefabSpawner.luau",
         )

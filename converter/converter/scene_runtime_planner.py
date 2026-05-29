@@ -1152,6 +1152,43 @@ def compute_class_name_collisions(
     return frozenset(collisions)
 
 
+def _compute_stem_collisions(
+    modules: dict[str, "SceneRuntimeModule | dict[str, object]"],
+) -> frozenset[str]:
+    """Return the set of ``stem`` values that appear on more than one
+    ``SceneRuntimeModule`` row.
+
+    Phase 2a slice 5 round 3 (Codex P3): the stem keyspace was the
+    fallback join channel in ``build_script_id_by_name`` but had no
+    collision-exclusion gate — ``setdefault`` silently picked the
+    first writer when two modules shared a stem, violating the
+    docstring's degraded-service contract ("colliding class_names
+    exclude BOTH rows"). This helper mirrors
+    ``compute_class_name_collisions`` for the stem keyspace so the
+    contract is uniform across both join channels.
+
+    Only counts stems that DIFFER from their row's ``class_name``
+    (matching stems are already covered by the class_name index).
+    Empty stems are ignored.
+    """
+    seen: set[str] = set()
+    collisions: set[str] = set()
+    for _script_id, module in modules.items():
+        if not isinstance(module, dict):
+            continue
+        cn_obj = module.get("class_name", "")
+        cn = cn_obj if isinstance(cn_obj, str) else ""
+        stem_obj = module.get("stem", "")
+        stem = stem_obj if isinstance(stem_obj, str) else ""
+        if not stem or stem == cn:
+            continue
+        if stem in seen:
+            collisions.add(stem)
+        else:
+            seen.add(stem)
+    return frozenset(collisions)
+
+
 # Legacy heading retained — refactored in round 5 to consume the
 # unified collision helper above. See the helper's docstring for the
 # rationale.
@@ -1346,13 +1383,22 @@ def build_script_id_by_name(
          differs from file stem — e.g. ``Bootstrap.cs`` contains
          ``class GameInit``).
 
+    The stem fallback honors a parallel ``colliding_stems`` set built
+    the same way as ``compute_class_name_collisions``: when two modules
+    expose the same stem (a stem that, by itself, would be ambiguous
+    as a join key), BOTH rows are excluded from the index — same
+    degraded-service contract the class_name keyspace uses. Without
+    this gate the prior ``setdefault`` silently picked the first
+    writer, violating the contract spelled out in this docstring.
+
     Scripts with empty ``name`` are skipped (cannot be addressed via
     the join). Scripts not present in any ``modules`` row are also
     omitted — the consumer treats them as orphans.
     """
     # Forward index from class_name + stem to script_id, with the same
-    # collision-exclusion contract.
+    # collision-exclusion contract on BOTH keyspaces.
     colliding_class_names = compute_class_name_collisions(modules)
+    colliding_stems = _compute_stem_collisions(modules)
     script_id_by_class_name: dict[str, str] = {}
     script_id_by_stem: dict[str, str] = {}
     for script_id, module in modules.items():
@@ -1367,9 +1413,10 @@ def build_script_id_by_name(
             script_id_by_class_name.setdefault(cn, script_id)
         stem_obj = module.get("stem", "")
         stem = stem_obj if isinstance(stem_obj, str) else ""
-        if stem and stem != cn:
+        if stem and stem != cn and stem not in colliding_stems:
             # Stem-fallback index. Skip when stem == class_name (the
-            # primary index already covers it).
+            # primary index already covers it). Skip colliding stems
+            # — both rows excluded per the degraded-service contract.
             script_id_by_stem.setdefault(stem, script_id)
 
     out: dict[str, str] = {}

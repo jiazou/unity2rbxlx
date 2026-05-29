@@ -1266,6 +1266,32 @@ class TestBuildScriptIdByName:
         assert "Utils" not in idx
         assert idx == {"Other": "guid-other"}
 
+    def test_colliding_stems_excluded_degraded_service(self) -> None:
+        # Round-3 fix (Codex P3): two modules share a ``stem`` whose
+        # class_name differs (e.g. ``Bootstrap.cs`` declares class
+        # ``GameInit`` in one folder; another ``Bootstrap.cs`` declares
+        # class ``BootSequence`` in a sibling folder). Pre-round-3 the
+        # stem-fallback ``setdefault`` silently picked the first writer
+        # — violating the docstring's degraded-service contract that
+        # colliding join keys exclude BOTH rows. After the fix, both
+        # rows fall through to the consumer's orphan-routing branch.
+        modules: dict[str, object] = {
+            "guid-a": {"stem": "Bootstrap", "class_name": "GameInit"},
+            "guid-b": {"stem": "Bootstrap", "class_name": "BootSequence"},
+            "guid-other": {"stem": "Other", "class_name": "Other"},
+        }
+        scripts = [
+            RbxScript(name="Bootstrap", source="", script_type="Script"),
+            RbxScript(name="Other", source="", script_type="Script"),
+        ]
+        idx = build_script_id_by_name(scripts, modules)
+        # "Bootstrap" stem → excluded (collision on the fallback key);
+        # neither row arbitrarily wins.
+        assert "Bootstrap" not in idx
+        # Primary-key lookups for the class_names themselves still work
+        # (the class_name keyspace doesn't have a collision here).
+        assert idx == {"Other": "guid-other"}
+
     def test_empty_script_names_skipped(self) -> None:
         modules: dict[str, object] = {
             "guid-a": {"stem": "Foo", "class_name": "Foo"},
