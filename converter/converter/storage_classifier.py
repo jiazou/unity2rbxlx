@@ -489,7 +489,16 @@ def _decide_script_container_from_topology(
            the analysis -- if topology says server-only, trust it)
          * orphan / unknown -> ReplicatedStorage (conservative)
       5. LocalScript -> StarterPlayerScripts
-      6. Script -> ServerScriptService
+      6. ``script_type == "Script"`` with ``domain == "client"`` ->
+         StarterPlayerScripts (round-2 patch -- restores the
+         pre-slice-7 ``_CLIENT_ONLY_PATTERNS`` regex semantic for
+         the narrow case where ``code_transpiler._classify_script_type``
+         did NOT promote ``Script`` to ``LocalScript`` but
+         ``infer_module_domains`` still classified the module as
+         client-domain. The downstream auto-coercion at
+         ``classify_storage`` flips ``script_type`` to ``LocalScript``
+         so ``_enforce_hard_constraints`` does not raise.)
+      7. Script -> ServerScriptService
 
     See ``scene-runtime-architecture-ir.md`` §"script_storage.py --
     bound deterministic mapper" for the design rationale.
@@ -544,7 +553,25 @@ def _decide_script_container_from_topology(
     if s.script_type == "LocalScript":
         return STARTER_PLAYER_SCRIPTS, "topology: LocalScript (default container)"
 
-    # script_type == "Script"
+    # script_type == "Script". Slice 7 round 2 (Codex R1 P1 #1+#3):
+    # check the client-domain branch BEFORE falling through to SSS.
+    # Restores the pre-slice-7 ``_CLIENT_ONLY_PATTERNS`` regex
+    # semantic for the narrow case where
+    # ``code_transpiler._classify_script_type`` left ``script_type``
+    # as ``Script`` but the upstream domain classifier flagged the
+    # module as client-domain (e.g. uses ``Players.LocalPlayer``
+    # without any of the API substrings that drive
+    # ``_classify_script_type``'s ``Script -> LocalScript`` promotion).
+    # The auto-coercion at ``classify_storage`` lines 237-239 then
+    # flips ``script_type`` to ``LocalScript`` so the resulting
+    # placement satisfies the Roblox engine constraint
+    # ``_enforce_hard_constraints`` checks for.
+    domain = topology_inputs["domains"].get(sid, "")
+    if domain == "client":
+        return STARTER_PLAYER_SCRIPTS, (
+            "topology: script_type=Script with client domain "
+            "(replaces legacy _CLIENT_ONLY_PATTERNS branch)"
+        )
     return SERVER_SCRIPT_SERVICE, "topology: server Script (default)"
 
 
