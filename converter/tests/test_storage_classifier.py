@@ -731,3 +731,165 @@ class TestSlice7HardConstraints:
         s = _make_script("X", "print()", script_type="LocalScript")
         plan = classify_storage([s])
         assert s.parent_path == STARTER_PLAYER_SCRIPTS
+
+
+# ---------------------------------------------------------------------------
+# Slice 7 round 3: legacy fallback path routing (Codex R2 P1 #4 + #5)
+# ---------------------------------------------------------------------------
+
+
+class TestSlice7Round3LegacyFallbackPath:
+    """Phase 2a slice 7 round 3 (Codex R2 P1 #4 + #5).
+
+    The legacy fallback path
+    (``_decide_script_container_legacy``) MUST recover the pre-slice-7
+    ``_CLIENT_ONLY_PATTERNS`` / ``_SERVER_ONLY_PATTERNS`` semantic AND
+    the ``_build_call_graph`` source-scan augmentation. These tests
+    pin both contracts: legacy is reached precisely when topology data
+    is degraded, and in that case it MUST NOT silently degrade a
+    LocalPlayer-using Script to SSS or a server-private require to RS.
+    """
+
+    def test_fallback_routes_script_with_localplayer_to_sps(self) -> None:
+        """Codex R2 P1 #4. A Script using ``Players.LocalPlayer`` that
+        escapes ``code_transpiler._classify_script_type``'s
+        ``Script -> LocalScript`` promotion must route to
+        StarterPlayerScripts via the fallback path. The fallback path
+        fires here because no ``topology_inputs`` is passed (legacy
+        mode).
+
+        Pre-round-3 the fallback would default to SSS where
+        ``LocalPlayer`` is nil at runtime; the round-3 restored
+        ``client_touchers`` branch routes to SPS, and the
+        ``classify_storage`` auto-coerce flips ``script_type`` to
+        ``LocalScript`` so ``_enforce_hard_constraints`` passes.
+        """
+        s = _make_script(
+            "LocalPlayerUser",
+            "local lp = game.Players.LocalPlayer\nprint(lp.Name)",
+            script_type="Script",
+        )
+        plan = classify_storage([s])  # no topology_inputs -> legacy fallback
+        assert s.parent_path == STARTER_PLAYER_SCRIPTS
+        assert s.script_type == "LocalScript"  # auto-coerced
+        assert s.name in plan.client_scripts
+        reasons = {d["script"]: d["reason"] for d in plan.decisions}
+        assert "client-only API surface" in reasons["LocalPlayerUser"]
+
+    def test_fallback_routes_script_with_server_only_api_to_sss(
+        self,
+    ) -> None:
+        """Codex R2 P1 #4 (server side). A Script using a server-only
+        API (``OnServerEvent``) must route to ServerScriptService via
+        the legacy fallback's restored ``server_touchers`` branch.
+        Stays Script type (no coercion needed).
+        """
+        s = _make_script(
+            "ServerOnly",
+            'local re = game.ReplicatedStorage.E\nre.OnServerEvent:Connect(function() end)',
+            script_type="Script",
+        )
+        plan = classify_storage([s])
+        assert s.parent_path == SERVER_SCRIPT_SERVICE
+        assert s.script_type == "Script"
+        reasons = {d["script"]: d["reason"] for d in plan.decisions}
+        assert "server-only API surface" in reasons["ServerOnly"]
+
+    def test_fallback_fires_when_transpile_not_ran_and_no_reachability(
+        self,
+    ) -> None:
+        """Verifies the fallback gate at
+        ``_decide_script_container``: when
+        ``transpile_ran=False`` AND ``reachability_requirements[sid]``
+        is absent AND the script is a ModuleScript, the legacy
+        fallback is invoked. The injected ``require()`` literal in a
+        caller Script is picked up by the source-scan augmentation in
+        ``_build_call_graph`` (Codex R2 P1 #5) and routes the
+        ModuleScript to ServerStorage.
+
+        Reproduces the post-transpile-injected-require scenario: the
+        C# analyzer dependency_map is empty (analyzer didn't see the
+        injection), but the literal `require("ServerPrivate")` exists
+        in the caller's source.
+        """
+        from converter.scene_runtime_topology.module_domain import (
+            TopologyInputs,
+        )
+
+        # Server caller with an injected require to ServerPrivate that
+        # the C# analyzer dependency_map cannot see.
+        caller = _make_script(
+            "ServerCaller",
+            'local DSS = game:GetService("DataStoreService")\n'
+            'local M = require(game:GetService("ServerStorage"):FindFirstChild("ServerPrivate"))',
+            script_type="Script",
+        )
+        target = _make_script(
+            "ServerPrivate", "return {}", script_type="ModuleScript",
+        )
+
+        # transpile_ran=False with empty reachability for both
+        # modules => fallback fires per-script for the ModuleScript.
+        # The caller (Script) still goes through the topology path
+        # for itself but the source-scan augmentation runs in
+        # _build_call_graph (which is what the fallback ModuleScript
+        # branch consults for "who requires me?").
+        inputs: TopologyInputs = {
+            "domains": {"g-caller": "server", "g-private": "server"},
+            "reachability_requirements": {},  # empty -> fallback for ModuleScripts
+            "lifecycle_roles": {},
+            "script_id_by_name": {
+                "ServerCaller": "g-caller",
+                "ServerPrivate": "g-private",
+            },
+            "caller_graph": {},  # topology graph empty (no dep_map)
+            "transpile_ran": False,  # no-transpile resume
+        }
+        plan = classify_storage(
+            [caller, target],
+            dependency_map=None,  # analyzer missed the injected require
+            topology_inputs=inputs,
+        )
+
+        # The ModuleScript falls back per-script and the source-scan
+        # augmentation discovers the require() literal, so the legacy
+        # path sees a server-side caller and routes to ServerStorage.
+        assert target.parent_path == SERVER_STORAGE, (
+            f"expected ServerStorage; got {target.parent_path}; "
+            f"reasons: {[(d['script'], d['reason']) for d in plan.decisions]}"
+        )
+        assert target.name in plan.server_modules
+
+    def test_fallback_via_sid_miss_routes_localplayer_script_to_sps(
+        self,
+    ) -> None:
+        """Twin-run for the ``script_id_by_name`` miss fallback gate.
+        When topology_inputs is provided but ``script_id_by_name``
+        cannot resolve the script (degraded-service contract on
+        stem/class_name collisions), the per-script fallback path
+        fires. A LocalPlayer-using Script in that gate must still
+        route to SPS via the restored ``client_touchers`` branch.
+        """
+        from converter.scene_runtime_topology.module_domain import (
+            TopologyInputs,
+        )
+
+        s = _make_script(
+            "ClientWithCollision",
+            "local lp = game.Players.LocalPlayer\nprint(lp.Name)",
+            script_type="Script",
+        )
+        # Note: script_id_by_name DOES NOT contain "ClientWithCollision"
+        # -> the fallback gate fires.
+        inputs: TopologyInputs = {
+            "domains": {},
+            "reachability_requirements": {},
+            "lifecycle_roles": {},
+            "script_id_by_name": {},  # sid miss
+            "caller_graph": {},
+            "transpile_ran": True,
+        }
+        plan = classify_storage([s], topology_inputs=inputs)
+        assert s.parent_path == STARTER_PLAYER_SCRIPTS
+        assert s.script_type == "LocalScript"  # auto-coerced
+        assert s.name in plan.client_scripts
