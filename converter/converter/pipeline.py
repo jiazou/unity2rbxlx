@@ -4325,6 +4325,15 @@ script.Disabled = true
             lifecycle_roles=lifecycle_roles,
             script_id_by_name=script_id_by_name,
             caller_graph=caller_graph,
+            # Slice 7: raw fact -- did transpile run this invocation?
+            # ``state.transpilation_result is not None`` is the
+            # canonical signal (see slice 3 round 5 + slice 6 handoff).
+            # Lets the consumer distinguish "no-transpile resume with
+            # degraded reachability_requirements" from "real
+            # classification bug." Per the slice-6 persistence rule
+            # this is a RAW FACT about pipeline execution, not a
+            # derived conclusion, so it is safe to carry.
+            transpile_ran=self.state.transpilation_result is not None,
         )
 
     def _build_and_apply_topology(

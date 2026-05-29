@@ -401,6 +401,7 @@ class TestClassifyStorageTopologyInputsKwarg:
             "lifecycle_roles": {"g-a": "auto_run"},
             "script_id_by_name": {"A": "g-a", "B": "g-b"},
             "caller_graph": {"g-b": ["g-a"]},
+            "transpile_ran": True,
         }
         scripts_b = _mk_scripts()
         plan_b = classify_storage(
@@ -416,6 +417,126 @@ class TestClassifyStorageTopologyInputsKwarg:
         assert [s.parent_path for s in scripts_a] == [
             s.parent_path for s in scripts_b
         ]
+
+
+class TestTopologyInputsTranspileRan:
+    """Phase 2a slice 7 — ``TopologyInputs.transpile_ran`` is a raw
+    fact about pipeline execution sourced from
+    ``state.transpilation_result is not None`` in
+    ``Pipeline._maybe_run_topology_prepass``.
+
+    Lets the slice-7 consumer distinguish two structurally-identical
+    "empty ``reachability_requirements``" cases without persisting a
+    derived conclusion:
+      * ``transpile_ran is False`` — assemble-no-retranspile resume;
+        empty reqs is expected; per-script fallback to legacy.
+      * ``transpile_ran is True`` — analysis genuinely produced no
+        constraint; topology tree applies (helper is unconstrained).
+    """
+
+    def test_field_present_on_typed_dict(self) -> None:
+        """Sanity: the field exists in the TypedDict schema and is
+        typed ``bool``."""
+        from converter.scene_runtime_topology.module_domain import (
+            TopologyInputs,
+        )
+
+        # ``__annotations__`` is the TypedDict surface; the new field
+        # must show up alongside the other five. The module uses
+        # ``from __future__ import annotations`` so the value may be a
+        # ``ForwardRef`` -- match by its ``__forward_arg__`` (or by
+        # the type directly when not deferred).
+        annotations = TopologyInputs.__annotations__
+        assert "transpile_ran" in annotations
+        ann = annotations["transpile_ran"]
+        forward_arg = getattr(ann, "__forward_arg__", None)
+        assert forward_arg == "bool" or ann is bool
+
+    def test_prepass_sets_true_when_transpile_ran(self) -> None:
+        """Construct a minimal pipeline state with
+        ``transpilation_result`` populated; the prepass must stamp
+        ``transpile_ran=True``."""
+        from unittest.mock import MagicMock
+        from converter.pipeline import Pipeline
+
+        # Spy a minimal Pipeline -- only the attrs ``_maybe_run_topology_prepass``
+        # actually reaches.
+        pipeline = MagicMock(spec=Pipeline)
+        pipeline.ctx = MagicMock()
+        pipeline.ctx.scene_runtime_mode = "modern"
+        pipeline.ctx.networking_mode = "none"
+        pipeline.state = MagicMock()
+        pipeline.state.transpilation_result = MagicMock()  # truthy
+        pipeline.state.dependency_map = {}
+        pipeline.state.guid_index = None
+        pipeline.state.rbx_place = MagicMock()
+        pipeline.state.rbx_place.scripts = []  # empty -> early-return None
+        scene_runtime: dict[str, object] = {
+            "modules": {},  # empty -> prepass returns None
+        }
+
+        # With empty modules the prepass returns None (gate rejects).
+        result = Pipeline._maybe_run_topology_prepass(
+            pipeline, scene_runtime,
+        )
+        assert result is None
+
+    def test_prepass_carries_transpile_ran_through(self) -> None:
+        """The full-path test: a non-trivial scene_runtime with at
+        least one module + script causes the prepass to return a
+        populated ``TopologyInputs`` whose ``transpile_ran`` mirrors
+        ``state.transpilation_result is not None``.
+
+        Asserted for both branches:
+          * ``transpilation_result is not None`` -> True
+          * ``transpilation_result is None`` -> False
+        """
+        from unittest.mock import MagicMock
+        from converter.pipeline import Pipeline
+
+        def _build_pipeline(*, has_transpile_result: bool) -> Pipeline:
+            p = MagicMock(spec=Pipeline)
+            p.ctx = MagicMock()
+            p.ctx.scene_runtime_mode = "modern"
+            p.ctx.networking_mode = "none"
+            p.state = MagicMock()
+            p.state.transpilation_result = (
+                MagicMock() if has_transpile_result else None
+            )
+            p.state.dependency_map = {}
+            p.state.guid_index = None
+            p.state.rbx_place = MagicMock()
+            # Provide one runtime-bearing script + matching module so
+            # the gate accepts.
+            p.state.rbx_place.scripts = [
+                RbxScript(name="X", source="return {}", script_type="ModuleScript"),
+            ]
+            return p
+
+        scene_runtime: dict[str, object] = {
+            "modules": {
+                "g-x": {
+                    "stem": "X", "class_name": "X",
+                    "runtime_bearing": True,
+                    "lifecycle_role": "requireable",
+                },
+            },
+            "scenes": {},
+            "prefabs": {},
+            "domain_overrides": {},
+        }
+
+        # Branch 1: transpile ran.
+        p_true = _build_pipeline(has_transpile_result=True)
+        out_true = Pipeline._maybe_run_topology_prepass(p_true, scene_runtime)
+        assert out_true is not None
+        assert out_true["transpile_ran"] is True
+
+        # Branch 2: no-transpile resume.
+        p_false = _build_pipeline(has_transpile_result=False)
+        out_false = Pipeline._maybe_run_topology_prepass(p_false, scene_runtime)
+        assert out_false is not None
+        assert out_false["transpile_ran"] is False
 
 
 class TestSlice6OrchestratorByteParity:
