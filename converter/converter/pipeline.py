@@ -4341,6 +4341,31 @@ script.Disabled = true
             # that wires the new consumer." Without this, the on-disk
             # plan contradicts the live RbxScript metadata + the
             # scene_runtime.topology block.
+            #
+            # Phase 2a slice 9a: ``topology_inputs`` from the prepass
+            # is passed through. Resume contract: on a
+            # ``--phase=write_output`` (or any) resume,
+            # ``materialize_and_classify`` is in ``ESSENTIAL_PHASES``
+            # (pipeline.py:612) so this method (``_classify_storage``)
+            # re-runs, ``_maybe_run_topology_prepass`` re-runs, and a
+            # fresh ``TopologyInputs`` is produced for this call —
+            # no persistence to ``StoragePlan`` is needed (and would
+            # violate slice 6's "save raw facts, recompute conclusions"
+            # rule, which keeps ``reachability_requirements`` /
+            # ``domains`` recomputed every run). Same gates fire on
+            # both the prepass and this branch (``scene_runtime_mode
+            # != "legacy"`` + non-empty ``modules`` + no
+            # ``__skip_domain_classifier__``) plus ``rbx_place``
+            # presence (checked inside both methods), so
+            # ``topology_inputs`` is non-None whenever this call site
+            # is reached; the kwarg's ``None`` default exists so unit
+            # tests + future callers can still invoke the method
+            # without forcing the prepass dependency.
+            assert topology_inputs is not None, (
+                "slice 9a invariant: ``topology_inputs`` must be set "
+                "whenever ``_build_and_apply_topology`` is reached "
+                "via ``_classify_storage`` — same gate as the prepass."
+            )
             self._build_and_apply_topology(
                 scene_runtime, plan, topology_inputs=topology_inputs,
             )
