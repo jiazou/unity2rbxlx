@@ -1312,6 +1312,26 @@ def derive_intrinsic_script_class(script: RbxScript | None) -> str:
     the mutable ``script_type``; neither touches
     ``intrinsic_script_type``.
 
+    Pre-classifier mutators robustness
+    -------------------------------------------------------------
+    The intrinsic value is specifically robust against the two
+    pre-classifier mutators that today are GATED OFF from the
+    topology consumer:
+
+      (a) ``classify_storage``'s ``Script→LocalScript`` routing
+          coercion (still gated by ``build_topology``'s consumer
+          design — topology reads intrinsic, not the mutable field).
+      (b) ``_subphase_cohere_scripts``'s
+          ``fix_require_classifications`` ``Script→ModuleScript``
+          rewrite, gated by generic-mode early-return (see
+          ``pipeline.py:2837-2843``); ``build_topology`` consumption
+          is itself gated to generic-mode (see
+          ``pipeline.py:4057-4058``).
+
+    If either gate is ever lifted, re-stamp
+    ``intrinsic_script_type`` after the relevant mutator runs so the
+    immutable-field contract holds at the topology consumption site.
+
     Returns ``"ModuleScript"`` when ``script`` is ``None`` (the
     require-target / orphan-module case at
     ``build_topology._build_modules_block``).
