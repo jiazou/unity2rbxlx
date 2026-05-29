@@ -733,6 +733,115 @@ class TestSlice7Round2LifecycleRoleStamping:
         assert out is not None
         assert out["lifecycle_roles"].get("g-cam") == "auto_run"
 
+    def test_prepass_join_unified_with_routing_on_class_name_collision(
+        self,
+    ) -> None:
+        """Round 4 (R3 review P2-NEW-B). When two modules share a
+        ``class_name`` but have DISTINCT stems, the lifecycle-role
+        prepass MUST still reach the lifecycle assignment for both
+        rows — same as the routing join in
+        ``_decide_script_container_from_topology``.
+
+        Pre-R4 the prepass joined on class_name only via
+        ``build_scripts_by_class_name`` (collision-exclude on
+        class_name), but the routing path joined on
+        ``script_id_by_name`` (collision-exclude on BOTH class_name
+        AND stem, with class_name → stem fallback). Disagreement
+        case: two modules with colliding ``class_name="X"`` but
+        distinct stems ``a`` / ``b`` were excluded from the prepass
+        index (their script_class fell back to ``""``), which
+        silently demoted their ``character_attached`` / ``loader``
+        lifecycle roles to the default ``"auto_run"`` branch — the
+        exact silent-demotion failure mode the slice-3
+        degraded-service contract was designed to surface.
+
+        R4 unifies the prepass on ``build_script_id_by_name`` (the
+        canonical helper) and inverts it to a sid → RbxScript map.
+        Both rows now reach the lifecycle assignment via the stem
+        fallback the routing path already uses.
+
+        This test pins the unification: two scripts named ``a`` and
+        ``b`` (distinct stems) with colliding ``class_name="X"``
+        and non-default lifecycle attrs MUST land in
+        ``lifecycle_roles`` with their derived roles
+        (``loader`` and ``character_attached``), NOT the empty-string
+        default that ``derive_module_lifecycle_role`` returns when
+        ``script_class`` is also empty.
+        """
+        from converter.pipeline import Pipeline
+
+        # Two scripts: file stems "a" / "b" matching the modules'
+        # distinct stem field. Their class_name both collide as "X" —
+        # the collision excludes the class_name keyspace, so the
+        # canonical helper falls back to stem (which is collision-free).
+        scripts = [
+            RbxScript(
+                # script.name == module.stem ("a") triggers the stem
+                # fallback inside ``build_script_id_by_name``.
+                name="a",
+                source="local p = game.Players.LocalPlayer",
+                script_type="Script",
+            ),
+            RbxScript(
+                name="b",
+                source=(
+                    "local p = game.Players.LocalPlayer\n"
+                    "print(p.Character)"
+                ),
+                script_type="LocalScript",
+            ),
+        ]
+        scene_runtime: dict[str, object] = {
+            "modules": {
+                "g-a": {
+                    # Colliding class_name, distinct stem.
+                    "stem": "a", "class_name": "X",
+                    "runtime_bearing": True,
+                    "is_loader": True, "character_attached": False,
+                },
+                "g-b": {
+                    "stem": "b", "class_name": "X",
+                    "runtime_bearing": True,
+                    "is_loader": False, "character_attached": True,
+                },
+            },
+            "scenes": {},
+            "prefabs": {},
+            "domain_overrides": {},
+        }
+        pipeline = self._build_pipeline_with(scripts=scripts)
+        out = Pipeline._maybe_run_topology_prepass(pipeline, scene_runtime)
+        assert out is not None
+
+        # Both rows reach lifecycle_roles via the canonical helper's
+        # stem fallback (collision-exclude removed them from
+        # class_name keyspace; stems "a"/"b" are collision-free).
+        # If the prepass still used ``build_scripts_by_class_name``,
+        # both sids would silently get ``""`` script_class and the
+        # ``is_loader`` / ``character_attached`` gates inside
+        # ``derive_module_lifecycle_role`` would NOT fire — they'd
+        # demote to ``"auto_run"`` (the default for empty script_class
+        # + client domain).
+        assert out["lifecycle_roles"].get("g-a") == "loader", (
+            f"g-a (class_name='X' collision, stem='a' unique) must "
+            f"reach the loader lifecycle role via the canonical "
+            f"stem-fallback join; got "
+            f"{out['lifecycle_roles'].get('g-a')!r}"
+        )
+        assert out["lifecycle_roles"].get("g-b") == "character_attached", (
+            f"g-b (class_name='X' collision, stem='b' unique) must "
+            f"reach the character_attached lifecycle role via the "
+            f"canonical stem-fallback join; got "
+            f"{out['lifecycle_roles'].get('g-b')!r}"
+        )
+
+        # Routing parity check: ``script_id_by_name`` (the routing
+        # path's join) ALSO resolved both scripts via the stem
+        # fallback. Pin the contract that the prepass and routing
+        # paths share ONE source of truth.
+        assert out["script_id_by_name"].get("a") == "g-a"
+        assert out["script_id_by_name"].get("b") == "g-b"
+
     def test_prepass_lifecycle_roles_parity_with_build_topology(
         self,
     ) -> None:

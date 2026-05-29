@@ -4248,7 +4248,6 @@ script.Disabled = true
         from converter.scene_runtime_planner import (
             backfill_lifecycle_role_inputs,
             build_script_id_by_name,
-            build_scripts_by_class_name,
             derive_intrinsic_script_class,
         )
         from converter.scene_runtime_topology.build_topology import (
@@ -4339,21 +4338,50 @@ script.Disabled = true
         # ``derive_module_lifecycle_role`` with the same inputs, so
         # the prepass dict and the artifact entry are byte-identical.
         # See ``slice-7-r1-decision.md`` for the verification chain.
+        #
+        # Round 4 (R3 review P2-NEW-B): unify the prepass join key with
+        # the routing join key. Pre-R4 the prepass joined on class_name
+        # only (via ``build_scripts_by_class_name``) but the routing
+        # path in ``_decide_script_container_from_topology`` joined on
+        # ``script_id_by_name`` (class_name with stem fallback, both
+        # collision-excluded). Disagreement case: two modules with
+        # colliding ``class_name`` but distinct stems pass routing's
+        # lookup via the stem fallback, but the prepass excludes them
+        # both (class_name collision) and silently demotes
+        # ``character_attached`` / ``loader`` to the default role —
+        # exactly the failure mode the slice-3 contract was designed
+        # to surface.
+        #
+        # Fix (option c per memory's "canonical contract" rule):
+        # invert ``script_id_by_name`` to build a ``script_by_sid``
+        # map keyed on the same join the routing path uses. One source
+        # of truth for class_name + stem + collision exclusion across
+        # both consumers. ``build_scripts_by_class_name`` is still
+        # used downstream by ``_build_and_apply_topology`` /
+        # ``_build_modules_block`` for the class_name keyspace there
+        # (see TODO in this method's R4 commit message for the
+        # symmetric follow-up).
         modules_dict = cast("dict[str, dict[str, object]]", modules)
-        scripts_by_class = build_scripts_by_class_name(
-            self.state.rbx_place.scripts,
-            cast(
-                "dict[str, SceneRuntimeModule | dict[str, object]]",
-                modules,
-            ),
-        )
+        scripts_by_name: dict[str, RbxScript] = {
+            s.name: s for s in self.state.rbx_place.scripts if s.name
+        }
+        # Invert ``script_id_by_name`` (``script.name -> sid``) to
+        # ``sid -> RbxScript``. Both directions share the SAME
+        # collision-exclusion contract because they're derived from the
+        # same producer. Modules whose class_name + stem both collide
+        # (or both miss) are absent from ``script_id_by_name`` and
+        # therefore also absent from ``script_by_sid`` — the prepass
+        # then drops them to ``script_class=""`` /
+        # ``derive_intrinsic_script_class(None)``, which is the
+        # safe-default outcome the slice-3 contract specifies.
+        script_by_sid: dict[str, RbxScript] = {
+            sid: scripts_by_name[script_name]
+            for script_name, sid in script_id_by_name.items()
+            if script_name in scripts_by_name
+        }
         lifecycle_roles: dict[str, str] = {}
         for sid, row in modules_dict.items():
-            class_name_obj = row.get("class_name", "")
-            class_name = (
-                class_name_obj if isinstance(class_name_obj, str) else ""
-            )
-            script = scripts_by_class.get(class_name)
+            script = script_by_sid.get(sid)
             script_class = derive_intrinsic_script_class(script)
             module_domain = domains.get(sid, "")
             character_attached = bool(row.get("character_attached", False))
