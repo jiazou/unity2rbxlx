@@ -279,6 +279,67 @@ class TestFinalizeTopologyContainersIdempotent:
         assert scripts[1].parent_path == first_helper_parent
 
 
+class TestNoParentPathInEarlyPrepass:
+    """Belt-and-suspenders: AST-walk ``module_domain.py`` and assert
+    that ``infer_module_domains`` + ``derive_reachability_requirements``
+    + their transitively-called private helpers do NOT touch the
+    ``parent_path`` attribute. Slice 6's whole structural premise --
+    that the early prepass can run before ``classify_storage`` --
+    breaks the moment any of these read ``parent_path``. If a future
+    edit reintroduces the dependency, this test catches it before the
+    pipeline silently regresses.
+
+    Whitelist: ``finalize_topology_containers`` is allowed to read
+    ``parent_path`` -- it runs AFTER ``classify_storage`` and must
+    mirror the post-classify ``parent_path`` onto the module row.
+    """
+
+    def test_infer_module_domains_does_not_read_parent_path(self) -> None:
+        import ast
+        import inspect
+
+        from converter.scene_runtime_topology import module_domain as md
+
+        source = inspect.getsource(md)
+        tree = ast.parse(source)
+
+        # Find the function defs we care about.
+        target_funcs = {
+            "infer_module_domains",
+            "derive_reachability_requirements",
+        }
+        # Helpers `infer_module_domains` reaches: `_classify_module`,
+        # `_collect_signals`, `_apply_rule_table`, `_classify_api_surface`,
+        # `_load_cs_source`, `_gather_per_instance_evidence`,
+        # `_build_displaced_rows`, `_compute_network_behaviour_reachable`,
+        # `_closure`. None of them read RbxScript.parent_path.
+        helper_funcs = {
+            "_classify_module",
+            "_collect_signals",
+            "_apply_rule_table",
+            "_classify_api_surface",
+            "_load_cs_source",
+            "_gather_per_instance_evidence",
+            "_build_displaced_rows",
+            "_compute_network_behaviour_reachable",
+            "_closure",
+        }
+        all_funcs_to_check = target_funcs | helper_funcs
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name in all_funcs_to_check:
+                for sub in ast.walk(node):
+                    if isinstance(sub, ast.Attribute) and sub.attr == "parent_path":
+                        pytest.fail(
+                            f"{node.name} reads 'parent_path' "
+                            f"(line {sub.lineno}) -- this breaks the "
+                            "slice-6 early-prepass invariant. The "
+                            "domain inference path must run "
+                            "BEFORE classify_storage, so it cannot "
+                            "depend on parent_path."
+                        )
+
+
 class TestClassifyStorageTopologyInputsKwarg:
     """Slice 6 commit 4 (rework): ``classify_storage`` accepts a
     ``topology_inputs`` kwarg. The legacy decision tree is UNCHANGED

@@ -1603,6 +1603,25 @@ def _apply_reachability_rule(
     Helpers required by client modules are forced to ``ReplicatedStorage``;
     a conflict (same helper required by both sides AND parked in
     ``ServerStorage``) excludes the helper from the runtime plan.
+
+    .. deprecated::
+        Phase 2a slice 6 split this rule into two pieces and no
+        longer invokes the function:
+
+          - ``derive_reachability_requirements`` runs EARLY
+            (before ``classify_storage``) and computes the
+            ``{script_id: required_container}`` mapping. PURE: no
+            ``parent_path`` reads, no mutation.
+          - ``finalize_topology_containers`` runs LATE (after
+            ``classify_storage``) and applies the requirements
+            atomically onto module rows + ``RbxScript.parent_path``,
+            preserving this function's predicate gate
+            (``current_container in _SERVER_CONTAINERS_FOR_REACHABILITY``)
+            so the behavior delta is zero.
+
+        The function stays alive in slice 6 so out-of-tree callers
+        don't break flag-day; slice 7 deletes it along with the
+        regex-API detectors. NO NEW CALL SITES.
     """
     # Phase 2a slice 4 round 5 review (Claude P1.2): consume the
     # unified ``compute_class_name_collisions`` set so the rule's
