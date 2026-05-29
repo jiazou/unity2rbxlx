@@ -4041,6 +4041,7 @@ script.Disabled = true
         plan = classify_storage(
             self.state.rbx_place.scripts,
             dependency_map=self.state.dependency_map or None,
+            topology_inputs=topology_inputs,
         )
         self.ctx.storage_plan = plan
 

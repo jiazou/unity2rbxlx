@@ -29,9 +29,12 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field, asdict
-from typing import Any, Iterable
+from typing import Any, Iterable, TYPE_CHECKING
 
 from core.roblox_types import RbxScript
+
+if TYPE_CHECKING:
+    from converter.scene_runtime_topology.module_domain import TopologyInputs
 
 log = logging.getLogger(__name__)
 
@@ -158,6 +161,7 @@ def classify_storage(
     character_script_names: Iterable[str] | None = None,
     template_names: Iterable[str] | None = None,
     template_spawn_callers: dict[str, list[str]] | None = None,
+    topology_inputs: "TopologyInputs | None" = None,
 ) -> StoragePlan:
     """Assign each script a concrete parent_path and build a StoragePlan.
 
@@ -174,6 +178,24 @@ def classify_storage(
             ``templates_manifest`` is wired through).
         template_spawn_callers: ``template_name -> [caller_script_names]``.
             Decides replicated vs server container.
+        topology_inputs: Phase 2a slice 6 -- output of
+            ``Pipeline._maybe_run_topology_prepass`` (per-module domain
+            verdict + reachability requirements + caller_graph +
+            script_id_by_name + lifecycle_roles), or ``None`` when the
+            prepass gate rejected this run (legacy mode / no modules /
+            probe flag). Slice 6 plumbs the kwarg but does NOT yet
+            change behavior -- ``_decide_script_container`` still runs
+            the legacy six-rule sequence. Slice 7 flips the consumer:
+            when ``topology_inputs is not None`` the decision tree
+            consults ``domains`` / ``reachability_requirements`` /
+            ``caller_graph`` etc. and the regex-API legacy branch is
+            removed atomically with this fork. Per the slice-6
+            "save raw facts, recompute conclusions" rule, this kwarg
+            is NEVER persisted onto ``StoragePlan`` -- it is always
+            recomputed by the pipeline on every run, including
+            assemble-no-retranspile resumes (when
+            ``reachability_requirements`` collapses to ``{}`` and
+            slice 7 falls back to the "unconstrained helper" path).
 
     Returns:
         StoragePlan describing every container assignment with an audit trail.
@@ -194,6 +216,7 @@ def classify_storage(
             server_touchers=server_touchers,
             character_set=character_set,
             script_by_name=script_by_name,
+            topology_inputs=topology_inputs,
         )
         s.parent_path = container
 
@@ -344,8 +367,24 @@ def _decide_script_container(
     server_touchers: set[str],
     character_set: set[str],
     script_by_name: dict[str, RbxScript],
+    topology_inputs: "TopologyInputs | None" = None,
 ) -> tuple[str, str]:
-    """Return (container, reason) for a single script."""
+    """Return (container, reason) for a single script.
+
+    Phase 2a slice 6: ``topology_inputs`` is plumbed through but NOT
+    yet consumed. The six-rule legacy decision sequence below runs
+    unchanged whether the kwarg is provided or not. Slice 7 will
+    fork on ``topology_inputs is not None`` and route through a
+    topology-driven decision tree; the legacy branch will then be
+    removed atomically with the regex-API detectors. Keeping the
+    plumbing inert in slice 6 means ``test_storage_classifier.py``'s
+    19 tests pass byte-for-byte against the unchanged legacy path.
+    """
+    # Slice 6: ``topology_inputs`` intentionally unused below. Asserting
+    # this here (with the underscored alias) keeps mypy happy without
+    # silencing the "unused parameter" lint at the call site.
+    _ = topology_inputs
+
     # Character-attached scripts go to StarterCharacterScripts.
     if s.name in character_set:
         return STARTER_CHARACTER_SCRIPTS, "character-attached per scene wiring"

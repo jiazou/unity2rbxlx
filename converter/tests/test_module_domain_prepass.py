@@ -279,6 +279,84 @@ class TestFinalizeTopologyContainersIdempotent:
         assert scripts[1].parent_path == first_helper_parent
 
 
+class TestClassifyStorageTopologyInputsKwarg:
+    """Slice 6 commit 4 (rework): ``classify_storage`` accepts a
+    ``topology_inputs`` kwarg. The legacy decision tree is UNCHANGED
+    in slice 6; slice 7's rewrite will fork on the kwarg.
+
+    Parity assertion here: same scripts in, same StoragePlan out
+    whether the kwarg is ``None`` or supplied. Per the slice-6
+    "save raw facts, recompute conclusions" rule, the kwarg is NOT
+    persisted onto ``StoragePlan`` -- it is always recomputed by the
+    pipeline on every run. That rule is upheld by the absence of a
+    ``StoragePlan.topology_inputs`` field; this class therefore only
+    asserts decision-tree parity, NOT persistence.
+    """
+
+    def test_legacy_path_wins_when_topology_inputs_none(self) -> None:
+        from converter.storage_classifier import classify_storage
+
+        scripts = [
+            RbxScript(name="A", source="Players.LocalPlayer", script_type="Script"),
+            RbxScript(name="B", source="return {}", script_type="ModuleScript"),
+        ]
+        plan = classify_storage(scripts, dependency_map={"A": ["B"]})
+        # Legacy six-rule sequence put A in StarterPlayerScripts
+        # (client-only API) and B in ReplicatedStorage (required by
+        # client-side caller).
+        assert scripts[0].parent_path == STARTER_PLAYER_SCRIPTS
+        assert scripts[1].parent_path == REPLICATED_STORAGE
+
+    def test_topology_inputs_kwarg_is_no_op_on_decisions(self) -> None:
+        """Slice 6 must NOT change ``_decide_script_container``'s
+        output. Pass an arbitrary ``topology_inputs`` -- buckets +
+        per-script ``parent_path`` should be IDENTICAL to the
+        ``None``-kwarg call.
+        """
+        from converter.scene_runtime_topology.module_domain import (
+            TopologyInputs,
+        )
+        from converter.storage_classifier import classify_storage
+
+        def _mk_scripts() -> list[RbxScript]:
+            return [
+                RbxScript(
+                    name="A", source="Players.LocalPlayer",
+                    script_type="Script",
+                ),
+                RbxScript(
+                    name="B", source="return {}",
+                    script_type="ModuleScript",
+                ),
+            ]
+
+        scripts_a = _mk_scripts()
+        plan_a = classify_storage(scripts_a, dependency_map={"A": ["B"]})
+
+        # Supply an arbitrary (but well-typed) topology_inputs blob.
+        inputs: TopologyInputs = {
+            "domains": {"g-a": "client", "g-b": "helper"},
+            "reachability_requirements": {"g-b": REPLICATED_STORAGE},
+            "lifecycle_roles": {"g-a": "auto_run"},
+            "script_id_by_name": {"A": "g-a", "B": "g-b"},
+            "caller_graph": {"g-b": ["g-a"]},
+        }
+        scripts_b = _mk_scripts()
+        plan_b = classify_storage(
+            scripts_b, dependency_map={"A": ["B"]},
+            topology_inputs=inputs,
+        )
+
+        # Buckets + parent_paths byte-identical between the two runs.
+        assert plan_a.server_scripts == plan_b.server_scripts
+        assert plan_a.client_scripts == plan_b.client_scripts
+        assert plan_a.shared_modules == plan_b.shared_modules
+        assert plan_a.server_modules == plan_b.server_modules
+        assert [s.parent_path for s in scripts_a] == [
+            s.parent_path for s in scripts_b
+        ]
+
+
 class TestSlice6OrchestratorByteParity:
     """The legacy entry point ``classify_scene_runtime_domains`` must
     still produce byte-identical output to slice 5. The new pure
