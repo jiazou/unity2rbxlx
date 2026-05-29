@@ -4001,6 +4001,20 @@ script.Disabled = true
         to ``self.ctx.storage_plan`` and to ``conversion_plan.json`` in the
         output directory.
 
+        Phase 2a slice 6: runs the scene-runtime topology PREPASS
+        (``infer_module_domains`` + ``derive_reachability_requirements``)
+        before ``classify_storage`` so slice 7's storage decision tree
+        can read per-module domain verdicts + reachability requirements
+        as inputs. The prepass uses ``self.ctx.scene_runtime`` (planner
+        artifact, available since the ``plan_scene_runtime`` phase) +
+        the on-disk merged ``domain_overrides`` (so operator-supplied
+        overrides flow through the prepass too). The prepass is gated
+        identically to the late classifier today — generic mode only,
+        and only when ``scene_runtime.modules`` is non-empty + the
+        ``__skip_domain_classifier__`` probe flag is unset. Slice 6's
+        kwarg into ``classify_storage`` defaults to ``None`` (legacy
+        path); slice 7 will flip the consumer to the prepass output.
+
         Safe to call multiple times — the classifier is idempotent.
         """
         if self.state.rbx_place is None or not self.state.rbx_place.scripts:
@@ -4008,6 +4022,21 @@ script.Disabled = true
 
         from converter.storage_classifier import classify_storage
         import json as _json
+
+        # Phase 2a slice 6: pre-merge scene_runtime so the prepass runs
+        # against the same artifact the legacy classifier sees (sticky
+        # ``domain_overrides`` + legacy-domain migration + any unknown
+        # on-disk keys preserved forward-compat). The same merged dict
+        # is reused after ``classify_storage`` -- _merge_scene_runtime
+        # is idempotent in its observable output.
+        plan_path = self.output_dir / "conversion_plan.json"
+        scene_runtime = self._merge_scene_runtime(plan_path)
+
+        # Phase 2a slice 6: early prepass. Same gate as the late classifier
+        # (see the comment block in the post-classify_storage branch
+        # below). Produces the per-module domain + reachability-requirement
+        # map slice 7 will consume from inside ``classify_storage``.
+        topology_inputs = self._maybe_run_topology_prepass(scene_runtime)
 
         plan = classify_storage(
             self.state.rbx_place.scripts,
@@ -4029,14 +4058,11 @@ script.Disabled = true
         if self.state.animation_result is not None:
             animation_routing = getattr(self.state.animation_result, "routing", {}) or {}
 
-        plan_path = self.output_dir / "conversion_plan.json"
-
-        # PR1 merge: the planner artifact stored on ``ctx.scene_runtime``
-        # (and any sticky ``domain_overrides`` an operator edited into a
-        # prior ``conversion_plan.json`` on disk) must survive this
-        # wholesale rewrite. Pre-PR1 ``_classify_storage`` emitted a fixed
-        # 3-key dict that silently dropped anything else.
-        scene_runtime = self._merge_scene_runtime(plan_path)
+        # ``plan_path`` + ``scene_runtime`` already computed pre-classify_storage
+        # (see slice-6 prepass block above). ``_merge_scene_runtime`` is
+        # behavior-equivalent at this point in the run -- on-disk plan
+        # hasn't been rewritten yet, so re-running it here would produce
+        # the same dict. Slice 6 deduplicates the call.
 
         # PR3b: stamp per-module ``domain`` / ``container`` / ``module_path``
         # / ``domain_signals`` once the storage classifier has finalized
@@ -4156,6 +4182,132 @@ script.Disabled = true
             "[classify_storage] %d scripts classified (plan written to %s)",
             len(plan.decisions),
             plan_path.name,
+        )
+
+    def _maybe_run_topology_prepass(
+        self,
+        scene_runtime: dict[str, object],
+    ) -> "TopologyInputs | None":
+        """Slice-6 early prepass: produce ``TopologyInputs`` BEFORE
+        ``classify_storage`` runs.
+
+        Returns ``None`` when the same gate the late classifier uses
+        rejects the call -- legacy mode, no ``modules`` block, or the
+        ``__skip_domain_classifier__`` probe flag is set. Slice 6's
+        ``classify_storage`` treats ``topology_inputs=None`` as the
+        legacy decision path (byte-identical to slice 5).
+
+        When the gate accepts, this function:
+          - Backfills lifecycle-role inputs on pre-slice-2 module rows.
+          - Runs ``infer_module_domains`` -- pure, no ``parent_path``.
+          - Runs ``derive_reachability_requirements`` -- pure.
+          - Builds ``script_id_by_name`` via the canonical helper.
+          - Builds ``caller_graph`` via the canonical
+            ``resolve_caller_graph`` helper (honors the
+            ``transpilation_result is None`` preserve rule -- same
+            signal ``_build_and_apply_topology`` uses).
+          - Reads ``lifecycle_role`` off each module row (when set
+            already by ``plan_scene_runtime``).
+
+        The returned ``TopologyInputs`` is persisted onto
+        ``StoragePlan`` by ``classify_storage`` so rehydration can
+        restore it on resume (slice 6 commit 4).
+        """
+        if self.ctx.scene_runtime_mode == "legacy":
+            return None
+        modules = scene_runtime.get("modules")
+        if not modules:
+            return None
+        if scene_runtime.get("__skip_domain_classifier__"):
+            return None
+        if self.state.rbx_place is None or not self.state.rbx_place.scripts:
+            return None
+
+        from converter.scene_runtime_domain import (
+            derive_reachability_requirements,
+            infer_module_domains,
+            migrate_legacy_domain_values,
+        )
+        from converter.scene_runtime_planner import (
+            backfill_lifecycle_role_inputs,
+            build_script_id_by_name,
+        )
+        from converter.scene_runtime_topology.build_topology import (
+            resolve_caller_graph,
+        )
+        from converter.scene_runtime_topology.module_domain import (
+            TopologyInputs,
+        )
+
+        # Migration + backfill mirror what the post-classify_storage
+        # branch does today (and are idempotent), so doing them here
+        # too keeps slice 5's "consistent classifier inputs across
+        # both passes" invariant.
+        migrate_legacy_domain_values(cast("SceneRuntimeArtifact", scene_runtime))
+        backfill_lifecycle_role_inputs(scene_runtime)
+
+        networking = getattr(self.ctx, "networking_mode", "none")
+
+        # Pre-classify-storage caller_graph derivation. Slice 3 round 5
+        # codified the ``state.transpilation_result is not None``
+        # signal as "did transpile run this invocation" -- empty
+        # dependency_map alongside a populated transpilation_result is
+        # the legitimate "fresh ran with no edges" case (don't
+        # preserve); populated dep_map alongside a None transpilation_result
+        # is the resume case (preserve the prior block).
+        preserved_caller_graph: dict[str, list[str]] | None
+        if self.state.transpilation_result is not None:
+            preserved_caller_graph = None
+        else:
+            prior_topology_obj = scene_runtime.get("topology", {})
+            prior_topology = (
+                prior_topology_obj
+                if isinstance(prior_topology_obj, dict) else {}
+            )
+            pcg = prior_topology.get("caller_graph", {})
+            preserved_caller_graph = (
+                pcg if isinstance(pcg, dict) and pcg else None
+            )
+
+        domain_results = infer_module_domains(
+            cast("SceneRuntimeArtifact", scene_runtime),
+            self.state.rbx_place.scripts,
+            dependency_map=self.state.dependency_map or None,
+            guid_index=self.state.guid_index,
+            networking=networking,
+        )
+        reqs = derive_reachability_requirements(
+            cast("SceneRuntimeArtifact", scene_runtime),
+            self.state.rbx_place.scripts,
+            domain_results,
+            dependency_map=self.state.dependency_map or None,
+        )
+        caller_graph = resolve_caller_graph(
+            cast("SceneRuntimeArtifact", scene_runtime),
+            self.state.dependency_map or None,
+            preserved_caller_graph=preserved_caller_graph,
+        )
+        script_id_by_name = build_script_id_by_name(
+            self.state.rbx_place.scripts,
+            cast("dict[str, SceneRuntimeModule | dict[str, object]]", modules),
+        )
+
+        domains: dict[str, str] = {
+            sid: res["domain"] for sid, res in domain_results.items()
+        }
+        lifecycle_roles: dict[str, str] = {}
+        modules_dict = cast("dict[str, dict[str, object]]", modules)
+        for sid, row in modules_dict.items():
+            role = row.get("lifecycle_role", "")
+            if isinstance(role, str) and role:
+                lifecycle_roles[sid] = role
+
+        return TopologyInputs(
+            domains=domains,
+            reachability_requirements=reqs,
+            lifecycle_roles=lifecycle_roles,
+            script_id_by_name=script_id_by_name,
+            caller_graph=caller_graph,
         )
 
     def _build_and_apply_topology(

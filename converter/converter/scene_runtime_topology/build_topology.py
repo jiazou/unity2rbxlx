@@ -430,39 +430,15 @@ def build_topology(
     # caller_graph: build fresh from dependency_map, OR use the
     # preserved block on assemble-no-retranspile workflows where the
     # planner's dependency_map is empty for legitimate reasons (codex
-    # round 4 P2). Detection collision runs only in the build-fresh
-    # path; the preserved path skips both the detection and the
-    # translation since both ran when the prior block was first
-    # computed.
-    if preserved_caller_graph is not None:
-        caller_graph_block = preserved_caller_graph
-    else:
-        # Detect class_name collisions in scene_runtime.modules that
-        # are touched by dependency_map BEFORE block-building, AND
-        # compute the dedup'd class_name → script_id translation
-        # index in the SAME walk. _build_caller_graph_block consumes
-        # the precomputed index instead of rebuilding it — round-3
-        # P1.2 flagged the two-walk design as vulnerable to silent
-        # divergence (if filters diverge in the future, exclusion set
-        # ↛ translation set).
-        #
-        # Degraded-service contract: colliding class_names are
-        # excluded from the index; the colliding scripts appear as
-        # orphan rows in caller_graph. Slice 5's storage_classifier
-        # rewrite (when it lands) routes orphans to ReplicatedStorage.
-        # Today's storage_classifier still uses its own lossy
-        # class_name routing — see _detect_caller_graph_collisions
-        # docstring for the forward-looking nature of the promise.
-        colliding_classes, class_to_script_id = (
-            _detect_caller_graph_collisions(
-                scene_runtime, dependency_map,
-            )
-        )
-        caller_graph_block = _build_caller_graph_block(
-            dependency_map,
-            class_to_script_id=class_to_script_id,
-            excluded_class_names=colliding_classes,
-        )
+    # round 4 P2). Slice 6 lifted the build / preserve logic into the
+    # public ``resolve_caller_graph`` helper so the early prepass
+    # (pipeline.py:_maybe_run_topology_prepass) shares ONE derivation
+    # with this late assembly — if the two diverged silently, slice 7's
+    # storage decision tree would route on a stale or wrong graph.
+    caller_graph_block = resolve_caller_graph(
+        scene_runtime, dependency_map,
+        preserved_caller_graph=preserved_caller_graph,
+    )
 
     modules_block = _build_modules_block(
         scene_runtime, scripts_by_class, guid_index,
@@ -836,6 +812,49 @@ def _build_caller_graph_block(
                 existing.append(caller_id)
 
     return callers_by_script_id
+
+
+def resolve_caller_graph(
+    scene_runtime: SceneRuntimeArtifact,
+    dependency_map: dict[str, list[str]] | None,
+    *,
+    preserved_caller_graph: dict[str, list[str]] | None = None,
+) -> dict[str, list[str]]:
+    """Build the script_id-keyed ``caller_graph`` view OR return the
+    preserved block on assemble-no-retranspile workflows.
+
+    Lifted from the duplicate logic that previously lived inline in
+    ``build_topology`` (the fresh-build branch) and at the pipeline
+    boundary (``_build_and_apply_topology`` preserve logic). Slice 6
+    plumbs the SAME helper into the early prepass so the prepass and
+    the late assembly share ONE caller_graph derivation -- without
+    this, the prepass would re-derive the graph and any future
+    divergence in the duplicated detection logic would silently leak
+    into storage decisions.
+
+    Behavior:
+      - ``preserved_caller_graph is not None`` -- return it verbatim.
+        Use this path when ``state.transpilation_result is None``
+        (assemble-no-retranspile workflows where ``dependency_map``
+        is empty for legitimate reasons -- the resume preserves the
+        prior block).
+      - Otherwise -- detect class_name collisions on the modules /
+        dependency_map combination, then build the incoming-edge
+        ``caller_graph`` block under the degraded-service contract.
+
+    Returns ``{}`` when ``dependency_map`` is empty/None AND no
+    preserved graph is provided.
+    """
+    if preserved_caller_graph is not None:
+        return preserved_caller_graph
+    colliding_classes, class_to_script_id = (
+        _detect_caller_graph_collisions(scene_runtime, dependency_map)
+    )
+    return _build_caller_graph_block(
+        dependency_map,
+        class_to_script_id=class_to_script_id,
+        excluded_class_names=colliding_classes,
+    )
 
 
 def callers_of(
@@ -1337,4 +1356,5 @@ __all__ = (
     "TopologyProvenance",
     "build_topology",
     "callers_of",
+    "resolve_caller_graph",
 )

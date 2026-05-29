@@ -578,6 +578,44 @@ class _DomainInferenceResult(TypedDict):
     excluded: bool
 
 
+class TopologyInputs(TypedDict):
+    """Output of the slice-6 prepass; input to ``classify_storage``'s
+    topology-driven branch (slice 7).
+
+    Composed by ``Pipeline._maybe_run_topology_prepass`` immediately
+    BEFORE ``classify_storage`` runs. Carries everything slice 7's
+    ``_decide_script_container_from_topology`` will read — per-module
+    domain verdict, reachability requirement, and the lookup indices
+    that map ``RbxScript.name`` ↔ ``script_id`` and ``script_id`` →
+    caller list. All entries are derived purely from
+    ``scene_runtime`` + the planner's ``dependency_map`` — NO
+    ``parent_path`` reads.
+
+    Slice 6 plumbs this through ``classify_storage`` as a
+    no-op-on-default kwarg; slice 7 flips ``_decide_script_container``
+    to consume it. Persisted onto ``StoragePlan`` so rehydration can
+    restore it on resume (mirrors slice 5's
+    ``intrinsic_script_type`` persistence pattern).
+    """
+
+    # ``script_id`` -> domain verdict from ``infer_module_domains``.
+    domains: dict[str, str]
+    # ``script_id`` -> required container ("ReplicatedStorage" or
+    # "__excluded__"). Helpers not listed are unconstrained.
+    reachability_requirements: dict[str, str]
+    # ``script_id`` -> ``lifecycle_role`` (planner-derived; available
+    # from the module row). Empty under legacy mode.
+    lifecycle_roles: dict[str, str]
+    # ``RbxScript.name`` -> ``script_id``. Built via the canonical
+    # ``build_script_id_by_name`` helper -- honors the
+    # degraded-service contract on colliding class_names + stems.
+    script_id_by_name: dict[str, str]
+    # ``script_id`` -> list of caller ``script_id``s. Built from the
+    # planner's ``dependency_map`` via the canonical
+    # ``_resolve_caller_graph`` helper in ``build_topology.py``.
+    caller_graph: dict[str, list[str]]
+
+
 def infer_module_domains(
     scene_runtime: SceneRuntimeArtifact,
     scripts: Iterable[RbxScript],
@@ -1827,6 +1865,7 @@ __all__ = (
     "NetworkingMode",
     "NETWORKING_MODES",
     "DEFAULT_NETWORKING_MODE",
+    "TopologyInputs",
     "_GENERIC_CLIENT_API_PATTERNS",
     "_GENERIC_SERVER_API_PATTERNS",
 )
