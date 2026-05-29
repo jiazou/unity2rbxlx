@@ -543,8 +543,8 @@ class TestSlice7TopologyDecisionTree:
         assert s.name in plan.client_scripts
 
     def test_script_goes_server_script_service(self) -> None:
-        """Rule 6: a Script with no other signals lands in
-        ServerScriptService."""
+        """Rule 6 (was 6 pre-round-2, now 7): a Script with no other
+        signals + server domain lands in ServerScriptService."""
         s = _make_script("World", "print('world')", script_type="Script")
         inputs = _mk_topology_inputs(
             script_id_by_name={"World": "g-world"},
@@ -553,6 +553,42 @@ class TestSlice7TopologyDecisionTree:
         plan = classify_storage([s], topology_inputs=inputs)
         assert s.parent_path == SERVER_SCRIPT_SERVICE
         assert s.name in plan.server_scripts
+
+    def test_client_domain_script_routes_to_starter_player_scripts(
+        self,
+    ) -> None:
+        """Round 2 (Codex R1 P1 #1+#3): a script that arrives at the
+        slice 7 tree with ``script_type == "Script"`` but
+        ``domain == "client"`` lands in ``STARTER_PLAYER_SCRIPTS`` --
+        NOT SSS. Replaces the deleted legacy ``_CLIENT_ONLY_PATTERNS``
+        regex semantic for the narrow case where
+        ``code_transpiler._classify_script_type`` did NOT promote the
+        Script to LocalScript (e.g. ``Players.LocalPlayer`` without
+        UI / input / cursor APIs).
+
+        Asserts both the container choice AND the ``script_type``
+        coercion to ``LocalScript`` (so ``_enforce_hard_constraints``
+        does not raise).
+        """
+        s = _make_script(
+            "LocalPlayerOnly",
+            "local p = game.Players.LocalPlayer\nprint(p.Name)",
+            script_type="Script",
+        )
+        inputs = _mk_topology_inputs(
+            script_id_by_name={"LocalPlayerOnly": "g-lp"},
+            domains={"g-lp": "client"},
+        )
+        plan = classify_storage([s], topology_inputs=inputs)
+        assert s.parent_path == STARTER_PLAYER_SCRIPTS
+        # In-flow auto-coercion at storage_classifier:237-239 flips
+        # script_type so the resulting placement satisfies the
+        # Roblox engine hard constraint.
+        assert s.script_type == "LocalScript"
+        assert s.name in plan.client_scripts
+        # Reason proves the new branch ran (not a fallthrough).
+        reasons = {d["script"]: d["reason"] for d in plan.decisions}
+        assert "client domain" in reasons["LocalPlayerOnly"]
 
 
 class TestSlice7FallbackGates:
