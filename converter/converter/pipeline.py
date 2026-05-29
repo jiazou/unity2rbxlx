@@ -2489,6 +2489,13 @@ return table.concat(allData, "\\n")'''
         "_subphase_inject_autogen_scripts",
         "_inject_runtime_modules",
         "_subphase_inject_scene_runtime",
+        # Phase 2a slice 8 commit 5 — Option (b) safety net. Runs AFTER
+        # the three injection subphases that append scripts to
+        # ``rbx_place.scripts`` post-classify. Stamps an explicit
+        # ``parent_path`` on any late-appended script whose generator
+        # left the field as ``None``, freezing the rbxlx_writer default
+        # routing into the storage plan as an explicit decision.
+        "_classify_late_appended_scripts",
         "_generate_prefab_packages",
         "_subphase_encode_terrain",
         "_subphase_inject_mesh_loader",
@@ -2622,6 +2629,7 @@ return table.concat(allData, "\\n")'''
         self._subphase_inject_autogen_scripts()
         self._inject_runtime_modules()
         self._subphase_inject_scene_runtime()
+        self._classify_late_appended_scripts()
         self._generate_prefab_packages()
         self._subphase_encode_terrain()
         self._subphase_inject_mesh_loader()
@@ -2936,6 +2944,86 @@ return table.concat(allData, "\\n")'''
         fixes = fix_require_classifications(self.state.rbx_place.scripts)
         if fixes:
             log.info("[write_output] Reclassified %d scripts based on require() dependencies", fixes)
+
+    # Default container fallbacks for ``_classify_late_appended_scripts``.
+    # Mirrors the rbxlx_writer's script_type-based fallback (see
+    # ``roblox/rbxlx_writer.py`` :1620-1632) so this safety-net stamps
+    # the same container the serializer would have implicitly routed to.
+    _LATE_APPEND_DEFAULT_PARENT: dict[str, str] = {
+        "LocalScript": "StarterPlayer.StarterPlayerScripts",
+        "ModuleScript": "ReplicatedStorage",
+        "Script": "ServerScriptService",
+    }
+
+    def _classify_late_appended_scripts(self) -> None:
+        """Phase 2a slice 8 commit 5 — Option (b) safety-net classify pass.
+
+        Stamps an explicit ``parent_path`` on any script in
+        ``rbx_place.scripts`` whose generator left the field as ``None``.
+        Mirrors the ``script_type`` -> container fallback the rbxlx
+        writer applies for unrouted scripts so this pass is byte-
+        equivalent to today's behavior: late-appended scripts
+        (GameServerManager / CollisionGroupSetup / CollisionFidelityRecook
+        / NavAgent / EventSystem / CharacterBridge / ObjectPool /
+        CinemachineRuntime / ClientBootstrap, …) get the SAME container
+        they had under the implicit-default routing today, just
+        explicitly stamped.
+
+        The point of this pass: make the implicit "rbxlx_writer default
+        wins for unrouted scripts" contract VISIBLE in the data model.
+        After this pass every script in ``rbx_place.scripts`` carries an
+        explicit ``parent_path`` — no script is silently routed by a
+        fallback during serialization. This:
+
+        - Pins late-appended scripts' container at slice-8 boundary so
+          a later refactor of the rbxlx writer can't drift their routing.
+        - Lets golden-output tests assert ZERO ``parent_path`` drift on
+          autogen / runtime-injection scripts after the lift (acceptance
+          gate from the design doc).
+        - Documents that Option (a) — moving autogen-script construction
+          earlier so they go through the full classifier — is the
+          long-term direction; (b) is the small, low-risk safety net
+          shipped first.
+
+        Idempotent: scripts that already carry an explicit ``parent_path``
+        (the SceneRuntime* entrypoints and the SceneRuntimePlan module,
+        plus any rehydrated script with a plan entry) pass through
+        untouched.
+
+        Why not run the full ``_classify_storage`` again? Two reasons:
+        (1) the topology apply pass mutates Anim_* placement and writes
+        the on-disk plan; rerunning it post-injection would double-apply
+        topology + rewrite the plan to include autogen names, neither
+        of which is desired for a "freeze defaults" pass. (2) Running
+        the full classifier over the augmented set could re-route the
+        runtime ModuleScripts (NavAgent, EventSystem, …) through the
+        topology decision tree, but they aren't in topology
+        ``script_id_by_name`` (added post-prepass) so the topology path
+        falls back to legacy per-script anyway. Stamping the rbxlx
+        writer default explicitly captures the same observable behavior
+        with no cross-script side effects.
+        """
+        if self.state.rbx_place is None or not self.state.rbx_place.scripts:
+            return
+
+        stamped = 0
+        for s in self.state.rbx_place.scripts:
+            if getattr(s, "parent_path", None):
+                continue
+            fallback = self._LATE_APPEND_DEFAULT_PARENT.get(s.script_type)
+            if fallback is None:
+                # Unknown script_type — let rbxlx_writer's fallback
+                # decide (it has the same Script default we'd pick).
+                continue
+            s.parent_path = fallback
+            stamped += 1
+
+        if stamped:
+            log.info(
+                "[write_output] Late-append classify stamped explicit "
+                "parent_path on %d script(s) (Option (b) safety net)",
+                stamped,
+            )
 
     def _subphase_inject_autogen_scripts(self) -> None:
         """Synthesize project-bootstrap scripts: collision-group setup,
