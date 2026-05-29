@@ -348,7 +348,32 @@ def _build_call_graph(
     scripts: list[RbxScript],
     dependency_map: dict[str, list[str]] | None,
 ) -> dict[str, set[str]]:
-    """Return caller -> set(callees) built from dependency_map or source scan."""
+    """Return caller -> set(callees) built from dependency_map + source scan.
+
+    **FALLBACK-PATH ONLY** -- the legacy decision tree
+    (``_decide_script_container_legacy``) consults this graph. The
+    topology path uses
+    ``topology_inputs["caller_graph"]`` instead, which is built by
+    ``scene_runtime_topology.build_topology.resolve_caller_graph`` as
+    a pure ``dependency_map`` projection (no source-scan).
+
+    Round 3 (Codex R2 P1 #5): the source-scan augmentation below is
+    INTENTIONALLY kept on the legacy path. ``dependency_map`` is
+    produced by the C# analyzer and misses ``require()`` calls
+    injected post-transpile (coherence packs / runtime helpers /
+    generic-mode callees discovered post-hoc). The legacy fallback
+    fires precisely in degraded-topology cases (no transpile this
+    run, ``script_id_by_name`` miss, etc.) where post-analyzer
+    requires are exactly the requires the topology pipeline could
+    not see. Removing the source-scan from the legacy path would
+    silently regress server-private modules to ReplicatedStorage.
+
+    The topology ``caller_graph`` stays as a pure projection because
+    the topology path's domain inference + reachability solver
+    already cover the cases this scanner targets when they have
+    valid inputs. Will be deleted from the legacy path when the
+    legacy path itself is deleted (post-topology-coverage extension).
+    """
     graph: dict[str, set[str]] = {s.name: set() for s in scripts}
     script_names = set(graph.keys())
 
@@ -358,9 +383,11 @@ def _build_call_graph(
                 continue
             graph[caller].update(c for c in callees if c in script_names)
 
-    # Always augment with source-scan: dependency_map is from C# analyzer and may
-    # miss require() calls injected post-transpile. Walk each `require(...)` and
-    # extract candidate names from its full body — including nested parens like
+    # FALLBACK-PATH ONLY source-scan augmentation (see docstring).
+    # Always augment: dependency_map is from C# analyzer and may
+    # miss require() calls injected post-transpile. Walk each
+    # `require(...)` and extract candidate names from its full body
+    # — including nested parens like
     # `require(game:GetService("ServerStorage"):FindFirstChild("Utility"))`.
     quoted_pat = re.compile(r'["\'](\w+)["\']')
     dotted_pat = re.compile(r'\.(\w+)')
