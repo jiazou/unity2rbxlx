@@ -645,6 +645,52 @@ class TestSlice7Round2LifecycleRoleStamping:
         assert out is not None
         assert out["lifecycle_roles"].get("g-loading") == "requireable"
 
+    def test_module_script_with_character_attached_stays_requireable(
+        self,
+    ) -> None:
+        """Slice 7 round 3 (Claude P2 fix). ``derive_module_lifecycle_role``
+        now gates ``character_attached`` symmetrically with ``is_loader``:
+        ``script_class != "ModuleScript"``. A ModuleScript with
+        ``character_attached=True`` resolves to ``requireable``, NOT
+        ``character_attached`` -- a ModuleScript in
+        StarterCharacterScripts does not auto-run on character spawn
+        (Roblox only auto-instantiates Script / LocalScript there), so
+        the assignment would silently be inert.
+        """
+        from converter.pipeline import Pipeline
+
+        scripts = [
+            RbxScript(
+                name="CharacterHelper",
+                source="return {}",
+                script_type="ModuleScript",
+            ),
+        ]
+        scene_runtime: dict[str, object] = {
+            "modules": {
+                "g-char-helper": {
+                    "stem": "CharacterHelper",
+                    "class_name": "CharacterHelper",
+                    "runtime_bearing": True,
+                    "is_loader": False,
+                    "character_attached": True,
+                },
+            },
+            "scenes": {},
+            "prefabs": {},
+            "domain_overrides": {},
+        }
+        pipeline = self._build_pipeline_with(scripts=scripts)
+        out = Pipeline._maybe_run_topology_prepass(pipeline, scene_runtime)
+        assert out is not None
+        # MUST NOT be "character_attached"; ModuleScript falls through
+        # to the class-driven default ("requireable").
+        assert out["lifecycle_roles"].get("g-char-helper") == "requireable"
+        assert (
+            out["lifecycle_roles"].get("g-char-helper")
+            != "character_attached"
+        )
+
     def test_auto_run_default_for_plain_client_script(self) -> None:
         """A plain client-domain script with no special facts resolves
         to ``"auto_run"``.
