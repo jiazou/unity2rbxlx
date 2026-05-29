@@ -82,6 +82,10 @@ def test_write_output_attaches_scriptable_objects_as_module_scripts(tmp_path):
     pipeline.ctx.completed_phases.append("transpile_scripts")
     pipeline._retranspile = True  # forces fresh branch (not preserve)
 
+    # Phase 2a slice 8: ``_subphase_emit_scripts_to_disk`` lives in
+    # ``materialize_and_classify`` now. Run it explicitly so write_output
+    # sees the materialized ScriptableObject ModuleScripts.
+    pipeline.materialize_and_classify()
     pipeline.write_output()
 
     names = [s.name for s in pipeline.state.rbx_place.scripts]
@@ -186,6 +190,9 @@ def test_preserve_scripts_does_not_clobber_hand_edited_scriptable_objects(tmp_pa
     pipeline._retranspile = False
     pipeline.state.transpilation_result = None
 
+    # Phase 2a slice 8: ``_subphase_emit_scripts_to_disk`` lives in
+    # ``materialize_and_classify`` now.
+    pipeline.materialize_and_classify()
     pipeline.write_output()
 
     surviving = hand_edited.read_text()
@@ -236,6 +243,9 @@ def test_scriptable_objects_dedupe_by_folder_when_names_collide(tmp_path):
     pipeline.ctx.completed_phases.append("transpile_scripts")
     pipeline._retranspile = True  # forces fresh-transpile branch
 
+    # Phase 2a slice 8: ``_subphase_emit_scripts_to_disk`` lives in
+    # ``materialize_and_classify`` now.
+    pipeline.materialize_and_classify()
     pipeline.write_output()
 
     so_dir = output / "scripts" / "scriptable_objects"

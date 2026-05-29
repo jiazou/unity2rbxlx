@@ -600,6 +600,13 @@ class Pipeline:
     ESSENTIAL_PHASES: frozenset[str] = frozenset({
         "parse", "extract_assets", "convert_materials",
         "transpile_scripts", "convert_animations", "convert_scene",
+        # Phase 2a slice 8: ``materialize_and_classify`` populates
+        # ``state.rbx_place.scripts`` (in-memory) which write_output
+        # consumes — it must re-run on every resumed invocation so a
+        # ``--phase=write_output`` resume gets a populated script list.
+        # The lifted emit subphase's preserve_scripts/rehydrate path
+        # handles the "transpile was skipped" branch on resume.
+        "materialize_and_classify",
     })
 
     def run_through(
@@ -2474,7 +2481,8 @@ return table.concat(allData, "\\n")'''
         )
 
     SUBPHASE_ORDER: tuple[str, ...] = (
-        "_subphase_emit_scripts_to_disk",
+        # ``_subphase_emit_scripts_to_disk`` lifted to
+        # ``materialize_and_classify`` in slice 8 commit 2.
         "_subphase_cohere_scripts",
         "_classify_storage",
         "_bind_scripts_to_parts",
@@ -2537,10 +2545,9 @@ return table.concat(allData, "\\n")'''
                     )
 
     MATERIALIZE_AND_CLASSIFY_ORDER: tuple[str, ...] = (
-        # Phase 2a slice 8: lifted out of ``write_output``. The exact
-        # subphases in this tuple are filled in over subsequent slice 8
-        # commits; the constant exists so the no-op first commit still
-        # exposes the canonical ordering hook for tests.
+        # Phase 2a slice 8: lifted out of ``write_output``. ``emit`` lifted
+        # in commit 2; ``cohere`` + ``classify`` follow in commits 3-4.
+        "_subphase_emit_scripts_to_disk",
     )
     """Order in which :meth:`materialize_and_classify` invokes its subphases.
 
@@ -2584,9 +2591,7 @@ return table.concat(allData, "\\n")'''
         # order declared in :data:`MATERIALIZE_AND_CLASSIFY_ORDER`. Each
         # lift commit moves one method's invocation from ``write_output``
         # to here and updates the constant.
-        # COMMIT 1 (this commit): no subphases yet — phase is a sequencing
-        # placeholder so ``--phase=materialize_and_classify`` resumes work
-        # immediately and downstream tests can land in the same PR.
+        self._subphase_emit_scripts_to_disk()
 
     def write_output(self) -> None:
         """Phase 6: Serialize the Roblox place to disk.
@@ -2604,7 +2609,9 @@ return table.concat(allData, "\\n")'''
         # write_output is the assembly + serialization pipeline. Each subphase
         # below mutates self.state.rbx_place and/or writes files to self.output_dir.
         # Order is load-bearing — see SUBPHASE_ORDER for dependency rationale.
-        self._subphase_emit_scripts_to_disk()
+        # Phase 2a slice 8 commit 2: ``_subphase_emit_scripts_to_disk`` is
+        # the responsibility of ``materialize_and_classify``; write_output
+        # now consumes ``rbx_place.scripts`` populated by the upstream phase.
         self._subphase_cohere_scripts()
         self._classify_storage()
         self._bind_scripts_to_parts()
