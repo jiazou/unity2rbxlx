@@ -3141,3 +3141,241 @@ class TestApplyTopologyToRbxScripts:
         topo = scene_runtime["topology"]
         assert topo["caller_graph"] == {"guid-target": ["guid-caller"]}  # type: ignore[index]
         assert topo["animation_drivers"] == {}  # type: ignore[index]
+
+
+# ===========================================================================
+# Phase 2a slice 5 round 2: immutable intrinsic_script_type tests
+# ===========================================================================
+
+
+class TestIntrinsicScriptTypeRoundTwoContract:
+    """Round 2 deliverable: ``RbxScript.intrinsic_script_type`` is the
+    immutable transpile-time class signal, and the topology artifact's
+    ``script_class`` reflects that immutable field rather than the
+    mutable ``script_type`` that ``classify_storage`` reassigns.
+
+    These tests are the behavior witnesses the synthesis required.
+    """
+
+    def test_transpiler_stamps_intrinsic_field_on_emit(
+        self, tmp_path: Path,
+    ) -> None:
+        """ROUND 2 — Test B (transpiler stamp).
+
+        ``_subphase_emit_scripts_to_disk`` is the canonical
+        ``RbxScript`` construction site for transpiled scripts. It
+        consumes ``TranspilationResult.scripts[*].script_type`` (the
+        output of ``code_transpiler._classify_script_type``) and MUST
+        stamp the same value into the new immutable
+        ``intrinsic_script_type`` field at construction time.
+
+        After the emit subphase runs, every RbxScript produced from
+        the transpilation result carries a non-None
+        ``intrinsic_script_type`` that equals the original
+        ``ts.script_type`` — even before classify_storage gets a chance
+        to mutate the live ``script_type``.
+        """
+        from converter.pipeline import Pipeline
+        from converter.code_transpiler import (
+            TranspilationResult,
+            TranspiledScript,
+        )
+        from core.roblox_types import RbxPlace
+
+        unity_project = tmp_path / "unity"
+        (unity_project / "Assets").mkdir(parents=True)
+        output = tmp_path / "out"
+        output.mkdir()
+
+        pipeline = Pipeline(str(unity_project), str(output))
+        pipeline.state.rbx_place = RbxPlace()
+        pipeline.state.transpilation_result = TranspilationResult(
+            scripts=[
+                TranspiledScript(
+                    source_path="Assets/Foo.cs",
+                    output_filename="Foo.luau",
+                    csharp_source="// stub",
+                    luau_source="-- Foo\nprint('foo')\n",
+                    strategy="rule_based",
+                    confidence=1.0,
+                    script_type="Script",
+                ),
+                TranspiledScript(
+                    source_path="Assets/Bar.cs",
+                    output_filename="Bar.luau",
+                    csharp_source="// stub",
+                    luau_source="-- Bar\nlocal M = {}\nreturn M\n",
+                    strategy="rule_based",
+                    confidence=1.0,
+                    script_type="ModuleScript",
+                ),
+            ],
+            total_transpiled=2,
+            total_rule_based=2,
+        )
+
+        pipeline._subphase_emit_scripts_to_disk()
+
+        by_name = {s.name: s for s in pipeline.state.rbx_place.scripts}
+        assert "Foo" in by_name and "Bar" in by_name
+
+        # Both fields agree IMMEDIATELY post-transpile (no classifier
+        # has run yet).
+        assert by_name["Foo"].script_type == "Script"
+        assert by_name["Foo"].intrinsic_script_type == "Script"
+        assert by_name["Bar"].script_type == "ModuleScript"
+        assert by_name["Bar"].intrinsic_script_type == "ModuleScript"
+
+        # The contract: mutating script_type post-construction (the way
+        # classify_storage does) MUST NOT change intrinsic_script_type.
+        by_name["Foo"].script_type = "LocalScript"  # simulate coercion
+        assert by_name["Foo"].intrinsic_script_type == "Script", (
+            "intrinsic_script_type must be immutable across post-"
+            "construction mutations of script_type"
+        )
+
+    def test_topology_artifact_script_class_reflects_intrinsic(
+        self,
+    ) -> None:
+        """ROUND 2 — Test C (persisted artifact uses intrinsic value).
+
+        Build a topology with an RbxScript whose ``script_type`` has
+        been mutated post-construction (simulating
+        ``classify_storage``'s Script→LocalScript coercion). The
+        topology artifact's ``modules[*].script_class`` MUST reflect
+        the intrinsic (pre-mutation) value, NOT the mutated one.
+
+        This is the round-2 contract witness: the helper genuinely
+        reads ``intrinsic_script_type``, and the persisted artifact
+        carries the intrinsic value all the way through.
+        """
+        sr = _mk_artifact(
+            modules={"guid-x": _mk_module("HudControl", "client")},
+        )
+        # Post-classify_storage shape: script_type was reassigned to
+        # LocalScript by the StarterPlayerScripts coercion, but the
+        # immutable intrinsic_script_type still holds the original
+        # transpiler decision ("Script").
+        script = RbxScript(
+            name="HudControl",
+            source="-- empty",
+            script_type="LocalScript",          # post-mutation
+            intrinsic_script_type="Script",     # original transpile-time
+        )
+        scripts_by_class = {"HudControl": script}
+
+        artifact = build_topology(
+            scene_runtime=sr,
+            emitted_animations=[],
+            scripts_by_class=scripts_by_class,
+        )
+
+        # The artifact's script_class field MUST be the intrinsic value.
+        # If this assertion flips to "LocalScript" the helper has
+        # regressed to reading the mutable field — the round-1 bug.
+        assert artifact["modules"]["guid-x"]["script_class"] == "Script"
+
+    def test_resume_with_cached_animation_drivers_does_not_abort(
+        self, tmp_path: Path,
+    ) -> None:
+        """ROUND 2 — Test D (resume regression GUARD).
+
+        The round-1 regression: when resume rehydrated a
+        scene_runtime with cached resolved ``animation_drivers``
+        alongside fresh ``modules`` rows with empty ``domain`` (because
+        the pre-classifier first build hadn't stamped them yet),
+        ``build_topology`` aborted on invariant 6/1.
+
+        Option 3 (the round-2 fix) doesn't introduce that path —
+        build_topology only runs ONCE, post-classifier, so module
+        domain is populated. This test guards against future
+        regressions that re-introduce a pre-classifier build by
+        asserting that the post-classifier shape (resolved cached
+        animation_drivers + populated module domains) builds cleanly.
+
+        The check is cheap and protects slice 6 if any future change
+        moves the build earlier.
+        """
+        # Reuse the door-shape fixture: it sets a client-domain module
+        # with a populated ``domain`` field, which is the post-
+        # classifier shape on resume.
+        artifact, prefab_id, door_script_id = _door_shape_artifact(
+            door_domain="client",
+        )
+        scene_runtime = cast("dict[str, object]", artifact)
+
+        # Seed a cached resolved animation_drivers block (the shape
+        # ``_merge_scene_runtime`` would rehydrate from disk on a
+        # resume). Mirror the existing slice-3-round-4 preserve fixture
+        # shape (``test_resume_with_animation_result_none_preserves_animation_drivers``)
+        # so the cached block carries every field invariants 1-4
+        # cross-check.
+        cached_sid = compute_stable_id(prefab_id, "door", "open")
+        cached_topology = {
+            "modules": {},          # stale — gets rebuilt below
+            "animation_drivers": {
+                cached_sid: {
+                    "stable_id": cached_sid,
+                    "routing_status": "resolved",
+                    "driver_module_guid": door_script_id,
+                    "domain": "client",
+                    "script_class": "LocalScript",
+                    "lifecycle_role": "auto_run",
+                    "observed_attribute": "open",
+                    "observed_target": {
+                        "kind": "self", "name": "", "scope": "workspace",
+                    },
+                    "bridge_group_id": None,
+                },
+            },
+            "caller_graph": {},     # stale — gets rebuilt below
+            "cross_domain_edges": [],
+        }
+        scene_runtime["topology"] = cached_topology
+
+        anim_script = _mk_rbx_script("Anim_Door_door_open", "Script")
+        plan = TestApplyTopologyToRbxScripts._mk_plan(server_scripts=[
+            "Anim_Door_door_open",
+        ])
+
+        # Resume shape: animation_result is None (no fresh emission run)
+        # but cached animation_drivers exists in scene_runtime["topology"].
+        # _build_and_apply_topology should preserve the cached block
+        # and NOT abort on any invariant.
+        from converter.pipeline import Pipeline
+        from core.roblox_types import RbxPlace
+        from converter.animation_converter import AnimationConversionResult
+        from types import SimpleNamespace
+        from converter.code_transpiler import TranspilationResult
+
+        pipeline = Pipeline.__new__(Pipeline)
+        pipeline.output_dir = tmp_path
+        rbx_place = RbxPlace()
+        rbx_place.scripts = [anim_script]
+        # animation_result=None signals "resume / no fresh emissions";
+        # _build_and_apply_topology preserves animation_drivers from
+        # the cached topology block.
+        pipeline.state = SimpleNamespace(
+            rbx_place=rbx_place,
+            animation_result=None,
+            guid_index=None,
+            dependency_map={},
+            # transpilation_result=None signals "no retranspile this run";
+            # preserve caller_graph too.
+            transpilation_result=None,
+        )
+
+        # This must NOT raise. Round-1's pre-classifier first build
+        # would abort here on invariant 6 (cached resolved drivers
+        # alongside modules with empty domain) — Option 3 doesn't
+        # introduce that path so the call succeeds cleanly.
+        pipeline._build_and_apply_topology(scene_runtime, plan)
+
+        # Cached animation_drivers preserved verbatim (the slice-3
+        # round-4 contract): the rebuilt topology carries the same
+        # block as the cached one.
+        topo = scene_runtime["topology"]
+        assert isinstance(topo, dict)
+        drivers = topo["animation_drivers"]
+        assert cached_sid in drivers
+        assert drivers[cached_sid]["routing_status"] == "resolved"

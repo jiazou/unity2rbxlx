@@ -1143,18 +1143,24 @@ class TestScenePrefabPlacements:
 
 
 # ---------------------------------------------------------------------------
-# Phase 2a slice 5 step 1: intrinsic script_class helper
+# Phase 2a slice 5 round 2: intrinsic script_class helper
 # ---------------------------------------------------------------------------
 
 class TestDeriveIntrinsicScriptClass:
-    """``derive_intrinsic_script_class`` returns the C# code-analysis
-    signal stamped by ``code_transpiler._classify_script_type``. Callers
-    must pass an ``RbxScript`` whose ``script_type`` is still the
-    pre-classifier value (the pipeline reorder in slice 5 step 2
-    guarantees this at the build_topology call site).
+    """``derive_intrinsic_script_class`` returns the script's class as
+    determined at construction time, stamped into the immutable
+    ``RbxScript.intrinsic_script_type`` field by the transpiler /
+    animation-gen / scriptable-object emit paths. The helper
+    consults that immutable field so the answer is invariant to
+    post-construction mutations of the mutable ``script_type`` (e.g.
+    ``classify_storage``'s ``Script→LocalScript`` coercion). Falls back
+    to ``script_type`` when ``intrinsic_script_type`` is unset (the
+    rehydration / pre-field-introduction path).
     """
 
-    def test_script_type_is_returned_as_is(self) -> None:
+    def test_script_type_is_returned_as_is_via_fallback(self) -> None:
+        # No intrinsic_script_type set — falls back to script_type
+        # (the rehydration / pre-field-introduction path).
         s = RbxScript(name="Foo", source="return 1", script_type="LocalScript")
         assert derive_intrinsic_script_class(s) == "LocalScript"
 
@@ -1175,6 +1181,30 @@ class TestDeriveIntrinsicScriptClass:
     def test_empty_script_type_defaults_to_module_script(self) -> None:
         s = RbxScript(name="Foo", source="return 1", script_type="")
         assert derive_intrinsic_script_class(s) == "ModuleScript"
+
+    # Round 2 deliverable — Test A: the WITNESS that the helper is
+    # genuinely intrinsic. Construct an RbxScript whose mutable
+    # script_type has been "mutated" by a simulated classify_storage
+    # pass (Script → LocalScript) while the immutable
+    # intrinsic_script_type retains the pre-classifier value. The
+    # helper MUST return the intrinsic value, NOT the mutated one.
+    # If this test fails, the helper is reading the wrong field — the
+    # round-1 regression where derive_intrinsic_script_class consulted
+    # script_type instead of intrinsic_script_type.
+    def test_helper_returns_intrinsic_not_mutated_script_type(self) -> None:
+        # Simulate the post-classify_storage shape:
+        #   intrinsic_script_type stays at the transpiler's "Script"
+        #   script_type was reassigned to "LocalScript" by classify_storage.
+        s = RbxScript(
+            name="Foo",
+            source="return 1",
+            script_type="LocalScript",          # post-classifier mutation
+            intrinsic_script_type="Script",     # original transpile-time value
+        )
+        # The helper MUST report the intrinsic value, ignoring the
+        # mutated script_type. This is the round-2 contract that
+        # round 1 failed to provide.
+        assert derive_intrinsic_script_class(s) == "Script"
 
 
 # ---------------------------------------------------------------------------
