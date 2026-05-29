@@ -4341,7 +4341,9 @@ script.Disabled = true
             # that wires the new consumer." Without this, the on-disk
             # plan contradicts the live RbxScript metadata + the
             # scene_runtime.topology block.
-            self._build_and_apply_topology(scene_runtime, plan)
+            self._build_and_apply_topology(
+                scene_runtime, plan, topology_inputs=topology_inputs,
+            )
 
         plan_path.write_text(
             _json.dumps({
@@ -4588,6 +4590,8 @@ script.Disabled = true
         self,
         scene_runtime: dict[str, object],
         plan: "StoragePlan",
+        *,
+        topology_inputs: "TopologyInputs | None" = None,
     ) -> None:
         """Phase 1, PR #148 of the scene-runtime topology authority refactor.
 
@@ -4595,6 +4599,23 @@ script.Disabled = true
         to the corresponding ``Anim_*`` RbxScripts. Called inside
         ``_classify_storage`` AFTER ``classify_scene_runtime_domains``
         populates module domains + BEFORE the on-disk plan is written.
+
+        ``topology_inputs`` (Phase 2a slice 9a): the same
+        ``TopologyInputs`` row ``_maybe_run_topology_prepass`` produced
+        earlier in ``_classify_storage`` (or ``None`` if the prepass
+        gate rejected the call -- legacy mode / no ``modules`` block /
+        ``__skip_domain_classifier__`` probe). Plumbed through so this
+        method can consume the canonical ``script_id_by_name`` index
+        (and the inverted ``script_by_sid`` derived from it) without
+        re-deriving via the legacy class_name-only join — closes the
+        same asymmetric-join hole slice 7 round 4 fixed at the prepass
+        boundary, this time on the late ``_build_modules_block`` side.
+        Per slice 6's "save raw facts, recompute conclusions" rule
+        ``TopologyInputs`` itself is NOT persisted to ``StoragePlan``;
+        plumbing means in-memory pass-through, and on a
+        ``--phase=write_output`` resume the prepass re-runs (because
+        ``materialize_and_classify`` is essential) and produces a fresh
+        ``TopologyInputs`` for this call.
 
         The artifact lands at ``scene_runtime["topology"]`` per design
         doc open-question D4 (option b). Consumers should read through
