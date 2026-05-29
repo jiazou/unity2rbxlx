@@ -802,7 +802,22 @@ def _decide_script_container_legacy(
     # StarterPlayerScripts. The downstream auto-coercion at
     # ``classify_storage`` flips ``script_type`` to ``LocalScript``
     # so ``_enforce_hard_constraints`` does not raise.
-    if s.name in client_touchers:
+    #
+    # Round 4 (this slice's R3 review, P1 reclassification from
+    # P2-NEW-A): the ``and s.name not in server_touchers`` guard
+    # mirrors legacy slice-6 line 426. Without it, a Script that
+    # touches BOTH ``Players.LocalPlayer`` AND ``DataStoreService``
+    # would coerce to ``LocalScript`` in SPS — but ``DataStoreService``
+    # is server-only and raises "DataStoreService cannot be used on
+    # the client" at runtime. Legacy fail-CLOSED to server (drop
+    # through to the ``server_touchers`` branch / default SSS); slice
+    # 7 R3 had inverted the failure mode to fail-OPEN to client.
+    # Restoring the guard re-establishes the legacy contract: a
+    # dual-surface Script lands in SSS where the server APIs work,
+    # even if some client-side calls fail there (server can call
+    # client-replicated APIs in many cases; the inverse is much
+    # less recoverable).
+    if s.name in client_touchers and s.name not in server_touchers:
         return STARTER_PLAYER_SCRIPTS, (
             "fallback: Script with client-only API surface "
             "(legacy _CLIENT_ONLY_PATTERNS branch)"

@@ -860,6 +860,59 @@ class TestSlice7Round3LegacyFallbackPath:
         )
         assert target.name in plan.server_modules
 
+    def test_fallback_dual_surface_script_routes_to_sss(self) -> None:
+        """Round 4 (P1, was P2-NEW-A in R3 review). A Script whose
+        source touches BOTH the ``_CLIENT_ONLY_PATTERNS`` set
+        (``Players.LocalPlayer``) AND the ``_SERVER_ONLY_PATTERNS``
+        set (``DataStoreService``) MUST fail-CLOSED to server.
+
+        Pre-R4 the slice-7 fallback dropped the ``and s.name not in
+        server_touchers`` guard that legacy slice-6 had on its
+        client_touchers branch (legacy line 426). With the guard
+        missing, the dual-surface Script coerced to LocalScript in
+        StarterPlayerScripts — but ``DataStoreService`` is server-only
+        and raises "DataStoreService cannot be used on the client" at
+        runtime.
+
+        R4 restores the guard so dual-surface Scripts drop through the
+        client_touchers branch, hit the restored ``server_touchers``
+        branch (or the default SSS branch), and land in
+        ServerScriptService where the server APIs work. This mirrors
+        legacy slice-6's fail-CLOSED-to-server semantic.
+        """
+        s = _make_script(
+            "DualSurface",
+            # Client-only pattern AND server-only pattern in one body.
+            "local lp = game.Players.LocalPlayer\n"
+            'local DSS = game:GetService("DataStoreService")\n'
+            'local store = DSS:GetDataStore("x")\n',
+            script_type="Script",
+        )
+        plan = classify_storage([s])  # legacy fallback path
+
+        # Pin the safety invariant: dual-surface routes to SERVER, not
+        # client. If this regresses, the server APIs in the script will
+        # call into nil at runtime on the client.
+        assert s.parent_path == SERVER_SCRIPT_SERVICE, (
+            f"dual-surface Script must fail-CLOSED to server; "
+            f"got parent_path={s.parent_path!r}"
+        )
+        # And it stays a Script (no LocalScript coercion). LocalScript
+        # in SSS would be caught by _enforce_hard_constraints anyway,
+        # but this asserts the early decision.
+        assert s.script_type == "Script", (
+            f"dual-surface Script must remain a Script; "
+            f"got script_type={s.script_type!r}"
+        )
+        assert s.name in plan.server_scripts
+        # Confirm via the decision reason which branch fired (the
+        # restored server_touchers branch).
+        reasons = {d["script"]: d["reason"] for d in plan.decisions}
+        assert "server-only API surface" in reasons["DualSurface"], (
+            f"expected the server_touchers branch to fire; "
+            f"got reason={reasons['DualSurface']!r}"
+        )
+
     def test_fallback_via_sid_miss_routes_localplayer_script_to_sps(
         self,
     ) -> None:
