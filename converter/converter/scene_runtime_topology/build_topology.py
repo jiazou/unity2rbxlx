@@ -511,12 +511,13 @@ def _build_modules_block(
 
     ``script_class`` reads through
     ``scene_runtime_planner.derive_intrinsic_script_class`` (Phase 2a
-    slice 5 step 1): the intrinsic (pre-classifier) C# code-analysis
-    signal set by ``code_transpiler._classify_script_type``. The
-    pipeline contract is that build_topology runs BEFORE
-    ``storage_classifier.classify_storage``'s post-pass mutations, so
-    ``RbxScript.script_type`` still carries the intrinsic value at this
-    read site. Helpers without an emitted script (the planner records
+    slice 5 round 2): the intrinsic (transpile-time) C# code-analysis
+    signal stamped into the immutable
+    ``RbxScript.intrinsic_script_type`` field at construction time. The
+    helper reads that field directly so the artifact's ``script_class``
+    is invariant to post-construction mutations like
+    ``storage_classifier.classify_storage``'s ``Script→LocalScript``
+    coercion. Helpers without an emitted script (the planner records
     them but storage_classifier didn't synthesize a body) default to
     ``"ModuleScript"`` — they're require-target shape.
 
@@ -543,15 +544,12 @@ def _build_modules_block(
         domain_obj = module.get("domain", "")
         domain = domain_obj if isinstance(domain_obj, str) else ""
 
-        # Phase 2a slice 5 step 1: read ``script_class`` through the
-        # centralized helper. The helper documents the "intrinsic =
-        # pre-classifier" contract so the read site is guarded by a
-        # named contract rather than relying on positional pipeline
-        # ordering alone. Behaviorally identical to the pre-slice-5
-        # inline form (``script.script_type`` when set, else
-        # ``"ModuleScript"``) — the contract change is structural, not
-        # observable in the artifact for callers that respect the
-        # ordering invariant.
+        # Phase 2a slice 5 round 2: read ``script_class`` through the
+        # centralized helper. The helper consults the immutable
+        # ``RbxScript.intrinsic_script_type`` field stamped at
+        # construction time, so the answer is independent of the
+        # mutable ``script_type`` field that ``classify_storage`` and
+        # the topology animation_drivers apply phase reassign.
         script = scripts_by_class.get(class_name)
         script_class = derive_intrinsic_script_class(script)
 

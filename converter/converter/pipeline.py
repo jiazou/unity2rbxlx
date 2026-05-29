@@ -2744,6 +2744,17 @@ return table.concat(allData, "\\n")'''
                     name=ts.output_filename.replace(".luau", ""),
                     source=ts.luau_source,
                     script_type=ts.script_type,
+                    # Phase 2a slice 5 round 2: stamp the intrinsic
+                    # class at transpile-time. ``ts.script_type`` is
+                    # the output of ``code_transpiler._classify_script_type``
+                    # (plus generic-runtime override), which is the
+                    # pre-classifier signal we want to preserve.
+                    # ``classify_storage`` later mutates the live
+                    # ``script_type`` field but leaves
+                    # ``intrinsic_script_type`` untouched, so
+                    # ``derive_intrinsic_script_class`` can read the
+                    # original C# code-analysis decision.
+                    intrinsic_script_type=ts.script_type,
                     source_path=ts.output_filename,
                 ))
 
@@ -2758,6 +2769,13 @@ return table.concat(allData, "\\n")'''
                     name=script_name,
                     source=luau_source,
                     script_type="Script",
+                    # Phase 2a slice 5 round 2: animation_converter
+                    # emits Anim_* scripts as plain ``"Script"`` at
+                    # birth. ``_build_and_apply_topology`` may later
+                    # flip ``script_type`` to ``"LocalScript"`` when
+                    # the driver lives on the client; the intrinsic
+                    # value remains the original ``"Script"``.
+                    intrinsic_script_type="Script",
                     source_path=f"animations/{script_name}.luau",
                 ))
             log.info("[write_output] Wrote %d animation scripts",
@@ -2778,6 +2796,10 @@ return table.concat(allData, "\\n")'''
                     name=stem,
                     source=asset.luau_source,
                     script_type="ModuleScript",
+                    # Phase 2a slice 5 round 2: ScriptableObjects are
+                    # always ModuleScripts by definition; the intrinsic
+                    # value mirrors the constructed ``script_type``.
+                    intrinsic_script_type="ModuleScript",
                     source_path=f"scriptable_objects/{stem}.luau",
                 ))
                 existing.add(stem)

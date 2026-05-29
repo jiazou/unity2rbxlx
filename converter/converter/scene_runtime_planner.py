@@ -1238,49 +1238,79 @@ def build_scripts_by_class_name(
 
 
 # ---------------------------------------------------------------------------
-# Intrinsic script_class derivation (Phase 2a slice 5 step 1).
+# Intrinsic script_class derivation (Phase 2a slice 5 round 2).
 #
 # The cycle this breaks: pre-slice-5, ``build_topology._build_modules_block``
 # read ``RbxScript.script_type`` AFTER ``storage_classifier.classify_storage``
 # had mutated it (the LocalScript-in-SSS coercion + StarterPlayerScripts /
 # StarterCharacterScripts post-pass at ``storage_classifier.py:185-194``).
 # That made topology a DOWNSTREAM consumer of storage routing — but the
-# design contract has topology AUTHORITY over storage. Slice 5 reorders
-# the pipeline so topology runs FIRST; this helper centralizes the
-# script_class signal so the contract is explicit and the read site is
-# guarded by a named contract rather than relying on positional pipeline
-# ordering alone.
+# design contract has topology AUTHORITY over storage.
+#
+# Round 1 tried to fix this by reordering the pipeline so build_topology
+# ran BEFORE classify_storage; review consensus rejected that approach
+# (see the revert commit message). Round 2 instead captures the
+# pre-classifier ``script_type`` in a NEW IMMUTABLE field
+# ``RbxScript.intrinsic_script_type`` stamped at construction time
+# (transpile / animation-gen / scriptable-object emit). This helper
+# reads through that field so the artifact's ``script_class`` reflects
+# the C# code-analysis decision regardless of the build_topology call
+# site's position in the pipeline.
 # ---------------------------------------------------------------------------
 
 def derive_intrinsic_script_class(script: RbxScript | None) -> str:
     """Return the intrinsic Roblox script class for ``script``.
 
-    "Intrinsic" means the value derived purely from the C# source by
-    ``code_transpiler._classify_script_type`` (Script / LocalScript /
-    ModuleScript). At pipeline call sites BEFORE
-    ``storage_classifier.classify_storage`` runs, ``RbxScript.script_type``
-    still holds that intrinsic value — no other code path mutates the
-    field between transpile and classify.
+    "Intrinsic" means the value determined at the script's birth —
+    by ``code_transpiler._classify_script_type`` for transpiled
+    scripts, or by the producing module (animation generators,
+    ScriptableObject emitter) for non-transpiled scripts. This value
+    is stamped ONCE into ``RbxScript.intrinsic_script_type`` at
+    construction time and NEVER mutated afterward.
 
-    Pre-slice-5 ``_build_modules_block`` read ``script.script_type``
-    directly. It worked because build_topology ran AFTER the classifier
-    inside ``_classify_storage`` — but it CONFLATED two readings: the
-    intrinsic C# signal and the post-coercion routing artefact. Slice 5
-    reorders the pipeline so build_topology runs BEFORE the classifier
-    mutation pass, and consumers go through this helper so the
-    contract is named ("intrinsic") rather than incidental ("whatever
-    script_type happens to hold at call time").
+    Returns the script_class as determined at transpile time; never
+    reflects post-transpile mutations like ``classify_storage``'s
+    ``LocalScript`` coercion or ``_build_and_apply_topology``'s
+    animation_drivers ``Script→LocalScript`` flip. Both pass through
+    the mutable ``script_type``; neither touches
+    ``intrinsic_script_type``.
 
-    Returns ``"ModuleScript"`` when ``script`` is ``None`` or when its
-    ``script_type`` is empty/missing. Same safe default as the
-    pre-slice-5 inline derivation (``build_topology.py:534-537``).
+    Returns ``"ModuleScript"`` when ``script`` is ``None`` (the
+    require-target / orphan-module case at
+    ``build_topology._build_modules_block``).
+
+    Fallback for non-transpiled / pre-field-introduction paths
+    -------------------------------------------------------------
+    When ``intrinsic_script_type`` is ``None`` (set neither by the
+    transpiler nor by an animation/ScriptableObject path), we fall
+    back to ``script.script_type``. In practice this happens for:
+
+      1. **Rehydration** (``_rehydrate_scripts_from_disk``): the
+         stored ``script_type`` reflects the post-classifier value
+         from the prior conversion. A resumed conversion has no
+         fresher signal — preserving the post-classifier reading is
+         the only honest option. The persisted topology artifact's
+         ``script_class`` is preserved verbatim on resume, so this
+         fallback only affects the modest set of rebuilt rows.
+      2. **Scaffolding / coherence-pack synthesized scripts** that
+         pre-date this field's introduction and have not been
+         migrated to stamp it. New construction paths SHOULD stamp
+         ``intrinsic_script_type`` so this fallback narrows over time.
+
+    The fallback is acknowledged-impure but bounded; the immutable-
+    field path is the canonical contract.
     """
     if script is None:
         return "ModuleScript"
-    intrinsic = script.script_type
-    if not intrinsic:
+    intrinsic = script.intrinsic_script_type
+    if intrinsic:
+        return intrinsic
+    # Fallback (see docstring): non-transpiled / pre-field-introduction
+    # construction paths fall back to the mutable ``script_type``.
+    fallback = script.script_type
+    if not fallback:
         return "ModuleScript"
-    return intrinsic
+    return fallback
 
 
 # ---------------------------------------------------------------------------
