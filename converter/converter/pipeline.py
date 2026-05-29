@@ -2484,7 +2484,7 @@ return table.concat(allData, "\\n")'''
         # ``_subphase_emit_scripts_to_disk`` lifted to
         # ``materialize_and_classify`` in slice 8 commit 2.
         # ``_subphase_cohere_scripts`` lifted in slice 8 commit 3.
-        "_classify_storage",
+        # ``_classify_storage`` lifted in slice 8 commit 4.
         "_bind_scripts_to_parts",
         "_subphase_inject_autogen_scripts",
         "_inject_runtime_modules",
@@ -2546,10 +2546,11 @@ return table.concat(allData, "\\n")'''
 
     MATERIALIZE_AND_CLASSIFY_ORDER: tuple[str, ...] = (
         # Phase 2a slice 8: lifted out of ``write_output``. ``emit`` lifted
-        # in commit 2; ``cohere`` lifted in commit 3; ``classify`` follows
+        # in commit 2; ``cohere`` lifted in commit 3; ``classify`` lifted
         # in commit 4.
         "_subphase_emit_scripts_to_disk",
         "_subphase_cohere_scripts",
+        "_classify_storage",
     )
     """Order in which :meth:`materialize_and_classify` invokes its subphases.
 
@@ -2589,12 +2590,13 @@ return table.concat(allData, "\\n")'''
             )
             return
 
-        # Subphases are lifted in over subsequent slice 8 commits in the
-        # order declared in :data:`MATERIALIZE_AND_CLASSIFY_ORDER`. Each
-        # lift commit moves one method's invocation from ``write_output``
-        # to here and updates the constant.
+        # Subphases run in the order declared in
+        # :data:`MATERIALIZE_AND_CLASSIFY_ORDER`. Ordering is load-bearing:
+        # cohere mutates script_type which classify reads; emit must run
+        # first because cohere/classify both walk ``rbx_place.scripts``.
         self._subphase_emit_scripts_to_disk()
         self._subphase_cohere_scripts()
+        self._classify_storage()
 
     def write_output(self) -> None:
         """Phase 6: Serialize the Roblox place to disk.
@@ -2612,11 +2614,10 @@ return table.concat(allData, "\\n")'''
         # write_output is the assembly + serialization pipeline. Each subphase
         # below mutates self.state.rbx_place and/or writes files to self.output_dir.
         # Order is load-bearing — see SUBPHASE_ORDER for dependency rationale.
-        # Phase 2a slice 8 commits 2-3: ``_subphase_emit_scripts_to_disk``
-        # and ``_subphase_cohere_scripts`` are owned by
-        # ``materialize_and_classify``; write_output consumes the cohered
+        # Phase 2a slice 8 commits 2-4: ``_subphase_emit_scripts_to_disk``,
+        # ``_subphase_cohere_scripts``, and ``_classify_storage`` are owned
+        # by ``materialize_and_classify``; write_output consumes the cohered
         # ``rbx_place.scripts`` list and the persisted ``StoragePlan``.
-        self._classify_storage()
         self._bind_scripts_to_parts()
         self._subphase_inject_autogen_scripts()
         self._inject_runtime_modules()
