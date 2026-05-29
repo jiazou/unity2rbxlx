@@ -574,6 +574,18 @@ class Pipeline:
             # Convert scene
             self._run_phase("convert_scene")
 
+            # Phase 2a slice 8 (round 2): the single-scene path runs
+            # ``materialize_and_classify`` between ``convert_scene`` and
+            # ``write_output`` via ``run_through`` honoring the PHASES
+            # ordering. The multi-scene loop drove ``_run_phase`` directly
+            # and silently skipped the lifted phase per scene — every
+            # per-scene rbxlx lost the script-set materialization +
+            # classification pass + the late-append safety net stamp.
+            # ``materialize_and_classify`` is in ``ESSENTIAL_PHASES`` so
+            # it re-runs cleanly per scene (no completed-phase short-
+            # circuit on the second iteration).
+            self._run_phase("materialize_and_classify")
+
             # Write output with scene-specific filename
             original_filename = RBXLX_OUTPUT_FILENAME
             try:
