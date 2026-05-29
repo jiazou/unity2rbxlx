@@ -4248,9 +4248,14 @@ script.Disabled = true
         from converter.scene_runtime_planner import (
             backfill_lifecycle_role_inputs,
             build_script_id_by_name,
+            build_scripts_by_class_name,
+            derive_intrinsic_script_class,
         )
         from converter.scene_runtime_topology.build_topology import (
             resolve_caller_graph,
+        )
+        from converter.scene_runtime_topology.lifecycle_roles import (
+            derive_module_lifecycle_role,
         )
         from converter.scene_runtime_topology.module_domain import (
             TopologyInputs,
@@ -4312,12 +4317,54 @@ script.Disabled = true
         domains: dict[str, str] = {
             sid: res["domain"] for sid, res in domain_results.items()
         }
-        lifecycle_roles: dict[str, str] = {}
+        # Slice 7 round 2 (Codex P1 #2 fix): compute ``lifecycle_role``
+        # INLINE here so the storage classifier's slice-7 decision tree
+        # actually sees a populated dict on a fresh run. Pre-round-2
+        # this dict was populated by reading
+        # ``row.get("lifecycle_role")``, but no upstream stamper writes
+        # that key onto the source row -- ``build_topology._build_modules_block``
+        # computes it for the artifact entry but does not mutate the
+        # row, and the planner stamps only the RAW inputs
+        # (``is_loader`` / ``character_attached``). So the prepass
+        # produced an empty dict, the consumer at
+        # ``storage_classifier._decide_script_container_from_topology``
+        # got ``""`` for every sid, and the ``character_attached`` /
+        # ``loader`` branches were dead in production. Unit tests
+        # passed because ``_mk_topology_inputs`` pre-stamped the dict
+        # directly, bypassing the producer/consumer ordering.
+        #
+        # Option A.2 from the round 1 decision doc: recompute inline
+        # via ``derive_module_lifecycle_role`` -- no row mutation. The
+        # late ``build_topology._build_modules_block`` also calls
+        # ``derive_module_lifecycle_role`` with the same inputs, so
+        # the prepass dict and the artifact entry are byte-identical.
+        # See ``slice-7-r1-decision.md`` for the verification chain.
         modules_dict = cast("dict[str, dict[str, object]]", modules)
+        scripts_by_class = build_scripts_by_class_name(
+            self.state.rbx_place.scripts,
+            cast(
+                "dict[str, SceneRuntimeModule | dict[str, object]]",
+                modules,
+            ),
+        )
+        lifecycle_roles: dict[str, str] = {}
         for sid, row in modules_dict.items():
-            role = row.get("lifecycle_role", "")
-            if isinstance(role, str) and role:
-                lifecycle_roles[sid] = role
+            class_name_obj = row.get("class_name", "")
+            class_name = (
+                class_name_obj if isinstance(class_name_obj, str) else ""
+            )
+            script = scripts_by_class.get(class_name)
+            script_class = derive_intrinsic_script_class(script)
+            module_domain = domains.get(sid, "")
+            character_attached = bool(row.get("character_attached", False))
+            is_loader = bool(row.get("is_loader", False))
+            role = derive_module_lifecycle_role(
+                domain=module_domain,
+                script_class=script_class,
+                character_attached=character_attached,
+                is_loader=is_loader,
+            )
+            lifecycle_roles[sid] = role
 
         return TopologyInputs(
             domains=domains,
