@@ -34,6 +34,7 @@ from converter.scene_runtime_topology.module_domain import (  # noqa: E402
     _DomainInferenceResult,
     classify_scene_runtime_domains,
     derive_reachability_requirements,
+    finalize_topology_containers,
     infer_module_domains,
 )
 from converter.storage_classifier import (  # noqa: E402
@@ -234,6 +235,48 @@ class TestDeriveReachabilityRequirementsParity:
             artifact, scripts, domains, dependency_map=None,
         )
         assert reqs == {}
+
+
+class TestFinalizeTopologyContainersIdempotent:
+    def test_finalize_twice_produces_same_row(self) -> None:
+        """``finalize_topology_containers`` must be safely re-runnable
+        (PR1 invariant: classifier idempotency). Reachability hoist
+        path included.
+        """
+        modules = dict([
+            _mk_module("g-client", "ClientA"),
+            _mk_module("g-helper", "Helper"),
+        ])
+        artifact = _mk_artifact(modules)
+        scripts = [
+            _mk_script(
+                "ClientA", "Players.LocalPlayer",
+                parent_path=STARTER_PLAYER_SCRIPTS,
+            ),
+            _mk_script("Helper", "return {}", parent_path=SERVER_STORAGE),
+        ]
+        dep_map = {"ClientA": ["Helper"]}
+        domains = infer_module_domains(
+            artifact, scripts, dependency_map=dep_map,
+        )
+        reqs = derive_reachability_requirements(
+            artifact, scripts, domains, dependency_map=dep_map,
+        )
+        finalize_topology_containers(artifact, scripts, domains, reqs)
+        first_helper = dict(artifact["modules"]["g-helper"])
+        first_helper_signals = dict(
+            artifact["modules"]["g-helper"]["domain_signals"]
+        )
+        first_helper_parent = scripts[1].parent_path
+
+        # Run again; result must match.
+        finalize_topology_containers(artifact, scripts, domains, reqs)
+        assert dict(artifact["modules"]["g-helper"]) == first_helper
+        assert (
+            dict(artifact["modules"]["g-helper"]["domain_signals"])
+            == first_helper_signals
+        )
+        assert scripts[1].parent_path == first_helper_parent
 
 
 class TestSlice6OrchestratorByteParity:

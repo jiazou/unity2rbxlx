@@ -772,6 +772,129 @@ def derive_reachability_requirements(
     return requirements
 
 
+def finalize_topology_containers(
+    scene_runtime: SceneRuntimeArtifact,
+    scripts: Iterable[RbxScript],
+    domain_results: dict[str, _DomainInferenceResult],
+    reachability_requirements: dict[str, str],
+) -> list[str]:
+    """Late finalizer: mirror domain verdicts + container/module_path
+    onto module rows after ``classify_storage`` has stamped final
+    ``parent_path`` values on every ``RbxScript``.
+
+    Mutates ``scene_runtime.modules[*]`` (stamps ``domain`` /
+    ``domain_signals`` / ``container`` / ``module_path`` /
+    ``reachability_forced_container``) AND, when a reachability
+    requirement says to hoist, mutates ``RbxScript.parent_path`` to
+    match — this preserves the legacy ``_apply_reachability_rule``
+    behavior verbatim. Slice 7 will move the hoist into the early
+    storage decision tree so this late mutation becomes vestigial;
+    until then, byte-identical observable behavior REQUIRES the
+    finalizer mirror the legacy mutation.
+
+    Returns the FINAL list of excluded ``script_id``s (early-inferred
+    excluded + reachability_conflict additions) so the caller can
+    compose the report.
+
+    Idempotent: re-running yields the same module rows + script
+    parent_paths (the reachability hoist short-circuits when the
+    helper is already in ``REPLICATED_STORAGE``, and the per-row
+    stamping is pure overwrite).
+    """
+    modules = scene_runtime.get("modules", {})
+    from converter.scene_runtime_planner import (
+        build_scripts_by_class_name,
+    )
+    scripts_list = list(scripts)
+    scripts_by_class = build_scripts_by_class_name(
+        scripts_list, cast("dict", modules),
+    )
+
+    excluded: list[str] = []
+
+    for script_id, module in modules.items():
+        result = domain_results.get(script_id)
+        if result is None:
+            # No early inference for this row (shouldn't happen for a
+            # legitimate caller, but be defensive).
+            _stamp_container_and_path(module, scripts_by_class)
+            continue
+
+        # Stamp domain + signals first.
+        if not module.get("runtime_bearing"):
+            module["domain"] = "helper"
+            _stamp_container_and_path(module, scripts_by_class)
+            continue
+
+        module["domain"] = result["domain"]
+        module["domain_signals"] = result["signals"]
+        _stamp_container_and_path(module, scripts_by_class)
+
+        if result["excluded"]:
+            excluded.append(script_id)
+
+    # Apply reachability decisions atomically (mirrors what the legacy
+    # ``_apply_reachability_rule`` did inline).
+    class_to_script_id: dict[str, str] = {}
+    for script_id, module in modules.items():
+        class_name = module.get("class_name", "")
+        if not class_name:
+            continue
+        class_to_script_id.setdefault(class_name, script_id)
+
+    for script_id, requirement in reachability_requirements.items():
+        module_row = modules.get(script_id)
+        if module_row is None:
+            continue
+        helper_class = module_row.get("class_name", "")
+        script = scripts_by_class.get(helper_class)
+        if script is None:
+            continue
+
+        if requirement == "__excluded__":
+            # Only mark as reachability_conflict if the helper is
+            # currently in a server-invisible container (i.e. the
+            # legacy rule would have actually fired). This preserves
+            # the exact predicate the legacy rule used: ``current_container
+            # in _SERVER_CONTAINERS_FOR_REACHABILITY``.
+            current_container = script.parent_path or ""
+            if current_container not in _SERVER_CONTAINERS_FOR_REACHABILITY:
+                continue
+            module_row["domain"] = "excluded"
+            signals = cast(
+                SceneRuntimeDomainSignals,
+                module_row.get("domain_signals", {}),
+            )
+            signals["fail_closed_reason"] = "reachability_conflict"
+            module_row["domain_signals"] = signals
+            if script_id not in excluded:
+                excluded.append(script_id)
+            continue
+
+        # Hoist requirement: REPLICATED_STORAGE. Same predicate gate.
+        current_container = script.parent_path or ""
+        if current_container not in _SERVER_CONTAINERS_FOR_REACHABILITY:
+            continue
+        # Atomic triple-write: script.parent_path + module.container +
+        # module.module_path + signals.reachability_forced_container.
+        # Slice 4 round 2 codified this as invariant 10 — see the
+        # docstring on ``_apply_reachability_rule`` for the empty-name
+        # guard discussion.
+        script.parent_path = REPLICATED_STORAGE
+        module_row["container"] = REPLICATED_STORAGE
+        module_row["module_path"] = (
+            f"{REPLICATED_STORAGE}.{script.name}"
+        )
+        signals = cast(
+            SceneRuntimeDomainSignals,
+            module_row.get("domain_signals", {}),
+        )
+        signals["reachability_forced_container"] = REPLICATED_STORAGE
+        module_row["domain_signals"] = signals
+
+    return excluded
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -788,6 +911,12 @@ def classify_scene_runtime_domains(
     """Populate ``domain`` / ``container`` / ``module_path`` /
     ``domain_signals`` on every runtime-bearing module in
     ``scene_runtime.modules`` (mutated in place).
+
+    Phase 2a slice 6: this function is a thin orchestrator on top of
+    ``infer_module_domains`` + ``derive_reachability_requirements`` +
+    ``finalize_topology_containers``. The observable behavior is
+    byte-identical to slice 5 — the split is internal so slice 7's
+    storage decision tree can consume the same prepass output.
 
     ``scripts`` must already carry their final ``parent_path`` (set by
     ``storage_classifier.classify_storage``). ``dependency_map`` is the
@@ -812,7 +941,8 @@ def classify_scene_runtime_domains(
     caller can format an actionable error message.
 
     Pure function over its inputs except for the in-place mutation of
-    ``scene_runtime.modules[*]``.
+    ``scene_runtime.modules[*]`` and (for the reachability-hoist path)
+    ``RbxScript.parent_path``.
     """
     if networking not in NETWORKING_MODES:
         raise ValueError(
@@ -820,106 +950,67 @@ def classify_scene_runtime_domains(
             f"expected one of {NETWORKING_MODES}"
         )
 
-    modules = scene_runtime.get("modules", {})
-    scenes = scene_runtime.get("scenes", {})
-    prefabs = scene_runtime.get("prefabs", {})
-    overrides = scene_runtime.get("domain_overrides", {})
-
-    # Phase 2a slice 4 round 3 review (Claude P1.A): use the shared
-    # ``build_scripts_by_class_name`` helper so the planner +
-    # pipeline share ONE source of truth for the class_name → script
-    # join. Pre-fix this loop duplicated the same logic that lived
-    # at the pipeline boundary, creating a drift surface.
-    from converter.scene_runtime_planner import (
-        build_scripts_by_class_name,
-    )
     scripts_list = list(scripts)
-    scripts_by_class = build_scripts_by_class_name(
-        scripts_list, cast("dict", modules),
+
+    # Early prepass: domain inference + reachability requirements. Both
+    # are pure over their inputs — see their docstrings for the
+    # parent_path invariants.
+    domain_results = infer_module_domains(
+        scene_runtime, scripts_list,
+        dependency_map=dependency_map,
+        guid_index=guid_index,
+        networking=networking,
+    )
+    requirements = derive_reachability_requirements(
+        scene_runtime, scripts_list, domain_results,
+        dependency_map=dependency_map,
     )
 
-    per_instance_evidence = _gather_per_instance_evidence(scenes, prefabs)
+    # Late finalizer: stamp the early-inferred domains + reachability
+    # decisions onto the module rows + (for the hoist path) onto the
+    # ``RbxScript.parent_path``. Returns the final excluded list.
+    excluded = finalize_topology_containers(
+        scene_runtime, scripts_list, domain_results, requirements,
+    )
 
-    # C# source text cached per script_id. We read on demand the first
-    # time a module is classified; helper modules + non-runtime-bearing
-    # rows don't pay the I/O.
-    cs_source_cache: dict[str, str] = {}
-
-    def _get_cs_source(script_id: str) -> str:
-        if script_id in cs_source_cache:
-            return cs_source_cache[script_id]
-        text = _load_cs_source(script_id, guid_index)
-        cs_source_cache[script_id] = text
-        return text
-
-    displaced: list[SceneRuntimeDisplacedInstance] = []
+    # Collect low_confidence + displaced from the early prepass results.
     low_confidence: list[str] = []
-    excluded: list[str] = []
-
-    # Pre-pass: compute the per-module set of moderate-server signal
-    # kinds that need cross-module data (require-graph reaches a
-    # NetworkBehaviour subclass). Empty under --networking=none per the
-    # design doc (the only graph-derived moderate-server signal is
-    # mirror_only).
-    network_reachable: set[str] = _compute_network_behaviour_reachable(
-        modules, dependency_map, _get_cs_source, networking,
-    )
-
-    # Pass 1: per-module classification (signals → rule table → override).
-    for script_id, module in modules.items():
-        # Pre-stamp helpers + non-runtime-bearing rows. Helpers (not
-        # runtime-bearing) become ``"helper"``; the host runtime never
-        # instantiates them but the module row still exists for require()
-        # resolution.
-        if not module.get("runtime_bearing"):
-            # Don't overwrite a pre-existing helper marker on re-classify.
-            module["domain"] = "helper"
-            _stamp_container_and_path(module, scripts_by_class)
-            continue
-
-        # Graph-derived moderate-server signals injected per-module. Only
-        # ``network_behaviour_reachable`` exists today.
-        extra_moderate_server: tuple[str, ...] = (
-            (_NETWORK_BEHAVIOUR_REACHABLE,)
-            if script_id in network_reachable
-            else ()
-        )
-
-        verdict, signals, instance_rows = _classify_module(
-            script_id, module, scripts_by_class,
-            per_instance_evidence.get(script_id, []),
-            overrides.get(script_id),
-            _get_cs_source(script_id),
-            networking,
-            extra_moderate_server=extra_moderate_server,
-        )
-        module["domain"] = verdict
-        module["domain_signals"] = signals
-        _stamp_container_and_path(module, scripts_by_class)
-        if signals.get("low_confidence"):
+    displaced: list[SceneRuntimeDisplacedInstance] = []
+    for script_id, result in domain_results.items():
+        if result["low_confidence"]:
             low_confidence.append(script_id)
-        if verdict == "excluded":
-            excluded.append(script_id)
-        if signals.get("override_applied") and signals.get("intra_class_conflict"):
-            for row in instance_rows:
-                displaced.append(row)
+        displaced.extend(result["displaced_instances"])
 
-    # Pass 2: client-domain require-graph reachability.
-    if dependency_map:
-        _apply_reachability_rule(
-            modules, dependency_map, scripts_by_class, excluded,
-        )
-
-    # Pass 3: mirror_adoption_low heuristic (after classification so we
-    # have the runtime-bearing count post-overrides).
+    # Mirror adoption check: requires a recomputed cs_source_cache. The
+    # cache the early prepass built was discarded — rebuild it here to
+    # preserve the legacy behavior. Skipped under --networking=none.
     mirror_low = False
     if networking in ("mirror", "netcode"):
+        modules = scene_runtime.get("modules", {})
+        from converter.scene_runtime_planner import (
+            build_scripts_by_class_name,
+        )
+        scripts_by_class = build_scripts_by_class_name(
+            scripts_list, cast("dict", modules),
+        )
+        cs_source_cache: dict[str, str] = {}
+
+        def _get_cs_source(script_id: str) -> str:
+            if script_id in cs_source_cache:
+                return cs_source_cache[script_id]
+            text = _load_cs_source(script_id, guid_index)
+            cs_source_cache[script_id] = text
+            return text
+
+        # Prewarm the cache with every runtime-bearing module so the
+        # imports-zero check sees the same set as the legacy pass.
+        for script_id, module in modules.items():
+            if module.get("runtime_bearing"):
+                _get_cs_source(script_id)
         mirror_low = _check_mirror_adoption(
             modules, scripts_by_class, cs_source_cache, _get_cs_source,
         )
 
-    # Pass 4: strict-classification violations enumeration. Always
-    # computed, never raised — callers decide policy.
     strict_violations = sorted(set(low_confidence) | set(excluded))
 
     return DomainClassifierReport(
@@ -1729,6 +1820,7 @@ def _check_mirror_adoption(
 __all__ = (
     "classify_scene_runtime_domains",
     "derive_reachability_requirements",
+    "finalize_topology_containers",
     "infer_module_domains",
     "migrate_legacy_domain_values",
     "DomainClassifierReport",

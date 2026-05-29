@@ -63,6 +63,7 @@ from converter.scene_runtime_topology.module_domain import (
     _using_rx,
     classify_scene_runtime_domains,
     derive_reachability_requirements,
+    finalize_topology_containers,
     infer_module_domains,
     migrate_legacy_domain_values,
 )
@@ -72,6 +73,7 @@ __all__ = (
     "classify_scene_runtime_domains",
     "compute_cross_domain_edges",
     "derive_reachability_requirements",
+    "finalize_topology_containers",
     "infer_module_domains",
     "migrate_legacy_domain_values",
     "DomainClassifierReport",
