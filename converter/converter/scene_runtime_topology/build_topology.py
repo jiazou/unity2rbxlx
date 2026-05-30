@@ -129,6 +129,7 @@ from converter.scene_runtime_topology.animation_routing import (
 from converter.scene_runtime_topology.cross_domain_edges import (
     CrossDomainEdge,
     compute_cross_domain_edges,
+    compute_shared_attribute_candidates,
 )
 from converter.scene_runtime_topology.lifecycle_roles import (
     LIFECYCLE_ROLES,
@@ -491,7 +492,23 @@ def build_topology(
         script_by_sid=script_by_sid,
         reachability_requirements=reachability_requirements,
     )
-    edges_block = compute_cross_domain_edges(scene_runtime)
+    # Phase 2b slice 1: two producers feed the cross-domain edge list.
+    # 1) component-ref edges (today's path; cross-domain peer-MonoBehaviour
+    #    serialized references).
+    # 2) shared-attribute candidates (new; structurally seeded from
+    #    ``SHARED_ATTRIBUTE_SEEDS``, replaces the hardcoded
+    #    ``PlayerSetSharedFlag`` prompt block once slice 3 lands the
+    #    bridge emitter).
+    # Order is deterministic — component-ref first, shared-attribute
+    # second — so downstream consumers reading the concatenated list
+    # see a stable index. The shared-attribute producer pass itself
+    # sorts scene/prefab keys before iterating; ``compute_cross_domain_edges``
+    # iterates in dict insertion order (preserved per scene_runtime build).
+    component_ref_edges = compute_cross_domain_edges(scene_runtime)
+    shared_attribute_candidates = compute_shared_attribute_candidates(
+        scene_runtime,
+    )
+    edges_block = [*component_ref_edges, *shared_attribute_candidates]
     if preserved_animation_drivers is not None:
         # Resume path: caller supplied prior animation_drivers. Skip
         # the build_from_emissions step. Invariant 3 will be skipped

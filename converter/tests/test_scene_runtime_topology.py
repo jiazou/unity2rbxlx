@@ -56,7 +56,11 @@ from converter.scene_runtime_topology.build_topology import (  # noqa: E402
     callers_of,
 )
 from converter.scene_runtime_topology.cross_domain_edges import (  # noqa: E402
+    SHARED_ATTRIBUTE_SEEDS,
+    compute_cross_domain_edges,
+    compute_shared_attribute_candidates,
     deterministic_edge_id,
+    shared_attribute_candidate_id,
 )
 from converter.scene_runtime_topology.lifecycle_roles import (  # noqa: E402
     LIFECYCLE_ROLES,
@@ -1614,6 +1618,292 @@ class TestCrossDomainEdgeId:
         assert deterministic_edge_id("P:1", "f", "P:2") == (
             deterministic_edge_id("P:1", "f", "P:2")
         )
+
+
+# ===========================================================================
+# CATEGORY 5b: Phase 2b slice 1 — extended edge schema + shared-attribute
+# candidates
+# ===========================================================================
+
+
+def _mk_edge_artifact(
+    *,
+    src_domain: str = "client",
+    tgt_domain: str = "server",
+    src_class: str = "Door",
+    tgt_class: str = "Anim",
+    field: str = "open",
+) -> dict[str, object]:
+    """Synthesize a 1-scene plan with one component-ref reference."""
+    return {
+        "modules": {
+            "src": {
+                "stem": src_class, "class_name": src_class,
+                "runtime_bearing": True, "domain": src_domain,
+                "module_path": f"ReplicatedStorage.{src_class}",
+            },
+            "tgt": {
+                "stem": tgt_class, "class_name": tgt_class,
+                "runtime_bearing": True, "domain": tgt_domain,
+                "module_path": f"ReplicatedStorage.{tgt_class}",
+            },
+        },
+        "scenes": {
+            "A.unity": {
+                "instances": [
+                    {"instance_id": "A.unity:1", "script_id": "src",
+                     "game_object_id": "A.unity:1", "active": True,
+                     "enabled": True, "config": {}},
+                    {"instance_id": "A.unity:2", "script_id": "tgt",
+                     "game_object_id": "A.unity:2", "active": True,
+                     "enabled": True, "config": {}},
+                ],
+                "references": [{
+                    "from": "A.unity:1",
+                    "field": field,
+                    "index": None,
+                    "target_kind": "component",
+                    "target_ref": "A.unity:2",
+                    "target_is_ui": False,
+                }],
+                "lifecycle_order": ["A.unity:1", "A.unity:2"],
+            },
+        },
+        "prefabs": {},
+        "domain_overrides": {},
+    }
+
+
+def _mk_shared_attr_artifact(
+    *,
+    producer_class: str = "Pickup",
+    producer_domain: str = "client",
+) -> dict[str, object]:
+    """Synthesize a 1-scene plan with one Pickup-class instance."""
+    return {
+        "modules": {
+            "pickup_sid": {
+                "stem": producer_class, "class_name": producer_class,
+                "runtime_bearing": True, "domain": producer_domain,
+                "module_path": f"ReplicatedStorage.{producer_class}",
+            },
+        },
+        "scenes": {
+            "Level.unity": {
+                "instances": [
+                    {"instance_id": "Level.unity:1",
+                     "script_id": "pickup_sid",
+                     "game_object_id": "Level.unity:1",
+                     "active": True, "enabled": True,
+                     "config": {"itemName": "Key"}},
+                ],
+                "references": [],
+                "lifecycle_order": ["Level.unity:1"],
+            },
+        },
+        "prefabs": {},
+        "domain_overrides": {},
+    }
+
+
+class TestPhase2bSlice1ExtendedSchema:
+    """Phase 2b slice 1: ``CrossDomainEdge`` schema extension +
+    pre-transpile structural producers (component-ref + shared-attribute).
+
+    Each test pins one of the four invariants slice 1 introduces:
+      1. Component-ref edges carry the new ``kind`` / ``resolution`` /
+         ``bridge_member_scripts`` / ``payload`` fields.
+      2. ``SHARED_ATTRIBUTE_SEEDS`` rows produce one candidate edge per
+         matching instance.
+      3. The ``PickupItemEvent`` name is LOCKED — Mitigation α regression
+         guard.
+      4. Component-ref and shared-attribute candidate ids never collide.
+      5. No seed match → no shared-attribute candidates emitted.
+
+    Refs: cross_domain_edges.py (slice 1), design doc Phase 2b section.
+    """
+
+    def test_component_ref_edge_has_new_schema_fields(self) -> None:
+        """A synthesized cross-domain component-ref edge carries
+        ``kind == "attribute_write"``, the new ``resolution`` with
+        ``strategy == "remote_event_bridge"``, an event name following
+        the ``<owner>_Set<Field>`` scheme (design doc L239 / L907),
+        an empty ``bridge_member_scripts`` (slice 2 fills it), and a
+        ``payload`` whose ``attribute_name`` matches the field.
+        """
+        plan = _mk_edge_artifact(
+            src_class="Door", field="open",
+            src_domain="client", tgt_domain="server",
+        )
+        edges = compute_cross_domain_edges(plan)  # type: ignore[arg-type]
+        assert len(edges) == 1
+        edge = edges[0]
+        assert edge["kind"] == "attribute_write"
+        assert edge["resolution"]["strategy"] == "remote_event_bridge"
+        # ``<owner>_Set<Field>``: owner is Door's class_name, field is
+        # ``open`` (capitalize first letter only).
+        assert edge["resolution"]["event_name"] == "Door_SetOpen"
+        assert edge["bridge_member_scripts"] == []
+        assert edge["payload"]["attribute_name"] == "open"
+        assert edge["payload"]["schema"] == "unknown"
+        # Flat fields preserved (no nested producer/consumer restructure
+        # in slice 1).
+        assert edge["from_script"] == "src"
+        assert edge["to_script"] == "tgt"
+        assert edge["field"] == "open"
+
+    def test_shared_attribute_seed_emits_candidate(self) -> None:
+        """A Pickup-class instance produces a shared-attribute
+        candidate with ``kind == "attribute_write"``,
+        ``resolution.event_name == "PickupItemEvent"``, the right
+        ``from_instance``, an empty ``bridge_member_scripts``, an empty
+        ``to_*`` (fan-out, slice 2 enriches), and the attribute_template
+        as the ``field`` / ``payload.attribute_name``.
+        """
+        plan = _mk_shared_attr_artifact()
+        candidates = compute_shared_attribute_candidates(
+            plan,  # type: ignore[arg-type]
+        )
+        assert len(candidates) == 1
+        cand = candidates[0]
+        assert cand["kind"] == "attribute_write"
+        assert cand["resolution"]["strategy"] == "remote_event_bridge"
+        assert cand["resolution"]["event_name"] == "PickupItemEvent"
+        assert cand["from_instance"] == "Level.unity:1"
+        assert cand["from_script"] == "pickup_sid"
+        # Fan-out: to_* unresolved in slice 1.
+        assert cand["to_instance"] == ""
+        assert cand["to_script"] == ""
+        assert cand["to_domain"] == ""
+        # Producer domain is captured when known.
+        assert cand["from_domain"] == "client"
+        # Slice 2 fills this.
+        assert cand["bridge_member_scripts"] == []
+        # Attribute template — slice 3 resolves ``<itemName>``.
+        assert cand["field"] == "has<itemName>"
+        assert cand["payload"]["attribute_name"] == "has<itemName>"
+        # Per code_transpiler.py:1279 the attribute value is a bool.
+        assert cand["payload"]["schema"] == "bool"
+        assert cand["owner_kind"] == "scene"
+        assert cand["owner_ref"] == "Level.unity"
+
+    def test_pickup_item_event_name_locked(self) -> None:
+        """Mitigation α regression guard. Three downstream sites in
+        ``script_coherence_packs.py`` hardcode the literal
+        ``"PickupItemEvent"``; this test fails closed if anyone
+        re-derives the name via the ``<owner>_Set<Field>`` scheme
+        (which would produce ``Pickup_SetHas<itemName>`` or similar).
+
+        Refs: SHARED_ATTRIBUTE_SEEDS Pickup row; design doc Phase 2b
+        deliverable 4.
+        """
+        # Direct seed table assertion.
+        pickup_seeds = [
+            s for s in SHARED_ATTRIBUTE_SEEDS
+            if s.producer_class_name == "Pickup"
+        ]
+        assert len(pickup_seeds) == 1
+        assert pickup_seeds[0].remote_event_name == "PickupItemEvent"
+
+        # End-to-end: any Pickup-class instance → literal event name.
+        plan = _mk_shared_attr_artifact(producer_class="Pickup")
+        candidates = compute_shared_attribute_candidates(
+            plan,  # type: ignore[arg-type]
+        )
+        assert len(candidates) == 1
+        assert candidates[0]["resolution"]["event_name"] == "PickupItemEvent"
+        # Negative: does NOT match the derived component-ref scheme.
+        assert (
+            candidates[0]["resolution"]["event_name"]
+            != "Pickup_SetHas<itemName>"
+        )
+
+    def test_shared_attribute_candidate_id_distinct_from_component_ref_id(
+        self,
+    ) -> None:
+        """Component-ref ids use the ``<from>::<field>::<to>`` scheme;
+        shared-attribute candidate ids use the ``shared_attr::`` prefix.
+        The two namespaces MUST NOT collide even when synthesized
+        against the same instance ids.
+        """
+        component_id = deterministic_edge_id(
+            "Level.unity:1", "open", "Level.unity:2",
+        )
+        shared_id = shared_attribute_candidate_id(
+            "Level.unity", "Level.unity:1", "PickupItemEvent",
+        )
+        assert component_id != shared_id
+        assert shared_id.startswith("shared_attr::")
+        # Full-pipeline check: build a plan that produces BOTH kinds and
+        # confirm zero id overlap in the combined edge list.
+        plan: dict[str, object] = {
+            "modules": {
+                "door_sid": {
+                    "stem": "Door", "class_name": "Door",
+                    "runtime_bearing": True, "domain": "client",
+                    "module_path": "ReplicatedStorage.Door",
+                },
+                "anim_sid": {
+                    "stem": "Anim", "class_name": "Anim",
+                    "runtime_bearing": True, "domain": "server",
+                    "module_path": "ReplicatedStorage.Anim",
+                },
+                "pickup_sid": {
+                    "stem": "Pickup", "class_name": "Pickup",
+                    "runtime_bearing": True, "domain": "client",
+                    "module_path": "ReplicatedStorage.Pickup",
+                },
+            },
+            "scenes": {
+                "Mixed.unity": {
+                    "instances": [
+                        {"instance_id": "Mixed.unity:1", "script_id": "door_sid",
+                         "game_object_id": "Mixed.unity:1", "active": True,
+                         "enabled": True, "config": {}},
+                        {"instance_id": "Mixed.unity:2", "script_id": "anim_sid",
+                         "game_object_id": "Mixed.unity:2", "active": True,
+                         "enabled": True, "config": {}},
+                        {"instance_id": "Mixed.unity:3", "script_id": "pickup_sid",
+                         "game_object_id": "Mixed.unity:3", "active": True,
+                         "enabled": True, "config": {"itemName": "Key"}},
+                    ],
+                    "references": [{
+                        "from": "Mixed.unity:1",
+                        "field": "open",
+                        "index": None,
+                        "target_kind": "component",
+                        "target_ref": "Mixed.unity:2",
+                        "target_is_ui": False,
+                    }],
+                    "lifecycle_order": [
+                        "Mixed.unity:1", "Mixed.unity:2", "Mixed.unity:3",
+                    ],
+                },
+            },
+            "prefabs": {},
+            "domain_overrides": {},
+        }
+        component = compute_cross_domain_edges(plan)  # type: ignore[arg-type]
+        shared = compute_shared_attribute_candidates(
+            plan,  # type: ignore[arg-type]
+        )
+        all_ids = [e["id"] for e in component] + [e["id"] for e in shared]
+        assert len(component) == 1
+        assert len(shared) == 1
+        assert len(set(all_ids)) == len(all_ids)
+
+    def test_no_shared_attribute_edges_when_no_seed_match(self) -> None:
+        """A scene with NO Pickup instances (only non-seed classes)
+        produces zero shared-attribute candidates. The seed table is
+        the closed enumeration source — anything outside it is silently
+        ignored by this producer.
+        """
+        # A scene with only Door instances — no seed match.
+        plan = _mk_shared_attr_artifact(producer_class="Door")
+        candidates = compute_shared_attribute_candidates(
+            plan,  # type: ignore[arg-type]
+        )
+        assert candidates == []
 
 
 # ===========================================================================
