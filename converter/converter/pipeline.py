@@ -4341,7 +4341,34 @@ script.Disabled = true
             # that wires the new consumer." Without this, the on-disk
             # plan contradicts the live RbxScript metadata + the
             # scene_runtime.topology block.
-            self._build_and_apply_topology(scene_runtime, plan)
+            #
+            # Phase 2a slice 9a: ``topology_inputs`` from the prepass
+            # is passed through. Resume contract: on a
+            # ``--phase=write_output`` (or any) resume,
+            # ``materialize_and_classify`` is in ``ESSENTIAL_PHASES``
+            # (pipeline.py:612) so this method (``_classify_storage``)
+            # re-runs, ``_maybe_run_topology_prepass`` re-runs, and a
+            # fresh ``TopologyInputs`` is produced for this call —
+            # no persistence to ``StoragePlan`` is needed (and would
+            # violate slice 6's "save raw facts, recompute conclusions"
+            # rule, which keeps ``reachability_requirements`` /
+            # ``domains`` recomputed every run). Same gates fire on
+            # both the prepass and this branch (``scene_runtime_mode
+            # != "legacy"`` + non-empty ``modules`` + no
+            # ``__skip_domain_classifier__``) plus ``rbx_place``
+            # presence (checked inside both methods), so
+            # ``topology_inputs`` is non-None whenever this call site
+            # is reached; the kwarg's ``None`` default exists so unit
+            # tests + future callers can still invoke the method
+            # without forcing the prepass dependency.
+            assert topology_inputs is not None, (
+                "slice 9a invariant: ``topology_inputs`` must be set "
+                "whenever ``_build_and_apply_topology`` is reached "
+                "via ``_classify_storage`` — same gate as the prepass."
+            )
+            self._build_and_apply_topology(
+                scene_runtime, plan, topology_inputs=topology_inputs,
+            )
 
         plan_path.write_text(
             _json.dumps({
@@ -4588,6 +4615,8 @@ script.Disabled = true
         self,
         scene_runtime: dict[str, object],
         plan: "StoragePlan",
+        *,
+        topology_inputs: "TopologyInputs | None" = None,
     ) -> None:
         """Phase 1, PR #148 of the scene-runtime topology authority refactor.
 
@@ -4595,6 +4624,23 @@ script.Disabled = true
         to the corresponding ``Anim_*`` RbxScripts. Called inside
         ``_classify_storage`` AFTER ``classify_scene_runtime_domains``
         populates module domains + BEFORE the on-disk plan is written.
+
+        ``topology_inputs`` (Phase 2a slice 9a): the same
+        ``TopologyInputs`` row ``_maybe_run_topology_prepass`` produced
+        earlier in ``_classify_storage`` (or ``None`` if the prepass
+        gate rejected the call -- legacy mode / no ``modules`` block /
+        ``__skip_domain_classifier__`` probe). Plumbed through so this
+        method can consume the canonical ``script_id_by_name`` index
+        (and the inverted ``script_by_sid`` derived from it) without
+        re-deriving via the legacy class_name-only join — closes the
+        same asymmetric-join hole slice 7 round 4 fixed at the prepass
+        boundary, this time on the late ``_build_modules_block`` side.
+        Per slice 6's "save raw facts, recompute conclusions" rule
+        ``TopologyInputs`` itself is NOT persisted to ``StoragePlan``;
+        plumbing means in-memory pass-through, and on a
+        ``--phase=write_output`` resume the prepass re-runs (because
+        ``materialize_and_classify`` is essential) and produces a fresh
+        ``TopologyInputs`` for this call.
 
         The artifact lands at ``scene_runtime["topology"]`` per design
         doc open-question D4 (option b). Consumers should read through
@@ -4710,6 +4756,33 @@ script.Disabled = true
             cast("dict", modules_in),
         )
 
+        # Phase 2a slice 9a (followup task #10 fold-in): invert
+        # ``topology_inputs.script_id_by_name`` (``s.name -> sid``,
+        # built via the canonical ``build_script_id_by_name`` helper
+        # which honors collision exclusion on BOTH the class_name and
+        # stem keyspaces) into ``sid -> RbxScript``. Pass to
+        # ``build_topology`` so ``_build_modules_block`` can join on
+        # ``script_id`` directly instead of the class_name-only
+        # ``scripts_by_class`` lookup — closes the same
+        # asymmetric-join hole slice 7 round 4 fixed at the prepass
+        # boundary, this time on the late-assembly side. Modules
+        # whose class_name + stem both collide (or both miss) are
+        # absent from ``script_id_by_name`` and therefore also absent
+        # from ``script_by_sid``; ``_build_modules_block`` then falls
+        # through to ``derive_intrinsic_script_class(None)`` ->
+        # ``"ModuleScript"``, the same safe-default outcome
+        # ``scripts_by_class`` already produces for those rows.
+        script_by_sid: dict[str, RbxScript] | None = None
+        if topology_inputs is not None:
+            scripts_by_name: dict[str, RbxScript] = {
+                s.name: s for s in self.state.rbx_place.scripts if s.name
+            }
+            script_by_sid = {
+                sid: scripts_by_name[script_name]
+                for script_name, sid in topology_inputs["script_id_by_name"].items()
+                if script_name in scripts_by_name
+            }
+
         try:
             artifact = build_topology(
                 scene_runtime=cast(
@@ -4736,6 +4809,10 @@ script.Disabled = true
                 # the prior populated graph would be overwritten
                 # with {} on every assemble rerun.
                 preserved_caller_graph=preserved_caller_graph,
+                # Phase 2a slice 9a (#10 fold-in): script_id-keyed
+                # join for ``_build_modules_block`` (see block
+                # comment above for the asymmetric-join rationale).
+                script_by_sid=script_by_sid,
             )
         except Exception as exc:
             # Topology invariants are fail-closed by design, but
