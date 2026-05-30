@@ -569,10 +569,18 @@ def classify_scene_runtime_domains(
     prefabs = scene_runtime.get("prefabs", {})
     overrides = scene_runtime.get("domain_overrides", {})
 
-    scripts_by_class: dict[str, RbxScript] = {}
-    for script in scripts:
-        if script.name:
-            scripts_by_class.setdefault(script.name, script)
+    # Phase 2a slice 4 round 3 review (Claude P1.A): use the shared
+    # ``build_scripts_by_class_name`` helper so the planner +
+    # pipeline share ONE source of truth for the class_name → script
+    # join. Pre-fix this loop duplicated the same logic that lived
+    # at the pipeline boundary, creating a drift surface.
+    from converter.scene_runtime_planner import (
+        build_scripts_by_class_name,
+    )
+    scripts_list = list(scripts)
+    scripts_by_class = build_scripts_by_class_name(
+        scripts_list, cast("dict", modules),
+    )
 
     per_instance_evidence = _gather_per_instance_evidence(scenes, prefabs)
 
@@ -1211,12 +1219,28 @@ def _apply_reachability_rule(
     a conflict (same helper required by both sides AND parked in
     ``ServerStorage``) excludes the helper from the runtime plan.
     """
+    # Phase 2a slice 4 round 5 review (Claude P1.2): consume the
+    # unified ``compute_class_name_collisions`` set so the rule's
+    # closure seeds + class_to_script_id index honor the same
+    # exclusion contract as ``build_scripts_by_class_name`` and
+    # ``_detect_caller_graph_collisions``. Pre-round-5 this loop
+    # used silent first-write ``setdefault`` and the closure walked
+    # colliding seeds — the same lossy class_name routing the other
+    # sites now exclude.
+    from converter.scene_runtime_planner import (
+        compute_class_name_collisions,
+    )
+    colliding_class_names = compute_class_name_collisions(modules)
     client_classes: set[str] = set()
     server_classes: set[str] = set()
     class_to_script_id: dict[str, str] = {}
     for script_id, module in modules.items():
         class_name = module.get("class_name", "")
         if not class_name:
+            continue
+        if class_name in colliding_class_names:
+            # Skip colliding class_names — same degraded-service
+            # contract used by the other two sites.
             continue
         class_to_script_id.setdefault(class_name, script_id)
         verdict = module.get("domain")
@@ -1258,6 +1282,14 @@ def _apply_reachability_rule(
                         excluded.append(module_id)
                 continue
             # Client-only-reach: hoist to ReplicatedStorage.
+            # Note (Phase 2a slice 4 round 2 review): empty-name
+            # scripts cannot reach this loop body — they're filtered
+            # out at ``script_by_name`` construction (line 574, the
+            # ``if script.name:`` guard upstream). The atomic
+            # triple-write below is therefore correct without an
+            # empty-name gate. If a future change relaxes the
+            # upstream filter, the triple-write atomicity codified
+            # by invariant 10 would catch any half-stamped row.
             script.parent_path = REPLICATED_STORAGE
             module_id = class_to_script_id.get(helper_class)
             if module_id and module_id in modules:
@@ -1272,10 +1304,9 @@ def _apply_reachability_rule(
                 # still resolved to ``ServerStorage.X`` at runtime and
                 # silently failed. Use the same naming convention as
                 # ``_stamp_container_and_path``.
-                if script.name:
-                    module_row["module_path"] = (
-                        f"{REPLICATED_STORAGE}.{script.name}"
-                    )
+                module_row["module_path"] = (
+                    f"{REPLICATED_STORAGE}.{script.name}"
+                )
                 signals = cast(
                     SceneRuntimeDomainSignals,
                     module_row.get("domain_signals", {}),

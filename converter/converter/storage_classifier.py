@@ -74,8 +74,13 @@ _SERVER_ONLY_PATTERNS = [
 ]
 
 # Name hints for ReplicatedFirst scripts (loaders / splash screens that must
-# run before full replication).
-_REPLICATED_FIRST_HINTS = re.compile(
+# run before full replication). Public: `scene_runtime_planner` imports it
+# as the single source of truth for the loader-name heuristic, stamping
+# `is_loader` on each module row (Phase 2a slice 2). Promoting from the
+# pre-slice-2 `_REPLICATED_FIRST_HINTS` keeps storage_classifier as the
+# canonical owner of the pattern — planner is a reader, not a divergent
+# fork.
+REPLICATED_FIRST_HINTS = re.compile(
     r"(?i)(loading|loader|boot|bootstrap|splash|preload|intro)"
 )
 
@@ -314,7 +319,7 @@ def _decide_script_container(
         return STARTER_CHARACTER_SCRIPTS, "character-attached per scene wiring"
 
     # Loader/splash scripts that need to run before full replication.
-    if _REPLICATED_FIRST_HINTS.search(s.name) and s.script_type != "ModuleScript":
+    if REPLICATED_FIRST_HINTS.search(s.name) and s.script_type != "ModuleScript":
         return REPLICATED_FIRST, f"name hint matches ReplicatedFirst pattern ({s.name})"
 
     # ModuleScripts: route by who requires them.

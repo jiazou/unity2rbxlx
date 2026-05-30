@@ -65,6 +65,10 @@ def _runtime_bearing_plan() -> dict:
                 "runtime_bearing": True,
                 "domain": "client",
                 "module_path": "ReplicatedStorage.Foo",
+                # Phase 2a slice 2: build_topology invariant 7 requires
+                # both booleans on every runtime_bearing planner row.
+                "character_attached": False,
+                "is_loader": False,
             },
         },
         "scenes": {},

@@ -23,6 +23,14 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TypedDict, cast
 
+# Loader-name regex is owned by storage_classifier (its original consumer);
+# the planner imports it so the `is_loader` field stamped on each module
+# row stays in lock-step with storage_classifier's parallel decision path.
+# Phase 2a slice 2 promoted the regex from `_REPLICATED_FIRST_HINTS` to
+# the public `REPLICATED_FIRST_HINTS` name to enable this share.
+from converter.storage_classifier import REPLICATED_FIRST_HINTS
+
+from core.roblox_types import RbxScript
 from core.unity_types import (
     ComponentData,
     GuidIndex,
@@ -80,6 +88,31 @@ class SceneRuntimeModule(TypedDict, total=False):
     # authored or Instantiate()-spawned. ``runtime_bearing`` stays
     # placement-based so it still drives only what the host boots at start.
     is_component_class: bool
+    # Phase 2a slice 2: lifecycle-role inputs available pre-RbxScript. Both
+    # are REQUIRED on every ``runtime_bearing`` row — build_topology
+    # invariant 7 fails closed when either is absent (catches external-
+    # provenance scene_runtime artifacts that bypass the planner). The
+    # planner stamps both at module-row construction (line ~1045) so
+    # downstream consumers (build_topology, slice 5's storage_classifier
+    # rewrite) read a single canonical surface rather than re-deriving.
+    #
+    # ``character_attached``: True when the script is attached to the
+    # player-character prefab (matches `derive_module_lifecycle_role`'s
+    # ``character_attached`` param exactly). Slice 2 stamps False
+    # everywhere; slice 5 plumbs the real signal from scene_converter's
+    # player-character-prefab walk into the planner. False default is
+    # behavior-neutral because storage_classifier's parallel
+    # `character_script_names` parameter still supplies the same signal
+    # to the legacy decision path.
+    #
+    # ``is_loader``: True when the script's stem matches the
+    # ``REPLICATED_FIRST_HINTS`` regex (loaders / splash / boot scripts
+    # destined for `ReplicatedFirst`). The planner imports the regex
+    # from `storage_classifier` so both producers share a single source
+    # of truth. Slice 5 will read this field instead of re-deriving the
+    # regex in storage_classifier's decision tree.
+    character_attached: bool
+    is_loader: bool
     domain: str
     container: str
     module_path: str
@@ -1044,6 +1077,14 @@ def _build_modules_table(
             "class_name": class_name,
             "runtime_bearing": script_guid in runtime_bearing,
             "is_component_class": is_component,
+            # Phase 2a slice 2: stamp lifecycle-role inputs at planner
+            # construction. `is_loader` derives from the public
+            # `REPLICATED_FIRST_HINTS` regex (single source — owned by
+            # storage_classifier, read here). `character_attached` is
+            # always False today; slice 5 wires the real signal from
+            # scene_converter's player-character walk.
+            "is_loader": bool(REPLICATED_FIRST_HINTS.search(stem)),
+            "character_attached": False,
         }
 
     # Scripts attached at runtime but absent from the guid index (e.g.,
@@ -1057,9 +1098,200 @@ def _build_modules_table(
                 "class_name": "",
                 "runtime_bearing": True,
                 "is_component_class": True,
+                # Empty stem can't match the loader regex.
+                "is_loader": False,
+                "character_attached": False,
             }
 
     return modules
+
+
+# ---------------------------------------------------------------------------
+# Class-name collision detection + script-by-class-name join
+# (Phase 2a slice 4 rounds 3-5).
+# ---------------------------------------------------------------------------
+
+def compute_class_name_collisions(
+    modules: dict[str, "SceneRuntimeModule | dict[str, object]"],
+) -> frozenset[str]:
+    """Return the set of ``class_name`` values that appear on more
+    than one ``SceneRuntimeModule`` row.
+
+    Phase 2a slice 4 round 5 review (Claude P1.1 + P1.2): the
+    class_name keyspace is degraded whenever two modules share a
+    class_name (e.g. two ``Utils.cs`` files declaring ``class Utils``
+    in different folders). Multiple call sites — the topology's
+    caller_graph collision detection, the planner's reachability
+    rule, the script-by-class-name join — need to make consistent
+    routing decisions for these classes. This helper is the SINGLE
+    canonical source of truth so all sites read the same set.
+
+    Pre-round-5 each consumer had its own collision walk with
+    different policies (caller_graph: fail closed if dep_map
+    touched; scripts_by_class join: unconditional exclude; reach-
+    ability rule: silent first-write-wins). The asymmetry was a
+    drift surface; collapsing it to a single set keeps the
+    contract explicit + maintainable.
+
+    The empty-class_name case is ignored (rows without a
+    class_name have nothing to collide on).
+    """
+    seen: set[str] = set()
+    collisions: set[str] = set()
+    for _script_id, module in modules.items():
+        if not isinstance(module, dict):
+            continue
+        cn_obj = module.get("class_name", "")
+        cn = cn_obj if isinstance(cn_obj, str) else ""
+        if not cn:
+            continue
+        if cn in seen:
+            collisions.add(cn)
+        else:
+            seen.add(cn)
+    return frozenset(collisions)
+
+
+# Legacy heading retained — refactored in round 5 to consume the
+# unified collision helper above. See the helper's docstring for the
+# rationale.
+
+def build_scripts_by_class_name(
+    scripts: list[RbxScript],
+    modules: dict[str, "SceneRuntimeModule | dict[str, object]"],
+) -> dict[str, RbxScript]:
+    """Build a class_name-keyed RbxScript index via primary-then-
+    fallback join. EXCLUDES colliding class_names per the slice-3
+    degraded-service contract.
+
+    For each ``SceneRuntimeModule`` row's ``class_name``, find the
+    matching ``RbxScript`` by:
+      1. Primary join: ``script.name == class_name`` (the typical
+         case where C# class name and emitted file name match).
+      2. Fallback join: ``script.name == module.stem`` (the case
+         where a C# file's declared class name differs from its
+         file stem — e.g. ``Bootstrap.cs`` containing
+         ``class GameInit``).
+
+    Misses on BOTH joins mean we cannot link the script to the
+    module — the entry is omitted.
+
+    **Collision exclusion** (Phase 2a slice 4 round 4 review,
+    Claude P1.1): when two ``SceneRuntimeModule`` rows share a
+    ``class_name``, the class_name-keyed join is fundamentally
+    ambiguous. Following the same degraded-service policy
+    ``_detect_caller_graph_collisions`` uses (slice 3 round 2):
+    exclude the colliding class_name from the index entirely.
+    Both module rows' downstream lookups will fall through to
+    safe defaults (``script_class="ModuleScript"`` in
+    ``_build_modules_block``; orphan-routing in the reachability
+    rule); the alternative (first-write-wins) would stamp the
+    WRONG script's metadata onto the second row.
+
+    Phase 2a slice 4 round 2 + round 3 review (Claude P1.B):
+    single source of truth for the join used by both
+    ``module_domain.classify_scene_runtime_domains`` (the planner's
+    reachability rule) and ``pipeline._build_and_apply_topology``
+    (the topology orchestrator).
+
+    Behavior note: scripts with empty ``name`` are skipped (they
+    can't be addressed via the join). Scripts present in ``scripts``
+    but with no corresponding ``modules`` row are also omitted —
+    pre-slice-4 the planner's reachability rule would iterate them
+    but the closure check would filter them out anyway (orphan
+    scripts aren't in client_classes or server_classes), so this
+    is behavior-neutral for production.
+    """
+    script_by_name: dict[str, RbxScript] = {}
+    for s in scripts:
+        if s.name:
+            script_by_name.setdefault(s.name, s)
+
+    # Phase 2a slice 4 round 5 review (Claude P1.1): consume the
+    # unified class_name collision set so all class-name-keyed
+    # producers share ONE source of truth.
+    colliding_class_names = compute_class_name_collisions(modules)
+
+    out: dict[str, RbxScript] = {}
+    for _script_id, module in modules.items():
+        if not isinstance(module, dict):
+            continue
+        cn_obj = module.get("class_name", "")
+        cn = cn_obj if isinstance(cn_obj, str) else ""
+        if not cn:
+            continue
+        if cn in colliding_class_names:
+            # Degraded-service exclusion: ambiguous class_name →
+            # consumers fall through to safe defaults.
+            continue
+        # Primary join: script.name == class_name.
+        joined = script_by_name.get(cn)
+        if joined is None:
+            # Fallback join: script.name == module.stem.
+            stem_obj = module.get("stem", "")
+            stem = stem_obj if isinstance(stem_obj, str) else ""
+            if stem:
+                joined = script_by_name.get(stem)
+        if joined is not None:
+            out[cn] = joined  # no setdefault — collisions already excluded
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Artifact migration: pre-slice-2 plans lack `character_attached` /
+# `is_loader` on their `runtime_bearing` rows. Applied to on-disk plans
+# on first read after slice 2 lands. Idempotent.
+# ---------------------------------------------------------------------------
+
+def backfill_lifecycle_role_inputs(scene_runtime: dict[str, object]) -> int:
+    """Stamp `character_attached` + `is_loader` on every runtime-bearing
+    module row that lacks them. Returns the count of rows mutated.
+
+    The use case is a user resuming a conversion whose
+    `conversion_context.json` was written by a pre-slice-2 converter.
+    Without this backfill, `build_topology`'s invariant 7 would
+    hard-abort the resume on every runtime-bearing module row that
+    lacks the two new keys (Claude review 2026-05-28 P1).
+
+    Migration semantics (single-source-of-truth with the planner):
+      - `is_loader` is derived from ``REPLICATED_FIRST_HINTS`` on the
+        stem — the same rule ``_build_modules_table`` uses at planner
+        construction time. Drift between this backfill and the planner
+        would mean a resumed run's modules disagree with a freshly
+        replanned run on identical stems.
+      - `character_attached` defaults to False. Slice 5 plumbs the
+        real signal from scene_converter's player-character walk; in
+        the meantime, False is the same value the planner stamps for
+        every row today, so the backfill is behavior-neutral relative
+        to a planner re-run on the same project.
+
+    Non-runtime-bearing rows are exempt from invariant 7 and are not
+    touched. Already-stamped rows are not touched (idempotent —
+    re-running this backfill yields 0).
+    """
+    modules_obj = scene_runtime.get("modules", {})
+    if not isinstance(modules_obj, dict):
+        return 0
+    count = 0
+    for module in modules_obj.values():
+        if not isinstance(module, dict):
+            continue
+        if not bool(module.get("runtime_bearing", False)):
+            continue
+        mutated = False
+        if "is_loader" not in module:
+            stem_obj = module.get("stem", "")
+            stem = stem_obj if isinstance(stem_obj, str) else ""
+            module["is_loader"] = bool(
+                REPLICATED_FIRST_HINTS.search(stem),
+            )
+            mutated = True
+        if "character_attached" not in module:
+            module["character_attached"] = False
+            mutated = True
+        if mutated:
+            count += 1
+    return count
 
 
 # Unity component base classes. A script extending any of these (directly

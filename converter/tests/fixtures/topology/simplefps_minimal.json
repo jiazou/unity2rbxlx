@@ -1,0 +1,75 @@
+{
+  "animation_drivers": {
+    "guid-door-prefab%3AAssets%2FPrefabs%2FDoor.prefab:Door:door_open": {
+      "bridge_group_id": null,
+      "domain": "client",
+      "driver_module_guid": "guid-door",
+      "lifecycle_role": "auto_run",
+      "observed_attribute": "Open",
+      "observed_target": {
+        "kind": "self",
+        "name": "",
+        "scope": "self.gameObject"
+      },
+      "routing_status": "resolved",
+      "script_class": "LocalScript",
+      "stable_id": "guid-door-prefab%3AAssets%2FPrefabs%2FDoor.prefab:Door:door_open"
+    }
+  },
+  "caller_graph": {},
+  "cross_domain_edges": [],
+  "modules": {
+    "guid-animator-target": {
+      "bridge_group_id": null,
+      "character_attached": false,
+      "domain": "client",
+      "is_loader": false,
+      "lifecycle_role": "auto_run",
+      "module_path": "",
+      "provenance": {},
+      "reachability_forced_container": "",
+      "reachability_required_container": "",
+      "script_class": "LocalScript",
+      "stem": "AnimatorTarget"
+    },
+    "guid-door": {
+      "bridge_group_id": null,
+      "character_attached": false,
+      "domain": "client",
+      "is_loader": false,
+      "lifecycle_role": "auto_run",
+      "module_path": "",
+      "provenance": {},
+      "reachability_forced_container": "",
+      "reachability_required_container": "",
+      "script_class": "LocalScript",
+      "stem": "Door"
+    },
+    "guid-hud": {
+      "bridge_group_id": null,
+      "character_attached": false,
+      "domain": "client",
+      "is_loader": false,
+      "lifecycle_role": "auto_run",
+      "module_path": "",
+      "provenance": {},
+      "reachability_forced_container": "",
+      "reachability_required_container": "",
+      "script_class": "LocalScript",
+      "stem": "HudControl"
+    },
+    "guid-spawn": {
+      "bridge_group_id": null,
+      "character_attached": false,
+      "domain": "server",
+      "is_loader": false,
+      "lifecycle_role": "auto_run",
+      "module_path": "",
+      "provenance": {},
+      "reachability_forced_container": "",
+      "reachability_required_container": "",
+      "script_class": "Script",
+      "stem": "SpawnManager"
+    }
+  }
+}

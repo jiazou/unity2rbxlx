@@ -101,17 +101,50 @@ def derive_module_lifecycle_role(
     Returns ``"auto_run"`` on the ``Script`` / ``LocalScript`` happy
     path, ``"requireable"`` for ``ModuleScript``, and the priority
     overrides above when they fire.
+
+    Domain gates on ``"character_attached"`` + ``"loader"``: both
+    roles are documented as "Always client-domain" in the role enum
+    above (``character_attached`` → `StarterCharacterScripts`,
+    ``loader`` → `ReplicatedFirst` — both client-side containers).
+    A runtime-bearing module the domain classifier put on
+    ``"server"`` cannot validly hold either role: a server module
+    routed to a client-only container would silently fail at runtime
+    or, worse, be silently demoted by the storage layer. So
+    ``character_attached`` and ``is_loader`` are *only* honored when
+    ``domain == "client"``; a server-domain module with either
+    boolean True falls through to the class-driven default
+    (auto_run / requireable). This matches storage_classifier's
+    parallel decision tree and surfaces the inconsistency at the
+    output rather than encoding it (codex review 2026-05-28 P2 on
+    slice 2 round 1).
+
+    ``is_loader`` is additionally gated by
+    ``script_class != "ModuleScript"``: a ModuleScript by definition
+    doesn't auto-run, so ReplicatedFirst placement is meaningless for
+    it. A ModuleScript whose stem matches the loader-name heuristic
+    (e.g. ``LoadingUtils`` required by a real Loader script) routes
+    to ``"requireable"``, NOT ``"loader"`` — matches
+    ``storage_classifier._decide_script_container``'s
+    ``script_type != "ModuleScript"`` skip (codex review 2026-05-28
+    P2 on slice 2 initial).
     """
-    if character_attached:
+    if character_attached and domain == "client":
         return "character_attached"
-    if is_loader:
+    if (
+        is_loader
+        and script_class in ("Script", "LocalScript")
+        and domain == "client"
+    ):
         return "loader"
     if script_class in ("Script", "LocalScript"):
         return "auto_run"
     # ModuleScript path AND any unrecognised class. ``"requireable"`` is
     # the safe default — the runtime never auto-instantiates a
     # ``"requireable"`` row, so an excluded / helper module that lands
-    # here won't accidentally boot.
+    # here won't accidentally boot. A ModuleScript with a loader-named
+    # stem (``is_loader=True``) also lands here, matching
+    # storage_classifier's "skip ModuleScript for the ReplicatedFirst
+    # heuristic" rule.
     return "requireable"
 
 

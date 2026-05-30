@@ -53,6 +53,7 @@ from converter.scene_runtime_topology.build_topology import (  # noqa: E402
     EmittedAnimation,
     TopologyInvariantError,
     build_topology,
+    callers_of,
 )
 from converter.scene_runtime_topology.cross_domain_edges import (  # noqa: E402
     deterministic_edge_id,
@@ -72,13 +73,24 @@ from core.roblox_types import RbxScript  # noqa: E402
 
 def _mk_module(
     stem: str, domain: str, *, class_name: str | None = None,
+    character_attached: bool = False, is_loader: bool = False,
 ) -> dict[str, object]:
-    """Return one ``scene_runtime.modules`` row."""
+    """Return one ``scene_runtime.modules`` row.
+
+    Phase 2a slice 2: every runtime_bearing row must carry
+    ``character_attached`` + ``is_loader`` booleans (build_topology
+    invariant 7). Defaults are False so most tests don't have to
+    plumb them; tests that exercise the
+    ``character_attached==True`` / ``is_loader==True`` branches pass
+    the kwargs explicitly.
+    """
     return {
         "stem": stem,
         "class_name": class_name if class_name is not None else stem,
         "runtime_bearing": True,
         "domain": domain,
+        "character_attached": character_attached,
+        "is_loader": is_loader,
     }
 
 
@@ -213,6 +225,548 @@ class TestTopologyEmissionShape:
         # LocalScript + non-character/loader → auto_run per
         # ``derive_module_lifecycle_role`` (lifecycle_roles.py:65).
         assert entry["lifecycle_role"] == "auto_run"
+        # Phase 2a slice 2: both bool inputs mirrored on the topology
+        # entry so slice 5's storage_classifier consumer reads a single
+        # canonical surface.
+        assert entry["character_attached"] is False
+        assert entry["is_loader"] is False
+
+    def test_character_attached_planner_input_drives_lifecycle_role(
+        self,
+    ) -> None:
+        """When the planner row carries ``character_attached=True``,
+        build_topology's `_build_modules_block` reads it (NOT
+        hardcoded False) and the derived ``lifecycle_role`` becomes
+        ``"character_attached"``.
+
+        Phase 2a slice 2 — the regression this guards: pre-slice-2
+        the inputs were always False at the call site
+        (build_topology.py:314-315), so this output was unreachable.
+
+        Refs: build_topology.py `_build_modules_block` post-slice-2;
+        lifecycle_roles.py:105-106 (priority branch).
+        """
+        sr = _mk_artifact(modules={
+            "guid-pchar": _mk_module(
+                "PlayerCharScript", "client",
+                character_attached=True,
+            ),
+        })
+        scripts_by_class = {
+            "PlayerCharScript": _mk_rbx_script(
+                "PlayerCharScript", "LocalScript",
+            ),
+        }
+        artifact = build_topology(
+            scene_runtime=sr,
+            emitted_animations=[],
+            scripts_by_class=scripts_by_class,
+        )
+        entry = artifact["modules"]["guid-pchar"]
+        assert entry["character_attached"] is True
+        assert entry["is_loader"] is False
+        assert entry["lifecycle_role"] == "character_attached"
+
+    def test_is_loader_planner_input_drives_lifecycle_role(self) -> None:
+        """When the planner row carries ``is_loader=True``,
+        build_topology's `_build_modules_block` reads it and the
+        derived ``lifecycle_role`` becomes ``"loader"``.
+
+        Phase 2a slice 2 — pre-slice-2 the input was hardcoded False
+        so this output was unreachable.
+
+        Refs: build_topology.py `_build_modules_block` post-slice-2;
+        lifecycle_roles.py:107-108 (priority branch).
+        """
+        sr = _mk_artifact(modules={
+            "guid-boot": _mk_module(
+                "BootSplash", "client", is_loader=True,
+            ),
+        })
+        scripts_by_class = {
+            "BootSplash": _mk_rbx_script("BootSplash", "LocalScript"),
+        }
+        artifact = build_topology(
+            scene_runtime=sr,
+            emitted_animations=[],
+            scripts_by_class=scripts_by_class,
+        )
+        entry = artifact["modules"]["guid-boot"]
+        assert entry["character_attached"] is False
+        assert entry["is_loader"] is True
+        assert entry["lifecycle_role"] == "loader"
+
+    def test_reachability_triple_empty_when_rule_did_not_fire(self) -> None:
+        """Slice 4: a module with no reachability rule firing has
+        all three reachability fields empty. The planner's
+        ``_apply_reachability_rule`` mutates these atomically only on
+        client-required helpers in server containers; everywhere else
+        the planner leaves them absent and topology mirrors that as
+        empty strings.
+
+        Refs: build_topology.py reachability-triple stamp;
+        Phase 2a slice 4.
+        """
+        sr = _mk_artifact(modules={
+            "guid-x": _mk_module("HudControl", "client"),
+        })
+        scripts_by_class = {
+            "HudControl": _mk_rbx_script("HudControl", "LocalScript"),
+        }
+        artifact = build_topology(
+            scene_runtime=sr,
+            emitted_animations=[],
+            scripts_by_class=scripts_by_class,
+        )
+        entry = artifact["modules"]["guid-x"]
+        assert entry["reachability_required_container"] == ""
+        assert entry["module_path"] == ""
+        assert entry["reachability_forced_container"] == ""
+
+    def test_reachability_triple_populated_when_rule_fired(self) -> None:
+        """Slice 4: when the planner's reachability rule fires on a
+        module, topology mirrors all three coordinated fields. The
+        test seeds the planner-side fields directly (simulating the
+        post-_apply_reachability_rule state) and asserts the
+        TopologyModuleEntry surfaces them.
+
+        Refs: module_domain.py:1261-1284 (planner triple-write);
+        build_topology.py reachability-triple stamp.
+        """
+        sr = _mk_artifact(modules={
+            "guid-helper": {
+                "stem": "Helper", "class_name": "Helper",
+                "runtime_bearing": True,
+                "domain": "helper",
+                "container": "ReplicatedStorage",
+                "module_path": "ReplicatedStorage.Helper",
+                "domain_signals": {
+                    "reachability_forced_container": "ReplicatedStorage",
+                },
+                "character_attached": False,
+                "is_loader": False,
+            },
+        })
+        artifact = build_topology(
+            scene_runtime=sr,
+            emitted_animations=[],
+            scripts_by_class={},
+        )
+        entry = artifact["modules"]["guid-helper"]
+        assert entry["reachability_required_container"] == "ReplicatedStorage"
+        assert entry["reachability_forced_container"] == "ReplicatedStorage"
+        assert entry["module_path"] == "ReplicatedStorage.Helper"
+
+    def test_planner_rule_end_to_end_satisfies_invariant_10(self) -> None:
+        """Slice 4 round 1 review (Claude P1.3): drive the planner's
+        ``_apply_reachability_rule`` end-to-end (via
+        ``classify_scene_runtime_domains``) on a client-module +
+        server-container-helper + require-edge fixture. Assert the
+        planner produces a triple-write that invariant 10 accepts.
+
+        Without this, a planner regression that splits the
+        triple-write into a non-atomic shape (the exact codex P1.1
+        failure mode) would not be caught by the unit tests — they
+        seed planner-side fields directly and never exercise the
+        rule.
+
+        Refs: module_domain.py:_apply_reachability_rule;
+        build_topology.py invariant 10.
+        """
+        from converter.scene_runtime_domain import (
+            classify_scene_runtime_domains,
+        )
+        # Set up: client module (HudControl) that requires a helper
+        # (HelperLib) — helper starts in ServerStorage (the pre-rule
+        # state), rule should hoist it to ReplicatedStorage.
+        sr = _mk_artifact(modules={
+            "guid-hud": _mk_module("HudControl", "client"),
+            "guid-helper": {
+                "stem": "HelperLib", "class_name": "HelperLib",
+                "runtime_bearing": False,
+                "is_loader": False, "character_attached": False,
+            },
+        })
+        # Helper script lives in ServerStorage pre-rule; rule should
+        # hoist it.
+        helper_script = RbxScript(
+            name="HelperLib", source="-- helper",
+            script_type="ModuleScript",
+            parent_path="ServerStorage",
+        )
+        hud_script = _mk_rbx_script("HudControl", "LocalScript")
+        scripts = [helper_script, hud_script]
+        dependency_map = {"HudControl": ["HelperLib"]}
+
+        # Run the planner's classification (includes
+        # _apply_reachability_rule).
+        classify_scene_runtime_domains(
+            cast("dict", sr),
+            scripts,
+            dependency_map=dependency_map,
+        )
+
+        # Now build topology and assert invariant 10 passes (no abort).
+        artifact = build_topology(
+            scene_runtime=sr,
+            emitted_animations=[],
+            scripts_by_class={
+                "HudControl": hud_script,
+                "HelperLib": helper_script,
+            },
+        )
+        # The rule should have fired on HelperLib.
+        helper_entry = artifact["modules"]["guid-helper"]
+        assert helper_entry["reachability_required_container"] == (
+            "ReplicatedStorage"
+        )
+        assert helper_entry["reachability_forced_container"] == (
+            "ReplicatedStorage"
+        )
+        assert helper_entry["module_path"] == (
+            "ReplicatedStorage.HelperLib"
+        )
+
+    def test_planner_rule_invisible_to_empty_name_scripts(self) -> None:
+        """Slice 4 round 2 review (Claude P1.A investigation):
+        empty-name RbxScripts are filtered out at
+        ``script_by_name`` construction (the ``if script.name:``
+        guard) so they cannot reach ``_apply_reachability_rule``.
+        Result: a helper module whose corresponding script has empty
+        name is invisible to the rule — the module stays in its
+        pre-rule state.
+
+        This pins the property that round 2 verified: the rule's
+        atomic triple-write below the upstream filter does NOT need
+        an additional empty-name gate inside the loop body. The
+        invariant 10 atomicity check codified at the topology layer
+        is the catch-all for any future regression that lets empty-
+        name scripts through (the half-stamped row would fail
+        closed there).
+
+        Refs: module_domain.py script_by_name filter (line 574);
+        Phase 2a slice 4 round 2 review.
+        """
+        from converter.scene_runtime_domain import (
+            classify_scene_runtime_domains,
+        )
+        sr = _mk_artifact(modules={
+            "guid-hud": _mk_module("HudControl", "client"),
+            "guid-noname-helper": {
+                "stem": "NoNameHelper", "class_name": "NoNameHelper",
+                "runtime_bearing": False,
+                "is_loader": False, "character_attached": False,
+            },
+        })
+        # Helper script has empty name (synthetic / stub).
+        helper_script = RbxScript(
+            name="", source="-- helper",
+            script_type="ModuleScript",
+            parent_path="ServerStorage",
+        )
+        hud_script = _mk_rbx_script("HudControl", "LocalScript")
+        scripts = [helper_script, hud_script]
+        dependency_map = {"HudControl": ["NoNameHelper"]}
+
+        classify_scene_runtime_domains(
+            cast("dict", sr),
+            scripts,
+            dependency_map=dependency_map,
+        )
+
+        # The helper stays in its pre-rule state — rule never fired
+        # because the empty-name script was filtered upstream.
+        helper_module = sr["modules"]["guid-noname-helper"]  # type: ignore[index]
+        # Domain stays "helper" (initial state for non-runtime-bearing
+        # modules per _classify_module's helper short-circuit).
+        assert helper_module.get("domain") == "helper"
+        # No reachability stamp — fields absent / empty.
+        signals = helper_module.get("domain_signals", {})
+        assert signals.get("reachability_forced_container", "") == ""
+
+    def test_planner_rule_fires_when_class_name_differs_from_file_stem(
+        self,
+    ) -> None:
+        """Slice 4 round 2 review (Claude P1.B): the planner's
+        ``scripts_by_class`` index conflated ``script.name`` (file
+        stem) with ``class_name`` (C# class declaration). When the
+        two differ (file ``Bootstrap.cs`` containing ``class
+        GameInit``), the rule's lookup silently missed and the
+        helper was never hoisted even though client modules required
+        it.
+
+        Round 2 fix: build ``scripts_by_class`` from the modules
+        dict, joining on ``class_name`` with fallback to ``stem``.
+        This test pins the fix by setting up a helper whose module
+        row has ``class_name="GameInit"`` while the corresponding
+        RbxScript has ``name="Bootstrap"`` (the file stem).
+
+        Refs: module_domain.py scripts_by_class join logic;
+        Phase 2a slice 4 round 2 review (Claude P1.B).
+        """
+        from converter.scene_runtime_domain import (
+            classify_scene_runtime_domains,
+        )
+        sr = _mk_artifact(modules={
+            "guid-hud": _mk_module("HudControl", "client"),
+            "guid-bootstrap": {
+                "stem": "Bootstrap",        # file stem
+                "class_name": "GameInit",   # C# class name
+                "runtime_bearing": False,
+                "is_loader": False, "character_attached": False,
+            },
+        })
+        # RbxScript with name == file stem (NOT == class_name).
+        helper_script = RbxScript(
+            name="Bootstrap",
+            source="-- bootstrap",
+            script_type="ModuleScript",
+            parent_path="ServerStorage",
+        )
+        hud_script = _mk_rbx_script("HudControl", "LocalScript")
+        scripts = [helper_script, hud_script]
+        # dependency_map keys by class_name (the C# analyzer view).
+        dependency_map = {"HudControl": ["GameInit"]}
+
+        classify_scene_runtime_domains(
+            cast("dict", sr),
+            scripts,
+            dependency_map=dependency_map,
+        )
+
+        # Rule should have fired: helper hoisted to ReplicatedStorage,
+        # module_path uses script.name (file stem), and the triple is
+        # consistent for invariant 10.
+        helper_module = sr["modules"]["guid-bootstrap"]  # type: ignore[index]
+        assert helper_module.get("container") == "ReplicatedStorage"
+        assert helper_module.get("module_path") == "ReplicatedStorage.Bootstrap"
+        signals = helper_module.get("domain_signals", {})
+        assert signals.get("reachability_forced_container") == "ReplicatedStorage"
+
+    def test_build_scripts_by_class_name_excludes_collisions(
+        self,
+    ) -> None:
+        """Slice 4 round 4 review (Claude P1.1): when two
+        ``SceneRuntimeModule`` rows share a ``class_name`` (e.g. two
+        ``Utils.cs`` files declaring ``class Utils``), the helper
+        EXCLUDES the colliding name from the index. Both modules'
+        downstream lookups fall through to safe defaults rather than
+        the first-write-wins case silently stamping the WRONG
+        script's metadata onto the second module.
+
+        Mirrors slice 3 round 2's degraded-service contract in
+        ``_detect_caller_graph_collisions``.
+
+        Refs: scene_runtime_planner.build_scripts_by_class_name
+        collision exclusion; Phase 2a slice 4 round 4 review.
+        """
+        from converter.scene_runtime_planner import (
+            build_scripts_by_class_name,
+        )
+        modules: dict[str, dict[str, object]] = {
+            "guid-first": {"stem": "Utils", "class_name": "Utils"},
+            "guid-second": {
+                # Different stem → different file, same class_name.
+                "stem": "Utils2", "class_name": "Utils",
+            },
+            "guid-noconflict": {"stem": "Foo", "class_name": "Foo"},
+        }
+        scripts = [
+            RbxScript(name="Utils", source="", script_type="ModuleScript"),
+            RbxScript(name="Utils2", source="", script_type="LocalScript"),
+            RbxScript(name="Foo", source="", script_type="Script"),
+        ]
+        result = build_scripts_by_class_name(scripts, modules)
+        # Colliding class_name is EXCLUDED entirely (neither
+        # first-write nor last-write wins — both modules fall through
+        # to ModuleScript defaults downstream).
+        assert "Utils" not in result
+        # Non-colliding class_name passes through normally.
+        assert "Foo" in result
+        assert result["Foo"].name == "Foo"
+
+    def test_build_scripts_by_class_name_helper(self) -> None:
+        """Slice 4 round 3 review (Claude P1.A): the shared
+        ``build_scripts_by_class_name`` helper joins modules' class_name
+        to scripts via a primary-then-fallback strategy. Direct unit
+        test of the helper covers all three join cases.
+
+        Refs: scene_runtime_planner.build_scripts_by_class_name;
+        Phase 2a slice 4 round 3 review.
+        """
+        from converter.scene_runtime_planner import (
+            build_scripts_by_class_name,
+        )
+        modules: dict[str, dict[str, object]] = {
+            "guid-foo": {"stem": "Foo", "class_name": "Foo"},
+            "guid-boot": {"stem": "Bootstrap", "class_name": "GameInit"},
+            "guid-orphan": {"stem": "Orphan", "class_name": "Orphan"},
+            "guid-empty-cn": {"stem": "Whatever", "class_name": ""},
+        }
+        scripts = [
+            RbxScript(name="Foo", source="", script_type="Script"),
+            # GameInit has no script named "GameInit"; fallback to
+            # the Bootstrap script (matches module.stem).
+            RbxScript(name="Bootstrap", source="", script_type="ModuleScript"),
+            # Orphan has no matching script (neither name nor stem
+            # matches an existing script) — entry omitted.
+            # No script for guid-empty-cn either, but it's skipped
+            # at class_name == "" check.
+        ]
+        result = build_scripts_by_class_name(scripts, modules)
+        # Direct match.
+        assert "Foo" in result
+        assert result["Foo"].name == "Foo"
+        # Fallback match: class_name → stem.
+        assert "GameInit" in result
+        assert result["GameInit"].name == "Bootstrap"
+        # No match: omitted.
+        assert "Orphan" not in result
+        # Empty class_name: never joined.
+        assert "" not in result
+
+    def test_topology_build_modules_handles_class_name_stem_mismatch(
+        self, tmp_path: Path,
+    ) -> None:
+        """Slice 4 round 3 review (Claude P1.A end-to-end): when
+        ``_build_modules_block`` is invoked via the pipeline (which
+        now uses the shared helper), a module with
+        ``class_name="GameInit"`` and a script with
+        ``name="Bootstrap"`` correctly resolves through the fallback
+        join and the topology row emits ``script_class`` matching
+        the actual RbxScript.script_type.
+
+        Pre-round-3 the pipeline-built scripts_by_class was keyed by
+        ``script.name``, so ``_build_modules_block.scripts_by_class.get
+        ("GameInit")`` returned None, falling through to
+        ``script_class="ModuleScript"`` regardless of the actual
+        script_type. This test pins the corrected behavior.
+
+        Refs: pipeline.py:_build_and_apply_topology + scene_runtime_
+        planner.build_scripts_by_class_name; Phase 2a slice 4 round 3.
+        """
+        from types import SimpleNamespace
+        from converter.pipeline import Pipeline
+        from converter.animation_converter import AnimationConversionResult
+        from converter.code_transpiler import TranspilationResult
+        from core.roblox_types import RbxPlace, RbxScript
+        artifact = _mk_artifact(modules={
+            # Module declares class_name="GameInit" but file stem
+            # is "Bootstrap" (the script's name).
+            "guid-init": {
+                "stem": "Bootstrap",
+                "class_name": "GameInit",
+                "runtime_bearing": True,
+                "domain": "client",
+                "character_attached": False,
+                "is_loader": False,
+            },
+        })
+        scene_runtime = cast("dict[str, object]", artifact)
+
+        pipeline = Pipeline.__new__(Pipeline)
+        pipeline.output_dir = tmp_path
+        rbx_place = RbxPlace()
+        # Script.name == "Bootstrap" (file stem), NOT class_name.
+        # script_type is LocalScript — topology should reflect it.
+        rbx_place.scripts = [
+            RbxScript(name="Bootstrap", source="", script_type="LocalScript"),
+        ]
+        anim_result = AnimationConversionResult()
+        anim_result.emitted_animations = []
+        pipeline.state = SimpleNamespace(
+            rbx_place=rbx_place,
+            animation_result=anim_result,
+            guid_index=None,
+            dependency_map={},
+            transpilation_result=TranspilationResult(),
+        )
+
+        plan = TestApplyTopologyToRbxScripts._mk_plan()
+        pipeline._build_and_apply_topology(scene_runtime, plan)
+
+        topo_module = scene_runtime["topology"]["modules"]["guid-init"]  # type: ignore[index]
+        # Pre-fix this would have defaulted to "ModuleScript"; post-fix
+        # the fallback join finds the Bootstrap script and surfaces its
+        # actual script_type.
+        assert topo_module["script_class"] == "LocalScript"
+
+    def test_invariant_10_module_path_equals_container_is_legal(
+        self,
+    ) -> None:
+        """Slice 4 round 1 review (Claude P1.2): invariant 10 must
+        accept ``module_path == reachability_required_container``
+        (a top-level container row with no module suffix). The
+        pre-fix ``startswith(f"{required}.")`` check rejected this
+        legitimate shape AND would have false-positively accepted a
+        sibling-container prefix.
+
+        Refs: build_topology.py invariant 10 module_path check;
+        Phase 2a slice 4 round 1 review.
+        """
+        from converter.scene_runtime_topology.build_topology import (
+            _enforce_invariants,
+        )
+        artifact = {
+            "modules": {
+                "guid-helper": {
+                    "stem": "Helper", "domain": "helper",
+                    "script_class": "ModuleScript",
+                    "lifecycle_role": "requireable",
+                    "character_attached": False, "is_loader": False,
+                    "bridge_group_id": None, "provenance": {},
+                    "reachability_required_container": "ReplicatedStorage",
+                    "module_path": "ReplicatedStorage",  # exact match — legal
+                    "reachability_forced_container": "ReplicatedStorage",
+                },
+            },
+            "animation_drivers": {},
+            "cross_domain_edges": [],
+            "caller_graph": {},
+        }
+        # Should not raise.
+        _enforce_invariants(
+            cast("dict", artifact),
+            emitted_animations=[],
+            scene_runtime=_mk_artifact(),
+        )
+
+    def test_invariant_10_rejects_sibling_container_prefix(
+        self,
+    ) -> None:
+        """Slice 4 round 1 review (Claude P1.2): the relaxed
+        ``module_path == required OR startswith(required + ".")`` check
+        must NOT false-positively accept a sibling-container prefix
+        like ``"ReplicatedStorageOther.Helper"`` (which would slip
+        through a bare ``startswith(required)`` without the dot).
+        """
+        from converter.scene_runtime_topology.build_topology import (
+            _enforce_invariants,
+        )
+        artifact = {
+            "modules": {
+                "guid-helper": {
+                    "stem": "Helper", "domain": "helper",
+                    "script_class": "ModuleScript",
+                    "lifecycle_role": "requireable",
+                    "character_attached": False, "is_loader": False,
+                    "bridge_group_id": None, "provenance": {},
+                    "reachability_required_container": "ReplicatedStorage",
+                    "module_path": "ReplicatedStorageOther.Helper",
+                    "reachability_forced_container": "ReplicatedStorage",
+                },
+            },
+            "animation_drivers": {},
+            "cross_domain_edges": [],
+            "caller_graph": {},
+        }
+        with pytest.raises(TopologyInvariantError) as excinfo:
+            _enforce_invariants(
+                cast("dict", artifact),
+                emitted_animations=[],
+                scene_runtime=_mk_artifact(),
+            )
+        assert "invariant 10" in str(excinfo.value)
 
     def test_door_shape_emits_resolved_animation_driver(self) -> None:
         """Door scenario: 1 prefab + 1 MonoBehaviour holding an Animator
@@ -512,6 +1066,391 @@ class TestTopologyInvariants:
             )
         assert "invariant 6" in str(excinfo.value)
 
+    def test_invariant_7_missing_character_attached_field(self) -> None:
+        """Runtime-bearing planner row lacking `character_attached` fails
+        closed. Reads scene_runtime["modules"] (planner input), not the
+        topology output — the check exists because _build_modules_block
+        defaults missing values to False, which would silently produce a
+        wrong lifecycle_role.
+
+        Refs: build_topology.py invariant 7 block; Phase 2a slice 2.
+        """
+        sr = _mk_artifact(modules={
+            "guid-x": {
+                "stem": "Foo", "class_name": "Foo", "runtime_bearing": True,
+                "domain": "client",
+                # `character_attached` deliberately omitted; `is_loader`
+                # present so the test exercises ONLY the
+                # character_attached branch.
+                "is_loader": False,
+            },
+        })
+        with pytest.raises(TopologyInvariantError) as excinfo:
+            build_topology(
+                scene_runtime=sr, emitted_animations=[], scripts_by_class={},
+            )
+        msg = str(excinfo.value)
+        assert "invariant 7" in msg
+        assert "character_attached" in msg
+
+    def test_invariant_7_missing_is_loader_field(self) -> None:
+        """Runtime-bearing planner row lacking `is_loader` fails closed.
+
+        Refs: build_topology.py invariant 7 block.
+        """
+        sr = _mk_artifact(modules={
+            "guid-x": {
+                "stem": "Foo", "class_name": "Foo", "runtime_bearing": True,
+                "domain": "client",
+                "character_attached": False,
+                # `is_loader` deliberately omitted.
+            },
+        })
+        with pytest.raises(TopologyInvariantError) as excinfo:
+            build_topology(
+                scene_runtime=sr, emitted_animations=[], scripts_by_class={},
+            )
+        msg = str(excinfo.value)
+        assert "invariant 7" in msg
+        assert "is_loader" in msg
+
+    def test_invariant_7_skips_non_runtime_bearing_rows(self) -> None:
+        """Helper rows (runtime_bearing=False) are exempt from invariant
+        7 — they have no lifecycle role to derive, so the inputs aren't
+        required. This is the migration-discipline path for legacy
+        helper artifacts that pre-date slice 2.
+
+        Refs: build_topology.py invariant 7 block (guarded on
+        ``runtime_bearing``).
+        """
+        sr = _mk_artifact(modules={
+            "guid-helper": {
+                "stem": "Helper", "class_name": "Helper",
+                "runtime_bearing": False,
+                # No character_attached, no is_loader; should be allowed.
+            },
+        })
+        # Should not raise.
+        artifact = build_topology(
+            scene_runtime=sr, emitted_animations=[], scripts_by_class={},
+        )
+        assert "guid-helper" in artifact["modules"]
+
+    def test_invariant_10_reachability_required_without_forced_aborts(
+        self,
+    ) -> None:
+        """Slice 4: a hand-edited or refactor-split artifact where
+        ``reachability_required_container`` is populated but
+        ``reachability_forced_container`` is empty fails closed —
+        the planner stamps both atomically.
+
+        Refs: build_topology.py invariant 10; Phase 2a slice 4.
+        """
+        sr = _mk_artifact(modules={
+            "guid-helper": {
+                "stem": "Helper", "class_name": "Helper",
+                "runtime_bearing": True,
+                "domain": "helper",
+                "container": "ReplicatedStorage",
+                "module_path": "ReplicatedStorage.Helper",
+                # Hand-edited: required is populated but forced is missing.
+                "domain_signals": {},
+                "character_attached": False,
+                "is_loader": False,
+            },
+        })
+        # _build_modules_block reads from planner -> entry has
+        # required="" and forced="" both empty (consistent). The
+        # invariant 10 mismatch test requires an artifact whose ENTRY
+        # has the mismatch. Test by manually constructing the entry +
+        # invoking _enforce_invariants directly.
+        from converter.scene_runtime_topology.build_topology import (
+            _enforce_invariants,
+        )
+        artifact = {
+            "modules": {
+                "guid-helper": {
+                    "stem": "Helper", "domain": "helper",
+                    "script_class": "ModuleScript",
+                    "lifecycle_role": "requireable",
+                    "character_attached": False, "is_loader": False,
+                    "bridge_group_id": None, "provenance": {},
+                    "reachability_required_container": "ReplicatedStorage",
+                    "module_path": "ReplicatedStorage.Helper",
+                    "reachability_forced_container": "",  # mismatch
+                },
+            },
+            "animation_drivers": {},
+            "cross_domain_edges": [],
+            "caller_graph": {},
+        }
+        with pytest.raises(TopologyInvariantError) as excinfo:
+            _enforce_invariants(
+                cast("dict", artifact),
+                emitted_animations=[],
+                scene_runtime=sr,
+            )
+        msg = str(excinfo.value)
+        assert "invariant 10" in msg
+        assert "mismatched reachability fields" in msg
+
+    def test_invariant_10_reachability_divergent_values_aborts(
+        self,
+    ) -> None:
+        """Slice 4: if the two reachability fields are both populated
+        but point at different containers, invariant 10 catches the
+        divergence (planner always stamps them with the same value)."""
+        from converter.scene_runtime_topology.build_topology import (
+            _enforce_invariants,
+        )
+        artifact = {
+            "modules": {
+                "guid-helper": {
+                    "stem": "Helper", "domain": "helper",
+                    "script_class": "ModuleScript",
+                    "lifecycle_role": "requireable",
+                    "character_attached": False, "is_loader": False,
+                    "bridge_group_id": None, "provenance": {},
+                    "reachability_required_container": "ReplicatedStorage",
+                    "module_path": "ReplicatedStorage.Helper",
+                    "reachability_forced_container": "ServerStorage",  # divergent
+                },
+            },
+            "animation_drivers": {},
+            "cross_domain_edges": [],
+            "caller_graph": {},
+        }
+        with pytest.raises(TopologyInvariantError) as excinfo:
+            _enforce_invariants(
+                cast("dict", artifact),
+                emitted_animations=[],
+                scene_runtime=_mk_artifact(),
+            )
+        msg = str(excinfo.value)
+        assert "invariant 10" in msg
+        assert "divergent" in msg
+
+    def test_invariant_10_module_path_must_start_with_container(
+        self,
+    ) -> None:
+        """Slice 4: when reachability fired, ``module_path`` MUST
+        start with the rule's container value. Pre-slice-4 codex P1.1
+        at module_domain.py:1266-1278 fixed a host-resolve bug where
+        the rule moved the container but left module_path pointing at
+        the old location. Invariant 10 codifies the constraint.
+        """
+        from converter.scene_runtime_topology.build_topology import (
+            _enforce_invariants,
+        )
+        artifact = {
+            "modules": {
+                "guid-helper": {
+                    "stem": "Helper", "domain": "helper",
+                    "script_class": "ModuleScript",
+                    "lifecycle_role": "requireable",
+                    "character_attached": False, "is_loader": False,
+                    "bridge_group_id": None, "provenance": {},
+                    "reachability_required_container": "ReplicatedStorage",
+                    "module_path": "ServerStorage.Helper",  # stale
+                    "reachability_forced_container": "ReplicatedStorage",
+                },
+            },
+            "animation_drivers": {},
+            "cross_domain_edges": [],
+            "caller_graph": {},
+        }
+        with pytest.raises(TopologyInvariantError) as excinfo:
+            _enforce_invariants(
+                cast("dict", artifact),
+                emitted_animations=[],
+                scene_runtime=_mk_artifact(),
+            )
+        msg = str(excinfo.value)
+        assert "invariant 10" in msg
+        assert "module_path" in msg
+
+    def test_invariant_8_loader_role_with_false_is_loader_aborts(
+        self,
+    ) -> None:
+        """``lifecycle_role="loader"`` with ``is_loader=False`` is
+        structurally impossible from `derive_module_lifecycle_role` but
+        an external-provenance artifact (hand-edited plan, future
+        derivation regression) could produce it. Invariant 8 catches
+        that drift.
+
+        Refs: build_topology.py invariant 8 block; Phase 2a slice 2
+        round 3.
+        """
+        from converter.scene_runtime_topology.build_topology import (
+            _enforce_invariants,
+        )
+        artifact = {
+            "modules": {
+                "guid-x": {
+                    "stem": "Loader", "domain": "client",
+                    "script_class": "LocalScript",
+                    "lifecycle_role": "loader",
+                    "character_attached": False,
+                    "is_loader": False,  # contradicts the role
+                    "bridge_group_id": None,
+                    "provenance": {},
+                },
+            },
+            "animation_drivers": {},
+            "cross_domain_edges": [],
+        }
+        with pytest.raises(TopologyInvariantError) as excinfo:
+            _enforce_invariants(
+                cast("dict", artifact),
+                emitted_animations=[],
+                scene_runtime=_mk_artifact(modules={
+                    "guid-x": _mk_module(
+                        "Loader", "client", is_loader=False,
+                    ),
+                }),
+            )
+        msg = str(excinfo.value)
+        assert "invariant 8" in msg
+        assert "is_loader=False" in msg
+
+    def test_invariant_8_loader_role_with_server_domain_aborts(
+        self,
+    ) -> None:
+        """A "loader" role on a server-domain module violates
+        invariant 8: ReplicatedFirst is client-only by definition."""
+        from converter.scene_runtime_topology.build_topology import (
+            _enforce_invariants,
+        )
+        artifact = {
+            "modules": {
+                "guid-x": {
+                    "stem": "Loader", "domain": "server",
+                    "script_class": "Script",
+                    "lifecycle_role": "loader",
+                    "character_attached": False,
+                    "is_loader": True,
+                    "bridge_group_id": None,
+                    "provenance": {},
+                },
+            },
+            "animation_drivers": {},
+            "cross_domain_edges": [],
+        }
+        with pytest.raises(TopologyInvariantError) as excinfo:
+            _enforce_invariants(
+                cast("dict", artifact),
+                emitted_animations=[],
+                scene_runtime=_mk_artifact(modules={
+                    "guid-x": _mk_module(
+                        "Loader", "server", is_loader=True,
+                    ),
+                }),
+            )
+        msg = str(excinfo.value)
+        assert "invariant 8" in msg
+        assert "client-domain" in msg
+
+    def test_invariant_8_allows_is_loader_true_with_auto_run_role(
+        self,
+    ) -> None:
+        """The deliberate raw-hint-vs-gated-decision divergence:
+        ``is_loader=True`` may legitimately coexist with
+        ``lifecycle_role="auto_run"`` when a gate fires (e.g. a
+        server-domain script whose stem matches the loader regex).
+        Invariant 8 only enforces ONE direction — `loader → bools`,
+        not `bool → loader`.
+
+        Refs: TopologyModuleEntry field-semantic contract docstring;
+        build_topology.py invariant 8.
+        """
+        # Server-domain "BootstrapServer.cs" matches REPLICATED_FIRST_HINTS
+        # but the loader gate drops it (domain != "client"), so the role
+        # falls through to "auto_run". The raw is_loader=True remains on
+        # the topology entry as audit info.
+        sr = _mk_artifact(modules={
+            "guid-srv": _mk_module(
+                "BootstrapServer", "server", is_loader=True,
+            ),
+        })
+        scripts_by_class = {
+            "BootstrapServer": _mk_rbx_script(
+                "BootstrapServer", "Script",
+            ),
+        }
+        # Should NOT raise. Build + assert the deliberate divergence.
+        artifact = build_topology(
+            scene_runtime=sr, emitted_animations=[],
+            scripts_by_class=scripts_by_class,
+        )
+        entry = artifact["modules"]["guid-srv"]
+        assert entry["is_loader"] is True
+        assert entry["lifecycle_role"] == "auto_run"
+
+    def test_backfill_lifecycle_role_inputs_unblocks_resumed_pre_slice2_plan(
+        self,
+    ) -> None:
+        """The migration helper makes a pre-slice-2 scene_runtime artifact
+        invariant-7-clean. Replicates the user-resume scenario the Claude
+        review (round 2 on slice 2) flagged as P1: an on-disk plan
+        without the two new fields would otherwise hard-abort when
+        build_topology runs.
+
+        Verifies single-source-of-truth: `is_loader` is derived from the
+        same REPLICATED_FIRST_HINTS regex the planner uses, so a backfill
+        of a 'Loader.cs' stem produces is_loader=True (matches what a
+        fresh replan would emit on the same project). Pairs that
+        bool with a LocalScript script-class binding so
+        ``derive_module_lifecycle_role`` returns ``"loader"`` (the
+        ModuleScript path correctly falls through to ``"requireable"``
+        per the codex P2 gate — covered separately in
+        ``TestLifecycleRoleDerivation``).
+
+        Refs: scene_runtime_planner.backfill_lifecycle_role_inputs;
+        pipeline._classify_storage call site.
+        """
+        from converter.scene_runtime_planner import (
+            backfill_lifecycle_role_inputs,
+        )
+        # Pre-slice-2 shape: runtime_bearing module without the new keys.
+        # `LevelLoader` matches REPLICATED_FIRST_HINTS, so the backfill
+        # should stamp is_loader=True.
+        sr = _mk_artifact(modules={
+            "guid-x": {
+                "stem": "LevelLoader",
+                "class_name": "LevelLoader",
+                "runtime_bearing": True,
+                "domain": "client",
+            },
+            "guid-helper": {
+                # Non-runtime-bearing row — backfill must skip it.
+                "stem": "Helper", "class_name": "Helper",
+                "runtime_bearing": False,
+            },
+        })
+        count = backfill_lifecycle_role_inputs(cast("dict", sr))
+        assert count == 1  # Only the runtime_bearing row mutated.
+        runtime_row = sr["modules"]["guid-x"]  # type: ignore[index]
+        assert runtime_row["character_attached"] is False
+        assert runtime_row["is_loader"] is True  # regex matched on 'Loader'
+        # Non-runtime-bearing row untouched.
+        helper_row = sr["modules"]["guid-helper"]  # type: ignore[index]
+        assert "character_attached" not in helper_row
+        assert "is_loader" not in helper_row
+        # And the now-backfilled artifact survives invariant 7.
+        # Pair with a LocalScript binding so lifecycle_role derives
+        # to "loader" (the executable-script branch).
+        scripts_by_class = {
+            "LevelLoader": _mk_rbx_script("LevelLoader", "LocalScript"),
+        }
+        artifact = build_topology(
+            scene_runtime=sr,
+            emitted_animations=[],
+            scripts_by_class=scripts_by_class,
+        )
+        assert artifact["modules"]["guid-x"]["lifecycle_role"] == "loader"
+        # Idempotent: re-running the backfill yields 0 mutations.
+        assert backfill_lifecycle_role_inputs(cast("dict", sr)) == 0
+
 
 # ===========================================================================
 # CATEGORY 3: routing_status path coverage
@@ -760,12 +1699,87 @@ class TestLifecycleRoleDerivation:
         assert role == "character_attached"
 
     def test_loader_wins_over_script_class(self) -> None:
-        """``is_loader=True`` overrides class-driven defaults."""
+        """``is_loader=True`` overrides class-driven defaults for
+        ``Script`` / ``LocalScript`` — ReplicatedFirst placement assumes
+        the script auto-runs."""
         role = derive_module_lifecycle_role(
             domain="client", script_class="LocalScript",
             character_attached=False, is_loader=True,
         )
         assert role == "loader"
+
+    def test_is_loader_with_server_domain_falls_through_to_auto_run(
+        self,
+    ) -> None:
+        """``is_loader=True`` is honored ONLY when ``domain="client"``.
+
+        ``loader`` routes to ReplicatedFirst, a client-only container —
+        the role docstring declares it "always client-domain." A
+        runtime-bearing server module whose name happens to match the
+        loader regex (e.g. a server-side ``BootstrapServer.cs``) must
+        fall through to ``"auto_run"`` (its Script default), NOT
+        ``"loader"``.
+
+        Without this gate the topology emits self-contradictory rows
+        (``domain="server", lifecycle_role="loader"``) that any
+        downstream consumer trusting ``lifecycle_role`` would route to
+        the wrong container (codex review 2026-05-28 P2 on slice 2
+        round 1).
+
+        Refs: lifecycle_roles.py loader branch domain gate.
+        """
+        role = derive_module_lifecycle_role(
+            domain="server", script_class="Script",
+            character_attached=False, is_loader=True,
+        )
+        assert role == "auto_run"
+
+    def test_character_attached_with_server_domain_falls_through(
+        self,
+    ) -> None:
+        """``character_attached=True`` is honored ONLY when
+        ``domain="client"``.
+
+        ``character_attached`` routes to StarterCharacterScripts, a
+        client-only container — the role docstring declares it "always
+        client-domain." A runtime-bearing server module flagged
+        character_attached (shouldn't happen in production, but could
+        appear in a malformed external artifact) must fall through to
+        its class-driven default, NOT silently emit a
+        client-only-container role on a server module.
+
+        Refs: lifecycle_roles.py character_attached branch domain gate.
+        """
+        role = derive_module_lifecycle_role(
+            domain="server", script_class="Script",
+            character_attached=True, is_loader=False,
+        )
+        assert role == "auto_run"
+
+    def test_is_loader_with_module_script_falls_through_to_requireable(
+        self,
+    ) -> None:
+        """``is_loader=True`` does NOT promote a ``ModuleScript`` to
+        ``"loader"``. A ModuleScript can't auto-run, so ReplicatedFirst
+        placement is meaningless for it — matches
+        ``storage_classifier._decide_script_container``'s explicit
+        ``script_type != "ModuleScript"`` gate.
+
+        Without this gate the topology row's ``lifecycle_role`` would
+        disagree with what storage_classifier actually places (codex
+        review 2026-05-28 P2 on slice 2: a ``LoadingUtils`` helper
+        required by a real Loader script lands in ReplicatedStorage
+        under the storage path, but the topology row would have
+        emitted ``lifecycle_role="loader"`` pre-gate).
+
+        Refs: lifecycle_roles.py:107-108 (gated branch);
+        storage_classifier.py:319 (the parallel gate).
+        """
+        role = derive_module_lifecycle_role(
+            domain="client", script_class="ModuleScript",
+            character_attached=False, is_loader=True,
+        )
+        assert role == "requireable"
 
     def test_local_script_routes_auto_run(self) -> None:
         role = derive_module_lifecycle_role(
@@ -1255,6 +2269,242 @@ class TestBuildAnimationDriverEntry:
 # end-to-end flow at runtime).
 # ===========================================================================
 
+
+# ===========================================================================
+# CATEGORY 7: caller_graph curation (Phase 2a slice 3)
+# ===========================================================================
+
+class TestCallerGraphCuration:
+    """``_build_caller_graph_block`` + the ``callers_of`` accessor.
+
+    Refs: build_topology.py:_build_caller_graph_block, callers_of;
+    Phase 2a slice 3 in the design doc.
+    """
+
+    def test_empty_dependency_map_emits_empty_graph(self) -> None:
+        """``dependency_map=None`` and ``dependency_map={}`` both produce
+        an empty ``caller_graph`` — back-compat for Phase 1 callers and
+        legacy-mode invocations."""
+        sr = _mk_artifact(modules={
+            "guid-foo": _mk_module("Foo", "client"),
+        })
+        artifact_none = build_topology(
+            scene_runtime=sr,
+            emitted_animations=[],
+            scripts_by_class={},
+            dependency_map=None,
+        )
+        artifact_empty = build_topology(
+            scene_runtime=sr,
+            emitted_animations=[],
+            scripts_by_class={},
+            dependency_map={},
+        )
+        assert artifact_none["caller_graph"] == {}
+        assert artifact_empty["caller_graph"] == {}
+
+    def test_inverts_outgoing_to_incoming_edges(self) -> None:
+        """Planner's outgoing form ``{Foo: [Bar]}`` (Foo requires Bar)
+        curates to incoming form ``{guid-bar: [guid-foo]}`` (Bar is
+        required-by Foo). Translation by class_name → script_id index
+        from ``scene_runtime.modules``."""
+        sr = _mk_artifact(modules={
+            "guid-foo": _mk_module("Foo", "client"),
+            "guid-bar": _mk_module("Bar", "client"),
+        })
+        artifact = build_topology(
+            scene_runtime=sr,
+            emitted_animations=[],
+            scripts_by_class={},
+            dependency_map={"Foo": ["Bar"]},
+        )
+        graph = artifact["caller_graph"]
+        assert graph == {"guid-bar": ["guid-foo"]}
+
+    def test_multiple_callers_aggregate_under_one_callee(self) -> None:
+        """Two callers requiring the same callee land in the callee's
+        list. Duplicates from a caller requiring the same callee twice
+        are deduplicated."""
+        sr = _mk_artifact(modules={
+            "guid-foo": _mk_module("Foo", "client"),
+            "guid-baz": _mk_module("Baz", "client"),
+            "guid-bar": _mk_module("Bar", "client"),
+        })
+        # Both Foo and Baz require Bar; Foo also lists Bar twice.
+        dep_map = {"Foo": ["Bar", "Bar"], "Baz": ["Bar"]}
+        artifact = build_topology(
+            scene_runtime=sr,
+            emitted_animations=[],
+            scripts_by_class={},
+            dependency_map=dep_map,
+        )
+        callers = sorted(artifact["caller_graph"]["guid-bar"])
+        assert callers == ["guid-baz", "guid-foo"]
+
+    def test_unknown_class_in_dep_map_skipped(self) -> None:
+        """A class in dependency_map that has no corresponding
+        ``scene_runtime.modules`` row is skipped (no topology row to
+        reference). Skips both caller-side (caller not in modules) and
+        callee-side (callee not in modules)."""
+        sr = _mk_artifact(modules={
+            "guid-foo": _mk_module("Foo", "client"),
+        })
+        # Foo→External: callee not in modules; skipped.
+        # External→Foo: caller not in modules; skipped.
+        dep_map = {"Foo": ["External"], "External": ["Foo"]}
+        artifact = build_topology(
+            scene_runtime=sr,
+            emitted_animations=[],
+            scripts_by_class={},
+            dependency_map=dep_map,
+        )
+        # Neither edge survived translation → empty graph.
+        assert artifact["caller_graph"] == {}
+
+    def test_callers_of_helper_returns_list_for_known_id(self) -> None:
+        """``callers_of(script_id, caller_graph)`` returns the caller
+        list for a known script_id. Empty list for unknown id (orphan
+        module — design doc decision tree treats no-callers same as
+        absent from graph)."""
+        graph = {"guid-bar": ["guid-foo", "guid-baz"]}
+        assert callers_of("guid-bar", graph) == ["guid-foo", "guid-baz"]
+        assert callers_of("guid-unknown", graph) == []
+
+    def test_callers_of_returns_fresh_list(self) -> None:
+        """``callers_of`` returns a fresh list so a consumer can mutate
+        without affecting the artifact."""
+        graph = {"guid-bar": ["guid-foo"]}
+        result = callers_of("guid-bar", graph)
+        result.append("guid-mutated")
+        # Original graph unchanged.
+        assert graph["guid-bar"] == ["guid-foo"]
+
+    def test_class_name_collision_excluded_from_caller_graph(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Slice 3 round 2 (codex P1 / Claude P1) degraded-service
+        contract: when two modules share a class_name AND that name
+        appears in dependency_map, the colliding class is EXCLUDED
+        from caller_graph translation (rather than aborting the
+        build). Both caller-side and callee-side appearances are
+        skipped. The colliding scripts appear as orphan rows (no
+        callers) in the curated view; slice 5's decision tree
+        falls back to ReplicatedStorage. A warning is logged per
+        collision.
+
+        Refs: build_topology._detect_caller_graph_collisions;
+        Phase 2a slice 3 round 2 review.
+        """
+        import logging
+        sr = _mk_artifact(modules={
+            "guid-first": _mk_module("Utils", "client"),
+            "guid-second": _mk_module(
+                "Utils", "client", class_name="Utils",
+            ),
+            "guid-caller": _mk_module("Caller", "client"),
+            "guid-target": _mk_module("Target", "client"),
+        })
+        caplog.set_level(
+            logging.WARNING,
+            logger="converter.scene_runtime_topology.build_topology",
+        )
+        # Caller→Utils (collision touch) + Caller→Target (no collision).
+        # Build should succeed; only the non-colliding edge should land
+        # in the graph.
+        artifact = build_topology(
+            scene_runtime=sr,
+            emitted_animations=[],
+            scripts_by_class={},
+            dependency_map={"Caller": ["Utils", "Target"]},
+        )
+        # Utils collision excluded; Target edge preserved.
+        assert artifact["caller_graph"] == {
+            "guid-target": ["guid-caller"],
+        }
+        # Warning logged with the offending class_name + remediation.
+        warnings = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING
+        ]
+        assert any("Utils" in r.getMessage() for r in warnings), (
+            f"expected warning naming the colliding class: {warnings!r}"
+        )
+
+    def test_class_name_collision_as_caller_also_excluded(
+        self,
+    ) -> None:
+        """The exclusion applies symmetrically: a colliding class as
+        the CALLER side of dependency_map is also skipped (we can't
+        determine which Utils script_id authored the edge)."""
+        sr = _mk_artifact(modules={
+            "guid-first": _mk_module("Utils", "client"),
+            "guid-second": _mk_module(
+                "Utils", "client", class_name="Utils",
+            ),
+            "guid-target": _mk_module("Target", "client"),
+        })
+        artifact = build_topology(
+            scene_runtime=sr,
+            emitted_animations=[],
+            scripts_by_class={},
+            dependency_map={"Utils": ["Target"]},
+        )
+        # No edges in caller_graph — Utils caller is excluded.
+        assert artifact["caller_graph"] == {}
+
+    def test_collision_not_in_dep_map_is_harmless(self) -> None:
+        """Collision that doesn't affect dependency_map is harmless
+        and produces no warning + no exclusion — the lossy translation
+        only matters when the colliding name is actually used.
+
+        Slice 3 round 2 refinement of the round 1 invariant 9 test.
+        """
+        sr = _mk_artifact(modules={
+            "guid-first": _mk_module("Utils", "client"),
+            "guid-second": _mk_module(
+                "Utils", "client", class_name="Utils",
+            ),
+            "guid-caller": _mk_module("Caller", "client"),
+            "guid-target": _mk_module("Target", "client"),
+        })
+        # `Utils` colliding but not in dep_map — no exclusion.
+        artifact = build_topology(
+            scene_runtime=sr,
+            emitted_animations=[],
+            scripts_by_class={},
+            dependency_map={"Caller": ["Target"]},
+        )
+        assert artifact["caller_graph"] == {
+            "guid-target": ["guid-caller"],
+        }
+
+    def test_helper_module_included_in_caller_graph(self) -> None:
+        """Slice 3 round 1 contract: non-runtime-bearing helpers ARE
+        included in caller_graph (keys and values). A helper required
+        by a runtime-bearing client script is a real edge slice 5's
+        decision tree needs (the helper's domain stays "helper" but
+        its placement is still informed by who requires it)."""
+        sr = _mk_artifact(modules={
+            "guid-caller": _mk_module("Caller", "client"),
+            "guid-helper": {
+                "stem": "Helper", "class_name": "Helper",
+                "runtime_bearing": False,
+                # Non-runtime-bearing rows are exempt from invariant 7;
+                # they CAN omit character_attached / is_loader.
+            },
+        })
+        artifact = build_topology(
+            scene_runtime=sr,
+            emitted_animations=[],
+            scripts_by_class={},
+            dependency_map={"Caller": ["Helper"]},
+        )
+        # The helper is keyed in caller_graph despite runtime_bearing=False.
+        assert artifact["caller_graph"] == {
+            "guid-helper": ["guid-caller"],
+        }
+
+
 class TestApplyTopologyToRbxScripts:
     """Drive ``Pipeline._build_and_apply_topology`` against synthetic
     fixtures + assert the RbxScript mutations + plan-bucket patches
@@ -1289,10 +2539,22 @@ class TestApplyTopologyToRbxScripts:
         rbx_place.scripts = scripts
         anim_result = AnimationConversionResult()
         anim_result.emitted_animations = emitted_animations
+        from converter.code_transpiler import TranspilationResult
         pipeline.state = SimpleNamespace(
             rbx_place=rbx_place,
             animation_result=anim_result,
             guid_index=None,
+            # Phase 2a slice 3 added `dependency_map` to the
+            # _build_and_apply_topology read set so build_topology can
+            # curate the caller_graph. Real PipelineState defaults to
+            # an empty dict (pipeline.py:126); mirror that here so the
+            # SimpleNamespace forge matches the prod shape.
+            dependency_map={},
+            # Slice 3 round 6 (codex P2): the caller_graph
+            # preservation signal switched from dep_map truthiness to
+            # ``transpilation_result is not None``. Populate it so
+            # these tests' fresh-build path runs as expected.
+            transpilation_result=TranspilationResult(),
         )
         return pipeline
 
@@ -1551,12 +2813,19 @@ class TestApplyTopologyToRbxScripts:
             "1 unmatched" in m for m in caplog.text.splitlines()
         ), caplog.text
 
-    def test_empty_emitted_animations_skips_topology_build(
+    def test_empty_emitted_animations_still_builds_topology(
         self, tmp_path: Path,
     ) -> None:
-        """When ``animation_result.emitted_animations`` is empty, the
-        method short-circuits before calling build_topology. Verifies
-        scene_runtime doesn't get a spurious ``topology`` key written.
+        """Slice 3 round 1 review (codex P2): when
+        ``animation_result.emitted_animations`` is empty, the method
+        STILL builds the topology artifact — caller_graph (slice 3),
+        modules block, and cross_domain_edges are independent of
+        animations. Pre-slice-3-round-1 the method short-circuited
+        here, which silently dropped the caller_graph for any
+        no-animation project.
+
+        Refs: pipeline.py:_build_and_apply_topology slice 3 round 1
+        fix; design doc Phase 2a slice 3.
         """
         artifact = _mk_artifact()
         scene_runtime = cast("dict[str, object]", artifact)
@@ -1567,5 +2836,308 @@ class TestApplyTopologyToRbxScripts:
             tmp_path=tmp_path,
         )
         pipeline._build_and_apply_topology(scene_runtime, plan)
-        # No topology key persisted; no RbxScript mutated.
-        assert "topology" not in scene_runtime
+        # Topology block IS now written (with empty animation_drivers
+        # + caller_graph). scene_runtime has the empty modules
+        # scenario from _mk_artifact() so all blocks are empty too,
+        # but the KEY exists.
+        assert "topology" in scene_runtime
+        topo = cast(dict, scene_runtime["topology"])
+        assert topo.get("animation_drivers") == {}
+        assert topo.get("modules") == {}
+        assert topo.get("caller_graph") == {}
+
+    def test_resume_with_animation_result_none_preserves_animation_drivers(
+        self, tmp_path: Path,
+    ) -> None:
+        """Slice 3 round 4 (Claude P1.A/P1.B): on resume where
+        convert_animations didn't run, ``state.animation_result``
+        is None and the persisted ``scene_runtime.topology`` block
+        carries animation_drivers from a prior conversion. The
+        round-4 fix preserves the animation_drivers block verbatim
+        while REBUILDING modules + caller_graph + cross_domain_edges
+        from current state — avoids both (1) silent erasure of prior
+        drivers (round 3 P1) and (2) stale caller_graph alongside
+        fresh dependency_map (round 4 P1.B).
+
+        Refs: pipeline.py:_build_and_apply_topology round 4 fix;
+        build_topology.py ``preserved_animation_drivers`` contract.
+        """
+        from types import SimpleNamespace
+        from converter.pipeline import Pipeline
+        from core.roblox_types import RbxPlace
+        artifact = _mk_artifact(modules={
+            "guid-foo": _mk_module("Foo", "client"),
+        })
+        scene_runtime = cast("dict[str, object]", artifact)
+        # Pre-existing topology block from a prior conversion run.
+        prior_animation_drivers = {
+            "guid-prior:Door:open": {
+                "stable_id": "guid-prior:Door:open",
+                "routing_status": "resolved",
+                "driver_module_guid": "guid-prior-door",
+                "domain": "client",
+                "script_class": "LocalScript",
+                "lifecycle_role": "auto_run",
+                "observed_attribute": "Open",
+                "observed_target": {
+                    "kind": "self", "name": "", "scope": "workspace",
+                },
+                "bridge_group_id": None,
+            },
+        }
+        prior_topology = {
+            "modules": {},  # stale — should get rebuilt
+            "animation_drivers": prior_animation_drivers,
+            "cross_domain_edges": [],
+            "caller_graph": {},  # stale — should get rebuilt
+        }
+        # The prior topology MUST include a module entry for the
+        # driver_module_guid `guid-prior-door` — invariant 1 will fire
+        # otherwise. For the resume test, add the prior driver module
+        # to scene_runtime.modules so the freshly-built modules_block
+        # includes it.
+        scene_runtime["modules"]["guid-prior-door"] = _mk_module(  # type: ignore[index]
+            "PriorDoor", "client",
+        )
+        scene_runtime["topology"] = prior_topology
+
+        pipeline = Pipeline.__new__(Pipeline)
+        pipeline.output_dir = tmp_path
+        rbx_place = RbxPlace()
+        rbx_place.scripts = [_mk_rbx_script("X", "Script")]
+        pipeline.state = SimpleNamespace(
+            rbx_place=rbx_place,
+            animation_result=None,  # <-- the resume signature
+            guid_index=None,
+            dependency_map={},
+            transpilation_result=None,  # transpile didn't run on resume
+        )
+
+        plan = TestApplyTopologyToRbxScripts._mk_plan()
+        pipeline._build_and_apply_topology(scene_runtime, plan)
+
+        # Topology block IS rebuilt (not preserved as-is)…
+        rebuilt = scene_runtime["topology"]
+        assert rebuilt is not prior_topology
+        # …and modules block reflects CURRENT scene_runtime (has Foo + PriorDoor)
+        assert "guid-foo" in rebuilt["modules"]  # type: ignore[index]
+        assert "guid-prior-door" in rebuilt["modules"]  # type: ignore[index]
+        # …animation_drivers preserved verbatim from prior topology
+        assert (
+            rebuilt["animation_drivers"]  # type: ignore[index]
+            == prior_animation_drivers
+        )
+
+    def test_retranspile_with_no_edges_overwrites_prior_caller_graph(
+        self, tmp_path: Path,
+    ) -> None:
+        """Slice 3 round 6 (codex P2): a GENUINE retranspile that
+        removed the last cross-script reference ALSO leaves
+        ``state.dependency_map`` empty. Pre-round-6 my dep_map
+        truthiness signal would silently preserve the prior populated
+        caller_graph in that case — carrying forward stale callers
+        that no longer exist in the current source.
+
+        Round 6 fix: use ``state.transpilation_result is not None``
+        as the "did transpile run this invocation?" signal instead.
+        Both transpilation_result + dependency_map are set in the
+        same code path (pipeline.py:1942-1971); a populated
+        transpilation_result with empty dep_map is the legitimate
+        "ran with no edges" case — emit empty caller_graph fresh.
+        """
+        from types import SimpleNamespace
+        from converter.pipeline import Pipeline
+        from converter.animation_converter import AnimationConversionResult
+        from converter.code_transpiler import TranspilationResult
+        from core.roblox_types import RbxPlace
+        artifact = _mk_artifact(modules={
+            "guid-foo": _mk_module("Foo", "client"),
+        })
+        scene_runtime = cast("dict[str, object]", artifact)
+        # Prior conversion produced a populated caller_graph.
+        prior_caller_graph = {"guid-stale": ["guid-stale-caller"]}
+        prior_topology = {
+            "modules": {},
+            "animation_drivers": {},
+            "cross_domain_edges": [],
+            "caller_graph": prior_caller_graph,
+        }
+        scene_runtime["topology"] = prior_topology
+
+        pipeline = Pipeline.__new__(Pipeline)
+        pipeline.output_dir = tmp_path
+        rbx_place = RbxPlace()
+        rbx_place.scripts = [_mk_rbx_script("Foo", "LocalScript")]
+        anim_result = AnimationConversionResult()
+        anim_result.emitted_animations = []
+        # Key: transpilation_result IS populated → transpile ran
+        # this invocation. dep_map is empty because no cross-script
+        # references exist in current source.
+        pipeline.state = SimpleNamespace(
+            rbx_place=rbx_place,
+            animation_result=anim_result,
+            guid_index=None,
+            dependency_map={},
+            transpilation_result=TranspilationResult(),
+        )
+
+        plan = TestApplyTopologyToRbxScripts._mk_plan()
+        pipeline._build_and_apply_topology(scene_runtime, plan)
+
+        # Empty caller_graph (no stale carry-forward).
+        topo = scene_runtime["topology"]
+        assert topo["caller_graph"] == {}  # type: ignore[index]
+
+    def test_invariant_1_catches_stale_preserved_anim_driver_domain(
+        self,
+    ) -> None:
+        """Slice 3 round 6 (codex P1): preserved animation_drivers
+        copy entries verbatim while modules_block is rebuilt fresh.
+        If ``domain_overrides`` / ``networking_mode`` changed between
+        runs, a driver module's domain shifts but the preserved
+        animation driver row keeps the old domain. Invariant 1's
+        equality check (re-added in round 6) catches the
+        self-contradictory pair and aborts with a clear remediation
+        message.
+
+        Refs: build_topology.py invariant 1 equality re-add;
+        Phase 2a slice 3 round 6 review.
+        """
+        # Modules block says driver is server-domain.
+        sr = _mk_artifact(modules={
+            "guid-driver": _mk_module("Driver", "server"),
+        })
+        scripts_by_class = {
+            "Driver": _mk_rbx_script("Driver", "Script"),
+        }
+        # Preserved animation_drivers row says client (stale).
+        stale_drivers = {
+            "scope:Driver:open": {
+                "stable_id": "scope:Driver:open",
+                "routing_status": "resolved",
+                "driver_module_guid": "guid-driver",
+                "domain": "client",  # stale
+                "script_class": "LocalScript",  # stale
+                "lifecycle_role": "auto_run",
+                "observed_attribute": "open",
+                "observed_target": {
+                    "kind": "self", "name": "", "scope": "workspace",
+                },
+                "bridge_group_id": None,
+            },
+        }
+        with pytest.raises(TopologyInvariantError) as excinfo:
+            build_topology(
+                scene_runtime=sr,
+                emitted_animations=[],
+                scripts_by_class=scripts_by_class,
+                preserved_animation_drivers=stale_drivers,
+            )
+        msg = str(excinfo.value)
+        assert "invariant 1" in msg
+        assert "Re-run from convert_animations" in msg
+
+    def test_assemble_no_retranspile_preserves_caller_graph(
+        self, tmp_path: Path,
+    ) -> None:
+        """Slice 3 round 5 (codex P2): when ``transpile_scripts`` is
+        skipped (assemble-without-retranspile workflow), the planner's
+        ``state.dependency_map`` stays empty for legitimate reasons
+        (the scripts cache is intact; no new edges to learn). Pre-
+        round-5 the empty dep_map caused build_topology to emit
+        ``caller_graph={}`` and silently overwrite the prior populated
+        graph in ``scene_runtime.topology``.
+
+        Round 5 fix: detect the empty-dep_map + prior-caller_graph
+        case and pass the prior block via
+        ``preserved_caller_graph``; build_topology uses it verbatim.
+
+        Refs: pipeline.py:_build_and_apply_topology round 5 fix;
+        build_topology.py ``preserved_caller_graph`` contract.
+        """
+        from types import SimpleNamespace
+        from converter.pipeline import Pipeline
+        from converter.animation_converter import AnimationConversionResult
+        from core.roblox_types import RbxPlace
+        artifact = _mk_artifact(modules={
+            "guid-foo": _mk_module("Foo", "client"),
+        })
+        scene_runtime = cast("dict[str, object]", artifact)
+        # Prior conversion produced a populated caller_graph.
+        prior_caller_graph = {"guid-target": ["guid-caller"]}
+        prior_topology = {
+            "modules": {},
+            "animation_drivers": {},
+            "cross_domain_edges": [],
+            "caller_graph": prior_caller_graph,
+        }
+        scene_runtime["topology"] = prior_topology
+
+        pipeline = Pipeline.__new__(Pipeline)
+        pipeline.output_dir = tmp_path
+        rbx_place = RbxPlace()
+        rbx_place.scripts = [_mk_rbx_script("Foo", "LocalScript")]
+        anim_result = AnimationConversionResult()
+        anim_result.emitted_animations = []
+        # transpilation_result=None: transpile_scripts didn't run
+        # this invocation (assemble-no-retranspile signature).
+        pipeline.state = SimpleNamespace(
+            rbx_place=rbx_place,
+            animation_result=anim_result,
+            guid_index=None,
+            dependency_map={},
+            transpilation_result=None,
+        )
+
+        plan = TestApplyTopologyToRbxScripts._mk_plan()
+        pipeline._build_and_apply_topology(scene_runtime, plan)
+
+        # Topology rebuilt; caller_graph preserved from prior.
+        topo = scene_runtime["topology"]
+        assert topo["caller_graph"] == prior_caller_graph  # type: ignore[index]
+
+    def test_fresh_no_animations_still_builds_caller_graph(
+        self, tmp_path: Path,
+    ) -> None:
+        """Slice 3 round 4 — fresh conversion with no animations
+        (animation_result populated but emitted_animations==[]).
+        Pre-round-4 the `animation_result is None` short-circuit
+        also fired here in some code paths, regressing slice 3
+        round 1's "topology always built" goal. Round 4 distinguishes
+        by checking animation_result identity vs emission contents.
+
+        Verifies: caller_graph IS built; topology block IS written;
+        animation_drivers is empty (no fresh emissions).
+        """
+        from types import SimpleNamespace
+        from converter.pipeline import Pipeline
+        from converter.animation_converter import AnimationConversionResult
+        from core.roblox_types import RbxPlace
+        artifact = _mk_artifact(modules={
+            "guid-caller": _mk_module("Caller", "client"),
+            "guid-target": _mk_module("Target", "client"),
+        })
+        scene_runtime = cast("dict[str, object]", artifact)
+
+        pipeline = Pipeline.__new__(Pipeline)
+        pipeline.output_dir = tmp_path
+        rbx_place = RbxPlace()
+        rbx_place.scripts = [_mk_rbx_script("Caller", "LocalScript")]
+        anim_result = AnimationConversionResult()
+        anim_result.emitted_animations = []  # populated but empty
+        from converter.code_transpiler import TranspilationResult
+        pipeline.state = SimpleNamespace(
+            rbx_place=rbx_place,
+            animation_result=anim_result,  # <-- populated, not None
+            guid_index=None,
+            dependency_map={"Caller": ["Target"]},
+            transpilation_result=TranspilationResult(),
+        )
+
+        plan = TestApplyTopologyToRbxScripts._mk_plan()
+        pipeline._build_and_apply_topology(scene_runtime, plan)
+
+        # Topology block written, caller_graph populated, animation_drivers empty.
+        topo = scene_runtime["topology"]
+        assert topo["caller_graph"] == {"guid-target": ["guid-caller"]}  # type: ignore[index]
+        assert topo["animation_drivers"] == {}  # type: ignore[index]

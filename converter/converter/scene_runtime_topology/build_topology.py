@@ -20,7 +20,7 @@ dict access to the artifact is discouraged (a future relocation to
 ``topology_plan.json`` should be a one-file change).
 
 Phase 1 invariants (per design doc §"topology artifact" + the review's
-6th add):
+6th add) + Phase 2a slice 2's 7th invariant:
 
   1. Every ``animation_drivers[*].driver_module_guid`` resolves to a
      ``modules`` entry; the animation's ``domain`` matches the driver's.
@@ -37,6 +37,70 @@ Phase 1 invariants (per design doc §"topology artifact" + the review's
   6. Every ``animation_drivers[*].driver_module_guid``'s module domain
      is in ``{"client", "server"}`` (helpers / excluded modules cannot
      drive animations).
+  7. Every ``runtime_bearing`` planner row carries both
+     ``character_attached`` and ``is_loader`` booleans (Phase 2a slice
+     2). Catches external-provenance ``scene_runtime`` artifacts that
+     bypass the planner — without it, lifecycle_role derivation
+     silently defaults the missing inputs to False and the topology
+     row misrepresents the underlying script.
+  8. ``lifecycle_role`` is consistent with the gated inputs on every
+     ``modules`` entry (Phase 2a slice 2 round 3). One-way implications:
+       - ``lifecycle_role == "loader"`` ⇒ ``is_loader == True`` AND
+         ``script_class in {"Script", "LocalScript"}`` AND
+         ``domain == "client"`` (matches the gate inside
+         ``derive_module_lifecycle_role``).
+       - ``lifecycle_role == "character_attached"`` ⇒
+         ``character_attached == True`` AND ``domain == "client"``.
+     The opposite direction is NOT required: ``is_loader=True`` may
+     legitimately coexist with ``lifecycle_role != "loader"`` when one
+     of the gates fired (e.g. a server-domain loader-named script is
+     auto_run, not loader — the bool preserves the raw planner
+     observation while the role is the gated decision). Slice 2 round
+     3 added this invariant so a future change to
+     ``derive_module_lifecycle_role`` can't silently produce a
+     "loader" role on a server-domain module.
+ 10. **Reachability triple-write atomicity** (Phase 2a slice 4) —
+     for every ``modules`` entry the three reachability fields are
+     coordinated:
+       - ``reachability_required_container`` non-empty ⟺
+         ``reachability_forced_container`` non-empty (both mirror the
+         planner's rule-fired signal; one without the other means
+         the planner artifact was hand-edited into an inconsistent
+         state).
+       - When both are non-empty, they MUST be equal in container
+         value (the planner stamps them together with the same
+         value).
+       - When non-empty, ``module_path`` MUST start with that
+         container value (e.g. ``"ReplicatedStorage.HudControl"``;
+         module_path is the dotted DataModel path the host runtime
+         requires, so it has to point at the actually-hoisted
+         container — pre-slice-4 codex P1.1 fix at
+         module_domain.py:1266-1278 codified this).
+     Catches both hand-edited artifacts and any future refactor that
+     splits the planner triple-write into separate paths without
+     keeping them in lockstep.
+
+Coherence policy (Phase 2a slice 3 rounds 2-3) — NOT a fail-closed
+invariant: when ``scene_runtime.modules`` contains a ``class_name``
+collision (two scripts sharing a class_name) AND that name is
+touched by ``dependency_map``, ``_detect_caller_graph_collisions``
+excludes it from ``caller_graph`` translation. The colliding scripts
+appear as orphan rows (no callers) in the curated view. An ERROR
+is logged per collision (slice 3 round 3 P1.3 — bumped from WARNING
+because the placement change is material and operators routinely
+filter WARNINGs out of batch logs).
+
+The "orphan → ReplicatedStorage" outcome is FORWARD-LOOKING (slice 3
+round 3 P1.1): slice 5's storage_classifier rewrite is the consumer
+that reads ``caller_graph`` + applies the orphan-fallback rule.
+Pre-slice-5 storage_classifier continues its own lossy class_name
+routing for the same scripts — slice 3 ships a topology that
+describes how slice 5 WILL route them, not how the current build
+routes them. The legacy pipeline silently mis-routed these projects
+pre-slice-3; this policy keeps them converting (no hard regression)
+while preventing slice 5 from receiving lossy edges. The deep fix
+(promote dependency_map's keyspace to script_id) lives in a future
+slice.
 """
 
 from __future__ import annotations
@@ -153,21 +217,78 @@ class TopologyModuleEntry(TypedDict, total=False):
     Distinct from ``SceneRuntimeModule`` (the planner's per-module row
     on ``scene_runtime.modules``): planner row is structural facts about
     the script's instances and dependencies; topology row is the
-    placement decision. They share ``stem`` + ``domain`` but diverge
-    everywhere else.
+    placement decision plus its provenance.
+
+    **Field-semantic contract (Phase 2a slice 2 round 3):**
+
+    ``character_attached`` and ``is_loader`` on the topology entry are
+    **raw planner hints**, mirrored verbatim from the planner row. They
+    are the OBSERVATIONS the planner made (a name match against
+    `REPLICATED_FIRST_HINTS`, a scene_converter character-attachment
+    flag in slice 5+). They are NOT post-derivation effective values.
+
+    ``lifecycle_role`` is the **gated decision** the topology layer
+    produces by feeding the bools + ``domain`` + ``script_class`` into
+    ``derive_module_lifecycle_role``. Three gates apply:
+      - ``character_attached`` honored only when ``domain == "client"``
+      - ``is_loader`` honored only when ``domain == "client"`` AND
+        ``script_class in {"Script", "LocalScript"}``
+      - Both fall through to the class-driven default when their gate
+        fires (``auto_run`` for Script/LocalScript, ``requireable`` for
+        ModuleScript)
+
+    Consequence: a topology row CAN have ``is_loader=True`` but
+    ``lifecycle_role`` other than ``"loader"`` — e.g. a
+    server-domain ``BootstrapServer.cs`` will have
+    ``is_loader=True, lifecycle_role="auto_run"``. This is **deliberate
+    and documented**: the bool preserves the audit trail of what the
+    planner observed; lifecycle_role is what the runtime should do.
+    The divergence is a feature, not a bug — slice 5's storage_classifier
+    rewrite reads ``lifecycle_role`` for placement, NOT the raw bools.
+
+    Invariant 8 (slice 2 round 3) pins the one-way implication so a
+    future derivation change can't silently break the relationship:
+    ``lifecycle_role == "loader"`` implies the gated bools were all
+    truthy at derivation time, and ditto for
+    ``lifecycle_role == "character_attached"``.
 
     Phase 1 populates: ``stem``, ``domain``, ``script_class``,
-    ``lifecycle_role``, ``provenance``. ``bridge_group_id`` is populated
-    when the module participates in a cross-domain edge; otherwise
-    ``None``.
+    ``lifecycle_role``, ``provenance``. Phase 2a slice 2 adds
+    ``character_attached`` + ``is_loader``. ``bridge_group_id`` is
+    populated when the module participates in a cross-domain edge;
+    otherwise ``None``.
     """
 
     stem: str
     domain: str
     script_class: str
     lifecycle_role: LifecycleRole
+    character_attached: bool
+    is_loader: bool
     bridge_group_id: str | None
     provenance: "TopologyProvenance"
+    # Phase 2a slice 4 — reachability triple. The planner's
+    # ``_apply_reachability_rule`` (module_domain.py:1202-1284) writes
+    # THREE coordinated values atomically when a client-required helper
+    # gets hoisted out of a server container:
+    #   - ``script.parent_path`` on the RbxScript (the live container);
+    #   - ``module_row["container"]`` + ``module_row["module_path"]``
+    #     on the planner row (the canonical placement);
+    #   - ``domain_signals["reachability_forced_container"]`` on the
+    #     planner row (the audit trail).
+    # Topology mirrors the planner-side two as fields here so slice
+    # 5's storage_classifier rewrite reads ONE canonical surface for
+    # both the decision input (``reachability_required_container``)
+    # and the audit (``reachability_forced_container``). Invariant 10
+    # enforces triple-write atomicity (presence + value coherence).
+    #
+    # When reachability did NOT fire for a module, all three fields
+    # are empty strings. When it fired, all three are present, equal
+    # in container value, and ``module_path`` starts with the
+    # container.
+    reachability_required_container: str
+    module_path: str
+    reachability_forced_container: str
 
 
 class TopologyProvenance(TypedDict, total=False):
@@ -191,11 +312,24 @@ class TopologyArtifact(TypedDict, total=False):
     per design doc open-question D4 (option b). A future relocation to
     a sibling file is a one-file change provided consumers go through
     the package's accessor surface (not direct dict indexing).
+
+    ``caller_graph`` (Phase 2a slice 3) is the curated dependency-graph
+    view: for each runtime-bearing module's ``script_id``, the list of
+    script_ids that ``require()`` it. INCOMING edges only — the
+    inverse of ``state.dependency_map``'s outgoing form. Slice 5's
+    ``script_storage`` rewrite reads this to satisfy the design doc's
+    ``callers_of(script, structural_inputs.caller_graph)`` decision-
+    tree term WITHOUT re-deriving graph shape from source. Empty in
+    legacy mode (build_topology is gated on
+    ``scene_runtime_mode != "legacy"`` at the call site); for legacy
+    mode `storage_classifier`'s parallel source-scan path remains the
+    single source of caller info.
     """
 
     modules: dict[str, TopologyModuleEntry]
     animation_drivers: dict[str, AnimationDriverEntry]
     cross_domain_edges: list[CrossDomainEdge]
+    caller_graph: dict[str, list[str]]
 
 
 # ---------------------------------------------------------------------------
@@ -204,7 +338,7 @@ class TopologyArtifact(TypedDict, total=False):
 
 class TopologyInvariantError(RuntimeError):
     """Raised when build_topology detects a topology artifact that
-    violates one of the 6 emit-time invariants. The message includes
+    violates one of the 8 emit-time invariants. The message includes
     the violated invariant number and the offending row (so a build
     failure is debuggable from the log alone).
     """
@@ -226,8 +360,11 @@ def build_topology(
     emitted_animations: list[EmittedAnimation],
     scripts_by_class: dict[str, RbxScript],
     guid_index: GuidIndex | None = None,
+    dependency_map: dict[str, list[str]] | None = None,
+    preserved_animation_drivers: dict[str, AnimationDriverEntry] | None = None,
+    preserved_caller_graph: dict[str, list[str]] | None = None,
 ) -> TopologyArtifact:
-    """Assemble the topology artifact + enforce 6 emit-time invariants.
+    """Assemble the topology artifact + enforce 8 emit-time invariants.
 
     ``scene_runtime`` must already carry classified domains on
     ``modules[*].domain`` (i.e. ``classify_scene_runtime_domains`` has
@@ -238,6 +375,43 @@ def build_topology(
     migrated yet, pass an empty list and the animation_drivers block
     stays empty (Phase 1 invariant 3 still applies).
 
+    ``dependency_map`` is the planner's class_name → required class_names
+    map (the same source ``classify_storage`` already uses). Phase 2a
+    slice 3 curates it into the ``caller_graph`` artifact field
+    (inverted + class_name → script_id translated) so slice 5's
+    ``script_storage`` rewrite reads a single canonical caller surface.
+    ``None`` (the default) emits an empty ``caller_graph`` — back-compat
+    for Phase 1 callers that pre-date slice 3 and for legacy-mode
+    invocations.
+
+    ``preserved_animation_drivers`` (Phase 2a slice 3 round 4) supports
+    the resume path where ``convert_animations`` did NOT run this build
+    but a prior conversion's ``animation_drivers`` block lives on the
+    rehydrated ``scene_runtime.topology``. Pass the prior block via
+    this parameter and ``emitted_animations=[]``; build_topology
+    uses the preserved drivers verbatim instead of rebuilding from
+    (empty) emissions. Invariant 3 (emission ↔ driver 1:1) is SKIPPED
+    in this mode because we don't have the original emissions to
+    cross-check. Invariants 1 + 4 + 5 + 6 still run on the preserved
+    block; if the persisted artifact was valid when first written,
+    those still hold (or the build aborts with a clear message). The
+    canonical caller for this mode is
+    ``pipeline._build_and_apply_topology`` when
+    ``self.state.animation_result is None``.
+
+    ``preserved_caller_graph`` (Phase 2a slice 3 round 5) supports the
+    assemble-without-retranspile path where ``transpile_scripts`` did
+    NOT run this build (``--no-retranspile`` or cached-script
+    workflows). In that case ``state.dependency_map`` is empty (it's
+    rebuilt only inside ``transpile_scripts``), so re-deriving
+    caller_graph from it would silently emit ``{}`` and overwrite the
+    prior caller_graph that came from a real transpile run (codex
+    review slice 3 round 4 P2). Pass the prior block here and
+    ``dependency_map=None`` (or the empty dict); build_topology uses
+    the preserved graph verbatim. Invariant 9 is skipped (no
+    dependency_map to detect collisions on); the preserved graph's
+    correctness derives from when it was first computed.
+
     Returns the artifact dict ready to merge into
     ``scene_runtime["topology"]``.
 
@@ -245,25 +419,73 @@ def build_topology(
     violation. No warnings, no soft-fails — the design doc commits to
     fail-closed on emit.
     """
+    # caller_graph: build fresh from dependency_map, OR use the
+    # preserved block on assemble-no-retranspile workflows where the
+    # planner's dependency_map is empty for legitimate reasons (codex
+    # round 4 P2). Detection collision runs only in the build-fresh
+    # path; the preserved path skips both the detection and the
+    # translation since both ran when the prior block was first
+    # computed.
+    if preserved_caller_graph is not None:
+        caller_graph_block = preserved_caller_graph
+    else:
+        # Detect class_name collisions in scene_runtime.modules that
+        # are touched by dependency_map BEFORE block-building, AND
+        # compute the dedup'd class_name → script_id translation
+        # index in the SAME walk. _build_caller_graph_block consumes
+        # the precomputed index instead of rebuilding it — round-3
+        # P1.2 flagged the two-walk design as vulnerable to silent
+        # divergence (if filters diverge in the future, exclusion set
+        # ↛ translation set).
+        #
+        # Degraded-service contract: colliding class_names are
+        # excluded from the index; the colliding scripts appear as
+        # orphan rows in caller_graph. Slice 5's storage_classifier
+        # rewrite (when it lands) routes orphans to ReplicatedStorage.
+        # Today's storage_classifier still uses its own lossy
+        # class_name routing — see _detect_caller_graph_collisions
+        # docstring for the forward-looking nature of the promise.
+        colliding_classes, class_to_script_id = (
+            _detect_caller_graph_collisions(
+                scene_runtime, dependency_map,
+            )
+        )
+        caller_graph_block = _build_caller_graph_block(
+            dependency_map,
+            class_to_script_id=class_to_script_id,
+            excluded_class_names=colliding_classes,
+        )
+
     modules_block = _build_modules_block(
         scene_runtime, scripts_by_class, guid_index,
     )
     edges_block = compute_cross_domain_edges(scene_runtime)
-    animation_drivers_block = _build_animation_drivers_block(
-        scene_runtime, emitted_animations,
-    )
+    if preserved_animation_drivers is not None:
+        # Resume path: caller supplied prior animation_drivers. Skip
+        # the build_from_emissions step. Invariant 3 will be skipped
+        # in _enforce_invariants because we don't have emissions to
+        # cross-check (see `_skip_invariant_3` flag passed below).
+        animation_drivers_block = preserved_animation_drivers
+    else:
+        animation_drivers_block = _build_animation_drivers_block(
+            scene_runtime, emitted_animations,
+        )
 
     artifact: TopologyArtifact = {
         "modules": modules_block,
         "animation_drivers": animation_drivers_block,
         "cross_domain_edges": edges_block,
+        "caller_graph": caller_graph_block,
     }
 
     # Invariants run AFTER assembly so they can cross-reference blocks.
+    # (Invariant 9 is the exception — it's an INPUT validator and ran
+    # before block-building via _detect_caller_graph_collisions.)
     _enforce_invariants(
         artifact,
         emitted_animations=emitted_animations,
         scene_runtime=scene_runtime,
+        skip_invariant_3=preserved_animation_drivers is not None,
     )
     return artifact
 
@@ -285,10 +507,16 @@ def _build_modules_block(
     didn't synthesize a body) default to ``"ModuleScript"`` — they're
     require-target shape.
 
-    ``lifecycle_role`` derives from domain + script_class via
-    ``derive_module_lifecycle_role``. Phase 1 hint inputs
-    (``character_attached`` / ``is_loader``) are always False — those
-    feed in via script_storage in Phase 2a.
+    ``lifecycle_role`` derives from domain + script_class +
+    character_attached + is_loader via ``derive_module_lifecycle_role``.
+    Phase 2a slice 2 reads ``character_attached`` + ``is_loader`` from
+    the planner row (stamped by `scene_runtime_planner._build_modules`
+    using the public `storage_classifier.REPLICATED_FIRST_HINTS` regex
+    for `is_loader`; `character_attached` defaults False until slice 5
+    plumbs the real signal). Invariant 7 in ``_enforce_invariants``
+    fails closed when a runtime-bearing planner row omits either
+    field — catches external-provenance scene_runtime artifacts that
+    bypass the planner.
     """
     modules_in = cast(
         dict[str, dict[str, object]], scene_runtime.get("modules", {}),
@@ -308,11 +536,18 @@ def _build_modules_block(
         else:
             script_class = "ModuleScript"
 
+        # Phase 2a slice 2: read lifecycle-role inputs from the planner
+        # row. `bool(module.get(..., False))` is defensive against
+        # external-provenance artifacts that bypass the planner (e.g. an
+        # on-disk plan from an earlier converter version); invariant 7
+        # at assembly end is the fail-closed guard for that case.
+        character_attached = bool(module.get("character_attached", False))
+        is_loader = bool(module.get("is_loader", False))
         lifecycle_role = derive_module_lifecycle_role(
             domain=domain,
             script_class=script_class,
-            character_attached=False,
-            is_loader=False,
+            character_attached=character_attached,
+            is_loader=is_loader,
         )
 
         provenance: TopologyProvenance = {}
@@ -336,13 +571,42 @@ def _build_modules_block(
                 if abs_path is not None:
                     provenance["source_path"] = abs_path.as_posix()
 
+        # Phase 2a slice 4 — read the reachability triple from the
+        # planner row. The planner stamps these in
+        # `_apply_reachability_rule` + `_stamp_container_and_path`
+        # (module_domain.py); empty strings indicate "rule did not
+        # fire for this module" (the default for non-helper modules
+        # and for helpers in non-server containers pre-rule).
+        module_path_obj = module.get("module_path", "")
+        module_path = module_path_obj if isinstance(module_path_obj, str) else ""
+        # The planner-side audit name is nested under
+        # `domain_signals.reachability_forced_container`. Topology
+        # surfaces it as a flat field so slice 5's consumer reads
+        # ONE level deep.
+        signals_obj = module.get("domain_signals", {})
+        signals = signals_obj if isinstance(signals_obj, dict) else {}
+        rfc_obj = signals.get("reachability_forced_container", "")
+        reachability_forced = rfc_obj if isinstance(rfc_obj, str) else ""
+        # `reachability_required_container` is the topology's
+        # consumer-facing name for the rule-derived REQUIREMENT.
+        # When the planner's rule fired, it set
+        # ``reachability_forced_container`` AND mutated `container` +
+        # `module_path` in lockstep — so the planner-side audit
+        # field IS the topology's required-container value. Mirror it.
+        reachability_required = reachability_forced
+
         entry: TopologyModuleEntry = {
             "stem": stem,
             "domain": domain,
             "script_class": script_class,
             "lifecycle_role": lifecycle_role,
+            "character_attached": character_attached,
+            "is_loader": is_loader,
             "bridge_group_id": None,
             "provenance": provenance,
+            "reachability_required_container": reachability_required,
+            "module_path": module_path,
+            "reachability_forced_container": reachability_forced,
         }
         out[script_id] = entry
     return out
@@ -448,6 +712,242 @@ def _build_animation_drivers_block(
     return out
 
 
+def _build_caller_graph_block(
+    dependency_map: dict[str, list[str]] | None,
+    *,
+    class_to_script_id: dict[str, str],
+    excluded_class_names: frozenset[str] = frozenset(),
+) -> dict[str, list[str]]:
+    """Curate the planner's outgoing dependency_map into the topology's
+    incoming ``caller_graph`` view.
+
+    Input ``dependency_map`` shape: ``class_name -> [required class_names]``
+    — the same outgoing form ``classify_storage`` consumes today
+    (pipeline.py:1942-1950 builds it during transpile_scripts).
+
+    Output shape: ``script_id -> [list of caller script_ids]`` — INCOMING
+    edges, keyed by canonical id (the planner's GUID-keyed
+    ``scene_runtime.modules`` key). Slice 5's ``_decide_script_container``
+    rewrite reads ``callers_of(script, caller_graph)`` per the design
+    doc decision tree (lines 290-306) — keyed by script_id matches the
+    rest of the topology artifact's canonical id contract.
+
+    **Contract — what's included** (slice 3 round 1 review):
+    Keys and values are script_ids of ANY module with a non-empty
+    ``class_name`` in ``scene_runtime.modules``, INCLUDING non-
+    runtime-bearing helpers. Helpers ARE valid require() targets and
+    callers (a runtime-bearing client script can require a helper, and
+    the helper's transitive caller domains influence its placement).
+    The consumer (slice 5's decision tree) reads ``module.domain`` on
+    each caller and filters by domain — a helper-domain caller doesn't
+    match the {client, server} branches, so including helpers in the
+    graph is informationally complete without changing slice 5's
+    decision for runtime-bearing modules.
+
+    **Translation step** (class_name -> script_id): walk
+    ``scene_runtime.modules.items()`` and build a class_name index
+    using ``setdefault`` — FIRST-WRITE wins on class_name collisions,
+    matching the ``scripts_by_class`` policy in ``_build_modules_block``
+    (codex review of slice 3 P3: divergent semantics across the topology
+    layer were inconsistent and caller_graph edges silently went to the
+    wrong script_id under last-write-wins). Modules with empty
+    ``class_name`` are skipped at indexing time — they have no callable
+    identity.
+
+    **Class_name collision handling** (slice 3 round 2 review,
+    codex P1 + Claude P1): when two modules share a class_name AND
+    the dependency_map names that class_name (caller or callee), the
+    translation would be FUNDAMENTALLY LOSSY because dependency_map's
+    keyspace (class_name) doesn't uniquely identify a script_id.
+    Rather than fail closed (which would regress projects with
+    duplicate class names that the legacy pipeline silently
+    processes), this builder applies a DEGRADED-SERVICE contract:
+    ``excluded_class_names`` (computed by
+    ``_detect_caller_graph_collisions`` pre-derivation) is the set
+    of colliding class_names. Both the caller and callee paths skip
+    them entirely, leaving the colliding scripts as orphan rows in
+    the curated view. Slice 5's ``_decide_script_container`` falls
+    back to ReplicatedStorage for callerless ModuleScripts (its
+    explicit "orphan module" rule). The operator sees a warning per
+    collision in the build log and can split the colliding class to
+    restore precise routing. The deep fix lives in a future slice
+    that promotes dependency_map's keyspace to script_id.
+
+    Returns empty dict when ``dependency_map`` is None or empty
+    (back-compat for Phase 1 callers + legacy-mode invocations).
+
+    ``class_to_script_id`` is the dedup'd index produced by
+    ``_detect_caller_graph_collisions`` in the SAME walk that
+    detected the collisions. This builder no longer rebuilds the
+    index — round-3 P1.2 (computing twice with parallel filters
+    invited silent divergence). ``excluded_class_names`` is the
+    paired exclusion set; defensive re-check below catches any
+    caller/callee class_name that's in the exclusion set (kept
+    explicit so a future change to the dedup pass that's
+    inconsistent with this read still fails closed).
+    """
+    if not dependency_map:
+        return {}
+
+    callers_by_script_id: dict[str, list[str]] = {}
+    for caller_class, callee_classes in dependency_map.items():
+        if caller_class in excluded_class_names:
+            # Colliding caller_class: we can't determine which actual
+            # script_id authored the edge. Skip entirely (degraded
+            # service per the docstring).
+            continue
+        caller_id = class_to_script_id.get(caller_class)
+        if caller_id is None:
+            # Caller class isn't in the planner's modules — it doesn't
+            # have a topology row to reference. Skip; the dependency
+            # is unobservable from the topology's script_id keyspace.
+            continue
+        for callee_class in callee_classes:
+            if callee_class in excluded_class_names:
+                # Colliding callee: same degraded-service rule.
+                continue
+            callee_id = class_to_script_id.get(callee_class)
+            if callee_id is None:
+                continue
+            # Append the caller's script_id to the callee's incoming list.
+            # Determinism: classes are walked in dependency_map's
+            # iteration order (insertion order in Py 3.7+); deduplicate
+            # so a class that requires another twice doesn't appear
+            # twice on the callee's list.
+            existing = callers_by_script_id.setdefault(callee_id, [])
+            if caller_id not in existing:
+                existing.append(caller_id)
+
+    return callers_by_script_id
+
+
+def callers_of(
+    script_id: str, caller_graph: dict[str, list[str]],
+) -> list[str]:
+    """Return the list of script_ids that ``require()`` ``script_id``.
+
+    Public accessor (per design doc decision tree at lines 290-306) so
+    slice 5's ``_decide_script_container`` reads through this function
+    rather than indexing the dict directly — keeps the surface
+    refactorable if the curated view ever moves to a different shape.
+    Returns an empty list when ``script_id`` has no callers (orphan
+    module or absent from the graph entirely — both treated the same
+    by the slice 5 decision tree).
+    """
+    return list(caller_graph.get(script_id, ()))
+
+
+# ---------------------------------------------------------------------------
+# Pre-derivation collision detection (Phase 2a slice 3 round 2)
+# ---------------------------------------------------------------------------
+
+def _detect_caller_graph_collisions(
+    scene_runtime: SceneRuntimeArtifact,
+    dependency_map: dict[str, list[str]] | None,
+) -> tuple[frozenset[str], dict[str, str]]:
+    """Detect ``class_name`` collisions in ``scene_runtime.modules``
+    that are touched by ``dependency_map``, AND return the
+    deduplicated class_name → script_id translation index.
+
+    Returns ``(excluded_class_names, class_to_script_id)``:
+      - ``excluded_class_names``: colliding class_names to exclude
+        from ``caller_graph`` translation (degraded-service contract;
+        see ``build_topology`` docstring).
+      - ``class_to_script_id``: the dedup'd index for the non-
+        colliding rows. ``_build_caller_graph_block`` consumes this
+        directly instead of re-walking ``scene_runtime.modules`` —
+        Claude review slice 3 round 3 P1.2 flagged the two-walk
+        design as vulnerable to silent divergence (if a future change
+        tightens one filter without the other, the exclusion set
+        wouldn't match the translation set). Computing once
+        eliminates the drift surface structurally.
+
+    For each collision, logs an ERROR-level entry (slice 3 round 3
+    P1.3 — WARNING was too soft for a placement-changing event).
+    The conversion proceeds; the colliding scripts appear as orphan
+    rows in the curated view. Once slice 5's storage_classifier
+    rewrite reads ``caller_graph``, the orphan-fallback routes them
+    to ReplicatedStorage. Until then the legacy storage_classifier
+    continues its own lossy class_name-keyed routing — slice 5 is
+    where the degraded-service promise becomes user-visible (slice 3
+    round 3 P1.1: the policy is forward-looking, not current
+    behavior).
+
+    Lives OUTSIDE ``_enforce_invariants`` (which validates artifact
+    outputs) because this check operates on INPUTS and informs the
+    derivation. Running it pre-derivation keeps the producer
+    structurally aware of the excluded class_names (Claude review
+    slice 3 round 2 P1).
+
+    Empty return tuple components when ``dependency_map`` is
+    None/empty.
+    """
+    if not dependency_map:
+        return frozenset(), {}
+    modules_in = cast(
+        dict[str, dict[str, object]], scene_runtime.get("modules", {}),
+    )
+    # Phase 2a slice 4 round 5 (Claude P1.1): consume the unified
+    # ``compute_class_name_collisions`` set so this site shares one
+    # canonical collision policy with the planner's
+    # ``build_scripts_by_class_name`` and (round 5) the reachability
+    # rule's ``class_to_script_id`` index. The dep_map-touched filter
+    # below is the SUBSET that affects caller_graph — the underlying
+    # collision detection is shared.
+    from converter.scene_runtime_planner import (
+        compute_class_name_collisions,
+    )
+    all_collisions = compute_class_name_collisions(modules_in)
+    # Still build per-class script_id lists so the log message can
+    # name the competing script_ids for operators.
+    class_to_script_ids: dict[str, list[str]] = {}
+    for script_id, module in modules_in.items():
+        cn_obj = module.get("class_name", "")
+        if isinstance(cn_obj, str) and cn_obj:
+            class_to_script_ids.setdefault(cn_obj, []).append(script_id)
+
+    # Class_names referenced as caller or callee in dep_map.
+    touched_classes: set[str] = set(dependency_map.keys())
+    for callees in dependency_map.values():
+        for c in callees:
+            if isinstance(c, str):
+                touched_classes.add(c)
+
+    excluded: set[str] = set()
+    class_to_script_id: dict[str, str] = {}
+    for cn, sids in class_to_script_ids.items():
+        # The dep-map-touched filter is what makes a collision matter
+        # for caller_graph — exclude only those.
+        if cn in all_collisions and cn in touched_classes:
+            excluded.add(cn)
+            continue
+        # Non-colliding (or untouched-collision): keep the first
+        # script_id. setdefault preserves first-write semantics,
+        # consistent with _build_modules_block's scripts_by_class.
+        class_to_script_id[cn] = sids[0]
+
+    if excluded:
+        # One log entry per collision so operators can grep + count.
+        for cn in sorted(excluded):
+            sids = sorted(class_to_script_ids[cn])
+            log.error(
+                "[scene_runtime_topology] class_name %r maps to %d "
+                "script_ids %r AND appears in dependency_map; "
+                "excluding from caller_graph (lossy class_name "
+                "keyspace). Slice 5's storage_classifier rewrite "
+                "(when it lands) will see these as orphan modules "
+                "and route to ReplicatedStorage. Today's legacy "
+                "storage_classifier continues its own lossy "
+                "class_name routing for the same scripts. Promote "
+                "dependency_map's keyspace to script_id at planner "
+                "construction or split the colliding class to "
+                "restore precise routing.",
+                cn, len(sids), sids,
+            )
+
+    return frozenset(excluded), class_to_script_id
+
+
 # ---------------------------------------------------------------------------
 # Invariants
 # ---------------------------------------------------------------------------
@@ -460,13 +960,28 @@ def _enforce_invariants(
     *,
     emitted_animations: list[EmittedAnimation],
     scene_runtime: SceneRuntimeArtifact,
+    skip_invariant_3: bool = False,
 ) -> None:
-    """Apply the 6 emit-time invariants. Raises on any violation.
+    """Apply the post-derivation emit-time invariants. Raises on any
+    violation.
 
     Each invariant is a single ``for`` loop with a clear failure
     message. The errors are catchable (``TopologyInvariantError``) so
     test code can assert specific invariant numbers without scraping
     log output.
+
+    Invariant 9 (the input-collision check) lives in
+    ``_detect_caller_graph_collisions`` and runs pre-derivation, NOT
+    here — see that helper's docstring for rationale.
+
+    ``skip_invariant_3`` (Phase 2a slice 3 round 4) bypasses the
+    emission ↔ driver 1:1 cross-check when the caller supplied
+    ``preserved_animation_drivers``. We don't have the original
+    emissions to cross-check against (the persisted artifact dropped
+    them when it was first written). Invariants 1, 4, 5, 6 still run
+    on the preserved drivers block — if the prior build was valid
+    those still hold; if the persisted artifact has been hand-edited
+    into an invalid state, those catch it.
     """
     modules_block = artifact.get("modules", {})
     animation_drivers = artifact.get("animation_drivers", {})
@@ -475,10 +990,20 @@ def _enforce_invariants(
     # Invariant 1 + 6: applied ONLY to resolved entries. Unresolved /
     # orphan entries have empty ``driver_module_guid`` by design (Phase
     # 1 narrowing limitation / deliberate orphan) and skip both checks.
-    # The tautological "anim_domain == driver_domain" check from the
-    # earlier draft is dropped — the entry's domain is built FROM the
-    # driver's domain in ``_build_animation_drivers_block``, so the
-    # equality could never fail by construction (subagent finding #1).
+    # The anim.domain == driver_module.domain equality check was
+    # tautological at fresh-build time (the entry's domain is BUILT
+    # FROM the driver's domain in ``_build_animation_drivers_block``).
+    # Slice 3 round 4 introduced ``preserved_animation_drivers``, which
+    # copies entries verbatim while ``modules_block`` is rebuilt from
+    # current classifier output — that breaks the by-construction
+    # tautology. Codex review slice 3 round 6 P1 flagged the gap: a
+    # ``domain_overrides`` / ``networking`` edit between runs moves a
+    # driver module's domain, but the preserved animation driver row
+    # keeps the old domain. Re-add the equality check so the topology
+    # cannot ship a self-contradictory ``animation_drivers[*].domain``
+    # vs ``modules[driver_guid].domain`` pair. On the fresh-build path
+    # the check remains tautological (no perf cost beyond a dict
+    # lookup).
     for stable_id, anim in animation_drivers.items():
         status = anim.get("routing_status", "")
         if status != "resolved":
@@ -505,6 +1030,19 @@ def _enforce_invariants(
                 f"(must be client or server)",
                 row=anim,
             )
+        anim_domain = anim.get("domain", "")
+        if anim_domain != driver_domain:
+            _abort(
+                1,
+                f"resolved animation driver {stable_id!r} has "
+                f"domain={anim_domain!r} but its driver module "
+                f"{driver_guid!r} now has domain={driver_domain!r} "
+                f"— stale preserved animation_drivers on a build "
+                f"whose classifier output changed. Re-run from "
+                f"convert_animations or clear the cached topology "
+                f"to refresh the routing.",
+                row=anim,
+            )
 
     # Invariant 2: every edge has producer + consumer with defined
     # runtime domains. ``compute_cross_domain_edges`` already filters out
@@ -527,42 +1065,48 @@ def _enforce_invariants(
     # must map to a stable_id present in animation_drivers (no script
     # without an entry), and each animation_drivers key must originate
     # from an emission (no spurious entries).
-    expected_stable_ids: dict[str, str] = {}
-    for row in emitted_animations:
-        # Mirror the keying choice in _build_animation_drivers_block:
-        # scope_ref (planner-stable) for the segment, ORPHAN_SCOPE
-        # sentinel when empty.
-        scope_ref = row.get("scope_ref", "")
-        scope_segment = scope_ref if scope_ref else ORPHAN_SCOPE
-        sid = compute_stable_id(
-            scope_segment,
-            row.get("ctrl_key", "") or None,
-            row.get("clip_disp", ""),
-        )
-        if sid in expected_stable_ids:
-            _abort(
-                3,
-                f"two emitted animations collide on stable_id {sid!r}: "
-                f"{expected_stable_ids[sid]!r} and {row.get('script_name', '')!r} "
-                f"— upstream disambiguator failed",
-                row=row,
+    #
+    # Skipped on the preserved-drivers resume path: we don't have
+    # original emissions to cross-check (see ``skip_invariant_3``).
+    # Invariants 4-8 below still run — they validate the preserved
+    # block's internal shape, which guards against on-disk tampering.
+    if not skip_invariant_3:
+        expected_stable_ids: dict[str, str] = {}
+        for row in emitted_animations:
+            # Mirror the keying choice in _build_animation_drivers_block:
+            # scope_ref (planner-stable) for the segment, ORPHAN_SCOPE
+            # sentinel when empty.
+            scope_ref = row.get("scope_ref", "")
+            scope_segment = scope_ref if scope_ref else ORPHAN_SCOPE
+            sid = compute_stable_id(
+                scope_segment,
+                row.get("ctrl_key", "") or None,
+                row.get("clip_disp", ""),
             )
-        expected_stable_ids[sid] = row.get("script_name", "")
-    for sid in animation_drivers:
-        if sid not in expected_stable_ids:
-            _abort(
-                3,
-                f"animation driver {sid!r} has no corresponding emission",
-                row=animation_drivers[sid],
-            )
-    for sid, script_name in expected_stable_ids.items():
-        if sid not in animation_drivers:
-            _abort(
-                3,
-                f"emitted animation {script_name!r} has no driver entry "
-                f"(stable_id {sid!r})",
-                row={"script_name": script_name, "stable_id": sid},
-            )
+            if sid in expected_stable_ids:
+                _abort(
+                    3,
+                    f"two emitted animations collide on stable_id {sid!r}: "
+                    f"{expected_stable_ids[sid]!r} and {row.get('script_name', '')!r} "
+                    f"— upstream disambiguator failed",
+                    row=row,
+                )
+            expected_stable_ids[sid] = row.get("script_name", "")
+        for sid in animation_drivers:
+            if sid not in expected_stable_ids:
+                _abort(
+                    3,
+                    f"animation driver {sid!r} has no corresponding emission",
+                    row=animation_drivers[sid],
+                )
+        for sid, script_name in expected_stable_ids.items():
+            if sid not in animation_drivers:
+                _abort(
+                    3,
+                    f"emitted animation {script_name!r} has no driver entry "
+                    f"(stable_id {sid!r})",
+                    row={"script_name": script_name, "stable_id": sid},
+                )
 
     # Invariant 4: every lifecycle_role in the closed enum. The Literal
     # type makes this true at the type system level; we still check at
@@ -609,6 +1153,164 @@ def _enforce_invariants(
                 row=entry,
             )
 
+    # Invariant 8 (Phase 2a slice 2 round 3): lifecycle_role
+    # consistent with gated inputs. One-way implication: if the role
+    # is "loader" or "character_attached", the inputs that produced it
+    # must satisfy the gates inside derive_module_lifecycle_role.
+    # The OPPOSITE direction is NOT enforced — `is_loader=True` may
+    # coexist with `lifecycle_role != "loader"` when a gate fired
+    # (this is the deliberate raw-hint-vs-gated-decision divergence
+    # documented on TopologyModuleEntry).
+    for guid, mod_entry in modules_block.items():
+        role = mod_entry.get("lifecycle_role", "")
+        if role == "loader":
+            if not mod_entry.get("is_loader", False):
+                _abort(
+                    8,
+                    f"module {guid!r} has lifecycle_role='loader' but "
+                    f"is_loader=False — derive_module_lifecycle_role's "
+                    f"loader branch requires is_loader=True",
+                    row=mod_entry,
+                )
+            sc = mod_entry.get("script_class", "")
+            if sc not in ("Script", "LocalScript"):
+                _abort(
+                    8,
+                    f"module {guid!r} has lifecycle_role='loader' but "
+                    f"script_class={sc!r} — only Script/LocalScript "
+                    f"can be loaders",
+                    row=mod_entry,
+                )
+            if mod_entry.get("domain", "") != "client":
+                _abort(
+                    8,
+                    f"module {guid!r} has lifecycle_role='loader' but "
+                    f"domain={mod_entry.get('domain', '')!r} — "
+                    f"loaders are always client-domain",
+                    row=mod_entry,
+                )
+        elif role == "character_attached":
+            if not mod_entry.get("character_attached", False):
+                _abort(
+                    8,
+                    f"module {guid!r} has "
+                    f"lifecycle_role='character_attached' but "
+                    f"character_attached=False",
+                    row=mod_entry,
+                )
+            if mod_entry.get("domain", "") != "client":
+                _abort(
+                    8,
+                    f"module {guid!r} has "
+                    f"lifecycle_role='character_attached' but "
+                    f"domain={mod_entry.get('domain', '')!r} — "
+                    f"character-attached scripts are always "
+                    f"client-domain",
+                    row=mod_entry,
+                )
+
+    # Invariant 7 (Phase 2a slice 2): every runtime-bearing planner row
+    # must carry both `character_attached` and `is_loader` booleans.
+    # Reads the PLANNER input (scene_runtime["modules"]) rather than the
+    # topology output because the goal is to catch a planner artifact
+    # that came in WITHOUT these fields — _build_modules_block defaults
+    # them to False on read, so a check against the output is
+    # tautological. The fail-closed case is an on-disk plan from a
+    # pre-slice-2 converter version, or a test fixture that hand-rolls
+    # `scene_runtime["modules"]` rows without going through the planner.
+    planner_modules = cast(
+        dict[str, dict[str, object]], scene_runtime.get("modules", {}),
+    )
+    for script_id, planner_module in planner_modules.items():
+        if not bool(planner_module.get("runtime_bearing", False)):
+            # Helpers and non-instance-backed rows don't have a
+            # lifecycle role to derive, so the inputs aren't required.
+            continue
+        ca = planner_module.get("character_attached", None)
+        if not isinstance(ca, bool):
+            _abort(
+                7,
+                f"runtime-bearing module {script_id!r} is missing "
+                f"`character_attached: bool` on the planner row (got "
+                f"{ca!r}); Phase 2a slice 2 requires every runtime_bearing "
+                f"row to carry it",
+                row=planner_module,
+            )
+        il = planner_module.get("is_loader", None)
+        if not isinstance(il, bool):
+            _abort(
+                7,
+                f"runtime-bearing module {script_id!r} is missing "
+                f"`is_loader: bool` on the planner row (got {il!r}); "
+                f"Phase 2a slice 2 requires every runtime_bearing row "
+                f"to carry it",
+                row=planner_module,
+            )
+
+    # Invariant 9 lives in `_detect_caller_graph_collisions` (called
+    # pre-derivation from `build_topology`). It's an INPUT validator,
+    # not an output one — keeping it here would let a future producer
+    # added between derivation and output validation leak the lossy
+    # data before invariant 9 fires (Claude review slice 3 round 2 P1).
+
+    # Invariant 10 (Phase 2a slice 4): reachability triple-write
+    # atomicity. The three fields mirror the planner's
+    # ``_apply_reachability_rule`` triple-write (parent_path +
+    # container + module_path + reachability_forced_container, with
+    # codex P1.1's atomicity guarantee that the triple stays in
+    # lockstep). Topology mirrors three of those onto each
+    # TopologyModuleEntry; this invariant enforces lockstep on the
+    # mirrored fields.
+    for guid, mod_entry in modules_block.items():
+        required = mod_entry.get("reachability_required_container", "")
+        forced = mod_entry.get("reachability_forced_container", "")
+        module_path_v = mod_entry.get("module_path", "")
+        # Both reachability fields are populated together by the
+        # planner. A non-empty/empty mismatch indicates a
+        # hand-edited artifact or a refactor that split the
+        # triple-write.
+        if bool(required) != bool(forced):
+            _abort(
+                10,
+                f"module {guid!r} has mismatched reachability fields: "
+                f"reachability_required_container={required!r}, "
+                f"reachability_forced_container={forced!r} "
+                f"— planner stamps these in lockstep, so one without "
+                f"the other indicates a hand-edited artifact",
+                row=mod_entry,
+            )
+        if required and forced and required != forced:
+            _abort(
+                10,
+                f"module {guid!r} has divergent reachability values: "
+                f"reachability_required_container={required!r}, "
+                f"reachability_forced_container={forced!r} "
+                f"— planner stamps both with the same container",
+                row=mod_entry,
+            )
+        # Slice 4 round 1 review (Claude P1.2): accept BOTH
+        # ``module_path == required`` (the container itself, no
+        # module suffix — e.g. a top-level container row) AND
+        # ``module_path.startswith(f"{required}.")`` (the strict
+        # child case). The pre-fix `startswith(f"{required}.")`
+        # rejected the legitimate exact-match case AND a bare
+        # `startswith(required)` would false-positive on a
+        # sibling-container prefix like ``ReplicatedStorageOther.X``.
+        if required and module_path_v != required and not (
+            module_path_v.startswith(f"{required}.")
+        ):
+            _abort(
+                10,
+                f"module {guid!r} has reachability_required_container="
+                f"{required!r} but module_path={module_path_v!r} does "
+                f"not equal the container nor start with that "
+                f"container plus a dot — the planner's codex P1.1 fix "
+                f"rewrites module_path together with the rule's "
+                f"container so the host's resolveModule call lands at "
+                f"the actually-hoisted location",
+                row=mod_entry,
+            )
+
 
 __all__ = (
     "EmittedAnimation",
@@ -617,4 +1319,5 @@ __all__ = (
     "TopologyModuleEntry",
     "TopologyProvenance",
     "build_topology",
+    "callers_of",
 )

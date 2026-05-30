@@ -45,6 +45,12 @@ def _seed_scene_runtime(pipeline: Pipeline) -> dict[str, object]:
         "modules": {
             "guid-a": {
                 "stem": "Foo", "class_name": "Foo", "runtime_bearing": True,
+                # Phase 2a slice 2: build_topology invariant 7 requires
+                # both booleans on every runtime_bearing planner row;
+                # without them, any code path that reaches
+                # build_topology (e.g. when this fixture is reused under
+                # `scene_runtime_mode != "legacy"`) fails closed.
+                "character_attached": False, "is_loader": False,
             },
         },
         "scenes": {

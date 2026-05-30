@@ -3991,10 +3991,22 @@ script.Disabled = true
                 classify_scene_runtime_domains,
                 migrate_legacy_domain_values,
             )
+            from converter.scene_runtime_planner import (
+                backfill_lifecycle_role_inputs,
+            )
             # Migrate any pre-v2 ``"legacy"`` domain values lurking in the
             # on-disk plan we just merged (the on-disk plan may have been
             # produced by an older converter run). Idempotent.
             migrate_legacy_domain_values(cast("dict", scene_runtime))
+            # Phase 2a slice 2: backfill ``character_attached`` /
+            # ``is_loader`` on runtime-bearing module rows that pre-date
+            # slice 2. Without this, a user resuming a pre-slice-2
+            # conversion hits ``build_topology`` invariant 7 on every
+            # runtime-bearing row. The backfill uses the same
+            # ``REPLICATED_FIRST_HINTS`` regex the planner stamps with,
+            # so a resume produces the same artifact a fresh replan
+            # would. Idempotent.
+            backfill_lifecycle_role_inputs(cast("dict", scene_runtime))
             networking = getattr(self.ctx, "networking_mode", "none")
             strict = bool(getattr(self.ctx, "strict_classification", False))
             report = classify_scene_runtime_domains(
@@ -4112,36 +4124,120 @@ script.Disabled = true
         """
         if self.state.rbx_place is None:
             return
-        if (
-            self.state.animation_result is None
-            or not getattr(
-                self.state.animation_result, "emitted_animations", None,
+
+        # Phase 2a slice 3 round 4 fix (Claude P1.A + P1.B): the
+        # round-3 "early return when animation_result is None" guard
+        # over-fired in two ways. (1) It fired on legitimate
+        # fresh-no-animations paths (--no-animations flag, projects
+        # without .anim files, test paths skipping convert_animations)
+        # and regressed slice 3 round 1's "topology always built"
+        # goal. (2) It preserved the WHOLE persisted topology on
+        # resume, including a now-stale caller_graph alongside a
+        # freshly-rebuilt state.dependency_map — silent divergence
+        # by construction.
+        #
+        # The structural fix is to ALWAYS rebuild modules + edges +
+        # caller_graph from current state, AND preserve the prior
+        # animation_drivers block ONLY when we lack fresh emission
+        # data. The prior topology block lives at
+        # ``scene_runtime["topology"]`` after ``_merge_scene_runtime``
+        # rehydrates it from a previous ``conversion_plan.json``;
+        # ``animation_result is None`` is the signal for "no fresh
+        # emissions available."
+        prior_topology = scene_runtime.get("topology", {})
+        if not isinstance(prior_topology, dict):
+            prior_topology = {}
+
+        if self.state.animation_result is not None:
+            # Fresh animation data available (covers fresh-with-anims
+            # AND fresh-no-anims — emitted_animations is just empty
+            # in the latter).
+            emitted_animations: list = list(
+                self.state.animation_result.emitted_animations,
             )
-        ):
-            # No animation emissions → nothing to route. Skip the
-            # build_topology call to keep test fixtures that omit
-            # animation_result green.
-            return
+            preserved_animation_drivers = None
+        else:
+            # No fresh animation data this build. If the persisted
+            # topology has a prior animation_drivers block, preserve
+            # it; otherwise emit empty (first-time-no-anims resume).
+            emitted_animations = []
+            pad = prior_topology.get("animation_drivers", {})
+            preserved_animation_drivers = (
+                pad if isinstance(pad, dict) and pad else None
+            )
+
+        # Phase 2a slice 3 round 5 (codex P2): on
+        # assemble-without-retranspile workflows, ``transpile_scripts``
+        # doesn't rerun and ``state.dependency_map`` stays empty —
+        # preserve the prior ``caller_graph`` so we don't overwrite
+        # it with ``{}``.
+        #
+        # Round 6 (codex P2): use ``transpilation_result`` rather
+        # than the dep_map's truthiness as the "did transpile run
+        # this invocation?" signal. A genuine retranspile that
+        # removes the last cross-script reference ALSO leaves
+        # dep_map empty — using dep_map alone would silently carry
+        # forward stale callers in that case. ``transpilation_result``
+        # is set IFF transpile_scripts ran this invocation (both are
+        # populated in the same code path, pipeline.py:1942-1971);
+        # an empty dep_map alongside a populated transpilation_result
+        # is the legitimate "ran with no edges" case (use the empty
+        # fresh graph, don't preserve).
+        if self.state.transpilation_result is not None:
+            preserved_caller_graph = None
+        else:
+            pcg = prior_topology.get("caller_graph", {})
+            preserved_caller_graph = (
+                pcg if isinstance(pcg, dict) and pcg else None
+            )
 
         from converter.scene_runtime_topology.build_topology import (
             build_topology,
         )
 
-        scripts_by_class: dict[str, RbxScript] = {}
-        for s in self.state.rbx_place.scripts:
-            if s.name:
-                scripts_by_class.setdefault(s.name, s)
+        # Phase 2a slice 4 round 3 review (Claude P1.A): use the
+        # shared ``build_scripts_by_class_name`` helper so the
+        # pipeline + planner share ONE source of truth for the
+        # class_name → script join. Pre-fix the pipeline keyed by
+        # ``script.name`` (file stem) but downstream consumers
+        # (build_topology._build_modules_block) looked up via
+        # module rows' ``class_name`` — same name-vs-class-name
+        # conflation slice 4 round 2 fixed in the planner.
+        from converter.scene_runtime_planner import (
+            build_scripts_by_class_name,
+        )
+        modules_in = scene_runtime.get("modules", {}) or {}
+        scripts_by_class = build_scripts_by_class_name(
+            self.state.rbx_place.scripts,
+            cast("dict", modules_in),
+        )
 
         try:
             artifact = build_topology(
                 scene_runtime=cast(
                     "SceneRuntimeArtifact", scene_runtime,
                 ),
-                emitted_animations=list(
-                    self.state.animation_result.emitted_animations,
-                ),
+                emitted_animations=emitted_animations,
                 scripts_by_class=scripts_by_class,
                 guid_index=self.state.guid_index,
+                # Phase 2a slice 3: pass the planner's class-keyed
+                # dependency_map so build_topology can curate it into
+                # the artifact's `caller_graph` (script_id-keyed
+                # incoming-edge view). `None` is treated as empty
+                # graph — back-compat for callers pre-dating slice 3.
+                dependency_map=self.state.dependency_map or None,
+                # Phase 2a slice 3 round 4: preserve prior
+                # animation_drivers on resume / no-fresh-emissions
+                # builds (caller computed above). Build_topology
+                # uses the preserved block verbatim and skips
+                # invariant 3 — see its docstring for the contract.
+                preserved_animation_drivers=preserved_animation_drivers,
+                # Phase 2a slice 3 round 5: preserve prior
+                # caller_graph on assemble-no-retranspile workflows
+                # where state.dependency_map is empty. Without this
+                # the prior populated graph would be overwritten
+                # with {} on every assemble rerun.
+                preserved_caller_graph=preserved_caller_graph,
             )
         except Exception as exc:
             # Topology invariants are fail-closed by design, but
@@ -4166,6 +4262,18 @@ script.Disabled = true
         # preserve today's server placement.
         animation_drivers = artifact.get("animation_drivers", {})
         if not animation_drivers:
+            return
+        # The application loop below maps emissions → drivers by
+        # script_name. On resume (animation_result is None) we have
+        # preserved drivers but no fresh emissions to walk. The
+        # persisted animation_drivers in scene_runtime["topology"]
+        # survives the rebuild and downstream readers consult it;
+        # RbxScripts on resume rely on their persisted parent_path
+        # from the cached conversion. Skipping the apply loop here is
+        # the slice-3-scoped fix; deeper resume semantics for
+        # RbxScript application are pre-existing scope (slice 3 round
+        # 4 fix didn't introduce this resume gap).
+        if self.state.animation_result is None:
             return
         # Index drivers by script_name so the apply loop is O(n).
         drivers_by_script_name: dict[str, dict[str, object]] = {}
