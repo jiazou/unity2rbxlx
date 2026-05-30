@@ -33,6 +33,26 @@ structural pre-transpile equivalent of today's hardcoded
 — lifted to a data table so the bridge emitter (slice 3) can consume it
 instead of the prompt embedding the RemoteEvent name forever.
 
+R1 wiring (codex P1, 2026-05-30): ``build_topology`` routes the two
+producers to SEPARATE artifact buckets, not a concatenated list:
+
+  - ``compute_cross_domain_edges`` outputs land in
+    ``artifact["cross_domain_edges"]`` — fully resolved, every row has a
+    runtime ``from_domain`` and ``to_domain`` and passes
+    ``_enforce_invariants`` invariant 2.
+  - ``compute_shared_attribute_candidates`` outputs land in
+    ``artifact["cross_domain_edge_candidates"]`` — fan-out shape with
+    empty ``to_*`` until slice 2 enrichment resolves consumers and
+    populates ``bridge_member_scripts``. Invariant 2 does NOT iterate
+    this bucket.
+
+Slice 2 enrichment reads from ``cross_domain_edge_candidates``, resolves
+domains + bridge members, and either promotes rows to
+``cross_domain_edges`` or keeps the two-bucket separation indefinitely
+(slice 2 decides). The two functions in this module remain pure producers
+with no awareness of the artifact buckets — wiring lives in
+``build_topology``.
+
 The CrossDomainEdge schema is intentionally KEPT FLAT (no nested
 ``producer{}/consumer{}`` sub-objects) for slice 1. The design doc's
 example (L228-251) shows a nested shape; that restructure is deferred
