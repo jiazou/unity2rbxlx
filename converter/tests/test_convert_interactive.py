@@ -200,6 +200,11 @@ class TestResumeVsRunThroughParity:
         assert Pipeline.ESSENTIAL_PHASES == frozenset({
             "parse", "extract_assets", "convert_materials",
             "transpile_scripts", "convert_animations", "convert_scene",
+            # Phase 2a slice 8: ``materialize_and_classify`` populates
+            # ``rbx_place.scripts`` in-memory; it must re-run on every
+            # resumed invocation so a ``--phase=write_output`` resume
+            # gets the populated script list.
+            "materialize_and_classify",
         })
 
     def test_prereq_phases_identical_minus_cloud(self):

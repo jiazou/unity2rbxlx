@@ -34,6 +34,9 @@ def _parse_write_output_call_sequence() -> list[str]:
         "_bind_scripts_to_parts",
         "_inject_runtime_modules",
         "_generate_prefab_packages",
+        # Phase 2a slice 8: Option (b) safety-net classify pass for
+        # late-appended autogen / runtime / scene-runtime scripts.
+        "_classify_late_appended_scripts",
     }
     calls: list[str] = []
     for node in ast.walk(tree):
