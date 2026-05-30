@@ -34,8 +34,11 @@ from core.unity_types import (
 )
 from converter.scene_runtime_planner import (
     build_require_graph,
+    build_script_id_by_name,
+    derive_intrinsic_script_class,
     plan_scene_runtime,
 )
+from core.roblox_types import RbxScript
 
 
 # ---------------------------------------------------------------------------
@@ -1137,3 +1140,183 @@ class TestScenePrefabPlacements:
         placements = artifact["scene_prefab_placements"]
         assert len(placements) == 1
         assert "parent_game_object_id" not in placements[0]
+
+
+# ---------------------------------------------------------------------------
+# Phase 2a slice 5 round 2: intrinsic script_class helper
+# ---------------------------------------------------------------------------
+
+class TestDeriveIntrinsicScriptClass:
+    """``derive_intrinsic_script_class`` returns the script's class as
+    determined at construction time, stamped into the immutable
+    ``RbxScript.intrinsic_script_type`` field by the transpiler /
+    animation-gen / scriptable-object emit paths. The helper
+    consults that immutable field so the answer is invariant to
+    post-construction mutations of the mutable ``script_type`` (e.g.
+    ``classify_storage``'s ``Script→LocalScript`` coercion). Falls back
+    to ``script_type`` when ``intrinsic_script_type`` is unset (the
+    rehydration / pre-field-introduction path).
+    """
+
+    def test_script_type_is_returned_as_is_via_fallback(self) -> None:
+        # No intrinsic_script_type set — falls back to script_type
+        # (the rehydration / pre-field-introduction path).
+        s = RbxScript(name="Foo", source="return 1", script_type="LocalScript")
+        assert derive_intrinsic_script_class(s) == "LocalScript"
+
+    def test_module_script_returned_for_module(self) -> None:
+        s = RbxScript(name="Foo", source="return 1", script_type="ModuleScript")
+        assert derive_intrinsic_script_class(s) == "ModuleScript"
+
+    def test_server_script_returned_for_script(self) -> None:
+        s = RbxScript(name="Foo", source="return 1", script_type="Script")
+        assert derive_intrinsic_script_class(s) == "Script"
+
+    def test_none_script_defaults_to_module_script(self) -> None:
+        # The orphan-row case at build_topology — no emitted script
+        # matches the module's class_name. ModuleScript is the safe
+        # require-target default.
+        assert derive_intrinsic_script_class(None) == "ModuleScript"
+
+    def test_empty_script_type_defaults_to_module_script(self) -> None:
+        s = RbxScript(name="Foo", source="return 1", script_type="")
+        assert derive_intrinsic_script_class(s) == "ModuleScript"
+
+    # Round 2 deliverable — Test A: the WITNESS that the helper is
+    # genuinely intrinsic. Construct an RbxScript whose mutable
+    # script_type has been "mutated" by a simulated classify_storage
+    # pass (Script → LocalScript) while the immutable
+    # intrinsic_script_type retains the pre-classifier value. The
+    # helper MUST return the intrinsic value, NOT the mutated one.
+    # If this test fails, the helper is reading the wrong field — the
+    # round-1 regression where derive_intrinsic_script_class consulted
+    # script_type instead of intrinsic_script_type.
+    def test_helper_returns_intrinsic_not_mutated_script_type(self) -> None:
+        # Simulate the post-classify_storage shape:
+        #   intrinsic_script_type stays at the transpiler's "Script"
+        #   script_type was reassigned to "LocalScript" by classify_storage.
+        s = RbxScript(
+            name="Foo",
+            source="return 1",
+            script_type="LocalScript",          # post-classifier mutation
+            intrinsic_script_type="Script",     # original transpile-time value
+        )
+        # The helper MUST report the intrinsic value, ignoring the
+        # mutated script_type. This is the round-2 contract that
+        # round 1 failed to provide.
+        assert derive_intrinsic_script_class(s) == "Script"
+
+
+# ---------------------------------------------------------------------------
+# Phase 2a slice 5 step 3: RbxScript → script_id accessor
+# ---------------------------------------------------------------------------
+
+class TestBuildScriptIdByName:
+    """``build_script_id_by_name`` mirrors ``build_scripts_by_class_name``
+    in reverse: ``RbxScript.name → SceneRuntimeModule script_id``. Slice
+    6's ``_decide_script_container_from_topology`` will use this for the
+    ``TopologyModuleEntry`` lookup.
+
+    Contract:
+      - Primary join: ``script.name == module.class_name``.
+      - Fallback join: ``script.name == module.stem`` (file-stem differs
+        from declared class name).
+      - Colliding class_names are excluded per the slice-3 degraded-
+        service contract (same as ``build_scripts_by_class_name``).
+    """
+
+    def test_primary_join_by_class_name(self) -> None:
+        modules: dict[str, object] = {
+            "guid-a": {"stem": "Foo", "class_name": "Foo"},
+            "guid-b": {"stem": "Bar", "class_name": "Bar"},
+        }
+        scripts = [
+            RbxScript(name="Foo", source="", script_type="Script"),
+            RbxScript(name="Bar", source="", script_type="LocalScript"),
+        ]
+        idx = build_script_id_by_name(scripts, modules)
+        assert idx == {"Foo": "guid-a", "Bar": "guid-b"}
+
+    def test_fallback_join_by_stem(self) -> None:
+        # Bootstrap.cs declares class GameInit — script name matches
+        # stem ("Bootstrap") but module's class_name is "GameInit".
+        modules: dict[str, object] = {
+            "guid-a": {"stem": "Bootstrap", "class_name": "GameInit"},
+        }
+        scripts = [RbxScript(name="Bootstrap", source="", script_type="Script")]
+        idx = build_script_id_by_name(scripts, modules)
+        assert idx == {"Bootstrap": "guid-a"}
+
+    def test_colliding_class_names_excluded_degraded_service(self) -> None:
+        # Two modules share class_name "Utils" (e.g. Utils.cs in two
+        # different folders). Both rows excluded from the index per the
+        # canonical ``compute_class_name_collisions`` contract — the
+        # consumer falls through to orphan-routing.
+        modules: dict[str, object] = {
+            "guid-a": {"stem": "UtilsA", "class_name": "Utils"},
+            "guid-b": {"stem": "UtilsB", "class_name": "Utils"},
+            "guid-other": {"stem": "Other", "class_name": "Other"},
+        }
+        scripts = [
+            RbxScript(name="Utils", source="", script_type="ModuleScript"),
+            RbxScript(name="Other", source="", script_type="Script"),
+        ]
+        idx = build_script_id_by_name(scripts, modules)
+        # "Utils" → excluded; "Other" → resolved.
+        assert "Utils" not in idx
+        assert idx == {"Other": "guid-other"}
+
+    def test_colliding_stems_excluded_degraded_service(self) -> None:
+        # Round-3 fix (Codex P3): two modules share a ``stem`` whose
+        # class_name differs (e.g. ``Bootstrap.cs`` declares class
+        # ``GameInit`` in one folder; another ``Bootstrap.cs`` declares
+        # class ``BootSequence`` in a sibling folder). Pre-round-3 the
+        # stem-fallback ``setdefault`` silently picked the first writer
+        # — violating the docstring's degraded-service contract that
+        # colliding join keys exclude BOTH rows. After the fix, both
+        # rows fall through to the consumer's orphan-routing branch.
+        modules: dict[str, object] = {
+            "guid-a": {"stem": "Bootstrap", "class_name": "GameInit"},
+            "guid-b": {"stem": "Bootstrap", "class_name": "BootSequence"},
+            "guid-other": {"stem": "Other", "class_name": "Other"},
+        }
+        scripts = [
+            RbxScript(name="Bootstrap", source="", script_type="Script"),
+            RbxScript(name="Other", source="", script_type="Script"),
+        ]
+        idx = build_script_id_by_name(scripts, modules)
+        # "Bootstrap" stem → excluded (collision on the fallback key);
+        # neither row arbitrarily wins.
+        assert "Bootstrap" not in idx
+        # Primary-key lookups for the class_names themselves still work
+        # (the class_name keyspace doesn't have a collision here).
+        assert idx == {"Other": "guid-other"}
+
+    def test_empty_script_names_skipped(self) -> None:
+        modules: dict[str, object] = {
+            "guid-a": {"stem": "Foo", "class_name": "Foo"},
+        }
+        scripts = [
+            RbxScript(name="", source="", script_type=""),  # skipped
+            RbxScript(name="Foo", source="", script_type="Script"),
+        ]
+        idx = build_script_id_by_name(scripts, modules)
+        assert idx == {"Foo": "guid-a"}
+
+    def test_scripts_without_module_row_omitted(self) -> None:
+        # Script present but no corresponding module — the consumer
+        # treats it as an orphan (slice 6's fallthrough branch).
+        modules: dict[str, object] = {}
+        scripts = [RbxScript(name="OrphanScript", source="", script_type="Script")]
+        idx = build_script_id_by_name(scripts, modules)
+        assert idx == {}
+
+    def test_modules_without_matching_script_omitted(self) -> None:
+        # Module row exists but no RbxScript synthesized for it (e.g.
+        # AI-only helper or unwalkable extern base). Not in the index;
+        # consumer falls through.
+        modules: dict[str, object] = {
+            "guid-a": {"stem": "Foo", "class_name": "Foo"},
+        }
+        idx = build_script_id_by_name([], modules)
+        assert idx == {}

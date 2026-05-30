@@ -3810,11 +3810,20 @@ def _inject_player_damage_remote_event(scripts: list["RbxScript"]) -> int:
             fixes += 1
             log.info("  Refreshed %s source", router_name)
     else:
+        # Phase 2a slice 5 round 3: stamp ``intrinsic_script_type`` at
+        # construction so resume rehydration carries the immutable
+        # transpile-time class verbatim. This pack runs in
+        # ``_subphase_cohere_scripts`` (BEFORE ``_classify_storage``),
+        # so ``Script`` here is the pre-coercion value and is safe to
+        # mirror onto ``intrinsic_script_type``. The router is a
+        # deterministic server-side dispatcher — never a LocalScript or
+        # ModuleScript — so the intrinsic is fixed at construction.
         scripts.append(
             RbxScript(
                 name=router_name,
                 source=_DAMAGE_ROUTER_SOURCE,
                 script_type="Script",
+                intrinsic_script_type="Script",
                 parent_path="ServerScriptService",
             )
         )
@@ -4360,11 +4369,19 @@ def _inject_localscript_api_shim(scripts: list["RbxScript"]) -> int:
             (s for s in scripts if s.name == shim_name), None,
         )
         if existing_shim is None:
+            # Phase 2a slice 5 round 3: stamp ``intrinsic_script_type``
+            # at construction so resume rehydration restores the
+            # immutable transpile-time class verbatim. This pack runs
+            # in ``_subphase_cohere_scripts`` (BEFORE
+            # ``_classify_storage``); ``classify_storage`` never coerces
+            # ModuleScript to any other class, so ``ModuleScript`` here
+            # is the intrinsic value by construction.
             scripts.append(
                 RbxScript(
                     name=shim_name,
                     source=shim_source,
                     script_type="ModuleScript",
+                    intrinsic_script_type="ModuleScript",
                     parent_path="ReplicatedStorage",
                 )
             )

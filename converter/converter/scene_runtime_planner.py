@@ -1152,6 +1152,43 @@ def compute_class_name_collisions(
     return frozenset(collisions)
 
 
+def _compute_stem_collisions(
+    modules: dict[str, "SceneRuntimeModule | dict[str, object]"],
+) -> frozenset[str]:
+    """Return the set of ``stem`` values that appear on more than one
+    ``SceneRuntimeModule`` row.
+
+    Phase 2a slice 5 round 3 (Codex P3): the stem keyspace was the
+    fallback join channel in ``build_script_id_by_name`` but had no
+    collision-exclusion gate — ``setdefault`` silently picked the
+    first writer when two modules shared a stem, violating the
+    docstring's degraded-service contract ("colliding class_names
+    exclude BOTH rows"). This helper mirrors
+    ``compute_class_name_collisions`` for the stem keyspace so the
+    contract is uniform across both join channels.
+
+    Only counts stems that DIFFER from their row's ``class_name``
+    (matching stems are already covered by the class_name index).
+    Empty stems are ignored.
+    """
+    seen: set[str] = set()
+    collisions: set[str] = set()
+    for _script_id, module in modules.items():
+        if not isinstance(module, dict):
+            continue
+        cn_obj = module.get("class_name", "")
+        cn = cn_obj if isinstance(cn_obj, str) else ""
+        stem_obj = module.get("stem", "")
+        stem = stem_obj if isinstance(stem_obj, str) else ""
+        if not stem or stem == cn:
+            continue
+        if stem in seen:
+            collisions.add(stem)
+        else:
+            seen.add(stem)
+    return frozenset(collisions)
+
+
 # Legacy heading retained — refactored in round 5 to consume the
 # unified collision helper above. See the helper's docstring for the
 # rationale.
@@ -1234,6 +1271,185 @@ def build_scripts_by_class_name(
                 joined = script_by_name.get(stem)
         if joined is not None:
             out[cn] = joined  # no setdefault — collisions already excluded
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Intrinsic script_class derivation (Phase 2a slice 5 round 2).
+#
+# The cycle this breaks: pre-slice-5, ``build_topology._build_modules_block``
+# read ``RbxScript.script_type`` AFTER ``storage_classifier.classify_storage``
+# had mutated it (the LocalScript-in-SSS coercion + StarterPlayerScripts /
+# StarterCharacterScripts post-pass at ``storage_classifier.py:185-194``).
+# That made topology a DOWNSTREAM consumer of storage routing — but the
+# design contract has topology AUTHORITY over storage.
+#
+# Round 1 tried to fix this by reordering the pipeline so build_topology
+# ran BEFORE classify_storage; review consensus rejected that approach
+# (see the revert commit message). Round 2 instead captures the
+# pre-classifier ``script_type`` in a NEW IMMUTABLE field
+# ``RbxScript.intrinsic_script_type`` stamped at construction time
+# (transpile / animation-gen / scriptable-object emit). This helper
+# reads through that field so the artifact's ``script_class`` reflects
+# the C# code-analysis decision regardless of the build_topology call
+# site's position in the pipeline.
+# ---------------------------------------------------------------------------
+
+def derive_intrinsic_script_class(script: RbxScript | None) -> str:
+    """Return the intrinsic Roblox script class for ``script``.
+
+    "Intrinsic" means the value determined at the script's birth —
+    by ``code_transpiler._classify_script_type`` for transpiled
+    scripts, or by the producing module (animation generators,
+    ScriptableObject emitter) for non-transpiled scripts. This value
+    is stamped ONCE into ``RbxScript.intrinsic_script_type`` at
+    construction time and NEVER mutated afterward.
+
+    Returns the script_class as determined at transpile time; never
+    reflects post-transpile mutations like ``classify_storage``'s
+    ``LocalScript`` coercion or ``_build_and_apply_topology``'s
+    animation_drivers ``Script→LocalScript`` flip. Both pass through
+    the mutable ``script_type``; neither touches
+    ``intrinsic_script_type``.
+
+    Pre-classifier mutators robustness
+    -------------------------------------------------------------
+    The intrinsic value is specifically robust against the two
+    pre-classifier mutators that today are GATED OFF from the
+    topology consumer:
+
+      (a) ``classify_storage``'s ``Script→LocalScript`` routing
+          coercion (still gated by ``build_topology``'s consumer
+          design — topology reads intrinsic, not the mutable field).
+      (b) ``_subphase_cohere_scripts``'s
+          ``fix_require_classifications`` ``Script→ModuleScript``
+          rewrite, gated by generic-mode early-return (see
+          ``pipeline.py:2837-2843``); ``build_topology`` consumption
+          is itself gated to generic-mode (see
+          ``pipeline.py:4057-4058``).
+
+    If either gate is ever lifted, re-stamp
+    ``intrinsic_script_type`` after the relevant mutator runs so the
+    immutable-field contract holds at the topology consumption site.
+
+    Returns ``"ModuleScript"`` when ``script`` is ``None`` (the
+    require-target / orphan-module case at
+    ``build_topology._build_modules_block``).
+
+    Fallback for non-transpiled / pre-field-introduction paths
+    -------------------------------------------------------------
+    When ``intrinsic_script_type`` is ``None`` (set neither by the
+    transpiler nor by an animation/ScriptableObject path), we fall
+    back to ``script.script_type``. In practice this happens for:
+
+      1. **Rehydration** (``_rehydrate_scripts_from_disk``): the
+         stored ``script_type`` reflects the post-classifier value
+         from the prior conversion. A resumed conversion has no
+         fresher signal — preserving the post-classifier reading is
+         the only honest option. The persisted topology artifact's
+         ``script_class`` is preserved verbatim on resume, so this
+         fallback only affects the modest set of rebuilt rows.
+      2. **Scaffolding / coherence-pack synthesized scripts** that
+         pre-date this field's introduction and have not been
+         migrated to stamp it. New construction paths SHOULD stamp
+         ``intrinsic_script_type`` so this fallback narrows over time.
+
+    The fallback is acknowledged-impure but bounded; the immutable-
+    field path is the canonical contract.
+    """
+    if script is None:
+        return "ModuleScript"
+    intrinsic = script.intrinsic_script_type
+    if intrinsic:
+        return intrinsic
+    # Fallback (see docstring): non-transpiled / pre-field-introduction
+    # construction paths fall back to the mutable ``script_type``.
+    fallback = script.script_type
+    if not fallback:
+        return "ModuleScript"
+    return fallback
+
+
+# ---------------------------------------------------------------------------
+# Topology join helper: RbxScript → script_id (Phase 2a slice 5 step 3).
+#
+# Slice 6 will need to look up a ``TopologyModuleEntry`` from an
+# ``RbxScript`` (the storage-classifier decision tree iterates RbxScripts
+# but topology is keyed by script_id). The class_name keyspace is the
+# canonical join channel (same one ``build_scripts_by_class_name`` uses
+# in reverse). This helper builds the FORWARD index so slice 6 can do
+# ``script_id_by_name[s.name]`` → topology entry in one hop.
+# ---------------------------------------------------------------------------
+
+def build_script_id_by_name(
+    scripts: list[RbxScript],
+    modules: dict[str, "SceneRuntimeModule | dict[str, object]"],
+) -> dict[str, str]:
+    """Build a ``script.name -> script_id`` index via the canonical
+    class_name join (primary-then-fallback), with collision exclusion.
+
+    Mirrors ``build_scripts_by_class_name`` (which produces the reverse
+    direction). Both consume ``compute_class_name_collisions`` so the
+    degraded-service contract stays uniform: a class_name shared by
+    two modules excludes BOTH from the index. The consumer (slice 6's
+    ``_decide_script_container_from_topology``) falls through to its
+    orphan-routing branch when ``script_id_by_name.get(script.name)``
+    returns ``None``.
+
+    The join uses the SAME primary-then-fallback rule as
+    ``build_scripts_by_class_name``:
+      1. Primary join: ``script.name == module.class_name``.
+      2. Fallback join: ``script.name == module.stem`` (C# class name
+         differs from file stem — e.g. ``Bootstrap.cs`` contains
+         ``class GameInit``).
+
+    The stem fallback honors a parallel ``colliding_stems`` set built
+    the same way as ``compute_class_name_collisions``: when two modules
+    expose the same stem (a stem that, by itself, would be ambiguous
+    as a join key), BOTH rows are excluded from the index — same
+    degraded-service contract the class_name keyspace uses. Without
+    this gate the prior ``setdefault`` silently picked the first
+    writer, violating the contract spelled out in this docstring.
+
+    Scripts with empty ``name`` are skipped (cannot be addressed via
+    the join). Scripts not present in any ``modules`` row are also
+    omitted — the consumer treats them as orphans.
+    """
+    # Forward index from class_name + stem to script_id, with the same
+    # collision-exclusion contract on BOTH keyspaces.
+    colliding_class_names = compute_class_name_collisions(modules)
+    colliding_stems = _compute_stem_collisions(modules)
+    script_id_by_class_name: dict[str, str] = {}
+    script_id_by_stem: dict[str, str] = {}
+    for script_id, module in modules.items():
+        if not isinstance(module, dict):
+            continue
+        cn_obj = module.get("class_name", "")
+        cn = cn_obj if isinstance(cn_obj, str) else ""
+        if cn and cn not in colliding_class_names:
+            # FIRST-WRITE wins — the colliding-class set has already
+            # excluded ambiguous keys, so any remaining duplicates are
+            # benign (e.g. multiple references to the same canonical row).
+            script_id_by_class_name.setdefault(cn, script_id)
+        stem_obj = module.get("stem", "")
+        stem = stem_obj if isinstance(stem_obj, str) else ""
+        if stem and stem != cn and stem not in colliding_stems:
+            # Stem-fallback index. Skip when stem == class_name (the
+            # primary index already covers it). Skip colliding stems
+            # — both rows excluded per the degraded-service contract.
+            script_id_by_stem.setdefault(stem, script_id)
+
+    out: dict[str, str] = {}
+    for s in scripts:
+        if not s.name:
+            continue
+        # Primary lookup: script.name as class_name.
+        sid = script_id_by_class_name.get(s.name)
+        if sid is None:
+            # Fallback lookup: script.name as stem.
+            sid = script_id_by_stem.get(s.name)
+        if sid is not None:
+            out[s.name] = sid
     return out
 
 

@@ -73,6 +73,32 @@ class RbxScript:
     name: str
     source: str
     script_type: ScriptType = "Script"
+    # Phase 2a slice 5 round 2: the intrinsic Roblox script class as
+    # determined at the script's birth — either by the C# transpiler's
+    # ``_classify_script_type`` pass (for transpiled scripts) or by the
+    # producing module (animation generators, scaffolding, autogen) when
+    # they construct the RbxScript. Set ONCE at construction (typically
+    # mirrors ``script_type``) and NEVER mutated afterward.
+    #
+    # The mutable ``script_type`` field above gets reassigned by
+    # ``storage_classifier.classify_storage`` (Script→LocalScript
+    # coercion for StarterPlayer*/StarterCharacterScripts containers,
+    # see ``storage_classifier.py:185-194``) and by
+    # ``pipeline._build_and_apply_topology``'s animation_drivers apply
+    # phase. Consumers that need to branch on the PRE-coercion class —
+    # the topology artifact's ``script_class`` field is the present one,
+    # and slice 6's storage decision tree will be the next — read
+    # through ``scene_runtime_planner.derive_intrinsic_script_class``
+    # which consults this immutable field.
+    #
+    # ``None`` is allowed for the small set of construction paths that
+    # genuinely cannot know the intrinsic value (e.g. rehydration from
+    # an on-disk plan whose stored ``script_type`` reflects the
+    # post-classifier value, never the pre-classifier one). The helper
+    # falls back to ``script_type`` in that case with an explicit
+    # comment that the fallback is for non-transpiled / rehydrated
+    # scripts only.
+    intrinsic_script_type: ScriptType | None = None
     parent_path: str | None = None     # where to place in hierarchy
     # Relative path within ``<output_dir>/scripts/`` where this script was
     # loaded from or should be written back to. Populated by the fresh-write
