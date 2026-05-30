@@ -4619,6 +4619,18 @@ script.Disabled = true
             # classification bug." Per the slice-6 persistence rule
             # this is a RAW FACT about pipeline execution, not a
             # derived conclusion, so it is safe to carry.
+            #
+            # Slice 10 R2: kept for potential future use; the current
+            # ``_build_modules_block`` read site at
+            # build_topology.py:719 intentionally does NOT consult
+            # ``transpile_ran`` (Option Y -- accept + document the
+            # ``reachability_required_container == ""`` on no-transpile
+            # resume rather than reviving the legacy audit-signal
+            # read or persisting reachability_requirements). The flag
+            # is still consumed by ``storage_classifier``'s slice-6
+            # unconstrained-helper amendment (storage_classifier.py:577),
+            # so the wiring is load-bearing for storage routing even
+            # though it is not consumed by the topology artifact read.
             transpile_ran=self.state.transpilation_result is not None,
         )
 

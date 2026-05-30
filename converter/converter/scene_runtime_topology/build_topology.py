@@ -715,6 +715,60 @@ def _build_modules_block(
         # pipeline call site (``_build_and_apply_topology``) always
         # passes the prepass output, so production runs go through the
         # primary path.
+        #
+        # No-transpile resume semantics (slice 10 R2, Option Y --
+        # accept + document + test-pin):
+        #
+        # On a ``--phase=write_output`` resume the pipeline runs
+        # ``_maybe_run_topology_prepass`` (essential, see slice 6) but
+        # ``state.dependency_map`` is empty (it is populated only inside
+        # ``transpile_scripts``). ``derive_reachability_requirements``
+        # short-circuits ``if not dependency_map: return {}`` (its
+        # module_domain.py:782-783 contract), so the prepass hands us
+        # an EMPTY ``reachability_requirements`` dict (not ``None``).
+        # The primary branch below therefore takes the ``is not None``
+        # path with every ``.get(sid)`` returning ``None`` -- and the
+        # normalization helper collapses ``None`` to ``""``. As a
+        # result, on no-transpile resume, ``reachability_required_container``
+        # regenerates to ``""`` for ALL modules, REGARDLESS of whether
+        # the late-hoist rule would have fired during a fresh run.
+        # This is a documented, accepted regression vs the pre-slice-10
+        # audit signal (which the planner persisted across resumes via
+        # ``domain_signals``).
+        #
+        # Why it's accepted:
+        #   1. The storage classifier reads
+        #      ``topology_inputs["reachability_requirements"]`` DIRECTLY
+        #      (``storage_classifier.py:645``), not via the topology
+        #      entry's ``reachability_required_container``. Storage
+        #      routing decisions are therefore unaffected -- the
+        #      classifier sees the same empty dict on resume that the
+        #      pre-slice-10 classifier saw, and falls back to the
+        #      legacy "unconstrained helper" decision path codified
+        #      by slice 6's amendment (``storage_classifier.py:569-587``,
+        #      gated on ``not topology_inputs["transpile_ran"]``).
+        #   2. Invariant 10 (``build_topology.py:1474-1487``) short-
+        #      circuits on ``if required and ...`` so an empty
+        #      ``required`` value does NOT trip the module_path / required-
+        #      container coherence abort.
+        #   3. Slice 9b's dual independent audit (Claude Explore + Codex
+        #      exec) verified no production code consumes the artifact
+        #      field for behavior; the only previous reader was the
+        #      invariant-10 lockstep check, which slice 9b deleted.
+        #
+        # The trade is consistent with slice 6's "empty reqs on no-
+        # transpile resume is acceptable" precedent (same trade slice
+        # 3's preserved_caller_graph also accepts on the caller_graph
+        # side -- raw facts are saved, conclusions are recomputed where
+        # producible). If a future consumer needs the regenerated
+        # signal on resume, the lever is to revive the
+        # ``transpile_ran=False`` branch here and either (a) persist
+        # ``reachability_requirements`` as a raw fact (Option X) or
+        # (b) read the legacy ``domain_signals`` audit signal back
+        # (the previous design). ``TopologyInputs.transpile_ran`` is
+        # plumbed through (pipeline.py:4622) and unused by THIS read
+        # site by design -- kept for that potential future use. See
+        # ``slice-10-r1-decision.md`` for the synthesis.
         reachability_required: str
         if reachability_requirements is not None:
             # Determine the helper's CURRENT container -- the script
