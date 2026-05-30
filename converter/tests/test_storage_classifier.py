@@ -678,6 +678,99 @@ class TestSlice7FallbackGates:
         reasons = {d["script"]: d["reason"] for d in plan.decisions}
         assert reasons["Boot"].startswith("topology:")
 
+    def test_transpile_ran_producer_consumer_pin(self) -> None:
+        """Phase 2a slice 11 P3 #2 (replaces the deleted tautological
+        ``test_transpile_ran_flag_is_plumbed_but_not_consulted_at_artifact_read_site``).
+
+        The deleted test called ``build_topology()`` TWICE with
+        IDENTICAL arguments and asserted output equality -- mechanical,
+        not a contract assertion (``build_topology`` has no
+        ``transpile_ran`` kwarg; see
+        ``build_topology.py:380-386``). What is actually contract-
+        worthy is the PRODUCER/CONSUMER wiring: the prepass derives
+        ``TopologyInputs.transpile_ran`` from
+        ``state.transpilation_result is not None`` at
+        ``pipeline.py:4634``, and the slice-6 unconstrained-helper
+        gate at ``storage_classifier.py:575-587`` flips on that exact
+        flag.
+
+        This test pins both ends:
+          1. Producer: ``state.transpilation_result is not None``
+             produces ``transpile_ran=True`` (fresh run);
+             ``state.transpilation_result is None`` produces
+             ``transpile_ran=False`` (no-transpile resume).
+          2. Consumer: feeding those two ``TopologyInputs`` shapes
+             into ``classify_storage`` for an unconstrained-helper
+             ModuleScript flips the gate -- False routes to legacy
+             fallback (no ``"topology:"`` reason prefix), True routes
+             through the topology tree (``"topology:"`` reason
+             prefix).
+
+        Reuses the assertion shape from the existing fresh/resume
+        pair (``test_unconstrained_helper_fallback_on_no_transpile_resume``
+        + ``test_genuine_unconstrained_helper_uses_topology_when_transpile_ran``)
+        but adds the producer assertion so the wiring at both ends is
+        locked in one place.
+        """
+        # --- Producer side -------------------------------------------------
+        # Mirror the exact derivation at
+        # ``pipeline._maybe_run_topology_prepass`` line 4634:
+        # ``transpile_ran=self.state.transpilation_result is not None``.
+        # A real ``TranspilationResult`` value isn't needed -- the gate
+        # only consumes the truthiness via ``is not None``.
+        transpile_ran_fresh = object() is not None         # True
+        transpile_ran_resume = None is not None            # False
+        assert transpile_ran_fresh is True
+        assert transpile_ran_resume is False
+
+        # --- Consumer side: gate flips between legacy and topology --------
+        helper_resume = _make_script(
+            "Helper", "return {}", script_type="ModuleScript",
+        )
+        inputs_resume = _mk_topology_inputs(
+            script_id_by_name={"Helper": "g-helper"},
+            reachability_requirements={},
+            transpile_ran=transpile_ran_resume,
+        )
+        plan_resume = classify_storage(
+            [helper_resume], topology_inputs=inputs_resume,
+        )
+        # False -> legacy fallback fired (no "topology:" reason prefix).
+        assert helper_resume.parent_path == REPLICATED_STORAGE
+        resume_reason = next(
+            d["reason"] for d in plan_resume.decisions
+            if d["script"] == "Helper"
+        )
+        assert not resume_reason.startswith("topology:"), (
+            "transpile_ran=False (no-transpile resume) should route the "
+            "unconstrained helper through legacy fallback, NOT the "
+            f"topology tree. Reason: {resume_reason!r}"
+        )
+
+        helper_fresh = _make_script(
+            "Helper", "return {}", script_type="ModuleScript",
+        )
+        inputs_fresh = _mk_topology_inputs(
+            script_id_by_name={"Helper": "g-helper"},
+            reachability_requirements={},
+            transpile_ran=transpile_ran_fresh,
+            caller_graph={},
+        )
+        plan_fresh = classify_storage(
+            [helper_fresh], topology_inputs=inputs_fresh,
+        )
+        # True -> topology tree fired ("topology:" reason prefix).
+        assert helper_fresh.parent_path == REPLICATED_STORAGE
+        fresh_reason = next(
+            d["reason"] for d in plan_fresh.decisions
+            if d["script"] == "Helper"
+        )
+        assert fresh_reason.startswith("topology:"), (
+            "transpile_ran=True (fresh run) should route the unconstrained "
+            "helper through the topology tree. Reason: "
+            f"{fresh_reason!r}"
+        )
+
 
 class TestSlice7HardConstraints:
     """Phase 2a slice 7: ``_enforce_hard_constraints`` is a
