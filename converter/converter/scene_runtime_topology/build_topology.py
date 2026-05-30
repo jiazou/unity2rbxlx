@@ -59,26 +59,21 @@ Phase 1 invariants (per design doc §"topology artifact" + the review's
      3 added this invariant so a future change to
      ``derive_module_lifecycle_role`` can't silently produce a
      "loader" role on a server-domain module.
- 10. **Reachability triple-write atomicity** (Phase 2a slice 4) —
-     for every ``modules`` entry the three reachability fields are
-     coordinated:
-       - ``reachability_required_container`` non-empty ⟺
-         ``reachability_forced_container`` non-empty (both mirror the
-         planner's rule-fired signal; one without the other means
-         the planner artifact was hand-edited into an inconsistent
-         state).
-       - When both are non-empty, they MUST be equal in container
-         value (the planner stamps them together with the same
-         value).
-       - When non-empty, ``module_path`` MUST start with that
-         container value (e.g. ``"ReplicatedStorage.HudControl"``;
-         module_path is the dotted DataModel path the host runtime
-         requires, so it has to point at the actually-hoisted
-         container — pre-slice-4 codex P1.1 fix at
-         module_domain.py:1266-1278 codified this).
-     Catches both hand-edited artifacts and any future refactor that
-     splits the planner triple-write into separate paths without
-     keeping them in lockstep.
+ 10. **Reachability ``module_path`` ↔ container coherence** (Phase
+     2a slice 4; narrowed by slice 9b which dropped the parallel
+     ``reachability_forced_container`` mirror) — for every
+     ``modules`` entry with non-empty
+     ``reachability_required_container``, ``module_path`` MUST either
+     equal that container (the bare top-level row) or start with that
+     container plus a dot (the strict child case — e.g.
+     ``"ReplicatedStorage.HudControl"``). ``module_path`` is the
+     dotted DataModel path the host runtime requires, so it has to
+     point at the actually-hoisted container; the pre-slice-4 codex
+     P1.1 fix at module_domain.py:1266-1278 codified this lockstep
+     between container + module_path. Catches both hand-edited
+     artifacts and any future refactor that splits the planner
+     triple-write without keeping ``container`` + ``module_path`` in
+     lockstep.
 
 Coherence policy (Phase 2a slice 3 rounds 2-3) — NOT a fail-closed
 invariant: when ``scene_runtime.modules`` contains a ``class_name``
@@ -275,28 +270,33 @@ class TopologyModuleEntry(TypedDict, total=False):
     is_loader: bool
     bridge_group_id: str | None
     provenance: "TopologyProvenance"
-    # Phase 2a slice 4 — reachability triple. The planner's
+    # Phase 2a slice 4 — reachability pair. The planner's
     # ``_apply_reachability_rule`` (module_domain.py:1202-1284) writes
-    # THREE coordinated values atomically when a client-required helper
-    # gets hoisted out of a server container:
+    # coordinated values atomically when a client-required helper gets
+    # hoisted out of a server container:
     #   - ``script.parent_path`` on the RbxScript (the live container);
     #   - ``module_row["container"]`` + ``module_row["module_path"]``
-    #     on the planner row (the canonical placement);
-    #   - ``domain_signals["reachability_forced_container"]`` on the
-    #     planner row (the audit trail).
+    #     on the planner row (the canonical placement).
     # Topology mirrors the planner-side two as fields here so slice
     # 5's storage_classifier rewrite reads ONE canonical surface for
-    # both the decision input (``reachability_required_container``)
-    # and the audit (``reachability_forced_container``). Invariant 10
-    # enforces triple-write atomicity (presence + value coherence).
+    # the decision input (``reachability_required_container``).
+    # Invariant 10 enforces ``module_path`` ↔ container coherence.
     #
-    # When reachability did NOT fire for a module, all three fields
-    # are empty strings. When it fired, all three are present, equal
-    # in container value, and ``module_path`` starts with the
-    # container.
+    # Slice 9b dropped a redundant ``reachability_forced_container``
+    # mirror that previously carried the audit-trail "rule fired"
+    # signal: no production code branched on it (only a tautological
+    # invariant-10 lockstep check and a trivial copy at this build
+    # site read it), and ``reachability_required_container`` already
+    # carries the full semantic ("this module needs to be in container
+    # X"). See revision-history entry 2026-05-30 and the
+    # scene-runtime-architecture-ir slice plan for the dual-audit
+    # rationale.
+    #
+    # When reachability did NOT fire for a module, both fields are
+    # empty strings. When it fired, both are present and
+    # ``module_path`` starts with the required container.
     reachability_required_container: str
     module_path: str
-    reachability_forced_container: str
 
 
 class TopologyProvenance(TypedDict, total=False):
@@ -606,7 +606,7 @@ def _build_modules_block(
                 if abs_path is not None:
                     provenance["source_path"] = abs_path.as_posix()
 
-        # Phase 2a slice 4 — read the reachability triple from the
+        # Phase 2a slice 4 — read the reachability pair from the
         # planner row. The planner stamps these in
         # `_apply_reachability_rule` + `_stamp_container_and_path`
         # (module_domain.py); empty strings indicate "rule did not
@@ -614,21 +614,20 @@ def _build_modules_block(
         # and for helpers in non-server containers pre-rule).
         module_path_obj = module.get("module_path", "")
         module_path = module_path_obj if isinstance(module_path_obj, str) else ""
-        # The planner-side audit name is nested under
-        # `domain_signals.reachability_forced_container`. Topology
-        # surfaces it as a flat field so slice 5's consumer reads
-        # ONE level deep.
+        # `reachability_required_container` is the topology's
+        # consumer-facing name for the rule-derived REQUIREMENT.
+        # The planner-side audit lives at
+        # `domain_signals.reachability_forced_container` (set by
+        # `_apply_reachability_rule` when the hoist fires); when the
+        # rule fires the planner mutates `container` + `module_path`
+        # in lockstep with that audit, so the audit signal IS the
+        # required-container value for non-degenerate runs. Slice 9b
+        # dropped the parallel topology-side mirror; the
+        # required-container surface is the single source of truth.
         signals_obj = module.get("domain_signals", {})
         signals = signals_obj if isinstance(signals_obj, dict) else {}
         rfc_obj = signals.get("reachability_forced_container", "")
-        reachability_forced = rfc_obj if isinstance(rfc_obj, str) else ""
-        # `reachability_required_container` is the topology's
-        # consumer-facing name for the rule-derived REQUIREMENT.
-        # When the planner's rule fired, it set
-        # ``reachability_forced_container`` AND mutated `container` +
-        # `module_path` in lockstep — so the planner-side audit
-        # field IS the topology's required-container value. Mirror it.
-        reachability_required = reachability_forced
+        reachability_required = rfc_obj if isinstance(rfc_obj, str) else ""
 
         entry: TopologyModuleEntry = {
             "stem": stem,
@@ -641,7 +640,6 @@ def _build_modules_block(
             "provenance": provenance,
             "reachability_required_container": reachability_required,
             "module_path": module_path,
-            "reachability_forced_container": reachability_forced,
         }
         out[script_id] = entry
     return out
@@ -1331,41 +1329,18 @@ def _enforce_invariants(
     # added between derivation and output validation leak the lossy
     # data before invariant 9 fires (Claude review slice 3 round 2 P1).
 
-    # Invariant 10 (Phase 2a slice 4): reachability triple-write
-    # atomicity. The three fields mirror the planner's
-    # ``_apply_reachability_rule`` triple-write (parent_path +
-    # container + module_path + reachability_forced_container, with
-    # codex P1.1's atomicity guarantee that the triple stays in
-    # lockstep). Topology mirrors three of those onto each
-    # TopologyModuleEntry; this invariant enforces lockstep on the
-    # mirrored fields.
+    # Invariant 10 (Phase 2a slice 4; narrowed by slice 9b):
+    # reachability ``module_path`` ↔ container coherence. The
+    # planner's ``_apply_reachability_rule`` rewrites ``container`` +
+    # ``module_path`` together (codex P1.1 atomicity); this invariant
+    # enforces the mirrored coherence on the topology entry. Slice
+    # 9b dropped the prior ``reachability_forced_container`` lockstep
+    # arm — same-loop-sets-both-fields-from-same-source made it
+    # tautological and the field itself was removed (no production
+    # branch read it).
     for guid, mod_entry in modules_block.items():
         required = mod_entry.get("reachability_required_container", "")
-        forced = mod_entry.get("reachability_forced_container", "")
         module_path_v = mod_entry.get("module_path", "")
-        # Both reachability fields are populated together by the
-        # planner. A non-empty/empty mismatch indicates a
-        # hand-edited artifact or a refactor that split the
-        # triple-write.
-        if bool(required) != bool(forced):
-            _abort(
-                10,
-                f"module {guid!r} has mismatched reachability fields: "
-                f"reachability_required_container={required!r}, "
-                f"reachability_forced_container={forced!r} "
-                f"— planner stamps these in lockstep, so one without "
-                f"the other indicates a hand-edited artifact",
-                row=mod_entry,
-            )
-        if required and forced and required != forced:
-            _abort(
-                10,
-                f"module {guid!r} has divergent reachability values: "
-                f"reachability_required_container={required!r}, "
-                f"reachability_forced_container={forced!r} "
-                f"— planner stamps both with the same container",
-                row=mod_entry,
-            )
         # Slice 4 round 1 review (Claude P1.2): accept BOTH
         # ``module_path == required`` (the container itself, no
         # module suffix — e.g. a top-level container row) AND

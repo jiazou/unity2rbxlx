@@ -575,22 +575,71 @@ re-planned 2026-05-30 after the slice 8 arch review found the original
     `reachability_forced_container` or `module_path` yet — byte-equivalence
     of `_build_modules_block`'s output for those fields must be preserved.
     Estimated ~150-200 LOC, 3-4 review rounds.
-  - **Slice 9b** (deferred until 9a ships): recompute
-    `module_path` / `reachability_forced_container` from canonical
-    helpers + raw inputs. **Decision pending:** Option A — accept the
-    "rule applies" semantic shift (recompute unconditionally from
-    `reachability_requirements[sid]`); Option B — add a `hoist_fired:
-    bool` raw fact to `TopologyInputs` so recompute preserves
-    byte-equivalence with today's `current_container not in
-    _SERVER_CONTAINERS_FOR_REACHABILITY` gate. Pick A vs B after 9a
-    lands and we can read the recompute call site against real code.
+  - **Slice 9b** (NEXT — Option C: drop the field).
 
-- **Slice 10** (after slice 9): delete the three `_stamp_container_and_path`
-  placement-mutation call sites at
-  `scene_runtime_topology/module_domain.py:880, 886, 891`. Depends on
-  slice 9 (`build_topology` no longer reads the stamped fields). The
-  function itself can stay or be deleted; the goal is to remove the
-  side-effect mutations.
+    Drop `reachability_forced_container` from `TopologyModuleEntry`.
+    The field is set ONLY when the late hoist rule fires
+    (`module_domain.py:935-948`) and is read by exactly two sites: a
+    trivial copy in `_build_modules_block:623-644` and an invariant-10
+    lockstep check in `_enforce_invariants:1344-1367`. The invariant is
+    tautological — same loop sets both fields from the same source. No
+    runtime / storage / transpile / output decision depends on this
+    field; `reachability_required_container` already carries the full
+    semantic ("this module needs to be in container X").
+
+    **Verification**: parallel Claude + Codex audits both independently
+    arrived at Option C with the same key citations. The original
+    Codex-discovered semantic gap (`reachability_forced_container` is
+    gated by `current_container not in
+    _SERVER_CONTAINERS_FOR_REACHABILITY`) is no longer a problem because
+    the field itself is removed.
+
+    **Deliverables**:
+    - Remove `reachability_forced_container` from `TopologyModuleEntry`.
+    - Remove the invariant-10 lockstep check at
+      `build_topology.py:1350-1368`.
+    - Update or delete the tests that exist purely to assert the field
+      is set: `test_scene_runtime_topology.py:326-428, 1139-1227`,
+      `test_module_domain_prepass.py:1184`,
+      `test_scene_runtime_domain*.py:347/712`.
+    - Fold in the slice 9a R1 degenerate-fixture corner: hoist
+      `scripts == []` check above `assert topology_inputs is not None`
+      at the new call site, OR conditional the assert.
+
+    After slice 9b, slice 10 inherits a **two-ended** scope (NOT just
+    write-deletion as originally framed): see the slice 10 entry below.
+
+    Estimated 2-3 review rounds; net diff likely slightly negative
+    (more deletions than additions).
+
+- **Slice 10** (after slice 9): **two-ended**, not just write-deletion.
+  Both slice 9b reviewers (Claude + Codex) and the implementer
+  independently identified that `build_topology._build_modules_block:629`
+  STILL reads `domain_signals["reachability_forced_container"]`
+  (the planner-row audit signal) as the SOURCE for the surviving
+  `reachability_required_container` field on `TopologyModuleEntry`.
+  Slice 10 must therefore:
+
+    1. **Switch the read site** at `_build_modules_block:629` from
+       `domain_signals["reachability_forced_container"]` to a different
+       source. Options to be picked by slice 10's arch review:
+       - **Option a:** read from `module_row["container"]` if it
+         already captures the needed semantic.
+       - **Option b:** recompute from `reachability_requirements[sid]`
+         (which is the underlying analysis output anyway).
+    2. **Then retire the writes** of the planner-row audit signal at
+       `scene_runtime_topology/module_domain.py:955` and `:1743`
+       (formerly numbered `:880, :886, :891` pre-slice-9b). The order
+       matters: switching the read MUST land before deleting the writes,
+       otherwise the surviving `reachability_required_container` field
+       loses its source.
+    3. **Migrate external tests** that assert the planner-row audit
+       signal directly: `test_module_domain_prepass.py:1184`,
+       `test_scene_runtime_domain.py:347`,
+       `test_scene_runtime_domain_v2.py:712`. They'll need migration or
+       deletion depending on what slice 10's arch review picks for #1.
+
+  Depends on slice 9b (the field is dropped from `TopologyModuleEntry`).
 
 - **Slice 11** (last): final test migration. Sweep remaining tests that
   assert pre-Phase-2a behavior or rely on the late stamping. Must come
@@ -845,6 +894,21 @@ while the topology work is multi-PR.
 
 ## Revision history
 
+- **2026-05-30** — slice 10 scope expanded after slice 9b R1 review:
+  both reviewers (Claude + Codex) and the implementer independently
+  identified that `_build_modules_block:629` still reads the
+  planner-row audit signal (`domain_signals["reachability_forced_container"]`)
+  as a source for the surviving topology-entry field
+  (`reachability_required_container`). Slice 10 is now **two-ended**:
+  switch the read site first (to `module_row["container"]` or a
+  recompute from `reachability_requirements[sid]`), then retire the
+  writes at `module_domain.py:955` and `:1743`. Original framing
+  ("slice 10 can delete the writes") was too optimistic.
+- **2026-05-30** — slice 9b path chosen: Option C (drop
+  `reachability_forced_container`) after parallel Claude + Codex
+  audits independently verified no production code uses the field for
+  runtime decisions. The semantic-shift concern that motivated the
+  9a/9b split is moot once the field is removed.
 - **2026-05-30** — slice 9 split into 9a (plumbing + #10 fold-in,
   unambiguous) and 9b (recompute, deferred until 9a ships + user picks
   A vs B). Codex caught the semantic-shift issue: today's

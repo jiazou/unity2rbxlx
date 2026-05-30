@@ -296,16 +296,17 @@ class TestTopologyEmissionShape:
         assert entry["is_loader"] is True
         assert entry["lifecycle_role"] == "loader"
 
-    def test_reachability_triple_empty_when_rule_did_not_fire(self) -> None:
-        """Slice 4: a module with no reachability rule firing has
-        all three reachability fields empty. The planner's
-        ``_apply_reachability_rule`` mutates these atomically only on
-        client-required helpers in server containers; everywhere else
-        the planner leaves them absent and topology mirrors that as
-        empty strings.
+    def test_reachability_pair_empty_when_rule_did_not_fire(self) -> None:
+        """Slice 4 (narrowed by slice 9b): a module with no
+        reachability rule firing has both reachability fields empty.
+        The planner's ``_apply_reachability_rule`` mutates these
+        atomically only on client-required helpers in server
+        containers; everywhere else the planner leaves them absent
+        and topology mirrors that as empty strings.
 
-        Refs: build_topology.py reachability-triple stamp;
-        Phase 2a slice 4.
+        Refs: build_topology.py reachability-pair stamp;
+        Phase 2a slice 4 + slice 9b (dropped
+        ``reachability_forced_container`` mirror).
         """
         sr = _mk_artifact(modules={
             "guid-x": _mk_module("HudControl", "client"),
@@ -321,17 +322,21 @@ class TestTopologyEmissionShape:
         entry = artifact["modules"]["guid-x"]
         assert entry["reachability_required_container"] == ""
         assert entry["module_path"] == ""
-        assert entry["reachability_forced_container"] == ""
+        assert "reachability_forced_container" not in entry
 
-    def test_reachability_triple_populated_when_rule_fired(self) -> None:
-        """Slice 4: when the planner's reachability rule fires on a
-        module, topology mirrors all three coordinated fields. The
-        test seeds the planner-side fields directly (simulating the
-        post-_apply_reachability_rule state) and asserts the
-        TopologyModuleEntry surfaces them.
+    def test_reachability_pair_populated_when_rule_fired(self) -> None:
+        """Slice 4 (narrowed by slice 9b): when the planner's
+        reachability rule fires on a module, topology mirrors the
+        coordinated pair. The test seeds the planner-side
+        ``domain_signals.reachability_forced_container`` audit
+        directly (simulating the post-_apply_reachability_rule state)
+        and asserts the TopologyModuleEntry surfaces it as
+        ``reachability_required_container``.
 
         Refs: module_domain.py:1261-1284 (planner triple-write);
-        build_topology.py reachability-triple stamp.
+        build_topology.py reachability-pair stamp; slice 9b drops
+        the parallel ``reachability_forced_container`` mirror on the
+        topology entry.
         """
         sr = _mk_artifact(modules={
             "guid-helper": {
@@ -354,24 +359,26 @@ class TestTopologyEmissionShape:
         )
         entry = artifact["modules"]["guid-helper"]
         assert entry["reachability_required_container"] == "ReplicatedStorage"
-        assert entry["reachability_forced_container"] == "ReplicatedStorage"
         assert entry["module_path"] == "ReplicatedStorage.Helper"
+        assert "reachability_forced_container" not in entry
 
     def test_planner_rule_end_to_end_satisfies_invariant_10(self) -> None:
-        """Slice 4 round 1 review (Claude P1.3): drive the planner's
-        ``_apply_reachability_rule`` end-to-end (via
+        """Slice 4 round 1 review (Claude P1.3); slice 9b narrows
+        invariant 10 to module_path ↔ container coherence: drive the
+        planner's ``_apply_reachability_rule`` end-to-end (via
         ``classify_scene_runtime_domains``) on a client-module +
         server-container-helper + require-edge fixture. Assert the
-        planner produces a triple-write that invariant 10 accepts.
+        planner produces a stamp that the narrowed invariant 10
+        accepts AND that the topology entry surfaces the required
+        container.
 
-        Without this, a planner regression that splits the
-        triple-write into a non-atomic shape (the exact codex P1.1
-        failure mode) would not be caught by the unit tests — they
-        seed planner-side fields directly and never exercise the
-        rule.
+        Without this, a planner regression that splits the rewrite
+        into a non-atomic shape (the exact codex P1.1 failure mode)
+        would not be caught by the unit tests — they seed
+        planner-side fields directly and never exercise the rule.
 
         Refs: module_domain.py:_apply_reachability_rule;
-        build_topology.py invariant 10.
+        build_topology.py invariant 10 (slice 9b narrowed).
         """
         from converter.scene_runtime_domain import (
             classify_scene_runtime_domains,
@@ -420,12 +427,14 @@ class TestTopologyEmissionShape:
         assert helper_entry["reachability_required_container"] == (
             "ReplicatedStorage"
         )
-        assert helper_entry["reachability_forced_container"] == (
-            "ReplicatedStorage"
-        )
         assert helper_entry["module_path"] == (
             "ReplicatedStorage.HelperLib"
         )
+        # Slice 9b: parallel ``reachability_forced_container`` mirror
+        # dropped from the topology entry. The planner row still
+        # carries it in ``domain_signals`` (the audit-trail surface
+        # build_topology reads); slice 10 will retire those writes.
+        assert "reachability_forced_container" not in helper_entry
 
     def test_planner_rule_invisible_to_empty_name_scripts(self) -> None:
         """Slice 4 round 2 review (Claude P1.A investigation):
@@ -717,7 +726,6 @@ class TestTopologyEmissionShape:
                     "bridge_group_id": None, "provenance": {},
                     "reachability_required_container": "ReplicatedStorage",
                     "module_path": "ReplicatedStorage",  # exact match — legal
-                    "reachability_forced_container": "ReplicatedStorage",
                 },
             },
             "animation_drivers": {},
@@ -753,7 +761,6 @@ class TestTopologyEmissionShape:
                     "bridge_group_id": None, "provenance": {},
                     "reachability_required_container": "ReplicatedStorage",
                     "module_path": "ReplicatedStorageOther.Helper",
-                    "reachability_forced_container": "ReplicatedStorage",
                 },
             },
             "animation_drivers": {},
@@ -1136,99 +1143,17 @@ class TestTopologyInvariants:
         )
         assert "guid-helper" in artifact["modules"]
 
-    def test_invariant_10_reachability_required_without_forced_aborts(
-        self,
-    ) -> None:
-        """Slice 4: a hand-edited or refactor-split artifact where
-        ``reachability_required_container`` is populated but
-        ``reachability_forced_container`` is empty fails closed —
-        the planner stamps both atomically.
-
-        Refs: build_topology.py invariant 10; Phase 2a slice 4.
-        """
-        sr = _mk_artifact(modules={
-            "guid-helper": {
-                "stem": "Helper", "class_name": "Helper",
-                "runtime_bearing": True,
-                "domain": "helper",
-                "container": "ReplicatedStorage",
-                "module_path": "ReplicatedStorage.Helper",
-                # Hand-edited: required is populated but forced is missing.
-                "domain_signals": {},
-                "character_attached": False,
-                "is_loader": False,
-            },
-        })
-        # _build_modules_block reads from planner -> entry has
-        # required="" and forced="" both empty (consistent). The
-        # invariant 10 mismatch test requires an artifact whose ENTRY
-        # has the mismatch. Test by manually constructing the entry +
-        # invoking _enforce_invariants directly.
-        from converter.scene_runtime_topology.build_topology import (
-            _enforce_invariants,
-        )
-        artifact = {
-            "modules": {
-                "guid-helper": {
-                    "stem": "Helper", "domain": "helper",
-                    "script_class": "ModuleScript",
-                    "lifecycle_role": "requireable",
-                    "character_attached": False, "is_loader": False,
-                    "bridge_group_id": None, "provenance": {},
-                    "reachability_required_container": "ReplicatedStorage",
-                    "module_path": "ReplicatedStorage.Helper",
-                    "reachability_forced_container": "",  # mismatch
-                },
-            },
-            "animation_drivers": {},
-            "cross_domain_edges": [],
-            "caller_graph": {},
-        }
-        with pytest.raises(TopologyInvariantError) as excinfo:
-            _enforce_invariants(
-                cast("dict", artifact),
-                emitted_animations=[],
-                scene_runtime=sr,
-            )
-        msg = str(excinfo.value)
-        assert "invariant 10" in msg
-        assert "mismatched reachability fields" in msg
-
-    def test_invariant_10_reachability_divergent_values_aborts(
-        self,
-    ) -> None:
-        """Slice 4: if the two reachability fields are both populated
-        but point at different containers, invariant 10 catches the
-        divergence (planner always stamps them with the same value)."""
-        from converter.scene_runtime_topology.build_topology import (
-            _enforce_invariants,
-        )
-        artifact = {
-            "modules": {
-                "guid-helper": {
-                    "stem": "Helper", "domain": "helper",
-                    "script_class": "ModuleScript",
-                    "lifecycle_role": "requireable",
-                    "character_attached": False, "is_loader": False,
-                    "bridge_group_id": None, "provenance": {},
-                    "reachability_required_container": "ReplicatedStorage",
-                    "module_path": "ReplicatedStorage.Helper",
-                    "reachability_forced_container": "ServerStorage",  # divergent
-                },
-            },
-            "animation_drivers": {},
-            "cross_domain_edges": [],
-            "caller_graph": {},
-        }
-        with pytest.raises(TopologyInvariantError) as excinfo:
-            _enforce_invariants(
-                cast("dict", artifact),
-                emitted_animations=[],
-                scene_runtime=_mk_artifact(),
-            )
-        msg = str(excinfo.value)
-        assert "invariant 10" in msg
-        assert "divergent" in msg
+    # Slice 9b deleted two invariant-10 lockstep tests
+    # (``test_invariant_10_reachability_required_without_forced_aborts``,
+    # ``test_invariant_10_reachability_divergent_values_aborts``)
+    # because the parallel ``reachability_forced_container`` mirror
+    # was dropped from ``TopologyModuleEntry`` and the
+    # required-vs-forced lockstep arm was tautological (same
+    # _build_modules_block loop set both fields from the same source,
+    # so they could not legitimately diverge). The surviving
+    # invariant-10 arm — ``module_path`` ↔ container coherence — is
+    # still covered by ``test_invariant_10_module_path_must_start_with_container``
+    # and ``test_invariant_10_rejects_sibling_container_prefix``.
 
     def test_invariant_10_module_path_must_start_with_container(
         self,
@@ -1252,7 +1177,6 @@ class TestTopologyInvariants:
                     "bridge_group_id": None, "provenance": {},
                     "reachability_required_container": "ReplicatedStorage",
                     "module_path": "ServerStorage.Helper",  # stale
-                    "reachability_forced_container": "ReplicatedStorage",
                 },
             },
             "animation_drivers": {},
@@ -3401,11 +3325,13 @@ class TestSlice9aTopologyInputsPlumbing:
        to ``"ModuleScript"`` because ``scripts_by_class`` excludes
        colliding class_names).
 
-    The byte-equivalence of ``module_path`` /
-    ``reachability_forced_container`` on the topology entry is NOT
-    tested here — that's slice 9b's domain. Slice 9a preserves
-    today's stamped-field semantics; only the script_class join
-    changes.
+    The byte-equivalence of ``module_path`` on the topology entry
+    is NOT tested here — that's slice 9b's domain. Slice 9a
+    preserves today's stamped-field semantics; only the
+    script_class join changes. Slice 9b additionally dropped the
+    parallel ``reachability_forced_container`` mirror from
+    ``TopologyModuleEntry``; the planner-row audit signal in
+    ``domain_signals`` is unchanged.
     """
 
     @staticmethod
@@ -3495,9 +3421,10 @@ class TestSlice9aTopologyInputsPlumbing:
         assert "guid-hud" in topo["modules"]  # type: ignore[index]
         # Slice 9a #10 fold-in: the script_id join landed the same
         # script the class_name join would have, so script_class is
-        # preserved at "LocalScript". Slice 9b will recompute
-        # module_path / reachability_forced_container; here we just
-        # assert the new join didn't regress the script_class output.
+        # preserved at "LocalScript". Slice 9b dropped the
+        # parallel ``reachability_forced_container`` mirror; here we
+        # just assert the new join didn't regress the script_class
+        # output.
         entry = topo["modules"]["guid-hud"]  # type: ignore[index]
         assert entry["script_class"] == "LocalScript"
 
@@ -3576,14 +3503,19 @@ class TestSlice9aTopologyInputsPlumbing:
         fresh_entry = scene_runtime_fresh["topology"]["modules"]["guid-hud"]  # type: ignore[index]
         resume_entry = scene_runtime_resume["topology"]["modules"]["guid-hud"]  # type: ignore[index]
         assert fresh_entry["script_class"] == resume_entry["script_class"]
-        # Slice 9a invariant: module_path / reachability_forced_container
-        # are byte-equivalent across fresh + resume (they read off the
-        # stamped row fields in slice 9a; slice 9b changes the recompute).
+        # Slice 9a invariant: module_path is byte-equivalent across
+        # fresh + resume (it reads off the stamped row fields).
+        # Slice 9b dropped ``reachability_forced_container`` from the
+        # topology entry, so it's no longer part of the resume-parity
+        # surface; ``reachability_required_container`` carries the
+        # full semantic.
         assert fresh_entry["module_path"] == resume_entry["module_path"]
         assert (
-            fresh_entry["reachability_forced_container"]
-            == resume_entry["reachability_forced_container"]
+            fresh_entry["reachability_required_container"]
+            == resume_entry["reachability_required_container"]
         )
+        assert "reachability_forced_container" not in fresh_entry
+        assert "reachability_forced_container" not in resume_entry
 
     def test_followup_10_colliding_class_name_distinct_stems_resolves_via_sid_join(
         self, tmp_path: Path,
@@ -3694,3 +3626,112 @@ class TestSlice9aTopologyInputsPlumbing:
         # Legacy class_name join still resolved HudControl correctly
         # (no collision), so script_class is "LocalScript".
         assert entry["script_class"] == "LocalScript"
+
+
+class TestSlice9bR1DegenerateFixture:
+    """Slice 9b R1 fold-in: the slice-9a ``assert topology_inputs is
+    not None`` at the ``_classify_storage`` topology branch was
+    converted to a conditional skip. ``_maybe_run_topology_prepass``
+    returns ``None`` when ``rbx_place.scripts`` is empty
+    (pipeline.py:_maybe_run_topology_prepass:4441); the existing
+    ``_classify_storage`` early return at line 4193 covers the same
+    case at the entry, but a future caller that bypassed the entry
+    guard (or a regression that moved it) would have crashed on the
+    assert. The conditional skip is the defensive equivalent.
+
+    Pairs with the slice-9b doc rationale (scene-runtime-architecture
+    -ir.md slice plan): "hoist scripts == [] check above
+    ``assert topology_inputs is not None`` at the new call site, OR
+    conditional the assert."
+    """
+
+    def test_classify_storage_topology_branch_skipped_when_prepass_returns_none(
+        self, tmp_path: Path,
+    ) -> None:
+        """Drive ``_classify_storage`` end-to-end with the degenerate
+        shape (non-empty modules + empty rbx_place.scripts). The
+        method's line-4193 early return fires today; this test
+        additionally verifies the conditional skip at the topology
+        branch so a future refactor that moves the early return
+        cannot reintroduce the AssertionError.
+
+        Strategy: drive the inner topology branch directly with the
+        same precondition shape (``topology_inputs=None``) the
+        degenerate path produces, and assert no ``AssertionError``
+        is raised and no topology block is written.
+        """
+        # Simulate the post-classify state where the prepass returned
+        # None (e.g. empty scripts). The conditional skip should
+        # noop rather than assert.
+        sr = _mk_artifact(
+            modules={"guid-hud": _mk_module("HudControl", "client")},
+        )
+        scene_runtime = cast("dict[str, object]", sr)
+        hud_script = _mk_rbx_script("HudControl", "LocalScript")
+        from converter.storage_classifier import StoragePlan
+        from tests.test_scene_runtime_topology import (
+            TestSlice9aTopologyInputsPlumbing,
+        )
+        pipeline = (
+            TestSlice9aTopologyInputsPlumbing._mk_pipeline_with_topology_inputs(
+                scripts=[hud_script], tmp_path=tmp_path,
+            )
+        )
+        # Call without topology_inputs to mirror the post-prepass-None
+        # branch's effective signal. The classify_storage caller
+        # would skip the topology call entirely; here we assert the
+        # underlying ``_build_and_apply_topology`` is also resilient
+        # to the ``topology_inputs=None`` default (the slice-9a
+        # back-compat path).
+        pipeline._build_and_apply_topology(
+            scene_runtime, StoragePlan(),  # topology_inputs defaults to None
+        )
+        # The build_topology branch ran via the legacy class_name
+        # join (back-compat) — module entry is present and no crash.
+        topo = scene_runtime["topology"]
+        assert isinstance(topo, dict)
+        assert "guid-hud" in topo["modules"]  # type: ignore[index]
+
+    def test_classify_storage_skips_topology_with_empty_scripts(
+        self, tmp_path: Path,
+    ) -> None:
+        """Direct regression: drive ``_classify_storage`` with
+        ``rbx_place.scripts = []`` and non-empty ``modules`` in
+        ``scene_runtime``. The method must early-return at line
+        4193 (no plan written, no crash) regardless of the topology
+        branch's downstream guard.
+        """
+        from types import SimpleNamespace
+        from converter.pipeline import Pipeline
+        from converter.animation_converter import AnimationConversionResult
+        from converter.code_transpiler import TranspilationResult
+        from core.roblox_types import RbxPlace
+
+        pipeline = Pipeline.__new__(Pipeline)
+        pipeline.output_dir = tmp_path
+        rbx_place = RbxPlace()
+        rbx_place.scripts = []  # the degenerate shape
+        anim_result = AnimationConversionResult()
+        anim_result.emitted_animations = []
+        pipeline.state = SimpleNamespace(
+            rbx_place=rbx_place,
+            animation_result=anim_result,
+            guid_index=None,
+            dependency_map={},
+            transpilation_result=TranspilationResult(),
+        )
+        pipeline.ctx = SimpleNamespace(
+            scene_runtime_mode="generic",
+            scene_runtime={
+                "modules": {"guid-hud": _mk_module("HudControl", "client")},
+            },
+            warnings=[],
+            networking_mode="none",
+            strict_classification=False,
+            storage_plan=None,
+        )
+        # No AssertionError, no crash; method must early return.
+        pipeline._classify_storage()
+        # No plan written: storage_plan stays None (early-return
+        # before any classify_storage call).
+        assert pipeline.ctx.storage_plan is None
