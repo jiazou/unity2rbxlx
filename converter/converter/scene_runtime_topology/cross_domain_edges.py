@@ -212,11 +212,37 @@ class SharedAttributeSeed:
     attribute_template: str
 
 
-# Phase 2b slice 1: structural pre-transpile seed table. Lifted verbatim
-# from the hardcoded ``PlayerSetSharedFlag`` prompt block at
-# ``code_transpiler.py:1267-1288`` — data, not code, so slice 3's bridge
-# emitter can read it instead of the prompt re-embedding the canonical
-# name forever.
+# Phase 2b slice 1: structural pre-transpile seed table. The table seeds
+# the structural candidate pass so slice 3's bridge emitter can consume
+# data, not regrep the prompt forever.
+#
+# SCOPE — narrower than the prompt it eventually replaces (Codex R2,
+# 2026-05-30). This table matches the EXISTING
+# ``pickup_remote_event_server`` pack's class-name detection scope
+# (``Pickup`` only), NOT the broader prompt scope at
+# ``code_transpiler.py:1271-1289``. That prompt is UNBOUNDED — it
+# instructs the AI to fire ``PlayerSetSharedFlag`` for ANY MonoBehaviour
+# writing shared state (``GetItem(itemName)``-style methods,
+# ``RecoverHealth``, ``gotWeapon = true``, etc.). The slice 1 seed
+# faithfully covers the one structural case the existing pack already
+# handles; it does NOT cover the long tail the prompt covers.
+#
+# WARNING for slice 3 (Codex R2, 2026-05-30): before slice 3 deletes
+# the hardcoded ``_GENERIC_RUNTIME_PROMPT`` ``PlayerSetSharedFlag``
+# block, slice 3 must decide between:
+#   (a) Require this table to be COMPREHENSIVE before deleting the
+#       prompt path — i.e. statically enumerate every MonoBehaviour
+#       class that writes shared player state across the converter's
+#       supported corpus, and add a seed row per class. High up-front
+#       cost; fully data-driven afterwards.
+#   (b) Keep a FALLBACK that scans AI output for
+#       ``PlayerSetSharedFlag:FireServer`` calls when no topology
+#       candidate covers the producing script. Lower cost; preserves
+#       coverage for non-Pickup shared-flag writers (e.g. a ``Player.cs``
+#       controller that records ``has<X>`` without routing through a
+#       Pickup instance) that the slice 1 seed misses.
+# Deleting the prompt path without picking one regresses any non-Pickup
+# shared-flag writer in real projects.
 #
 # IMPORTANT — Mitigation α (LOCKED PickupItemEvent): the Pickup seed's
 # ``remote_event_name`` MUST stay the literal ``"PickupItemEvent"``.
