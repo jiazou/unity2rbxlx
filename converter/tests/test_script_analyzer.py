@@ -117,6 +117,23 @@ class TestReferencedTypesGlobalLookupExclusion:
         )
         assert "GameManager" not in refs
 
+    def test_all_global_lookup_variants_excluded(self, tmp_path: Path):
+        # Every global-finder spelling must be skipped — incl. the plural
+        # ``FindObjectsOfTypeAll`` (Codex review: the singular form was a
+        # typo that left it poisoning) and the Unity 2023+ ``ByType`` APIs.
+        for call in (
+            "FindObjectOfType<Singleton>()",
+            "FindObjectsOfType<Singleton>()",
+            "Resources.FindObjectsOfTypeAll<Singleton>()",
+            "FindFirstObjectByType<Singleton>()",
+            "FindAnyObjectByType<Singleton>()",
+            "FindObjectsByType<Singleton>(FindObjectsSortMode.None)",
+        ):
+            refs = self._refs(
+                tmp_path, "Finder", f"  void Start() {{ var s = {call}; }}",
+            )
+            assert "Singleton" not in refs, call
+
     def test_getcomponent_arg_is_still_a_dependency(self, tmp_path: Path):
         # Component-lookup: a REAL peer edge the caller_graph / reachability
         # consumers need. Must NOT be dropped (Codex review 2026-06-01).

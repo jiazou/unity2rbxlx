@@ -58,7 +58,13 @@ _RE_SERIALIZED_FIELD = re.compile(
 # ``require()`` is a separate, pre-existing concern at the injection site,
 # out of scope here.)
 _GLOBAL_LOOKUP_GENERIC_METHODS = frozenset({
-    "FindObjectOfType", "FindObjectsOfType", "FindObjectOfTypeAll",
+    # Legacy global finders.
+    "FindObjectOfType", "FindObjectsOfType",
+    # ``Resources.FindObjectsOfTypeAll<T>()`` is PLURAL "Objects" (Codex
+    # review 2026-06-01 — the singular form does not exist as an API).
+    "FindObjectsOfTypeAll",
+    # Unity 2023+ replacements for the deprecated finders above.
+    "FindFirstObjectByType", "FindAnyObjectByType", "FindObjectsByType",
 })
 
 CLIENT_APIS = frozenset({
