@@ -79,3 +79,94 @@ class TestAnalyzeScriptBaseless:
         # The Awake hook + MonoBehaviour base still routes to Script —
         # PR1 must not regress the legacy classifier.
         assert info.suggested_type == "Script"
+
+
+class TestReferencedTypesGlobalLookupExclusion:
+    """``referenced_types`` must NOT count the type arg of a GLOBAL
+    scene-lookup generic (``FindObjectOfType<T>``) as a dependency — that
+    locates an already-existing T, creating no edge and no ``require()``
+    need. Counting it poisons ``dependency_map`` and misroutes the target
+    in storage classification (TODO.md "Transpiler false-positive
+    require() injection").
+
+    But COMPONENT-lookup generics (``GetComponent<T>`` / ``AddComponent<T>``)
+    ARE real peer edges the reachability consumers need — they must STILL be
+    captured (Codex review 2026-06-01: dropping them would orphan a
+    component referenced only that way).
+
+    test_findobjectoftype FAILS against the pre-fix regex (captured the
+    arg); the rest guard the boundaries — global-lookup excluded, but
+    component-lookup / collection / genuine deps preserved.
+    """
+
+    def _refs(self, tmp_path: Path, name: str, body: str) -> list[str]:
+        cs = tmp_path / f"{name}.cs"
+        cs.write_text(
+            f"using UnityEngine;\npublic class {name} : MonoBehaviour {{\n"
+            f"{body}\n}}\n",
+            encoding="utf-8",
+        )
+        return analyze_script(cs).referenced_types
+
+    def test_findobjectoftype_arg_is_not_a_dependency(self, tmp_path: Path):
+        # The Plane→GameManager false edge: a global scene lookup, not a
+        # dependency.
+        refs = self._refs(
+            tmp_path, "Plane",
+            "  void Start() { var gm = FindObjectOfType<GameManager>(); }",
+        )
+        assert "GameManager" not in refs
+
+    def test_all_global_lookup_variants_excluded(self, tmp_path: Path):
+        # Every global-finder spelling must be skipped — incl. the plural
+        # ``FindObjectsOfTypeAll`` (Codex review: the singular form was a
+        # typo that left it poisoning) and the Unity 2023+ ``ByType`` APIs.
+        for call in (
+            "FindObjectOfType<Singleton>()",
+            "FindObjectsOfType<Singleton>()",
+            "Resources.FindObjectsOfTypeAll<Singleton>()",
+            "FindFirstObjectByType<Singleton>()",
+            "FindAnyObjectByType<Singleton>()",
+            "FindObjectsByType<Singleton>(FindObjectsSortMode.None)",
+        ):
+            refs = self._refs(
+                tmp_path, "Finder", f"  void Start() {{ var s = {call}; }}",
+            )
+            assert "Singleton" not in refs, call
+
+    def test_getcomponent_arg_is_still_a_dependency(self, tmp_path: Path):
+        # Component-lookup: a REAL peer edge the caller_graph / reachability
+        # consumers need. Must NOT be dropped (Codex review 2026-06-01).
+        refs = self._refs(
+            tmp_path, "Mover",
+            "  void Start() { var r = GetComponent<Movement>(); }",
+        )
+        assert "Movement" in refs
+
+    def test_addcomponent_arg_is_still_a_dependency(self, tmp_path: Path):
+        # AddComponent literally CREATES the peer at runtime — a real edge.
+        refs = self._refs(
+            tmp_path, "Rig",
+            "  void Start() { gameObject.AddComponent<Health>(); }",
+        )
+        assert "Health" in refs
+
+    def test_collection_generic_arg_still_captured(self, tmp_path: Path):
+        # Don't over-tighten: a collection generic IS a real type reference.
+        refs = self._refs(
+            tmp_path, "Inventory",
+            "  private System.Collections.Generic.List<ItemDef> items;",
+        )
+        assert "ItemDef" in refs
+
+    def test_type_required_elsewhere_still_captured(self, tmp_path: Path):
+        # Referenced BOTH via a global lookup AND a real ``new`` — the
+        # ``new`` path must still register it as a dependency.
+        refs = self._refs(
+            tmp_path, "Spawner",
+            "  void Start() {\n"
+            "    var gm = FindObjectOfType<GameManager>();\n"
+            "    var fresh = new GameManager();\n"
+            "  }",
+        )
+        assert "GameManager" in refs
