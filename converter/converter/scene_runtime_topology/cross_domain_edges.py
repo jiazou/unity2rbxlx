@@ -1,5 +1,5 @@
-"""cross_domain_edges — enumerate every client<->server serialized
-reference in the plan.
+"""cross_domain_edges — enumerate every cross-domain edge candidate in
+the plan.
 
 Relocated in Phase 1 from ``scene_runtime_domain.compute_cross_domain_edges``.
 Schema extended with the design doc's ``id`` field (the
@@ -7,14 +7,63 @@ Schema extended with the design doc's ``id`` field (the
 consumers). The id is populated deterministically in Phase 1 so Phase 2b
 can read it without a schema migration.
 
-Phase 1 has only one consumer of the ``id`` field: the topology artifact
-builder, which uses it to link a module / animation driver to its bridge
-edge. No code paths produce bridge code from the id yet — that's Phase 2b.
+Phase 2b slice 1 extends this further with:
+  - ``kind: "attribute_write"`` (closed-enum discriminator; today's only
+    value, but slice 2+ may add more).
+  - ``resolution`` (strategy + event_name): the resolution metadata Phase
+    2b's bridge emitter (slice 3) consumes. Slice 1 produces the
+    structural ``resolution.strategy`` (always ``"remote_event_bridge"``
+    for slice 1's outputs) and a stable ``resolution.event_name`` derived
+    from owner+field; slice 2's enrichment pass may revise the event_name
+    or downgrade strategy to ``"same_domain_no_bridge"``.
+  - ``bridge_member_scripts`` (list, EMPTY in slice 1): slice 2's
+    enrichment populates this with the 4-script bridge unit (client
+    caller, server listener, RemoteEvent, anim listener) per design doc.
+  - ``payload`` (attribute_name + schema): the payload the bridge
+    transmits. ``attribute_name`` is the field name (component-ref
+    edges) or a per-instance template (shared-attribute candidates that
+    resolve to a dynamic per-pickup attribute at slice 3 emit time).
+
+Slice 1 also introduces a SECOND producer:
+``compute_shared_attribute_candidates``. Walks scene/prefab instances
+and, for each instance whose component class matches a seed in
+``SHARED_ATTRIBUTE_SEEDS``, emits a candidate edge. This is the
+structural pre-transpile equivalent of today's hardcoded
+``PlayerSetSharedFlag`` prompt block at ``code_transpiler.py:1267-1288``
+— lifted to a data table so the bridge emitter (slice 3) can consume it
+instead of the prompt embedding the RemoteEvent name forever.
+
+R1 wiring (codex P1, 2026-05-30): ``build_topology`` routes the two
+producers to SEPARATE artifact buckets, not a concatenated list:
+
+  - ``compute_cross_domain_edges`` outputs land in
+    ``artifact["cross_domain_edges"]`` — fully resolved, every row has a
+    runtime ``from_domain`` and ``to_domain`` and passes
+    ``_enforce_invariants`` invariant 2.
+  - ``compute_shared_attribute_candidates`` outputs land in
+    ``artifact["cross_domain_edge_candidates"]`` — fan-out shape with
+    empty ``to_*`` until slice 2 enrichment resolves consumers and
+    populates ``bridge_member_scripts``. Invariant 2 does NOT iterate
+    this bucket.
+
+Slice 2 enrichment reads from ``cross_domain_edge_candidates``, resolves
+domains + bridge members, and either promotes rows to
+``cross_domain_edges`` or keeps the two-bucket separation indefinitely
+(slice 2 decides). The two functions in this module remain pure producers
+with no awareness of the artifact buckets — wiring lives in
+``build_topology``.
+
+The CrossDomainEdge schema is intentionally KEPT FLAT (no nested
+``producer{}/consumer{}`` sub-objects) for slice 1. The design doc's
+example (L228-251) shows a nested shape; that restructure is deferred
+indefinitely — every consumer reads ``from_*`` / ``to_*`` today, and
+restructuring is scope creep slice 1's brief explicitly excludes.
 """
 
 from __future__ import annotations
 
-from typing import TypedDict, cast
+from dataclasses import dataclass
+from typing import Literal, TypedDict, cast
 
 from converter.scene_runtime_planner import (
     SceneRuntimeArtifact,
@@ -22,21 +71,90 @@ from converter.scene_runtime_planner import (
 )
 
 
+class BridgeMember(TypedDict):
+    """One script (or RemoteEvent) participating in a bridge.
+
+    ``role`` values are the design doc's 4-script unit (``client_caller``,
+    ``server_listener``, ``remote_event``, ``anim_listener``). Slice 1
+    leaves the list empty on every emitted edge; slice 2 populates it
+    after enrichment resolves the listeners.
+
+    ``ref`` is the consumer-readable identifier the bridge emitter (slice
+    3) will dereference (a script id, a GUID, or a dotted DataModel path
+    for ``remote_event``). Format intentionally unconstrained so slice 2
+    can pick the right kind per role.
+    """
+
+    role: str
+    ref: str
+
+
+class ResolutionSpec(TypedDict):
+    """How the bridge emitter should resolve the producer's write.
+
+    ``strategy``:
+      - ``"remote_event_bridge"``: the emitter (slice 3) rewrites the
+        producer's ``SetAttribute`` to ``<event_name>:FireServer(target,
+        v)`` and synthesizes a server listener.
+      - ``"same_domain_no_bridge"``: producer + consumer share a domain;
+        the bridge is unnecessary. Slice 2 may downgrade an edge to this
+        once enrichment confirms domains.
+      - ``"excluded"``: the edge is structurally cross-domain but the
+        operator opted out (or the consumer is itself non-runtime). The
+        emitter skips these.
+
+    ``event_name`` is the RemoteEvent name the producer fires and the
+    listener subscribes to. For component-ref edges, slice 1 derives it
+    deterministically from ``<owner>_Set<Field>``. For shared-attribute
+    candidates, slice 1 sets it from the seed table (LOCKED — see
+    ``PickupItemEvent`` in ``SHARED_ATTRIBUTE_SEEDS``).
+    """
+
+    strategy: Literal["remote_event_bridge", "same_domain_no_bridge", "excluded"]
+    event_name: str
+
+
+class PayloadSpec(TypedDict):
+    """What the bridge transmits.
+
+    ``attribute_name`` is the Roblox Instance Attribute the listener
+    writes on the target. Component-ref edges set this to the C# field
+    name verbatim. Shared-attribute candidates set it to a TEMPLATE
+    (e.g. ``"has<itemName>"``) the bridge emitter (slice 3) resolves
+    per-instance at emit time — slice 1 does NOT resolve the template
+    because the producer pass doesn't know which instance the producer
+    is writing at runtime.
+
+    ``schema``:
+      - ``"unknown"``: slice 1's default for component-ref edges; slice
+        2 may sharpen via type analysis.
+      - ``"bool"``: the slice 1 default for shared-attribute candidates,
+        matching the hardcoded prompt at ``code_transpiler.py:1279``
+        (``_plr:SetAttribute(_flag, true)``).
+    """
+
+    attribute_name: str
+    schema: str
+
+
 class CrossDomainEdge(TypedDict):
-    """One client<->server reference identified at conversion time.
+    """One cross-domain attribute-write edge identified at conversion
+    time.
 
-    ``id`` is added in Phase 1 (see module docstring). All other fields
-    are byte-stable with the pre-Phase-1 CrossDomainEdge in
-    ``scene_runtime_domain.py`` so on-disk plans + the cross-domain
-    report writer keep working.
+    ``id`` is added in Phase 1 (see module docstring). The original 10
+    flat fields (``from_*``, ``to_*``, ``field``, ``owner_*``) are
+    byte-stable with the pre-Phase-1 CrossDomainEdge so on-disk plans +
+    the cross-domain report writer keep working.
 
-    Phase 2b extends this further with ``resolution`` +
-    ``bridge_member_scripts`` once bridge code emission lands; those are
-    intentionally absent here to avoid committing to a Phase 2b shape
-    Phase 1 isn't ready to validate.
+    Phase 2b slice 1 adds ``kind`` / ``resolution`` /
+    ``bridge_member_scripts`` / ``payload`` per the design doc Path C
+    architecture. The producer/consumer restructure (nested objects per
+    design doc L232-235) is intentionally NOT done — slice 1's brief
+    excludes it.
     """
 
     id: str
+    kind: Literal["attribute_write"]
     from_instance: str
     to_instance: str
     from_script: str
@@ -46,6 +164,9 @@ class CrossDomainEdge(TypedDict):
     to_domain: str
     owner_kind: str
     owner_ref: str
+    resolution: ResolutionSpec
+    bridge_member_scripts: list[BridgeMember]
+    payload: PayloadSpec
 
 
 # Domain values the cross-domain pass refuses to wire through.
@@ -56,6 +177,90 @@ class CrossDomainEdge(TypedDict):
 #   already rewritten.
 NON_RUNTIME_DOMAINS: frozenset[str] = frozenset(
     {"", "helper", "excluded", "legacy"},
+)
+
+
+@dataclass(frozen=True)
+class SharedAttributeSeed:
+    """One canonical shared-attribute pattern the converter knows how to
+    bridge.
+
+    ``producer_class_name``: the Unity component class whose lifecycle
+    writes the shared attribute. Matched against
+    ``modules[script_id].class_name`` — instances whose ``script_id``
+    resolves to a module with this class name are seeded.
+
+    ``remote_event_name``: the RemoteEvent name the bridge fires.
+    LOCKED for ``Pickup`` — see Mitigation α in slice 1's brief and the
+    locked-name regression guard in test_pickup_item_event_name_locked.
+    Three downstream sites in ``script_coherence_packs.py`` hardcode
+    this literal string; Phase 2b deliberately does NOT migrate them
+    because the bridge emitter (slice 3) re-produces the same byte
+    shape.
+
+    ``attribute_template``: the per-instance attribute name shape. For
+    ``Pickup``, this is ``"has<itemName>"`` (literal template string;
+    slice 3 resolves ``<itemName>`` per-instance at emit time from the
+    instance's ``itemName`` config field). Captured as a raw template
+    here because the producer pass walks the SCENE — it does not know
+    the per-instance ``itemName`` config without re-resolving every
+    instance, which would invert the candidate enumeration cost.
+    """
+
+    producer_class_name: str
+    remote_event_name: str
+    attribute_template: str
+
+
+# Phase 2b slice 1: structural pre-transpile seed table. The table seeds
+# the structural candidate pass so slice 3's bridge emitter can consume
+# data, not regrep the prompt forever.
+#
+# SCOPE — narrower than the prompt it eventually replaces (Codex R2,
+# 2026-05-30). This table matches the EXISTING
+# ``pickup_remote_event_server`` pack's class-name detection scope
+# (``Pickup`` only), NOT the broader prompt scope at
+# ``code_transpiler.py:1271-1289``. That prompt is UNBOUNDED — it
+# instructs the AI to fire ``PlayerSetSharedFlag`` for ANY MonoBehaviour
+# writing shared state (``GetItem(itemName)``-style methods,
+# ``RecoverHealth``, ``gotWeapon = true``, etc.). The slice 1 seed
+# faithfully covers the one structural case the existing pack already
+# handles; it does NOT cover the long tail the prompt covers.
+#
+# WARNING for slice 3 (Codex R2, 2026-05-30): before slice 3 deletes
+# the hardcoded ``_GENERIC_RUNTIME_PROMPT`` ``PlayerSetSharedFlag``
+# block, slice 3 must decide between:
+#   (a) Require this table to be COMPREHENSIVE before deleting the
+#       prompt path — i.e. statically enumerate every MonoBehaviour
+#       class that writes shared player state across the converter's
+#       supported corpus, and add a seed row per class. High up-front
+#       cost; fully data-driven afterwards.
+#   (b) Keep a FALLBACK that scans AI output for
+#       ``PlayerSetSharedFlag:FireServer`` calls when no topology
+#       candidate covers the producing script. Lower cost; preserves
+#       coverage for non-Pickup shared-flag writers (e.g. a ``Player.cs``
+#       controller that records ``has<X>`` without routing through a
+#       Pickup instance) that the slice 1 seed misses.
+# Deleting the prompt path without picking one regresses any non-Pickup
+# shared-flag writer in real projects.
+#
+# IMPORTANT — Mitigation α (LOCKED PickupItemEvent): the Pickup seed's
+# ``remote_event_name`` MUST stay the literal ``"PickupItemEvent"``.
+# Three downstream sites continue to hardcode this string through Phase
+# 2b:
+#   - ``pickup_remote_event_client`` regex at
+#     ``script_coherence_packs.py:780-783``
+#   - ``pickup_visual_target`` template at
+#     ``script_coherence_packs.py:1167-1189``
+#   - listener pack at ``script_coherence_packs.py:1032-1079``
+# Changing this string here breaks all three. The design doc explicitly
+# locks it (Phase 2b deliverable 4).
+SHARED_ATTRIBUTE_SEEDS: tuple[SharedAttributeSeed, ...] = (
+    SharedAttributeSeed(
+        producer_class_name="Pickup",
+        remote_event_name="PickupItemEvent",
+        attribute_template="has<itemName>",
+    ),
 )
 
 
@@ -76,6 +281,38 @@ def deterministic_edge_id(
     return f"{from_instance}::{field}::{to_instance}"
 
 
+def shared_attribute_candidate_id(
+    owner_ref: str, instance_id: str, event_name: str,
+) -> str:
+    """Stable id for a shared-attribute candidate.
+
+    Distinct namespace (``shared_attr::``) from ``deterministic_edge_id``
+    so the two producers can NEVER collide. The triple is the minimum
+    that makes one Pickup instance distinguishable from another while
+    the seed's ``event_name`` flags WHICH seed produced it (debug
+    triage).
+    """
+    return f"shared_attr::{owner_ref}::{instance_id}::{event_name}"
+
+
+def _derive_event_name_from_owner_field(owner_class: str, field: str) -> str:
+    """Component-ref edges: deterministic ``<owner>_Set<Field>`` event
+    name per design doc L239 (the ``Door_SetOpen`` example).
+
+    ``field`` is capitalized only at its first character; multi-word
+    camelCase fields (``isOpen`` → ``IsOpen``) keep internal casing so
+    the name is human-recognizable. Empty field yields
+    ``<owner>_Set`` rather than asserting — slice 2's enrichment can
+    detect and reject the empty-field shape if needed; slice 1 stays
+    permissive so a malformed input doesn't crash the producer.
+    """
+    if not field:
+        capitalized = ""
+    else:
+        capitalized = field[0].upper() + field[1:]
+    return f"{owner_class}_Set{capitalized}"
+
+
 def compute_cross_domain_edges(
     scene_runtime: SceneRuntimeArtifact,
 ) -> list[CrossDomainEdge]:
@@ -86,6 +323,14 @@ def compute_cross_domain_edges(
       - Both source and target instances resolve to modules with
         execution domains in ``{"client", "server"}``
       - The two domains differ
+
+    Slice 1 stamps the new ``kind`` / ``resolution`` /
+    ``bridge_member_scripts`` / ``payload`` fields on every emitted
+    edge. The ``resolution.strategy`` is ``"remote_event_bridge"``
+    unconditionally — slice 2's enrichment may downgrade to
+    ``"same_domain_no_bridge"`` once it cross-checks finalized domains
+    against the live module table. ``bridge_member_scripts`` stays
+    empty until slice 2 fills it.
 
     Pure function; does not mutate ``scene_runtime``.
     """
@@ -102,6 +347,14 @@ def compute_cross_domain_edges(
             instance_to_script[inst["instance_id"]] = inst["script_id"]
 
     out: list[CrossDomainEdge] = []
+
+    def _module_class_name(script_id: str) -> str:
+        mod = modules.get(script_id, {})
+        class_name = mod.get("class_name", "")
+        if isinstance(class_name, str) and class_name:
+            return class_name
+        stem = mod.get("stem", "")
+        return stem if isinstance(stem, str) else ""
 
     def _scan(
         owner_kind: str,
@@ -129,8 +382,13 @@ def compute_cross_domain_edges(
             if src_domain == tgt_domain:
                 continue
             field = ref.get("field", "")
+            owner_class = _module_class_name(src_sid)
+            event_name = _derive_event_name_from_owner_field(
+                owner_class, field,
+            )
             out.append(CrossDomainEdge(
                 id=deterministic_edge_id(src_inst, field, tgt_inst),
+                kind="attribute_write",
                 from_instance=src_inst,
                 to_instance=tgt_inst,
                 from_script=src_sid,
@@ -140,6 +398,15 @@ def compute_cross_domain_edges(
                 to_domain=tgt_domain,
                 owner_kind=owner_kind,
                 owner_ref=owner_ref,
+                resolution=ResolutionSpec(
+                    strategy="remote_event_bridge",
+                    event_name=event_name,
+                ),
+                bridge_member_scripts=[],
+                payload=PayloadSpec(
+                    attribute_name=field,
+                    schema="unknown",
+                ),
             ))
 
     for key, scene in scenes.items():
@@ -150,9 +417,130 @@ def compute_cross_domain_edges(
     return out
 
 
+def compute_shared_attribute_candidates(
+    scene_runtime: SceneRuntimeArtifact,
+) -> list[CrossDomainEdge]:
+    """Enumerate every scene/prefab instance whose component class
+    matches a ``SHARED_ATTRIBUTE_SEEDS`` row.
+
+    This is the structural pre-transpile equivalent of today's
+    hardcoded ``PlayerSetSharedFlag`` prompt block: walks scenes +
+    prefabs, finds Pickup instances (and any future seed kinds), emits
+    one candidate edge per match.
+
+    Slice 1's candidates are intentionally FAN-OUT: ``to_*`` fields are
+    empty strings and ``bridge_member_scripts`` is empty. Slice 2's
+    enrichment pass walks the module graph to find consumers (the
+    scripts that ``GetAttribute(has<itemName>)``) and populates
+    ``bridge_member_scripts`` with them.
+
+    Iteration order is deterministic: scenes (sorted by key, then
+    instance list order), then prefabs (sorted by key, then instance
+    list order). Stable across runs given the same input. Matches the
+    `_scan` traversal order in ``compute_cross_domain_edges`` so the
+    concatenated output in ``build_topology`` stays sortable.
+
+    Pure function; does not mutate ``scene_runtime``.
+    """
+    modules = cast(dict[str, dict[str, object]], scene_runtime.get("modules", {}))
+    scenes = scene_runtime.get("scenes", {})
+    prefabs = scene_runtime.get("prefabs", {})
+
+    # Index seeds by class name for O(1) lookup. Slice 1 has exactly
+    # one seed, but the lookup pattern stays the same as the table
+    # grows.
+    seeds_by_class: dict[str, SharedAttributeSeed] = {
+        seed.producer_class_name: seed for seed in SHARED_ATTRIBUTE_SEEDS
+    }
+    if not seeds_by_class:
+        return []
+
+    out: list[CrossDomainEdge] = []
+
+    def _module_class_name(script_id: str) -> str:
+        mod = modules.get(script_id, {})
+        class_name = mod.get("class_name", "")
+        if isinstance(class_name, str) and class_name:
+            return class_name
+        stem = mod.get("stem", "")
+        return stem if isinstance(stem, str) else ""
+
+    def _module_domain(script_id: str) -> str:
+        mod = modules.get(script_id, {})
+        domain = mod.get("domain", "")
+        return domain if isinstance(domain, str) else ""
+
+    def _emit_for_owner(
+        owner_kind: str, owner_ref: str,
+        instances: list[dict[str, object]],
+    ) -> None:
+        for inst in instances:
+            script_id_obj = inst.get("script_id", "")
+            script_id = script_id_obj if isinstance(script_id_obj, str) else ""
+            if not script_id:
+                continue
+            class_name = _module_class_name(script_id)
+            seed = seeds_by_class.get(class_name)
+            if seed is None:
+                continue
+            instance_id_obj = inst.get("instance_id", "")
+            instance_id = (
+                instance_id_obj if isinstance(instance_id_obj, str) else ""
+            )
+            if not instance_id:
+                continue
+            from_domain = _module_domain(script_id)
+            out.append(CrossDomainEdge(
+                id=shared_attribute_candidate_id(
+                    owner_ref, instance_id, seed.remote_event_name,
+                ),
+                kind="attribute_write",
+                from_instance=instance_id,
+                to_instance="",
+                from_script=script_id,
+                to_script="",
+                field=seed.attribute_template,
+                from_domain=from_domain,
+                to_domain="",
+                owner_kind=owner_kind,
+                owner_ref=owner_ref,
+                resolution=ResolutionSpec(
+                    strategy="remote_event_bridge",
+                    event_name=seed.remote_event_name,
+                ),
+                bridge_member_scripts=[],
+                payload=PayloadSpec(
+                    attribute_name=seed.attribute_template,
+                    schema="bool",
+                ),
+            ))
+
+    for key in sorted(scenes.keys()):
+        scene = scenes[key]
+        _emit_for_owner(
+            "scene", key,
+            cast(list[dict[str, object]], scene.get("instances", [])),
+        )
+    for key in sorted(prefabs.keys()):
+        prefab = prefabs[key]
+        _emit_for_owner(
+            "prefab", key,
+            cast(list[dict[str, object]], prefab.get("instances", [])),
+        )
+
+    return out
+
+
 __all__ = (
+    "BridgeMember",
     "CrossDomainEdge",
     "NON_RUNTIME_DOMAINS",
+    "PayloadSpec",
+    "ResolutionSpec",
+    "SHARED_ATTRIBUTE_SEEDS",
+    "SharedAttributeSeed",
     "compute_cross_domain_edges",
+    "compute_shared_attribute_candidates",
     "deterministic_edge_id",
+    "shared_attribute_candidate_id",
 )

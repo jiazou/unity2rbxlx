@@ -17,6 +17,7 @@
     }
   },
   "caller_graph": {},
+  "cross_domain_edge_candidates": [],
   "cross_domain_edges": [],
   "modules": {
     "guid-animator-target": {

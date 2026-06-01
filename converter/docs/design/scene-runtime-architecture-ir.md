@@ -760,37 +760,116 @@ verifier work moves to Phase 3 where it's actually scheduled.
   becomes a single emit step driven by topology, not an independent
   pipeline pass.
 
-### Phase 2b — `code_transpiler.py` becomes bound consumer (bridge emission)
+### Phase 2b — bridge emission (post-transpile rewriter, edge-driven)
 
 Higher-risk codegen behavior change; gated behind Phase 2a's checkpoint.
+Architecture finalized 2026-05-30 after Claude+Codex parallel adversarial
+review (`/tmp/topology/phase2b-adversarial-{claude.md,codex-raw.log,synthesis.md}`).
+The earlier framing ("transpile-emit bridge code generation… AT EMIT TIME")
+was structurally infeasible — see "Path C decision" below.
+
+**Path C decision (Claude+Codex unanimous, 2026-05-30):** edges are
+DERIVED across two stages (structural pre-transpile, enriched post-transpile)
+and EMITTED post-transpile. NOT consumed inside the AI prompt at transpile
+time. Rationale: the topology prepass that resolves `domains`,
+`script_id_by_name`, and `bridge_member_scripts` runs inside
+`_classify_storage`, which depends on `convert_scene` + `_subphase_emit_scripts_to_disk`
++ `_subphase_cohere_scripts` (`pipeline.py:2566-2618`,
+`scene-runtime-pr4-followups.md:600-626`). Reordering would re-architect
+`materialize_and_classify`'s entire phase contract. Path A (post-AI
+rewriter ONLY) is too narrow to cover the pickup case; Path B (pre-transpile
+move) is structurally blocked.
 
 **Deliverables:**
 
-1. **Transpile-emit bridge code generation.** For every
-   `cross_domain_edges[*]` with `resolution.strategy ==
-   "remote_event_bridge"`, `code_transpiler` rewrites the producer's
-   `SetAttribute(name, v)` call to `<event_name>:FireServer(target, v)`
-   AT EMIT TIME. Server-side bridge listener script is auto-generated
-   (lives in `ServerScriptService` per the bridge member descriptors).
-   RemoteEvent is auto-added to `ReplicatedStorage`. No coherence pack
-   rewrites.
+1. **Two-stage edge derivation.**
+   - **Structural candidate pass (pre-transpile).** Off `plan_scene_runtime`
+     (`pipeline.py:40-48`), enumerate edge candidates from (a) today's
+     `target_kind=="component"` peer-MonoBehaviour serialized references
+     in `scenes/prefabs.references`, AND (b) a new `shared_attribute`
+     candidate kind seeded from the hardcoded `PlayerSetSharedFlag`
+     allowlist at `code_transpiler.py:1267-1288` (lifted to a topology
+     input table — data, not code). Both kinds emit `kind:
+     "attribute_write"` in the artifact; the derivation source stays as
+     internal metadata.
+   - **Enrichment pass (post-transpile, inside `_maybe_run_topology_prepass`).**
+     Resolve `domains`, `bridge_member_scripts`, and `resolution.event_name`
+     for each candidate. The duplicate-`event_name` invariant lives
+     HERE, not in slice 1 — real names aren't known until enrichment.
 
-2. **Per-Codex round-1:** *"transpile-time generation is easier to reason
-   about, easier to diff, and keeps failure visible in generated code. A
-   runtime host service centralizes logic, but it can become a hidden
-   second architecture layer."*
+2. **Post-transpile, pre-pack bridge emitter.** New module
+   `scene_runtime_topology/bridge_emit.py`. Runs in
+   `_subphase_cohere_scripts` BEFORE `run_packs` (or as its own subphase
+   between cohere and pack). For every edge with `resolution.strategy ==
+   "remote_event_bridge"`, rewrites the producer script's
+   `SetAttribute(name, v)` to `<event_name>:FireServer(target, v)`.
+   Idempotent: rows whose source already has the canonical
+   `:FireServer(target, v)` shape are skipped. Gated on
+   `self.state.transpilation_result is not None` (fresh transpile only).
 
-3. **Existing `pickup_remote_event_server` pack retires.** Pickup's
-   `hasKey`/`hasRifle` writes become just another cross-domain edge
-   handled at transpile-emit. Byte-equivalence regression test guards the
-   migration.
+3. **Auto-generated server-side bridge listener + RemoteEvent.** For
+   each `remote_event_bridge` edge, synthesize a server `Script` in
+   `ServerScriptService` whose body installs `OnServerEvent` →
+   `target:SetAttribute(field, v)`. Stamp the corresponding
+   `RemoteEvent` in `ReplicatedStorage`. `bridge_member_scripts[*]`
+   names the synthesized script id; `lifecycle_role: bridge_listener`
+   (forward-allocated at `lifecycle_roles.py:50`) tags the row.
+
+4. **PickupItemEvent name locked for the SimpleFPS pickup edge.** Slice
+   1 sets `resolution.event_name = "PickupItemEvent"` for that edge
+   verbatim, preserving the literal string. The 3 downstream
+   hardcoded sites (`pickup_remote_event_client` regex detector
+   `packs.py:780-783`; `pickup_visual_target` template `packs.py:1167-1189`;
+   client listener pack `packs.py:1032-1079`) continue to match without
+   migration. Future cleanup migrates those sites to consume the edge
+   artifact directly; Phase 2b does NOT.
+
+5. **autogen.py scope: PlayerSetSharedFlag migrates, PlayerShoot and
+   PlayerGetItem stay.** `autogen.py:147-177` keeps owning the two
+   player-input RemoteEvents (`PlayerShoot`, `PlayerGetItem`) — those
+   are input-domain events, not cross-domain attribute bridges, and
+   don't fit the edge model. Phase 2b only retires the
+   `PlayerSetSharedFlag` block by routing its writes through the new
+   bridge emitter. The `_GENERIC_RUNTIME_PROMPT` hardcoded special case
+   for `PlayerSetSharedFlag` (`code_transpiler.py:1267-1288`) is
+   deleted in slice 3 — its semantics move to the topology-driven
+   emitter.
+
+6. **`pickup_remote_event_server` retires; walk-up `GetAttribute`
+   compensation is DETANGLED first.** The pack mixes (a) cross-domain
+   bridge rewriting with (b) AI-bug compensation (walk-up
+   `GetAttribute("itemName")` lookups at `packs.py:849-908`). (b) is
+   NOT bridge work — it's a Pickup-specific AI repair pass that
+   survives the retirement. Slice 4 extracts (b) into a new pack
+   `pickup_attribute_walkup` (or into the AI reprompt loop) BEFORE
+   slice 5 deletes the bridge logic.
+
+**5-slice plan (Codex producer-split philosophy):**
+
+| Slice | Scope | Rounds |
+|---|---|---|
+| 1 | Edge schema extension (`kind: "attribute_write"`, `resolution`, `bridge_member_scripts`) + pre-transpile structural candidate pass (both component-ref and shared_attribute candidates, latter seeded from `PlayerSetSharedFlag` data). No emit, no consumer. Persisted-bytes change only in `conversion_plan.json`. | 2 |
+| 2 | Post-transpile enrichment inside `_maybe_run_topology_prepass`. Resolve domains + `bridge_member_scripts` + final `event_name`s. Duplicate-`event_name` invariant lives here. No emit. | 2-3 |
+| 3 | Consumer: `scene_runtime_topology/bridge_emit.py`. Idempotent. Gated on `self.state.transpilation_result is not None`. Delete `_GENERIC_RUNTIME_PROMPT` `PlayerSetSharedFlag` special case. | 3-4 |
+| 4 | Detangle Pickup walk-up `GetAttribute` compensation into a separate pack. Update the 6 `after=("pickup_remote_event_server",)` consumers to depend on the new `bridge_emit` ordering anchor. Document the canonical-form acceptance criterion (replaces byte-equivalence). | 2-3 |
+| 5 | Delete `_convert_pickup_to_remote_event` apply fn + helpers. Verify all 6 downstream packs work, specifically: `pickup_remote_event_client` regex detector still matches `"PickupItemEvent"`; `pickup_visual_target` template still produces a working pickup. Full e2e on SimpleFPS. | 3-4 |
+
+**Total: 5 slices, 12-17 review rounds.**
+
+**Per-Codex round-1:** *"transpile-time generation is easier to reason
+about, easier to diff, and keeps failure visible in generated code. A
+runtime host service centralizes logic, but it can become a hidden
+second architecture layer."* The post-transpile rewriter preserves this
+property (generated code is inspectable byte-shape) without requiring
+the structurally infeasible AI-emit-time consumption.
 
 **What this resolves:**
 
 - Server-authoritative state for door (multiplayer correctness, per user's
   explicit requirement).
 - Generic mechanism that subsumes the ad-hoc `pickup_remote_event_server`
-  pack and removes a class of one-off coherence packs.
+  pack and the hardcoded `PlayerSetSharedFlag` prompt block, replacing
+  both with one edge-driven path.
 
 ### Phase 3 — Contract verifier in `contract_pipeline.py`
 
@@ -875,15 +954,44 @@ Per Codex round-2: **"Remove, not deprecate" is right, but per slice.**
   logic; deltas are intentional and documented).
 
 ### Phase 2b
-- **Golden-file regression:** synthesize a 2-module plan with a client
-  writer + server reader sharing an attribute; assert transpiled output
-  contains `<event>:FireServer(target, v)` (not raw `SetAttribute`).
-- **Byte-equivalence regression:** existing `pickup_remote_event_server`
-  pack output matches the new transpile-emit output. Proves migration
-  didn't semantically drift before retiring the pack.
-- **Fast suite:** full converter test suite green. The existing
-  `test_script_coherence_packs.py::TestPickupRemoteEventServer` must
-  still pass after the pack becomes a no-op.
+- **Slice 1 (schema + producer):** synthesize candidate edges from a
+  fixture scene/prefab pair (component-ref) AND from the
+  `PlayerSetSharedFlag` allowlist (shared_attribute); assert both
+  emit `kind: "attribute_write"` with stable `id`s; assert the
+  artifact persists with the new shape.
+- **Slice 2 (enrichment + invariant):** synthesize two candidates that
+  would resolve to the same `event_name`; assert the duplicate-name
+  invariant aborts the build. Synthesize a same-domain candidate;
+  assert it gets `resolution.strategy: "same_domain_no_bridge"`.
+- **Slice 3 (emitter, golden-file regression):** synthesize a 2-module
+  plan with a client writer + server reader sharing an attribute;
+  assert post-emit Luau contains `<event>:FireServer(target, v)` (not
+  raw `SetAttribute`). Adversarial fixtures for AI non-determinism: at
+  least 3 receiver shapes (qualified, method-call chain, multi-line).
+  Idempotency: run the emitter twice; assert byte-identical output.
+- **Slice 4 (detangle + ordering):** the extracted
+  `pickup_attribute_walkup` pack still applies the walk-up
+  `GetAttribute` repair under the new ordering; each of the 6
+  downstream `after=(...)` packs fires under its new ordering anchor
+  with synthetic input. Canonical-form acceptance criterion (the
+  documented diff allowlist) is committed alongside slice 4.
+- **Slice 5 (retirement):** **canonical-form equivalence regression**
+  (replaces the abandoned literal byte-equivalence promise): the
+  emitted pickup-bridge bytes under the new path semantically match
+  the pre-Phase-2b pack output, allowing a documented diff allowlist
+  (whitespace, comment text, the walk-up `GetAttribute` block which is
+  now in `pickup_attribute_walkup`). Specifically: post-emit place has
+  `ReplicatedStorage.PickupItemEvent`; client listener at
+  `Player.luau` still calls `getItem(itemName)`;
+  `pickup_visual_target`-replaced Pickup still fires the bridge event;
+  `door_player_flag_location` + `door_module_player_to_attribute` +
+  `door_direct_character_attribute` still read the attribute the
+  bridge writes.
+- **Fast suite + e2e:** full converter test suite green; e2e on
+  SimpleFPS — `door_opens_with_key` fixture passes. Existing
+  `test_script_coherence_packs.py::TestPickupRemoteEventServer` is
+  retired alongside the pack and replaced by the slice 3 golden-file
+  regression + slice 5 canonical-form regression.
 
 ### Phase 3
 - **Build-fail tests:** synthesize plans with each contract violation
@@ -901,7 +1009,8 @@ Per Codex round-2: **"Remove, not deprecate" is right, but per slice.**
 |---|---|---|---|
 | Topology artifact schema proves insufficient mid-migration | medium | high | Lightweight invariant checks (Codex round-1) catch contradictions early; Phase 1 ships with a SINGLE concrete consumer (animation_converter) before promising the schema to other phases |
 | **Planner/consumer skew during phased rollout** (Codex round-3) | medium | high | Schema-compat test cut + frozen-fixture round-trip test prevents drift; topology version field in artifact so consumers can detect mismatches |
-| Phase 2b's `pickup_remote_event_server` pack migration regresses Pickup | medium | medium | Byte-equivalence regression test before retiring the pack; keep both paths for one release behind a feature flag |
+| Phase 2b's `pickup_remote_event_server` pack migration regresses Pickup | medium | medium | Canonical-form (not literal-byte) equivalence regression with documented diff allowlist; walk-up `GetAttribute` compensation extracted to `pickup_attribute_walkup` BEFORE pack deletion; PickupItemEvent name locked for the existing edge so the 3 downstream hardcoded sites continue to match unmodified |
+| Phase 2b's edge derivation reordering (Path B) is structurally blocked | n/a | n/a | (resolved 2026-05-30) Path C decision in deliverable 1 splits derivation into structural-candidate (pre-transpile) + enrichment (post-transpile); rewriter is post-transpile, pre-pack. Cited evidence: `pipeline.py:2566-2618`, `scene-runtime-pr4-followups.md:600-626` |
 | Phase 3 fail-closed mode breaks newly-converted external projects | medium | high | Shadow-mode metrics first; corpus audit across bundled projects; one-release escape hatch (env var to revert to warnings) |
 | `lifecycle_role` enum proves insufficient for future cases | low | low | Closed enum + optional metadata bag (Codex round-4) — non-placement-affecting hints go in the bag, structural roles go in the enum; future enum extensions are backward-compatible |
 | Cross-domain bridge RemoteEvent naming collisions across prefabs | low | medium | Deterministic `event_name = <prefab>_Set<Attribute>` scheme; topology invariant rejects collisions at emit time |
@@ -961,6 +1070,45 @@ while the topology work is multi-PR.
 
 ## Revision history
 
+- **2026-05-30** — Phase 2b section rewritten BEFORE slice 1 implementer
+  runs (per `update-design-doc-before-implementation` memory rule). Two
+  parallel architectural reviews (Claude design subagent + `codex exec`
+  on the consensus 5-slice plan) followed by an adversarial pass on the
+  same brief converged unanimously on **Path C** (structural edge
+  candidates pre-transpile, enrichment + emission post-transpile).
+  Reviews on disk at `/tmp/topology/phase2b-{arch,adversarial}-*` and
+  `/tmp/topology/phase2b-adversarial-synthesis.md`. Key corrections to
+  the prior Phase 2b text:
+  - "AT EMIT TIME" framing was structurally infeasible: `_classify_storage`
+    depends on `convert_scene` + emit + cohere (`pipeline.py:2566-2618`,
+    `scene-runtime-pr4-followups.md:600-626`), so the topology prepass
+    cannot run before transpile. Replaced with the post-transpile
+    rewriter triangle.
+  - The edge model required widening: today's
+    `cross_domain_edges` only enumerates `target_kind=="component"`
+    peer-MonoBehaviour refs (`cross_domain_edges.py:84-88,111-143`), so
+    Pickup's attribute-name shared-state writes are NOT in the set. Slice 1
+    adds a second derivation source (`PlayerSetSharedFlag` allowlist
+    lifted to topology data) so the artifact covers the pickup edge.
+  - Byte-equivalence regression replaced by canonical-form / semantic
+    equivalence with documented diff allowlist (the prior promise was
+    unrealistic — the pack hardcodes `'\t\t\t'` indent, a 7-line comment
+    block, AND walk-up `GetAttribute` compensation that isn't bridge
+    work).
+  - Walk-up `GetAttribute` compensation (`packs.py:849-908`) is now
+    explicitly detangled into `pickup_attribute_walkup` in slice 4
+    BEFORE slice 5 deletes the bridge logic. The current pack mixes
+    bridge rewriting with AI-bug repair.
+  - `PickupItemEvent` event name locked at slice 1 for the SimpleFPS
+    pickup edge so the 3 downstream hardcoded sites (regex detector,
+    visual_target template, listener pack) continue matching without
+    migration. Future cleanup can migrate them to consume the edge
+    artifact directly.
+  - autogen.py scope narrowed: `PlayerShoot` + `PlayerGetItem` STAY
+    (player-input events, don't fit the cross-domain edge model);
+    only `PlayerSetSharedFlag` retires alongside the
+    `_GENERIC_RUNTIME_PROMPT` special case at
+    `code_transpiler.py:1267-1288`.
 - **2026-05-30** — slice 11 (Phase 2a close-out) shipped: cleanup-only
   scope picked by parallel Claude + Codex arch review. Three commits:
   (1) test-only -- fixed two P3 pin-test gaps from the slice 10 handoff

@@ -129,6 +129,7 @@ from converter.scene_runtime_topology.animation_routing import (
 from converter.scene_runtime_topology.cross_domain_edges import (
     CrossDomainEdge,
     compute_cross_domain_edges,
+    compute_shared_attribute_candidates,
 )
 from converter.scene_runtime_topology.lifecycle_roles import (
     LIFECYCLE_ROLES,
@@ -347,6 +348,20 @@ class TopologyArtifact(TypedDict, total=False):
     modules: dict[str, TopologyModuleEntry]
     animation_drivers: dict[str, AnimationDriverEntry]
     cross_domain_edges: list[CrossDomainEdge]
+    # Phase 2b slice 1 R1 (codex P1): shared-attribute candidates live in
+    # a SEPARATE top-level bucket from fully-resolved component-ref edges
+    # because they intentionally have empty ``to_*`` fields until slice
+    # 2's enrichment pass resolves consumers + bridge_member_scripts.
+    # Mixing them into ``cross_domain_edges`` would violate invariant 2
+    # (``compute_cross_domain_edges`` emits only runtime-domain edges;
+    # ``compute_shared_attribute_candidates`` fan-out shape carries
+    # ``to_domain=""`` for every row). Slice 2 enrichment reads from
+    # this bucket, resolves domains + bridge members, and promotes rows
+    # to ``cross_domain_edges`` (or keeps the separation indefinitely —
+    # slice 2 decides). Defense-in-depth: invariant 2 only iterates
+    # ``cross_domain_edges`` so candidate rows can sit here unenriched
+    # without aborting the build.
+    cross_domain_edge_candidates: list[CrossDomainEdge]
     caller_graph: dict[str, list[str]]
 
 
@@ -491,7 +506,29 @@ def build_topology(
         script_by_sid=script_by_sid,
         reachability_requirements=reachability_requirements,
     )
-    edges_block = compute_cross_domain_edges(scene_runtime)
+    # Phase 2b slice 1: two producers feed two SEPARATE artifact buckets.
+    # 1) component-ref edges (today's path; cross-domain peer-MonoBehaviour
+    #    serialized references) -> ``cross_domain_edges``. Fully resolved:
+    #    every row has runtime ``from_domain`` + ``to_domain`` and passes
+    #    invariant 2.
+    # 2) shared-attribute candidates (new; structurally seeded from
+    #    ``SHARED_ATTRIBUTE_SEEDS``, replaces the hardcoded
+    #    ``PlayerSetSharedFlag`` prompt block once slice 3 lands the
+    #    bridge emitter) -> ``cross_domain_edge_candidates``. Fan-out
+    #    shape: ``to_*`` empty until slice 2 enrichment resolves consumers.
+    #
+    # R1 (codex P1, 2026-05-30): the two outputs were concatenated into
+    # ``cross_domain_edges`` in the initial slice-1 commit, which crashed
+    # invariant 2 on any real conversion containing a Pickup instance
+    # (``to_domain=""`` -> not in ``_VALID_RUNTIME_DOMAINS`` -> abort).
+    # Separating into two buckets resolves the conflict structurally:
+    # invariant 2 keeps its fully-resolved-only contract on the edges
+    # bucket; the candidates bucket carries unenriched rows for slice 2.
+    component_ref_edges = compute_cross_domain_edges(scene_runtime)
+    shared_attribute_candidates = compute_shared_attribute_candidates(
+        scene_runtime,
+    )
+    edges_block = component_ref_edges
     if preserved_animation_drivers is not None:
         # Resume path: caller supplied prior animation_drivers. Skip
         # the build_from_emissions step. Invariant 3 will be skipped
@@ -507,6 +544,7 @@ def build_topology(
         "modules": modules_block,
         "animation_drivers": animation_drivers_block,
         "cross_domain_edges": edges_block,
+        "cross_domain_edge_candidates": shared_attribute_candidates,
         "caller_graph": caller_graph_block,
     }
 
