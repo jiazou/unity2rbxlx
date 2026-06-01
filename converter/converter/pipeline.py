@@ -3037,6 +3037,47 @@ return table.concat(allData, "\\n")'''
                 stamped,
             )
 
+    def _shared_flag_funnel_present(self) -> bool:
+        """Read the ``PlayerSetSharedFlag`` gate from the topology fact.
+
+        Phase 2b slice 3: the topology prepass (``build_topology`` in
+        ``materialize_and_classify``) writes
+        ``scene_runtime["topology"]["shared_flag_channels"]
+        ["PlayerSetSharedFlag"]["present"]`` — ``True`` iff a cross-domain
+        server reader of a shared flag exists on a fresh transpile (and
+        ``True`` as the resume / unmappable-reader fail-open). That phase
+        runs BEFORE ``write_output`` (where the autogen injection lives),
+        so the fact is on ``ctx.scene_runtime`` by the time this reads it.
+
+        FAIL-SAFE DEFAULT ``True``: when the topology block is absent
+        (legacy mode, no topology, or any shape surprise) keep the funnel
+        — that is exactly today's unconditional behavior, strictly no
+        worse. The gate only NARROWS the funnel when the fact authoritatively
+        says ``present: False``.
+
+        Strict typing: ``ctx.scene_runtime`` is ``dict[str, object]``, so
+        each nested level is narrowed with ``isinstance`` before the next
+        lookup; ``present`` is coerced to ``bool``. No ``Any``.
+        """
+        from converter.scene_runtime_topology.shared_flag_channels import (
+            FUNNEL_EVENT_NAME,
+        )
+
+        scene_runtime = self.ctx.scene_runtime or {}
+        topology = scene_runtime.get("topology")
+        if not isinstance(topology, dict):
+            return True
+        channels = topology.get("shared_flag_channels")
+        if not isinstance(channels, dict):
+            return True
+        channel = channels.get(FUNNEL_EVENT_NAME)
+        if not isinstance(channel, dict):
+            return True
+        present = channel.get("present", True)
+        if not isinstance(present, bool):
+            return True
+        return present
+
     def _subphase_inject_autogen_scripts(self) -> None:
         """Synthesize project-bootstrap scripts: collision-group setup,
         GameServerManager spawn handling, ClientBootstrap that requires
@@ -3102,8 +3143,21 @@ return table.concat(allData, "\\n")'''
         from converter.autogen import generate_game_server_script
         existing_server_mgr = [s for s in self.state.rbx_place.scripts if s.name == "GameServerManager"]
         if not existing_server_mgr:
-            self.state.rbx_place.scripts.append(generate_game_server_script())
-            log.info("[write_output] Injected GameServerManager script")
+            # Phase 2b slice 3: gate the PlayerSetSharedFlag funnel on the
+            # shared_flag_channels topology fact (fail-safe True when the
+            # fact is absent). The rest of GameServerManager is always
+            # injected.
+            include_funnel = self._shared_flag_funnel_present()
+            self.state.rbx_place.scripts.append(
+                generate_game_server_script(
+                    include_shared_flag_funnel=include_funnel,
+                )
+            )
+            log.info(
+                "[write_output] Injected GameServerManager script "
+                "(shared-flag funnel %s)",
+                "included" if include_funnel else "omitted",
+            )
 
         # Auto-generate CollisionFidelityRecook server script when ANY
         # MeshPart in the scene has a non-Default ``collision_fidelity``.
