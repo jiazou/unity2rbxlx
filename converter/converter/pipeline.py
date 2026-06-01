@@ -4279,6 +4279,17 @@ script.Disabled = true
 
         Safe to call multiple times — the classifier is idempotent.
         """
+        # Phase 2b reframe step 2 R3 (Codex P3, 2026-06-01): reset the
+        # shared-flag stash at the START of every classification attempt —
+        # BEFORE the no-scripts early-return below — so the funnel-gate
+        # decision is SCENE-LOCAL. Otherwise a multi-scene driver reusing
+        # this Pipeline state could leak a prior scene's ``present=False``
+        # verdict into a later scene that skips classification (no user
+        # scripts) → ``write_output`` would omit the funnel instead of
+        # taking the documented fail-open path. Clearing here means a
+        # skipped/early-returned classify leaves the stash ``None`` → the
+        # gate reads fail-open ``True`` (keep the funnel).
+        self.state.shared_flag_channels = None
         if self.state.rbx_place is None or not self.state.rbx_place.scripts:
             return
 

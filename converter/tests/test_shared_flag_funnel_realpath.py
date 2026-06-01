@@ -245,3 +245,53 @@ class TestSharedFlagFunnelRealPath:
         src = _game_server_source(pipeline)
         assert _FUNNEL_EVENT_NAME in src
         assert _FUNNEL_LISTENER in src
+
+    def test_stash_reset_keeps_funnel_decision_scene_local(
+        self, tmp_path: Path,
+    ) -> None:
+        """REGRESSION GUARD (Codex R2 P3, 2026-06-01): the funnel decision
+        must be SCENE-LOCAL. A multi-scene driver reusing one Pipeline
+        state could leak a prior scene's ``present=False`` verdict into a
+        later scene that SKIPS classification (no user scripts → the
+        ``_classify_storage`` no-scripts early-return), making
+        ``write_output`` wrongly OMIT the funnel.
+
+        The fix resets ``state.shared_flag_channels`` at the START of every
+        ``_classify_storage`` attempt — before the early-return — so a
+        skipped classify leaves the stash ``None`` → the gate fails open
+        (keeps the funnel). Without the reset, the stash here would still
+        hold scene A's ``present=False`` and the final assertion would
+        fail (funnel wrongly omitted)."""
+        pipeline = _make_pipeline(tmp_path)
+
+        # Scene A: no cross-domain reader → classify records present=False.
+        _stage_real_inputs(
+            pipeline,
+            reader_name="Hud",
+            reader_luau='local v = plr:GetAttribute("hasKey")',
+            reader_domain="client",
+        )
+        pipeline._classify_storage()
+        assert pipeline.state.shared_flag_channels is not None
+        assert (
+            pipeline.state.shared_flag_channels[_FUNNEL_EVENT_NAME]["present"]
+            is False
+        )
+
+        # Scene B on the SAME pipeline: no user scripts → classify takes
+        # the no-scripts early-return and never runs the prepass. The
+        # start-of-classify reset must clear A's stale verdict.
+        assert pipeline.state.rbx_place is not None
+        pipeline.state.rbx_place.scripts = []
+        pipeline._classify_storage()
+        assert pipeline.state.shared_flag_channels is None, (
+            "the start-of-classify reset must clear the prior scene's "
+            "verdict so a skipped classify is scene-local (None → fail-open)"
+        )
+
+        # write_output for scene B → gate reads None → fail-open → funnel
+        # KEPT (not omitted from a leaked stale present=False).
+        pipeline._subphase_inject_autogen_scripts()
+        src = _game_server_source(pipeline)
+        assert _FUNNEL_EVENT_NAME in src
+        assert _FUNNEL_LISTENER in src
