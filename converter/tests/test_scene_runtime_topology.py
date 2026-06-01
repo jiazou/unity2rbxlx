@@ -5589,43 +5589,49 @@ class TestSharedFlagChannels:
         assert "has3rdGem" in channel["read_names"]
         assert "hasKey" in channel["read_names"]
 
-    def test_shared_flag_channels_fail_open_skips_localscript_reader(
+    def test_shared_flag_channels_fail_open_on_any_unmappable_reader(
         self,
     ) -> None:
-        """An unmappable ``LocalScript`` reader is provably CLIENT from
-        its ``script_type`` alone. The funnel writer is also client-domain,
-        so it's a SAME-DOMAIN read — it must NOT fail open and keep the
-        funnel on. An unmappable ``Script`` (server) with the same read
-        DOES fail open (cross-domain). Codex R2 P3, 2026-06-01."""
-        # Provably-client LocalScript -> no fail-open.
-        client = compute_shared_flag_channels(
-            transpiled_scripts=[
-                _mk_transpiled(
-                    "Hud.luau",
-                    'local v = plr:GetAttribute("hasKey")',
-                    script_type="LocalScript",
-                ),
-            ],
-            script_id_by_name={},  # unmappable
-            domains={},
-        )
-        assert client["PlayerSetSharedFlag"]["present"] is False
-        assert client["PlayerSetSharedFlag"]["read_names"] == []
+        """An unmappable reader with a qualifying read fails open
+        (``present=True``) REGARDLESS of its pre-coherence ``script_type``.
 
-        # Server Script -> fail open (domain truly ambiguous w/o mapping).
-        server = compute_shared_flag_channels(
+        Codex R2↔R3 oscillation resolution (2026-06-01): the
+        ``script_type`` available here is PRE-COHERENCE and NOT
+        authoritative — ``_fix_client_server_classification`` can flip
+        LocalScript→Script later — so we do NOT use it to suppress
+        fail-open. Fail-open is conservative (keeps the funnel, == today's
+        unconditional behavior); over-reporting a genuinely-client reader
+        is the lesser evil vs wrongly suppressing a reclassified server
+        reader. Authoritative domain resolution is deferred (see TODO.md
+        pre/post-coherence follow-up). A scene with NO qualifying read
+        still yields ``present=False`` — fail-open is specific to
+        unmappable-WITH-read, not blanket."""
+        for stype in ("LocalScript", "Script", "ModuleScript"):
+            out = compute_shared_flag_channels(
+                transpiled_scripts=[
+                    _mk_transpiled(
+                        "Reader.luau",
+                        'local v = x:GetAttribute("hasKey")',
+                        script_type=stype,
+                    ),
+                ],
+                script_id_by_name={},  # unmappable
+                domains={},
+            )
+            assert out["PlayerSetSharedFlag"]["present"] is True, stype
+            # No domain to attribute it to -> name set stays unpolluted.
+            assert out["PlayerSetSharedFlag"]["read_names"] == []
+
+        # Specificity guard: unmappable reader with NO GetAttribute read
+        # -> still present=False (fail-open is not blanket).
+        none = compute_shared_flag_channels(
             transpiled_scripts=[
-                _mk_transpiled(
-                    "Door.luau",
-                    'local v = part:GetAttribute("hasKey")',
-                    script_type="Script",
-                ),
+                _mk_transpiled("Quiet.luau", "local v = 1", script_type="Script"),
             ],
-            script_id_by_name={},  # unmappable
+            script_id_by_name={},
             domains={},
         )
-        assert server["PlayerSetSharedFlag"]["present"] is True
-        assert server["PlayerSetSharedFlag"]["read_names"] == []
+        assert none["PlayerSetSharedFlag"]["present"] is False
 
     def test_shared_flag_channels_two_reads_on_one_line(self) -> None:
         """Two ``GetAttribute`` reads on one line are captured as two

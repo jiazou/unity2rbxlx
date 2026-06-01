@@ -209,7 +209,7 @@ def compute_shared_flag_channels(
             continue
         reader_sid = _script_id_for_transpiled(ts, script_id_by_name)
         if not reader_sid:
-            # Codex R1 P3, 2026-06-01 — fail open on unmappable reader.
+            # Fail open on unmappable reader.
             # ``build_script_id_by_name`` deliberately omits ambiguous
             # names (class/stem collisions), so this is reachable on real
             # projects. Silently dropping a script that HAS a qualifying
@@ -219,16 +219,23 @@ def compute_shared_flag_channels(
             # NOT add to ``read_names`` (no domain to attribute it to), so
             # the name set stays unpolluted.
             #
-            # Codex R2 P3, 2026-06-01 — but a ``LocalScript`` is provably
-            # CLIENT from its ``script_type`` alone (no script_id mapping
-            # needed). The funnel writer is also client-domain, so a
-            # client reader is SAME-DOMAIN, not cross-domain — it must NOT
-            # fail open and keep the funnel on. Only fail open for a
-            # ``Script`` (server) or a genuinely ambiguous type
-            # (ModuleScript / unknown), where the reader's domain truly
-            # cannot be ruled same-side.
-            if ts.script_type == "LocalScript":
-                continue
+            # Codex R2↔R3 OSCILLATION resolved 2026-06-01: R2 P3 asked to
+            # skip fail-open for ``LocalScript`` readers (provably client →
+            # same-domain → over-reports otherwise); R3 P2 showed that
+            # ``TranspiledScript.script_type`` here is PRE-COHERENCE and
+            # NOT authoritative (``script_coherence._fix_client_server_classification``
+            # can flip LocalScript→Script for server-only APIs), so trusting
+            # it to SUPPRESS fail-open can wrongly drop a real server reader.
+            # The two asks point opposite directions on the same signal.
+            # Resolution: do NOT decide on the non-authoritative pre-coherence
+            # type — fail open on ANY unmappable reader with a qualifying
+            # read. Fail-open is conservative: it keeps the funnel, which is
+            # harmless-if-unused and is exactly today's unconditional
+            # behavior (strictly no worse). Over-reporting ``present`` for a
+            # genuinely-client unmappable reader (R2 P3's concern) is the
+            # lesser evil vs wrongly suppressing a reclassified-to-server
+            # reader (R3 P2). The authoritative-domain fix belongs with the
+            # pre-vs-post-coherence root issue (see TODO.md follow-up).
             if _GET_ATTR_RE.search(ts.luau_source):
                 fail_open_present = True
             continue
