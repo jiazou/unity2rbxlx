@@ -4645,9 +4645,12 @@ script.Disabled = true
             scene_runtime_typed,
             domains_override=domains,
         )
+        # R3 (2026-05-31): no ``domains_override`` here — seeded
+        # candidates take ``from_domain`` from the seed's
+        # ``producer_domain`` (the runtime bridge contract), not from
+        # ``infer_module_domains``. See compute_shared_attribute_candidates.
         shared_attribute_candidates = compute_shared_attribute_candidates(
             scene_runtime_typed,
-            domains_override=domains,
         )
         # Resume case (state.transpilation_result is None): pass None
         # to the enricher; consumer rows stay empty (slice 3 falls back

@@ -1775,8 +1775,13 @@ class TestPhase2bSlice1ExtendedSchema:
         assert cand["to_instance"] == ""
         assert cand["to_script"] == ""
         assert cand["to_domain"] == ""
-        # Producer domain is captured when known.
-        assert cand["from_domain"] == "client"
+        # R3 (2026-05-31): ``from_domain`` comes from the seed's
+        # ``producer_domain`` (the runtime bridge contract), NOT from
+        # the module's classified/inferred domain. The Pickup seed is
+        # server-originated (the existing pack fires ``:FireClient``),
+        # so the candidate is ``"server"`` even though
+        # ``_mk_shared_attr_artifact`` stamps the module as ``"client"``.
+        assert cand["from_domain"] == "server"
         # Slice 2 fills this.
         assert cand["bridge_member_scripts"] == []
         # Attribute template — slice 3 resolves ``<itemName>``.
@@ -2113,32 +2118,98 @@ class TestPhase2bSlice1R1CandidateBucketWiring:
         assert len(artifact_edges["cross_domain_edges"]) == 1
         assert artifact_edges["cross_domain_edge_candidates"] == []
 
-    def test_excluded_domain_pickup_still_emits_candidate(self) -> None:
-        """Claude P2-1 pin. ``compute_shared_attribute_candidates`` does
-        NOT skip NON_RUNTIME ``from_domain`` producers — by design,
-        because the bucket separation now makes that safe (invariant 2
-        only iterates ``cross_domain_edges``, the fully-resolved bucket).
+    def test_seed_producer_domain_overrides_module_classification(
+        self,
+    ) -> None:
+        """R3 (2026-05-31): the seed's ``producer_domain`` is the SOLE
+        authority for a seeded candidate's ``from_domain`` — it
+        overrides ANY module-level classification, including
+        NON_RUNTIME values like ``"excluded"``.
 
-        A Pickup whose producer module is ``domain == "excluded"`` still
-        emits a candidate; slice 2 enrichment will downgrade
-        ``resolution.strategy`` to ``"excluded"`` rather than dropping it.
-        This is INTENTIONALLY asymmetric with
-        ``compute_cross_domain_edges`` which DOES filter NON_RUNTIME —
-        component-ref edges have no "downgrade" semantics so dropping
-        is the only safe move there, but candidates' fan-out shape
-        lets slice 2 record the exclusion explicitly.
+        Why the seed wins even over ``"excluded"``: at
+        ``compute_shared_attribute_candidates`` time the module's
+        classified domain is unreliable. On a FRESH run it is unstamped
+        (``""``), which is itself in ``NON_RUNTIME_DOMAINS`` — so
+        ``"excluded"`` and ``"not-yet-classified"`` are
+        indistinguishable here. Respecting the module classification
+        would reintroduce the P1-A bug Codex caught at R1 (fresh-run
+        producers seeing ``""`` and dropping everything). The seed is
+        the only reliable signal for a bundled pattern, so it governs
+        unconditionally.
+
+        This also preserves the original Claude-P2-1 property: the
+        candidate producer does NOT silently drop the row (unlike
+        ``compute_cross_domain_edges``, which filters NON_RUNTIME).
+        The row is always emitted; its direction comes from the seed.
+
+        NOTE for R3/R4 review: if a reviewer believes a genuinely
+        ``"excluded"`` Pickup should suppress the bridge entirely,
+        that is a follow-on — it requires a reliable
+        exclude-vs-unstamped signal this producer does not have.
         """
+        # Module is stamped ``"excluded"`` — the seed must override it.
         plan = _mk_shared_attr_artifact(producer_domain="excluded")
         candidates = compute_shared_attribute_candidates(
             plan,  # type: ignore[arg-type]
         )
         assert len(candidates) == 1
-        assert candidates[0]["from_domain"] == "excluded"
+        # Seed wins: ``"server"`` (Pickup's runtime contract), NOT the
+        # module's ``"excluded"`` classification.
+        assert candidates[0]["from_domain"] == "server"
         # Still emitted, no silent drop.
         assert candidates[0]["from_script"] == "pickup_sid"
         assert (
             candidates[0]["resolution"]["event_name"] == "PickupItemEvent"
         )
+
+    def test_pickup_seed_pins_producer_domain_to_server_against_inferred_client(
+        self,
+    ) -> None:
+        """R3 production-correctness regression guard. In production,
+        ``infer_module_domains`` (Rule 7) defaults a low-signal
+        ``Pickup.cs`` (plain MonoBehaviour, ``OnTriggerEnter``, no
+        Network APIs) to low-confidence ``"client"``. R2's
+        direction-aware enrichment was correct, but the SIGNAL feeding
+        it (the candidate's ``from_domain``) was production-wrong — it
+        followed the inferred ``"client"`` and inverted the bridge.
+
+        With the seed's ``producer_domain="server"``, the candidate is
+        ``"server"`` regardless of inference, so enrichment produces the
+        correct server->client roles matching the existing
+        ``pickup_remote_event_server`` pack contract
+        (``:FireClient`` at ``script_coherence_packs.py:380-394``).
+        """
+        from converter.scene_runtime_topology.edge_enrichment import (
+            enrich_cross_domain_edges,
+        )
+
+        # Realistic fresh-run shape: module stamped ``"client"`` (what
+        # Rule 7 inference would produce). The seed must override it.
+        plan = _mk_shared_attr_artifact(producer_domain="client")
+        candidates = compute_shared_attribute_candidates(
+            plan,  # type: ignore[arg-type]
+        )
+        assert len(candidates) == 1
+        assert candidates[0]["from_domain"] == "server", (
+            "seed producer_domain='server' must override the inferred "
+            "'client' so the bridge direction matches the pack contract"
+        )
+
+        # Enrichment must then produce server->client roles.
+        _edges, enriched = enrich_cross_domain_edges(
+            edges=[],
+            candidates=candidates,
+            transpiled_scripts=None,
+            script_id_by_name={},
+        )
+        roles = {m["role"] for m in enriched[0]["bridge_member_scripts"]}
+        assert "server_caller" in roles
+        listener_refs = [
+            m["ref"] for m in enriched[0]["bridge_member_scripts"]
+            if m["role"] == "client_listener"
+        ]
+        assert len(listener_refs) == 1
+        assert listener_refs[0].startswith("__bridge_listener_client__")
 
 
 # ===========================================================================

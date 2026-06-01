@@ -256,11 +256,27 @@ class SharedAttributeSeed:
     here because the producer pass walks the SCENE — it does not know
     the per-instance ``itemName`` config without re-resolving every
     instance, which would invert the candidate enumeration cost.
+
+    ``producer_domain`` (R3, 2026-05-31): the bridge direction the
+    converter's runtime contract REQUIRES for this pattern. Encoded
+    here because ``infer_module_domains`` (``module_domain.py``
+    Rule 7) defaults low-signal producers to ``"client"`` — for the
+    locked Pickup case, the existing ``pickup_remote_event_server``
+    pack at ``script_coherence_packs.py:380-394`` fires
+    ``:FireClient`` (server-originated), so the seeded candidate
+    MUST be tagged ``"server"`` regardless of what inference says
+    about ``Pickup.cs``'s source. ``compute_shared_attribute_candidates``
+    uses this field for the candidate's ``from_domain`` — the inferred
+    domain remains the structural signal for FINDING the producer
+    instance, but the seed encodes the bridge direction (the runtime
+    contract is authoritative for seeded patterns; inference is a
+    tool for instance discovery, not for naming the contract).
     """
 
     producer_class_name: str
     remote_event_name: str
     attribute_template: str
+    producer_domain: Literal["client", "server"]
 
 
 # Phase 2b slice 1: structural pre-transpile seed table. The table seeds
@@ -311,6 +327,13 @@ SHARED_ATTRIBUTE_SEEDS: tuple[SharedAttributeSeed, ...] = (
         producer_class_name="Pickup",
         remote_event_name="PickupItemEvent",
         attribute_template="has<itemName>",
+        # R3 (2026-05-31): server-originated. The existing
+        # ``pickup_remote_event_server`` pack fires ``:FireClient``
+        # (``script_coherence_packs.py:380-394``), so the bridge runs
+        # server->client. ``infer_module_domains`` Rule 7 would
+        # default Pickup.cs to low-confidence ``"client"``; the seed
+        # overrides that for the bridge direction.
+        producer_domain="server",
     ),
 )
 
@@ -518,8 +541,6 @@ def compute_cross_domain_edges(
 
 def compute_shared_attribute_candidates(
     scene_runtime: SceneRuntimeArtifact,
-    *,
-    domains_override: Mapping[str, str] | None = None,
 ) -> list[CrossDomainEdge]:
     """Enumerate every scene/prefab instance whose component class
     matches a ``SHARED_ATTRIBUTE_SEEDS`` row.
@@ -544,14 +565,15 @@ def compute_shared_attribute_candidates(
     — required by the enrichment pass that feeds both producers'
     outputs into a single duplicate-event-name check.
 
-    ``domains_override`` (Phase 2b slice 2 R1 P1-A fix): when supplied,
-    consulted FIRST for each script_id's ``from_domain`` stamping.
-    Falls back to ``scene_runtime["modules"][sid]["domain"]`` only
-    when the override is missing or empty. Required by the prepass
-    call site (``pipeline.py`` ``_maybe_run_topology_prepass``) which
-    runs BEFORE ``classify_scene_runtime_domains()`` writes domains
-    back onto ``scene_runtime`` — without the override, every
-    candidate row would carry ``from_domain=""`` on fresh runs.
+    Note (Phase 2b slice 2 R3, 2026-05-31): unlike
+    ``compute_cross_domain_edges``, this producer does NOT take a
+    ``domains_override``. Each candidate's ``from_domain`` is set from
+    the matched seed's ``producer_domain`` — the converter's runtime
+    bridge contract is authoritative for seeded patterns, NOT
+    ``infer_module_domains`` (which would mislabel a low-signal Pickup
+    as ``"client"`` via Rule 7). The inferred domain is irrelevant to
+    a seeded candidate's bridge direction, so the override the
+    component-ref producer needs has no role here.
 
     Pure function; does not mutate ``scene_runtime``.
     """
@@ -578,18 +600,6 @@ def compute_shared_attribute_candidates(
         stem = mod.get("stem", "")
         return stem if isinstance(stem, str) else ""
 
-    def _module_domain(script_id: str) -> str:
-        # P1-A fix: consult ``domains_override`` first (the prepass's
-        # already-inferred-but-not-yet-stamped domains), then fall
-        # back to the on-row stamped value (direct callers / resume).
-        if domains_override is not None:
-            override_val = domains_override.get(script_id, "")
-            if isinstance(override_val, str) and override_val:
-                return override_val
-        mod = modules.get(script_id, {})
-        domain = mod.get("domain", "")
-        return domain if isinstance(domain, str) else ""
-
     def _emit_for_owner(
         owner_kind: str, owner_ref: str,
         instances: list[dict[str, object]],
@@ -609,7 +619,16 @@ def compute_shared_attribute_candidates(
             )
             if not instance_id:
                 continue
-            from_domain = _module_domain(script_id)
+            # R3 (2026-05-31): the seed's ``producer_domain`` is the
+            # bridge direction the converter's runtime contract REQUIRES
+            # — authoritative over whatever ``infer_module_domains``
+            # says about the producer's source. The inferred domain
+            # (``_module_domain``) is only the structural signal for
+            # FINDING the producer instance; the bridge direction is the
+            # seed's to declare. For Pickup this is ``"server"`` (the
+            # existing pack fires ``:FireClient``); inference Rule 7
+            # would mislabel it ``"client"`` on a low-signal source.
+            from_domain = seed.producer_domain
             out.append(CrossDomainEdge(
                 id=shared_attribute_candidate_id(
                     owner_ref, instance_id, seed.remote_event_name,
