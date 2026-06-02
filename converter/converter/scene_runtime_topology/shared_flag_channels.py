@@ -104,11 +104,14 @@ _FUNNEL_WRITER_DOMAIN = "client"
 # constraint: ``"hasRed Key"`` (space) and ``"hasKey-A"`` (hyphen) are NOT
 # valid Roblox attribute names and the runtime cannot deliver them.
 # Empirically every ``GetAttribute`` name in the live transpile cache is
-# identifier-safe. So the capture is ``\w+`` (Python ``\w`` == ``[A-Za-z0-9_]``,
-# == Lua ``%w`` + ``_``); ``\w+`` allows a leading digit, exactly matching
-# ``^[%w_]+$``. The length cap (<=64) is enforced below. The closing quote
-# is back-referenced to the opening one so mismatched quote styles don't
-# span across args.
+# identifier-safe. So the capture is the ASCII-explicit ``[A-Za-z0-9_]+`` —
+# NOT ``\w``: Python 3 ``\w`` is Unicode-aware (matches accented letters,
+# other-script digits, etc.), so it would over-capture names that Lua's
+# byte-oriented ``%w`` (and therefore the funnel's ``^[%w_]+$`` gate and
+# Roblox's attribute charset) would reject. ``[A-Za-z0-9_]+`` allows a
+# leading digit, exactly matching ``^[%w_]+$`` on ASCII. The length cap
+# (<=64) is enforced below. The closing quote is back-referenced to the
+# opening one so mismatched quote styles don't span across args.
 #
 # SUPERSEDES the slice-2 R4 broadening (``[^"']+?``, restored at R2): that
 # change recorded impossible attribute names (spaces/hyphens) the funnel's
@@ -120,11 +123,11 @@ _FUNNEL_WRITER_DOMAIN = "client"
 # cross-domain reader as the literal ``:GetAttribute("name")`` form, and
 # Phase 3 deliverable #2 explicitly lists ``GetAttributeChangedSignal``
 # readers. The optional ``ChangedSignal`` group keeps one regex for both;
-# the ``\w+`` charset + <=64 cap + quote backreference are unchanged
-# (Roblox attribute-name constraint == the funnel's ``^[%w_]+$`` filter).
-# Claude R1 P2, 2026-06-01.
+# the ``[A-Za-z0-9_]+`` charset + <=64 cap + quote backreference are
+# unchanged in intent (Roblox attribute-name constraint == the funnel's
+# ``^[%w_]+$`` filter). Claude R1 P2, 2026-06-01.
 _GET_ATTR_RE = re.compile(
-    r""":GetAttribute(?:ChangedSignal)?\(\s*(?P<q>['"])(?P<attr>\w+)(?P=q)\s*\)""",
+    r""":GetAttribute(?:ChangedSignal)?\(\s*(?P<q>['"])(?P<attr>[A-Za-z0-9_]+)(?P=q)\s*\)""",
 )
 
 # Mirror the funnel listener's length cap (``#flagName > 64``): a captured
