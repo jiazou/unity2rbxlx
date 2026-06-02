@@ -82,8 +82,20 @@ tokens for ASCII):**
 - Skip the mirror entirely when: name is empty, sanitizes to no original alphanumeric,
   or `"has"+stem` would exceed 64 chars (the funnel's cap). Don't relax the funnel gate.
 
-**Placement: C.** A (runtime) is load-bearing; B (python) is cheap defense, WIDER than the
-original brief.
+**Placement: A only (B REJECTED in code review — see correction below).** A (runtime) is
+load-bearing AND sufficient.
+
+> **CORRECTION (code-review, 2026-06-02):** the design pair voted C (A+B), but the code
+> review (Codex P1×2) showed **B is harmful**: `itemName`/`ItemType` are GAMEPLAY PAYLOADS
+> forwarded raw to `GetItem(itemName)` (`packs.py:402/850` → client listener) and
+> `pickup_runtime.luau`'s `SetAttribute("GetItem", itemType)`. Sanitizing them at the
+> python source corrupts dispatch for dirty-name items (`"Red Key"` → `GetItem("Red_Key")`).
+> The runtime gsub at the `"has" .. name` concat (A) sanitizes the FLAG only, leaving the
+> raw value for gameplay — necessary and sufficient. **B was reverted.** The Python
+> `sanitize_flag_stem` is kept ONLY as the parity-test reference mirror of the emitted Luau
+> (no production caller); its former skip-rules (the P2 asymmetry) were removed — the
+> runtime gsub can't skip, so the funnel gate is the overlong backstop and a symbol-only
+> name → consistent `has_` (documented degenerate edge, not guarded).
 - **A (runtime, inline from ONE Python constant):** `code_transpiler._GENERIC_RUNTIME_PROMPT`
   example (`:1265`) + add a sentence telling the AI to sanitize any name before
   concatenating; pack writers `script_coherence_packs.py:389/832/959`; pack DYNAMIC reader
