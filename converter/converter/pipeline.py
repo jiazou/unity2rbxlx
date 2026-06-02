@@ -4773,7 +4773,7 @@ script.Disabled = true
             plan_path.name,
         )
 
-    def _run_contract_verifier(self, scene_runtime: dict) -> None:
+    def _run_contract_verifier(self, scene_runtime: dict[str, object]) -> None:
         """Phase 3 slice 0: run the shadow-mode contract verifier and stash
         its violations on ``ctx.scene_runtime``.
 
@@ -4816,19 +4816,23 @@ script.Disabled = true
         )
 
         # Stash to ctx (NOT the local scene_runtime) so downstream report
-        # assembly can read it. ``setdefault`` + identity-dedup mirrors the
-        # ``contract_fail_closed`` plumbing (pipeline.py:2041) so a resume
-        # replay of this phase does not double-count.
-        rows = cast(
-            "list[dict[str, str]]",
-            self.ctx.scene_runtime.setdefault("contract_check_violations", []),
-        )
-        appended = contract_verifier.stash_violations(rows, result)
+        # assembly can read it. The verifier OWNS the
+        # ``contract_check_violations`` key and is deterministic over its
+        # inputs, so each run REPLACES the rows with the current result --
+        # we do NOT append to whatever was loaded from a prior run's
+        # ``conversion_context.json``. ``ctx.scene_runtime`` persists +
+        # reloads across a resume (core/conversion_context.py:118,177), so an
+        # append-only stash would keep a stale violation forever even after
+        # the underlying issue is fixed and the current run is clean (codex
+        # slice-0 review P2). ``stash_violations`` still dedups identities
+        # WITHIN this run's result; the fresh list it fills overwrites the
+        # reloaded one.
+        rows: list[dict[str, str]] = []
+        contract_verifier.stash_violations(rows, result)
+        self.ctx.scene_runtime["contract_check_violations"] = rows
         log.info(
-            "[contract_verifier] shadow run: %d violation(s) total, "
-            "%d new this run (%r)",
+            "[contract_verifier] shadow run: %d violation(s) this run (%r)",
             result.total(),
-            appended,
             result.counts_by_check(),
         )
 

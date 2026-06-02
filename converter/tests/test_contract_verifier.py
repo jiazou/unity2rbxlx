@@ -215,6 +215,60 @@ class TestRunContractVerifierHook:
         rows = pipeline.ctx.scene_runtime.get("contract_check_violations", [])
         assert len(rows) == 1
 
+    def test_hook_drops_stale_rows_on_clean_resume(self, tmp_path: Path) -> None:
+        """Resume regression (codex slice-0 P2): ctx.scene_runtime persists +
+        reloads across a resume, so a violation row recorded by a PRIOR run is
+        present when the hook re-runs. If the current run is now clean, that
+        stale row MUST be dropped -- the verifier replaces its rows, not
+        appends. (Fails against the pre-fix setdefault+append stash, which
+        would keep the stale row forever.)"""
+        pipeline = _make_pipeline(tmp_path)
+        # Simulate a reloaded context carrying a stale violation from a run
+        # whose underlying issue is now fixed.
+        pipeline.ctx.scene_runtime = {
+            "contract_check_violations": [
+                {
+                    "check": "smoke",
+                    "severity": "warning",
+                    "script": "",
+                    "detail": "stale from prior run",
+                    "identity": "smoke:missing-modules",
+                },
+            ],
+        }
+
+        passed = {"topology": _topology_with_modules()}  # clean -> no violations
+        pipeline._run_contract_verifier(passed)
+
+        rows = pipeline.ctx.scene_runtime.get("contract_check_violations", [])
+        assert rows == []
+
+    def test_hook_replaces_stale_rows_with_current_run(
+        self, tmp_path: Path
+    ) -> None:
+        """A stale row with a DIFFERENT identity than the current run's
+        violation is dropped too -- the metric reflects only the current run,
+        never a union with reloaded history."""
+        pipeline = _make_pipeline(tmp_path)
+        pipeline.ctx.scene_runtime = {
+            "contract_check_violations": [
+                {
+                    "check": "consumer_compliance",
+                    "severity": "warning",
+                    "script": "Door.luau",
+                    "detail": "stale, different identity",
+                    "identity": "consumer_compliance:Door.luau:stale",
+                },
+            ],
+        }
+
+        passed = {"topology": {}}  # missing modules -> current smoke fires
+        pipeline._run_contract_verifier(passed)
+
+        rows = pipeline.ctx.scene_runtime.get("contract_check_violations", [])
+        assert len(rows) == 1
+        assert rows[0]["identity"] == "smoke:missing-modules"
+
     def test_env_hatch_disables_verifier(
         self, tmp_path: Path, monkeypatch
     ) -> None:
