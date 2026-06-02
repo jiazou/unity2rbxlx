@@ -532,136 +532,83 @@ def _check_component_availability(
 # Check C — cross-domain attribute access (Class-1 component-ref edges)
 # ---------------------------------------------------------------------------
 #
-# SCOPE (slice 3): the STRUCTURAL Class-1 check only. A literal cross-domain
-# ``SetAttribute("X")`` writer + ``GetAttribute[ChangedSignal]("X")`` reader
-# pair (writer and reader in DIFFERENT domains, same field X) must be covered
-# by a ``cross_domain_edges`` entry with ``resolution.strategy ==
-# "remote_event_bridge"`` whose ``from_script``/``to_script`` script_ids match
-# the writer/reader. Otherwise the write never reaches the reader's process →
-# the reader silently sees a stale value.
+# SCOPE (slice 3): a STRUCTURAL edge-invariant check, read directly off the
+# topology's ``cross_domain_edges`` — NOT a Luau scan. For every edge whose
+# ``from_domain`` and ``to_domain`` are both RUNTIME (client/server) and
+# DIFFERENT, ``resolution.strategy`` MUST be ``"remote_event_bridge"``; an
+# unbridged runtime-cross-domain edge means the cross-process write never
+# reaches the reader. Zero false positives (no field-name pairing, no Luau
+# parsing, no shared-flag confusion); currently-satisfied (the producer stamps
+# remote_event_bridge for runtime cross-domain edges) but a real regression
+# guard if a future producer/enrichment change leaves one unbridged.
+#
+# WHY NOT a literal Luau scan (the original slice-3 plan, reverted after the
+# codex slice-3 review): scanning ``SetAttribute("X")``/``GetAttribute("X")``
+# sites and pairing them by field name is FALSE-POSITIVE-prone in two ways the
+# emitted Luau can't disambiguate:
+#   * P1 — it flags legitimate Class-2 shared-flag literal mirrors
+#     (``character:SetAttribute("hasKey")`` + server ``player:GetAttribute(
+#     "hasKey")``), which are modeled in ``shared_flag_channels``, NOT in
+#     ``cross_domain_edges`` — so they have no Class-1 edge by design;
+#   * P2 — the writer×reader Cartesian over a shared field name (``open``,
+#     ``TakeDamage``) pairs UNRELATED sites: the emitted Luau carries no
+#     instance identity, so it can't match the edge's real
+#     (from_instance, field, to_instance) granularity.
 #
 # DEFERRED (Class-2 dynamic shared-flag store mismatch — the door bug): the
-# topology does NOT record the reader's OWN store (shared_flag_channels records
-# the WRITER funnel dests Character+Player, not what the reader reads from), so
-# detecting "reader reads the shared flag from the HumanoidRootPart instead of
-# Player/Character" requires parsing the reader's store expression out of the
-# Luau. That is (a) a brittle regex-on-AI-output heuristic the project rule
-# forbids, and (b) PHANTOM on the validation corpus: the verifier runs
-# POST-coherence (pipeline.py:4759, after _subphase_cohere_scripts), and the
-# ``door_player_flag_location`` coherence pack has already rewritten the
-# wrong-store read to ``player:`` before the verifier scans — so the bug no
-# longer exists in the scanned scripts. The would-be ``present == False``
-# coverage alternative is vacuous (``present = bool(read_names) or
-# fail_open_present`` — read_names non-empty ⟹ present True). Class-2 needs a
-# PRE-coherence hook (or to detect the gap the pack itself keys on) + an
-# adversarial review; it is recorded as a known deferred false-negative, not
-# shipped as a phantom heuristic.
+# topology does NOT record the reader's OWN store, and the verifier runs
+# POST-coherence (pipeline.py:4759) where the ``door_player_flag_location`` pack
+# has already rewritten the wrong-store read to ``player:`` — so a store-mismatch
+# scan is both brittle regex-on-AI-output AND phantom on the corpus. The
+# ``present == False`` coverage alternative is vacuous (``present =
+# bool(read_names) or fail_open_present``). Class-2 needs a PRE-coherence hook +
+# adversarial review; recorded as a known deferred false-negative.
 
-# Authoritative domain for a read/write SITE is the domain of the MODULE whose
-# script contains it — read from the topology artifact (the infer_module_domains
-# verdict), NOT RbxScript.script_type (coherence flips Script<->LocalScript, so
-# script_type disagrees with the domain the edge producer used).
-_SETATTR_RE = re.compile(r""":SetAttribute\s*\(\s*['"]([A-Za-z0-9_]+)['"]""")
-_GETATTR_RE = re.compile(
-    r""":GetAttribute(?:ChangedSignal)?\s*\(\s*['"]([A-Za-z0-9_]+)['"]""",
-)
-
-
-def _name_to_script_id(topology: TopologyArtifact) -> dict[str, str]:
-    """``{emitted script name -> script_id}`` from the topology modules block.
-
-    The emitted name is the tail of ``module_path`` (``f"{container}.{name}"``)
-    when present, else ``stem`` — the same join check A uses. A name that maps
-    to MORE than one script_id is dropped (collision → the caller abstains),
-    mirroring the storage classifier's collision-exclusion contract."""
-    by_name: dict[str, list[str]] = {}
-    modules = topology.get("modules") or {}
-    for script_id, module in modules.items():
-        # Reuse check A's join (module_path tail else stem) so the two never
-        # drift (review P3).
-        name = _join_name(module)
-        if name:
-            by_name.setdefault(name, []).append(str(script_id))
-    return {name: ids[0] for name, ids in by_name.items() if len(ids) == 1}
+_RUNTIME_DOMAINS = frozenset({"client", "server"})
 
 
 def _check_cross_domain_attribute(
     topology: TopologyArtifact,
     scripts: list[RbxScript],
 ) -> list[ContractViolation]:
-    """Class-1 cross-domain attribute reconciliation. See section comment."""
-    modules = topology.get("modules") or {}
-    if not modules:
-        return []
-    name_to_sid = _name_to_script_id(topology)
-
-    def _domain(sid: str) -> str:
-        module = modules.get(sid)
-        return str(module.get("domain") or "") if isinstance(module, dict) else ""
-
-    # Collect writer/reader sites keyed by field: {field -> {sid, ...}}.
-    writers: dict[str, set[str]] = {}
-    readers: dict[str, set[str]] = {}
-    for script in scripts:
-        sid = name_to_sid.get(script.name)
-        if sid is None:
-            continue  # unjoinable / colliding name → abstain (no silent fail)
-        source = _strip_luau_comments(script.source or "")
-        for m in _SETATTR_RE.finditer(source):
-            writers.setdefault(m.group(1), set()).add(sid)
-        for m in _GETATTR_RE.finditer(source):
-            readers.setdefault(m.group(1), set()).add(sid)
-
-    # Index covered (from_script, field, to_script) triples from the edges.
-    covered: set[tuple[str, str, str]] = set()
+    """Structural cross-domain-edge bridging invariant. See section comment.
+    ``scripts`` is unused (the check reads the structured edges, not Luau)."""
+    violations: list[ContractViolation] = []
     for edge in topology.get("cross_domain_edges") or []:
         if not isinstance(edge, dict):
+            continue
+        from_d = str(edge.get("from_domain") or "")
+        to_d = str(edge.get("to_domain") or "")
+        # Only runtime-to-runtime, cross-domain edges require a bridge. A
+        # non-runtime endpoint (helper/excluded/"") is legitimately excluded;
+        # a same-domain edge needs no bridge.
+        if from_d not in _RUNTIME_DOMAINS or to_d not in _RUNTIME_DOMAINS:
+            continue
+        if from_d == to_d:
             continue
         resolution = edge.get("resolution")
         strategy = (
             resolution.get("strategy") if isinstance(resolution, dict) else ""
         )
-        if strategy != "remote_event_bridge":
-            continue
+        if strategy == "remote_event_bridge":
+            continue  # correctly bridged
         field_name = str(edge.get("field") or "")
-        covered.add((
-            str(edge.get("from_script") or ""),
-            field_name,
-            str(edge.get("to_script") or ""),
-        ))
-
-    violations: list[ContractViolation] = []
-    # Each (w_sid, field_name, r_sid) triple is unique by construction
-    # (fixed field, set-sourced sids), so no cross-iteration dedup is needed.
-    for field_name, writer_sids in writers.items():
-        reader_sids = readers.get(field_name)
-        if not reader_sids:
-            continue
-        for w_sid in writer_sids:
-            w_domain = _domain(w_sid)
-            if not w_domain:
-                continue
-            for r_sid in reader_sids:
-                r_domain = _domain(r_sid)
-                if not r_domain or r_domain == w_domain:
-                    continue  # same-domain (or unknown) — no bridge needed
-                if (w_sid, field_name, r_sid) in covered:
-                    continue
-                identity = (
-                    f"cross_domain_attribute:{w_sid}:{field_name}:{r_sid}"
-                )
-                violations.append(
-                    ContractViolation(
-                        check="cross_domain_attribute",
-                        severity="warning",
-                        script=field_name,
-                        detail=(
-                            f"attribute {field_name!r} is SetAttribute-written "
-                            f"in domain {w_domain!r} and read in domain "
-                            f"{r_domain!r} with no remote_event_bridge edge — "
-                            f"the cross-process write never reaches the reader"
-                        ),
-                        identity=identity,
-                    )
-                )
+        edge_id = str(
+            edge.get("id")
+            or f"{edge.get('from_script')}::{field_name}::{edge.get('to_script')}"
+        )
+        violations.append(
+            ContractViolation(
+                check="cross_domain_attribute",
+                severity="warning",
+                script=field_name,
+                detail=(
+                    f"cross-domain edge {edge_id!r} (field {field_name!r}, "
+                    f"{from_d!r}→{to_d!r}) has resolution strategy "
+                    f"{str(strategy)!r}, not 'remote_event_bridge' — the "
+                    f"cross-process write never reaches the reader"
+                ),
+                identity=f"cross_domain_attribute:{edge_id}",
+            )
+        )
     return violations

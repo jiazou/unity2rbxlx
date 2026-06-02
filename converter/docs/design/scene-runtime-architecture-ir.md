@@ -1178,17 +1178,17 @@ review against the merged code (original deliverable text preserved in git):**
 - **Slice 2** — check B (GetComponent reachability), keyed off the PARSED runtime
   `_UNITY_TO_ROBLOX_CLASS` + peer set (stem ∪ script_id) + Roblox-class
   allowlist. Reachability only; method-validity deferred.
-- **Slice 3** — check C **Class-1 only** (static component-ref edge
-  reconciliation: a cross-domain literal `SetAttribute`/`GetAttribute` pair
-  must be covered by a `remote_event_bridge` edge, matched on script identity).
-  **Class-2 (dynamic shared-flag store mismatch) DEFERRED** — slice-3 arch
-  review (2026-06-02) found it is (a) PHANTOM on the corpus: the verifier runs
-  POST-coherence and the `door_player_flag_location` pack already rewrites the
-  wrong-store read to `player:` before the scan; (b) brittle regex on AI output
-  (the reader's store is a Luau variable the topology doesn't record — GF7);
-  and the `present==False` coverage alternative is VACUOUS (`present =
-  bool(read_names) or fail_open`). Class-2 needs a PRE-coherence hook +
-  adversarial review; recorded as a known deferred false-negative.
+- **Slice 3** — check C = a STRUCTURAL cross-domain-edge bridging invariant
+  (read directly off `cross_domain_edges`: every runtime client↔server edge
+  MUST be `remote_event_bridge`). Zero-FP regression guard. The original
+  literal `SetAttribute`/`GetAttribute` Luau-scan reconciliation was REVERTED
+  after the codex slice-3 review found it false-positives on (P1) Class-2
+  shared-flag literal mirrors (modeled in `shared_flag_channels`, not edges)
+  and (P2) the writer×reader Cartesian over reused field names (the emitted
+  Luau carries no instance identity to match the edge granularity). **Class-2
+  store-mismatch DEFERRED** (phantom post-coherence + brittle + the
+  `present==False` alternative is vacuous) — known deferred false-negative,
+  needs a pre-coherence hook + adversarial review.
 - **Slice 4** — corpus shadow audit (AI transpile) + per-check flip behind the
   env-var hatch.
 
