@@ -2022,8 +2022,17 @@ def _classify_script_type(csharp_source: str, info: Any) -> str:
         # "Script" would fail every ``require()`` of the helper. (Gate on the
         # analyzer's structured ``base_class``, not a ``"monobehaviour" in
         # source`` grep, which false-positives on comments / ``using static``.)
-        if suggested == "Script" and (getattr(info, "base_class", "") or ""):
-            return "Script"
+        if suggested == "Script":
+            if getattr(info, "base_class", "") or "":
+                return "Script"
+            # A base-less class the analyzer suggested "Script" is a require-only
+            # helper: short-circuit to ModuleScript. Do NOT fall through to the
+            # source heuristics below — the analyzer already ruled out client
+            # (it suggests "LocalScript" for client code), so re-running the
+            # client-substring matches would only mislabel it (e.g. a bare
+            # "canvas"/"camera" substring → LocalScript), which is equally
+            # un-require-able in generic mode (codex review P2).
+            return "ModuleScript"
 
     # Fallback: analyze the source directly.
     source_lower = csharp_source.lower()

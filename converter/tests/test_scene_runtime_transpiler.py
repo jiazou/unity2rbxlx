@@ -203,11 +203,16 @@ class _ScriptInfoStub:
     ``suggested_type``, and (optionally) ``is_visual_only`` off it."""
 
     def __init__(self, path: Path, class_name: str,
-                 suggested_type: str = "Script") -> None:
+                 suggested_type: str = "Script",
+                 base_class: str = "MonoBehaviour") -> None:
         self.path = path
         self.class_name = class_name
         self.referenced_types: list[str] = []
         self.suggested_type = suggested_type
+        # These stubs model real gameplay scripts (MonoBehaviour components by
+        # default); _classify_script_type reads base_class to distinguish a
+        # component (-> Script) from a base-less helper (-> ModuleScript).
+        self.base_class = base_class
 
 
 @pytest.fixture

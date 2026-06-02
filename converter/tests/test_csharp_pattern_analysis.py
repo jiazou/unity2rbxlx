@@ -235,6 +235,15 @@ class TestBaselessHelperSuggestedScript:
         info = self._info(suggested="Script", base_class="")
         assert _classify_script_type(source, info) == "ModuleScript"
 
+    def test_baseless_helper_with_client_substring_not_localscript(self):
+        # codex P2: a base-less "Script"-suggested helper must short-circuit to
+        # ModuleScript, NOT fall through to the client-substring heuristics
+        # (here a bare "canvas" substring would otherwise mislabel it
+        # LocalScript — equally un-require-able in generic mode).
+        source = "public class CanvasPool { void Update() { var c = canvas; } }"
+        info = self._info(suggested="Script", base_class="")
+        assert _classify_script_type(source, info) == "ModuleScript"
+
     def test_indirect_monobehaviour_subclass_stays_script(self):
         # Turret : Weapon, Weapon : MonoBehaviour — base_class is non-empty, so
         # the planner-recognized indirect component must NOT be flipped.
