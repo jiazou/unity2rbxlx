@@ -1122,17 +1122,30 @@ review against the merged code (original deliverable text preserved in git):**
    Otherwise fail with the offending file:line + a pointer to the missing
    channel/edge.
 
-3. **Component-availability check (check B).** Keyed off the **runtime**
-   `_UNITY_TO_ROBLOX_CLASS` (`runtime/scene_runtime.luau:71`) — the table that
-   actually resolves `GetComponent` at runtime — NOT Python `api_mappings.TYPE_MAP`
-   (the two disagree: runtime `CharacterController → BasePart`, Python →
-   `Humanoid`; `BasePart`-has-no-`.Move()` is the catch). For every resolved
-   `:FindFirstChildWhichIsA("Y")` GetComponent site, verify `Y` is reachable (a
-   peer converted-MonoBehaviour, a runtime `_UNITY_TO_ROBLOX_CLASS` target, or a
-   real Roblox class) and that any following `:Method()` is valid on the mapped
-   class. MUST exclude the peer `self:GetComponent(name)` form (resolved at
-   runtime against the host component table, `scene_runtime.luau:753-760`). Do
-   NOT unify the two maps — they serve different roles.
+3. **Component-availability check (check B) = GetComponent reachability.**
+   Slice-2 arch review (2026-06-02) scoped this to REACHABILITY. Generic mode
+   emits the peer form `self:GetComponent("X")` (`code_transpiler.py:1329`),
+   resolved at runtime (`scene_runtime.luau:752-780`) as: peer
+   converted-MonoBehaviour → else `_UNITY_TO_ROBLOX_CLASS[X]` →
+   `findFirstChildWhichIsA(mapped or X)` → **nil** if unknown (subsequent use
+   errors). Check B flags `:GetComponent[InChildren|InParent]("X")` literal-arg
+   sites where `X` is UNREACHABLE: not a peer (module `stem` ∪ `script_id`, matching the runtime peer lookup),
+   not a `_UNITY_TO_ROBLOX_CLASS` key, not one of its values, not in an explicit
+   minimal Roblox-class allowlist. The allowlist exists because the emitted arg
+   is always a Unity name or peer class name (never a Roblox class), so the
+   values-as-proxy is "safe by accident" — the allowlist makes legitimate
+   direct-Roblox-class passes (e.g. `GetComponent("Humanoid")`) safe-by-design
+   before the fail-closed flip; it is biased to ABSTAIN (over-broad only fails
+   open). The runtime map is the authority (NOT Python `TYPE_MAP`; they disagree
+   — runtime `CharacterController → BasePart`); the verifier PARSES it from the
+   Luau file (single source of truth) guarded by an EXHAUSTIVE key/value test.
+   **Method-validity DEFERRED** (the `CharacterController → BasePart` →
+   `:Move()` anecdote): the repo has no Roblox class→method database, and the
+   transpiler already routes `CharacterController.Move`/`.SimpleMove`/`.isGrounded`
+   through a bridge (`api_mappings` `API_CALL_MAP`), so the anecdote is largely
+   already handled. Documented gap, not silently dropped. **Coverage:** only
+   string-literal args (a variable arg can't be resolved statically and is
+   skipped) — so a fail-closed flip of check B covers literal sites only.
 
 4. **Shadow-mode rollout + metric.** Every check ships first as warnings + a
    structured `contract_check_violations` metric on `ConversionReport`
@@ -1162,8 +1175,9 @@ review against the merged code (original deliverable text preserved in git):**
   escape hatch, resume-idempotent dedup. Smoke check only.
 - **Slice 1** — check A = domain⟂placement consistency (modules only; NO
   container stamp — see check #1 above). Animation_drivers deferred.
-- **Slice 2** — check B (GetComponent), keyed off runtime `_UNITY_TO_ROBLOX_CLASS`
-  + peer-module set.
+- **Slice 2** — check B (GetComponent reachability), keyed off the PARSED runtime
+  `_UNITY_TO_ROBLOX_CLASS` + peer set (stem ∪ script_id) + Roblox-class
+  allowlist. Reachability only; method-validity deferred.
 - **Slice 3** — check C (cross-domain attribute) + the reader-store scan
   extension (Phase 3 #2 above).
 - **Slice 4** — corpus shadow audit (AI transpile) + per-check flip behind the

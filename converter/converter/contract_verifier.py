@@ -30,7 +30,10 @@ imported from their real modules for concrete typing — no ``Any``.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
+from functools import lru_cache
+from pathlib import Path
 
 from converter.scene_runtime_topology.build_topology import TopologyArtifact
 from core.roblox_types import RbxScript
@@ -123,6 +126,9 @@ def verify_contract(
 
     # Check A — consumer compliance (domain⟂placement consistency).
     violations.extend(_check_consumer_compliance(topology, scripts))
+
+    # Check B — component availability (GetComponent reachability).
+    violations.extend(_check_component_availability(topology, scripts))
 
     return ContractVerifierResult(violations=violations)
 
@@ -372,3 +378,188 @@ def stash_violations(
         existing_rows.append(violation_to_dict(v))
         appended += 1
     return appended
+
+
+# ---------------------------------------------------------------------------
+# Check B — component availability (GetComponent reachability)
+# ---------------------------------------------------------------------------
+#
+# Generic mode emits the peer form ``self:GetComponent("X")``
+# (code_transpiler.py:1329). At runtime (scene_runtime.luau:752-780) X resolves
+# to: a peer converted-MonoBehaviour (by stem/scriptId) -> else
+# ``_UNITY_TO_ROBLOX_CLASS[X]`` -> else ``findFirstChildWhichIsA(X)``. An X that
+# is none of those returns nil, so any subsequent use/method-call errors. Check
+# B flags those unreachable sites.
+#
+# SCOPE (slice 2): reachability only. Method-validity (X maps to a Roblox class
+# that lacks the called method — the CharacterController->BasePart->:Move()
+# anecdote) is DEFERRED: the repo has no Roblox class->method database, and the
+# transpiler already routes CharacterController.Move/.SimpleMove/.isGrounded
+# through a bridge (api_mappings API_CALL_MAP), so that anecdote is largely
+# already handled. Documented gap, not silently dropped.
+#
+# COVERAGE: only STRING-LITERAL args are checked. A non-literal arg
+# (``self:GetComponent(typeVar)``) cannot be resolved statically and is skipped
+# — so a future fail-closed flip of check B covers literal-arg sites only.
+
+# Matches ``:GetComponent("X")`` with a string-literal arg ONLY. Deliberately
+# does NOT match:
+#   * the plural ``GetComponents`` (list semantics, different bug class) — a
+#     literal "(" must follow "GetComponent", and "GetComponents(" has an "s";
+#   * ``GetComponentInChildren`` / ``GetComponentInParent`` — the transpiler
+#     lowers those to a GetDescendants()/GetAncestors() hierarchy WALK
+#     (code_transpiler.py:1330), not a ``_UNITY_TO_ROBLOX_CLASS`` resolution, so
+#     check B's reachability model does not apply to them (review P3).
+# The arg char class is ``[\w-]+`` (not ``[A-Za-z_]\w*``) so a peer lookup by
+# scriptId is scannable too: runtime peer lookup matches ``m.stem == name or
+# m.scriptId == name`` (scene_runtime.luau:758), and scriptIds are Unity GUIDs /
+# ``<stem>-<idx>`` strings that contain ``-`` and may start with a digit. The
+# old identifier-only class silently skipped ``GetComponent("some-guid")``
+# (Codex slice-2 review P2). Real transpiler output passes C# class names
+# (identifier-shaped), so this only ADDS coverage; it never narrows it.
+_GETCOMPONENT_RE = re.compile(
+    r""":GetComponent\s*\(\s*['"]([\w-]+)['"]""",
+)
+
+
+def _strip_luau_comments(source: str) -> str:
+    """Remove Luau comments so the GetComponent scan doesn't fire on a
+    commented-out call (review P2). Strips ``--[[ ... ]]`` block comments first,
+    then ``-- ...`` to end-of-line. Imperfect inside string literals (a ``--``
+    in a string truncates the line), but that only DROPS a would-be match —
+    never creates one — which is the safe direction (we never want to flag a
+    GetComponent that lives inside a string anyway)."""
+    no_block = re.sub(r"--\[\[.*?\]\]", "", source, flags=re.DOTALL)
+    return re.sub(r"--[^\n]*", "", no_block)
+
+# Roblox classes converted (or hand-edited) code may legitimately pass to
+# GetComponent directly — runtime ``findFirstChildWhichIsA`` resolves them, so
+# they must NOT be flagged. The runtime map's VALUES already cover the
+# transpiler's own outputs; this allowlist guards the fail-closed flip against
+# legitimate direct-Roblox-class passes the values set happens to miss. Biased
+# to ABSTAIN: an over-broad allowlist only suppresses warnings (fails open),
+# which is the safe direction for a shadow→fail-closed check. Never flag a name
+# the runtime can resolve.
+_ROBLOX_CLASS_ALLOWLIST = frozenset({
+    "Humanoid", "HumanoidRootPart", "Seat", "VehicleSeat",
+    "ClickDetector", "ProximityPrompt", "Sound", "SoundGroup",
+    "Camera", "BasePart", "MeshPart", "Part", "UnionOperation", "Model",
+    "ParticleEmitter", "Beam", "Trail", "Light", "PointLight",
+    "SpotLight", "SurfaceLight", "Attachment",
+    "SurfaceGui", "BillboardGui", "ScreenGui", "Frame",
+    "TextLabel", "TextButton", "TextBox", "ImageLabel", "ImageButton",
+    "GuiButton", "Decal", "Texture", "Weld", "WeldConstraint", "Motor6D",
+    "Highlight", "Folder", "Configuration",
+})
+
+
+@lru_cache(maxsize=1)
+def _runtime_class_map() -> tuple[frozenset[str], frozenset[str]]:
+    """Parse ``_UNITY_TO_ROBLOX_CLASS`` from ``runtime/scene_runtime.luau`` and
+    return ``(keys, values)``.
+
+    This is the single source of truth check B trusts (the locked decision:
+    trust the RUNTIME map, which differs from Python ``TYPE_MAP`` — e.g.
+    CharacterController -> "BasePart" here vs "Humanoid" there). Parsed, not
+    duplicated, so the verifier and the runtime never drift. An EXHAUSTIVE
+    guard test (``test_runtime_class_map_*``) pins the full parsed key/value
+    set so a runtime-file refactor that drops/renames an entry fails loudly.
+    Cached: the file never changes within a process.
+    """
+    path = Path(__file__).resolve().parent.parent / "runtime" / "scene_runtime.luau"
+    text = path.read_text(encoding="utf-8")
+    keys: set[str] = set()
+    values: set[str] = set()
+    # Block-bounded: the table body from ``= {`` to the first line that is a
+    # bare ``}`` (the table's close). Avoids matching ``Ident = "Str"`` pairs
+    # elsewhere in the file.
+    block = re.search(
+        r"local\s+_UNITY_TO_ROBLOX_CLASS[^=]*=\s*\{(.*?)\n\}",
+        text,
+        re.DOTALL,
+    )
+    if block is not None:
+        for key, value in re.findall(r'(\w+)\s*=\s*"([^"]+)"', block.group(1)):
+            keys.add(key)
+            values.add(value)
+    # Sentinel assigns outside the table literal:
+    #   _UNITY_TO_ROBLOX_CLASS.Transform = _CLASS_TRANSFORM_SELF
+    for key in re.findall(r"_UNITY_TO_ROBLOX_CLASS\.(\w+)\s*=", text):
+        keys.add(key)
+    sentinel = re.search(r'_CLASS_TRANSFORM_SELF\s*=\s*"([^"]+)"', text)
+    if sentinel is not None:
+        values.add(sentinel.group(1))
+    return frozenset(keys), frozenset(values)
+
+
+def _check_component_availability(
+    topology: TopologyArtifact,
+    scripts: list[RbxScript],
+) -> list[ContractViolation]:
+    """Flag ``GetComponent("X")`` sites whose ``X`` resolves to nil at runtime.
+    See the section comment above + design doc §Phase 3 check #3."""
+    keys, values = _runtime_class_map()
+
+    # Peer converted-MonoBehaviours are reachable exactly as the runtime
+    # resolves them: ``m.stem == name or m.scriptId == name``
+    # (scene_runtime.luau:758). ``scriptId`` is the topology ``modules`` dict
+    # KEY. (Review P1: an earlier draft used ``class_name``, which the runtime
+    # never checks AND which ``TopologyModuleEntry`` never carries — a dead
+    # clause. A peer whose stem ≠ its C# class name genuinely does NOT resolve
+    # by class name at runtime, so flagging such a GetComponent is correct, not
+    # a false positive.)
+    # Peer reachability is GLOBAL (any module's stem/scriptId in the whole
+    # project), NOT scoped to the GameObject the call's ``self`` is on. The
+    # runtime peer branch only searches ``_componentsByGameObject[gameObjectId]``
+    # (scene_runtime.luau:754), so a global set is LENIENT — it can miss a real
+    # nil-return where the named peer exists elsewhere but not on this
+    # GameObject (Codex slice-2 review P1, a known FALSE NEGATIVE). This is
+    # intentional and not fixable here: the verifier's inputs (topology +
+    # scripts) carry NO per-GameObject component placement, and a
+    # GameObject-scoped check would otherwise have to flag every peer
+    # GetComponent (massive false positives). Abstain-on-peer-by-name is the
+    # safe bias for a check bound for a fail-closed flip; the per-GameObject
+    # tightening needs an instance→component map a future slice would add.
+    peer: set[str] = set()
+    modules = topology.get("modules") or {}
+    for script_id, module in modules.items():
+        if script_id:
+            peer.add(str(script_id))
+        if not isinstance(module, dict):
+            continue
+        stem = module.get("stem")
+        if isinstance(stem, str) and stem:
+            peer.add(stem)
+
+    reachable = peer | set(keys) | set(values) | _ROBLOX_CLASS_ALLOWLIST
+
+    violations: list[ContractViolation] = []
+    # Dedup + identity key on (name, parent_path, X) so two DIFFERENT scripts
+    # that share a name (e.g. duplicate "Door") each surface their own
+    # violation instead of collapsing into one (Codex slice-2 review P3).
+    seen: set[tuple[str, str, str]] = set()
+    for script in scripts:
+        source = _strip_luau_comments(script.source or "")
+        ppath = script.parent_path or ""
+        for match in _GETCOMPONENT_RE.finditer(source):
+            x = match.group(1)
+            if x in reachable:
+                continue
+            key = (script.name, ppath, x)
+            if key in seen:
+                continue
+            seen.add(key)
+            violations.append(
+                ContractViolation(
+                    check="component_availability",
+                    severity="warning",
+                    script=script.name,
+                    detail=(
+                        f"GetComponent({x!r}) resolves to nil — {x!r} is not a "
+                        f"converted component, a mapped Unity type, or a known "
+                        f"Roblox class; the result will error when used"
+                    ),
+                    identity=f"component_availability:{script.name}@{ppath}:{x}",
+                )
+            )
+    return violations
