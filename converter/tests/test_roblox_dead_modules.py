@@ -24,7 +24,9 @@ from core.roblox_types import RbxScript
 from converter.roblox_dead_modules import (
     classify_module_dead,
     compute_prunable_dead,
+    csharp_source_has_rendering_api,
     extract_require_edges,
+    has_genuine_roblox_effect,
     is_input_side_dead,
     measure_input_coverage,
 )
@@ -572,9 +574,9 @@ def test_pipeline_keeps_dead_module_with_live_requirer_end_to_end(tmp_path):
 
 
 def test_pipeline_resume_without_transpilation_result_abstains(tmp_path):
-    """On a no-transpile resume (``transpilation_result is None``) the pass
-    abstains entirely -- no dead verdicts, no prune. Preserves the storage plan
-    computed on the run that transpiled."""
+    """On a no-transpile resume (``transpilation_result is None``) with NO
+    persisted dead set, the pass abstains entirely -- no dead verdicts, no
+    prune. Preserves the storage plan computed on the run that transpiled."""
     from core.roblox_types import RbxPlace, RbxScript
 
     pipeline = _make_pipeline(tmp_path)
@@ -589,3 +591,311 @@ def test_pipeline_resume_without_transpilation_result_abstains(tmp_path):
     assert pipeline.state.dead_modules == frozenset()
     pipeline._subphase_prune_dead_module_closures()
     assert {s.name for s in pipeline.state.rbx_place.scripts} == {"WaterBase"}
+
+
+# ---------------------------------------------------------------------------
+# P1-a: the transpile-time stub gate requires a POSITIVE rendering-API signal.
+# A portable menu / save / scene controller (low coverage, NO rendering API) is
+# NOT stubbed; a true rendering helper (rendering API present) IS.
+# ---------------------------------------------------------------------------
+
+
+# A portable menu / save / scene controller: low mapping coverage, gameplay-
+# adjacent persistence + scene-management behavior, but ZERO rendering APIs.
+_MENU_CSHARP = """
+using UnityEngine;
+using UnityEngine.SceneManagement;
+public class MenuController : MonoBehaviour {
+    void Start() {
+        Cursor.lockState = CursorLockMode.None;
+    }
+    void OnPlay() {
+        PlayerPrefs.SetInt("started", 1);
+        SceneManager.LoadScene("Game");
+    }
+    void OnQuit() {
+        Application.Quit();
+    }
+}
+"""
+
+# A single-rendering-API helper: ONE rendering token (Shader.) plus other
+# render-target APIs, no gameplay -> still stubbed.
+_SINGLE_RENDER_CSHARP = """
+using UnityEngine;
+public class Glow : MonoBehaviour {
+    void Refresh() {
+        Shader.EnableKeyword("GLOW");
+        sharedMaterial.shader.maximumLOD = 100;
+        Camera.main.depthTextureMode |= DepthTextureMode.Depth;
+        bool ok = SystemInfo.SupportsRenderTextureFormat(RenderTextureFormat.Depth);
+    }
+}
+"""
+
+
+def test_menu_controller_not_stubbed_at_transpile_time():
+    """P1-a: a portable menu/save/scene controller (low coverage, ZERO rendering
+    APIs) must NOT be stubbed by the destructive transpile-time gate.
+
+    Fail-before-fix CONFIRMED: before requiring a positive rendering signal,
+    ``is_input_side_dead`` returned True for this body (no gameplay veto + low
+    coverage was sufficient), silently dropping portable behavior. The witness:
+    the body has NO rendering-API signal yet coverage is dead-leaning, so the
+    pre-fix (gameplay-veto + coverage only) gate would have stubbed it.
+    """
+    # Witness: coverage IS dead-leaning and there is NO gameplay veto, so the
+    # OLD gate (which lacked the rendering-signal requirement) would stub it.
+    assert measure_input_coverage(_MENU_CSHARP).dead_leaning
+    assert not csharp_source_has_rendering_api(_MENU_CSHARP)
+    # New gate: NOT dead (no positive rendering signal).
+    assert not is_input_side_dead(_MENU_CSHARP)
+
+
+def test_single_rendering_api_helper_is_stubbed():
+    """P1-a: a helper with even ONE rendering-API signal (+ low coverage, no
+    gameplay) IS stubbed -- the positive signal isolates true rendering
+    helpers from menu/save/scene controllers without a class-name list."""
+    assert csharp_source_has_rendering_api(_SINGLE_RENDER_CSHARP)
+    assert is_input_side_dead(_SINGLE_RENDER_CSHARP)
+
+
+def test_water_cluster_shapes_still_stub():
+    """P1-a regression: the documented water-module shapes (each a single
+    ``Shader.`` ref plus other rendering APIs) still stub after the gate now
+    requires a positive rendering signal -- the fix narrows menu controllers
+    OUT without losing the real rendering helpers."""
+    # WaterBase shape (from _RENDER_CSHARP) + the renamed/Displace-style shapes.
+    assert is_input_side_dead(_RENDER_CSHARP)            # WaterBase
+    assert is_input_side_dead(_RENAMED_RENDER_CSHARP)    # OceanShimmer / GL-only
+    displace = (
+        "using UnityEngine;\n"
+        "public class Displace : MonoBehaviour {\n"
+        "  void OnWillRenderObject() {\n"
+        "    Shader.EnableKeyword(\"WATER_VERTEX_DISPLACEMENT_ON\");\n"
+        "    Shader.DisableKeyword(\"WATER_VERTEX_DISPLACEMENT_OFF\");\n"
+        "  }\n}\n"
+    )
+    assert is_input_side_dead(displace)                  # Displace
+
+
+# ---------------------------------------------------------------------------
+# P1-b: prune must protect TRANSITIVE dead deps of a kept-inert module.
+# ---------------------------------------------------------------------------
+
+
+def test_prune_protects_transitive_dead_dep_of_kept_module():
+    """P1-b: ``live -> A -> B`` with dead={A,B}. A is kept inert (live caller),
+    but A still ``require``s B at module scope -- pruning B would make A's
+    require resolve to nil (``require(nil)`` crash). BOTH A and B must be kept
+    inert; NOTHING is prunable.
+
+    Fail-before-fix CONFIRMED: the prior direct-caller-only partition returned
+    ``prunable={B}, keep_inert={A}`` (B has no DIRECT live caller), which would
+    crash A. The transitive-closure partition protects B.
+    """
+    edges = {"LiveMod": {"A"}, "A": {"B"}, "B": set()}
+    result = compute_prunable_dead(frozenset({"A", "B"}), edges)
+    assert result.prunable == set(), (
+        "B is transitively required by kept-inert A -- must not be pruned"
+    )
+    assert result.keep_inert == {"A", "B"}
+
+
+def test_prune_fully_isolated_dead_closure_still_prunable():
+    """P1-b: a fully-isolated dead closure (no live requirer ANYWHERE) is
+    entirely prunable -- the transitive protection only fires when a live
+    module reaches into the closure."""
+    edges = {"A": {"B"}, "B": set()}
+    result = compute_prunable_dead(frozenset({"A", "B"}), edges)
+    assert result.prunable == {"A", "B"}
+    assert result.keep_inert == set()
+
+
+# ---------------------------------------------------------------------------
+# P1-c: extract_require_edges recognises non-FindFirstChild lookup shapes.
+# ---------------------------------------------------------------------------
+
+
+def test_waitforchild_require_shape_registers_edge():
+    """P1-c: a ``require(...:WaitForChild("Name"))`` form is a real emitted
+    module-require shape. The edge must register so a live module requiring a
+    dead one via ``WaitForChild`` keeps it inert (not false-pruned).
+
+    Fail-before-fix CONFIRMED: ``_REQUIRE_EDGE`` hardcoded ``FindFirstChild(``,
+    so a WaitForChild require returned an empty edge set -> the requirer looked
+    like it required nothing -> the dead callee was wrongly prunable.
+    """
+    src = (
+        'local W = require(game:GetService("ReplicatedStorage")'
+        ':WaitForChild("WaterBase"))'
+    )
+    assert extract_require_edges(src, frozenset({"WaterBase"})) == {"WaterBase"}
+
+
+def test_waitforchild_edge_blocks_false_prune():
+    """P1-c end-to-end: a LIVE module requiring a dead one via WaitForChild
+    keeps the dead module inert (the edge is visible to the partitioner)."""
+    live_src = (
+        'local Dead = require(game:GetService("ReplicatedStorage")'
+        ':WaitForChild("DeadHelper"))\n'
+        "local part = Instance.new('Part')\npart.Parent = workspace"
+    )
+    scripts = [
+        RbxScript(name="LiveLogic", source=live_src, script_type="ModuleScript"),
+        RbxScript(name="DeadHelper", source="local M={}\nreturn M",
+                  script_type="ModuleScript"),
+    ]
+    edges = _edges(scripts)
+    assert edges["LiveLogic"] == {"DeadHelper"}
+    result = compute_prunable_dead(frozenset({"DeadHelper"}), edges)
+    assert result.prunable == set()
+    assert result.keep_inert == {"DeadHelper"}
+
+
+# ---------------------------------------------------------------------------
+# P2-b: the hard veto catches CHAINED instance property writes.
+# ---------------------------------------------------------------------------
+
+
+def test_chained_property_write_vetoes():
+    """P2-b: chained-receiver instance property writes
+    (``self.part.CFrame = ...`` / ``workspace.CurrentCamera.FieldOfView = ...``)
+    are genuine Roblox effects and must VETO the dead verdict.
+
+    Fail-before-fix CONFIRMED: ``_PROP_WRITE`` only matched ``obj.Prop = ...``
+    (a single-segment receiver), so a chained write slipped through and a live
+    module mutating Roblox state via a chained write could be flagged dead.
+    """
+    assert has_genuine_roblox_effect("self.part.CFrame = x")
+    assert has_genuine_roblox_effect("workspace.CurrentCamera.FieldOfView = 70")
+    # Exclusions still hold: class-table boilerplate, the injected PrimaryPart
+    # fixup, and local declarations do NOT veto.
+    assert not has_genuine_roblox_effect("WaterBase.__index = WaterBase")
+    assert not has_genuine_roblox_effect(
+        'self.model.PrimaryPart = self.model:FindFirstChildWhichIsA("BasePart")'
+    )
+    assert not has_genuine_roblox_effect("local x = a.b")
+
+
+def test_chained_write_module_is_not_dead():
+    """P2-b end-to-end: a module whose only Roblox effect is a chained property
+    write is NOT flagged dead (the veto wins)."""
+    csharp = _RENDER_CSHARP  # dead-leaning input
+    luau = (
+        "local M = {}\nM.__index = M\n"
+        "function M:Update()\n  self.part.CFrame = CFrame.new(0, 1, 0)\nend\n"
+        "return M\n"
+    )
+    v = classify_module_dead("Mover", csharp_source=csharp, luau_source=luau)
+    assert not v.is_dead, v.reason
+    assert v.vetoed
+
+
+# ---------------------------------------------------------------------------
+# P2-a: a no-transpile resume REUSES the persisted dead set (does not abstain).
+# ---------------------------------------------------------------------------
+
+
+def test_pipeline_resume_reuses_persisted_dead_set(tmp_path):
+    """P2-a: on a no-transpile resume (``transpilation_result is None``) with a
+    PERSISTED dead set on the context, the pass reuses it -- so the downstream
+    storage classifier keeps the dead module out of ServerStorage instead of
+    re-routing it back.
+
+    Fail-before-fix CONFIRMED: before persistence, the resume path returned an
+    empty ``dead_modules`` set (abstain), and ``_classify_storage`` re-routed
+    the previously-dead module by caller-domain (back into ServerStorage). The
+    persisted-set reuse keeps the prior verdict alive across the resume.
+    """
+    from core.roblox_types import RbxPlace, RbxScript
+
+    pipeline = _make_pipeline(tmp_path)
+    pipeline.state.rbx_place = RbxPlace()
+    pipeline.state.rbx_place.scripts = [
+        RbxScript(name="WaterBase", source=_INERT_LUAU,
+                  script_type="ModuleScript"),
+    ]
+    pipeline.state.transpilation_result = None
+    # Simulate the persisted verdict from the run that transpiled.
+    pipeline.ctx.dead_modules = ["WaterBase"]
+
+    pipeline._subphase_analyze_dead_modules()
+    assert pipeline.state.dead_modules == frozenset({"WaterBase"})
+
+
+def test_pipeline_resume_reuse_drops_stale_names(tmp_path):
+    """P2-a: a persisted dead name no longer present in the emitted place is
+    dropped on reuse (never resurrects a stale verdict for a removed script)."""
+    from core.roblox_types import RbxPlace, RbxScript
+
+    pipeline = _make_pipeline(tmp_path)
+    pipeline.state.rbx_place = RbxPlace()
+    pipeline.state.rbx_place.scripts = [
+        RbxScript(name="WaterBase", source=_INERT_LUAU,
+                  script_type="ModuleScript"),
+    ]
+    pipeline.state.transpilation_result = None
+    pipeline.ctx.dead_modules = ["WaterBase", "GoneModule"]
+
+    pipeline._subphase_analyze_dead_modules()
+    assert pipeline.state.dead_modules == frozenset({"WaterBase"})
+
+
+def test_pipeline_persists_dead_set_on_fresh_transpile(tmp_path):
+    """P2-a: a fresh transpile persists the computed dead set onto the context
+    (``ctx.dead_modules``) so a later no-transpile resume can reuse it.
+
+    Fail-before-fix CONFIRMED: ``ctx.dead_modules`` did not exist; the dead set
+    lived only on transient ``state.dead_modules``, lost across a resume."""
+    from converter.code_transpiler import TranspilationResult, TranspiledScript
+    from core.roblox_types import RbxPlace, RbxScript
+
+    pipeline = _make_pipeline(tmp_path)
+    pipeline.state.rbx_place = RbxPlace()
+    pipeline.state.rbx_place.scripts = [
+        RbxScript(name="WaterBase", source=_INERT_LUAU,
+                  script_type="ModuleScript"),
+    ]
+    pipeline.state.transpilation_result = TranspilationResult(
+        scripts=[
+            TranspiledScript(
+                source_path="Assets/WaterBase.cs",
+                output_filename="WaterBase.luau",
+                csharp_source=_RENDER_CSHARP, luau_source=_INERT_LUAU,
+                strategy="stub", confidence=1.0, script_type="ModuleScript",
+            ),
+        ],
+        total_transpiled=1, total_ai=0,
+    )
+
+    pipeline._subphase_analyze_dead_modules()
+    assert pipeline.ctx.dead_modules == ["WaterBase"]
+
+
+# ---------------------------------------------------------------------------
+# P3-b: dotted-member method-name tokens do not leak into the bare-type surface.
+# ---------------------------------------------------------------------------
+
+
+def test_dotted_method_name_not_counted_as_bare_type():
+    """P3-b: a method name from a dotted call (``EnableKeyword`` from
+    ``Shader.EnableKeyword``) must NOT leak into the bare-type surface, where it
+    would be measured against TYPE_MAP (no entry) and inflate the unmapped
+    count.
+
+    Fail-before-fix CONFIRMED: the prior code stripped only the dotted LEAD
+    (``Shader``) from the bare set, leaving ``EnableKeyword`` as a bare token.
+    Now the full dotted member chain is stripped.
+    """
+    from converter.roblox_dead_modules import _extract_csharp_api_refs
+
+    src = (
+        "using UnityEngine;\n"
+        "public class C : MonoBehaviour {\n"
+        "  void F() { Shader.EnableKeyword(\"X\"); }\n}\n"
+    )
+    dotted, bare = _extract_csharp_api_refs(src)
+    assert "Shader.EnableKeyword" in dotted
+    assert "EnableKeyword" not in bare
+    assert "Shader" not in bare
