@@ -953,6 +953,78 @@ def test_pipeline_persists_dead_set_on_fresh_transpile(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# P1 (re-review): on resume, REVALIDATE persisted dead verdicts against the
+# CURRENT rehydrated Luau body. A still-inert module stays dead (reroute
+# preserved); a hand-edited module that now has a genuine Roblox effect is
+# DROPPED from the dead set (not pruned, not rerouted-inert) -- the prior
+# fix reused the persisted set BY NAME only and clobbered hand-edits.
+# ---------------------------------------------------------------------------
+
+
+def test_pipeline_resume_revalidates_still_inert_module_stays_dead(tmp_path):
+    """P1: a persisted-dead module whose rehydrated Luau is STILL inert stays in
+    the dead set on resume -- the genuinely-dead reroute is preserved (original
+    P2-a goal retained)."""
+    from core.roblox_types import RbxPlace, RbxScript
+
+    pipeline = _make_pipeline(tmp_path)
+    pipeline.state.rbx_place = RbxPlace()
+    pipeline.state.rbx_place.scripts = [
+        RbxScript(name="WaterBase", source=_INERT_LUAU,
+                  script_type="ModuleScript"),
+    ]
+    pipeline.state.transpilation_result = None
+    pipeline.ctx.dead_modules = ["WaterBase"]
+
+    pipeline._subphase_analyze_dead_modules()
+    assert pipeline.state.dead_modules == frozenset({"WaterBase"})
+
+
+def test_pipeline_resume_drops_hand_edited_module_from_dead_set(tmp_path):
+    """P1: a persisted-dead module whose rehydrated Luau was HAND-EDITED to add a
+    genuine Roblox effect (``Instance.new`` / ``.Parent =``) is DROPPED from the
+    dead set on resume -- so the prune / reroute-inert consumers never clobber
+    the user's edit (supported preserve-scripts / hand-edit workflow).
+
+    Fail-before-fix CONFIRMED: the prior resume path reused the persisted set
+    purely BY NAME (filtered only to names still present), so a hand-edited
+    still-named ``WaterBase`` stayed flagged dead despite its now-live body. The
+    revalidation (output-inert AND not vetoed against the CURRENT body) drops it.
+    The prune pass then leaves it in place.
+    """
+    from core.roblox_types import RbxPlace, RbxScript
+
+    # A body that was hand-edited to add real Roblox logic post-transpile.
+    hand_edited = (
+        "local WaterBase = {}\n"
+        "WaterBase.__index = WaterBase\n"
+        "function WaterBase.new()\n"
+        "    local part = Instance.new(\"Part\")\n"
+        "    part.Parent = workspace\n"
+        "    return setmetatable({}, WaterBase)\n"
+        "end\n"
+        "return WaterBase\n"
+    )
+
+    pipeline = _make_pipeline(tmp_path)
+    pipeline.state.rbx_place = RbxPlace()
+    pipeline.state.rbx_place.scripts = [
+        RbxScript(name="WaterBase", source=hand_edited,
+                  script_type="ModuleScript"),
+    ]
+    pipeline.state.transpilation_result = None
+    pipeline.ctx.dead_modules = ["WaterBase"]
+
+    pipeline._subphase_analyze_dead_modules()
+    # Dropped from the dead set: the current body is no longer inert (veto).
+    assert pipeline.state.dead_modules == frozenset()
+
+    # And the prune pass leaves the hand-edited module in place (NOT pruned).
+    pipeline._subphase_prune_dead_module_closures()
+    assert {s.name for s in pipeline.state.rbx_place.scripts} == {"WaterBase"}
+
+
+# ---------------------------------------------------------------------------
 # P3-b: dotted-member method-name tokens do not leak into the bare-type surface.
 # ---------------------------------------------------------------------------
 

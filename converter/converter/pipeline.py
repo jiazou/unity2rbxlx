@@ -3014,10 +3014,15 @@ return table.concat(allData, "\\n")'''
         ``ctx.dead_modules`` (round-trips through ``conversion_context.json``).
         On a no-transpile resume (preserve-scripts / ``--phase=write_output``,
         ``transpilation_result`` is None) the input prior cannot be recomputed
-        from C#, so this REUSES the persisted set from the run that transpiled.
-        Without that reuse the verdict would abstain (empty) and the downstream
-        ``_classify_storage`` would re-route the previously-dead modules back
-        into ServerStorage, overwriting the prior plan.
+        from C#, so this REUSES the persisted set from the run that transpiled
+        -- but RE-VALIDATES each persisted name against its CURRENT rehydrated
+        Luau body first. A module that was dead at last transpile but has since
+        been HAND-EDITED to add real Roblox logic is dropped from the dead set,
+        so the prune / reroute-inert consumers never clobber the user's edit (the
+        supported preserve-scripts / hand-edit workflow). Without the reuse the
+        verdict would abstain (empty) and ``_classify_storage`` would re-route
+        the still-dead modules back into ServerStorage; without the revalidation
+        a hand-edited module would be wrongly pruned/rerouted-inert.
         """
         self.state.dead_modules = frozenset()
         if self.state.rbx_place is None or not self.state.rbx_place.scripts:
@@ -3029,17 +3034,49 @@ return table.concat(allData, "\\n")'''
         # transpilation_result is absent) instead of abstaining.
         result = self.state.transpilation_result
         if result is None or not result.scripts:
+            from converter.roblox_dead_modules import (
+                has_genuine_roblox_effect,
+                is_output_inert,
+            )
+
             persisted = getattr(self.ctx, "dead_modules", None) or []
-            # Only retain names that are still present in the emitted place, so a
-            # stale verdict for a removed script never lingers.
-            present = {s.name for s in self.state.rbx_place.scripts}
-            reused = frozenset(n for n in persisted if n in present)
-            self.state.dead_modules = reused
+            persisted_set = set(persisted)
+            # RE-VALIDATE each persisted-dead verdict against its CURRENT
+            # rehydrated Luau body. ``materialize_and_classify`` rehydrates the
+            # on-disk ``*.luau`` first, so a module that was dead at last
+            # transpile but has since been HAND-EDITED to add real Roblox logic
+            # must be DROPPED from the dead set -- otherwise the prune /
+            # reroute-inert consumers would clobber the user's edit (the
+            # supported preserve-scripts / hand-edit workflow). The C# input
+            # prior does NOT need re-measuring: C# is unchanged by a Luau hand-
+            # edit and the verdict was measured dead-leaning at transpile time;
+            # the decisive OUTPUT signal is what a hand-edit changes. Keep a
+            # module dead ONLY when its current body is still output-inert and
+            # not vetoed.
+            reused: set[str] = set()
+            dropped: list[str] = []
+            for s in self.state.rbx_place.scripts:
+                if s.name not in persisted_set:
+                    continue
+                if is_output_inert(s.source) and not has_genuine_roblox_effect(
+                    s.source
+                ):
+                    reused.add(s.name)
+                else:
+                    dropped.append(s.name)
+            self.state.dead_modules = frozenset(reused)
             if reused:
                 log.info(
-                    "[dead-modules] resume (no transpile): reusing %d persisted "
-                    "Roblox-dead verdict(s): %s",
+                    "[dead-modules] resume (no transpile): revalidated %d "
+                    "persisted Roblox-dead verdict(s) against current Luau: %s",
                     len(reused), ", ".join(sorted(reused)),
+                )
+            if dropped:
+                log.info(
+                    "[dead-modules] resume (no transpile): dropped %d persisted "
+                    "verdict(s) whose current Luau is no longer inert "
+                    "(hand-edited): %s",
+                    len(dropped), ", ".join(sorted(dropped)),
                 )
             return
 
