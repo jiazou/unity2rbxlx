@@ -1859,3 +1859,63 @@ class TestSyntheticEmbeddedKeySizingParity:
                 f"paths: fallback={a:.4f} resolved={b:.4f} -- the embedded "
                 f"mesh would render at the wrong Size after upload."
             )
+
+
+class TestPickupPayloadStaysRaw:
+    """ItemType and the serialized ``itemName`` are GAMEPLAY PAYLOADS, not
+    flag stems: pickups forward them raw to ``GetItem`` / ``pickup_runtime``
+    dispatch. They must NOT be sanitized at the source — sanitizing only the
+    derived ``"has" .. name`` flag (at the runtime concat) keeps the raw value
+    intact for gameplay while the cross-script flag stays ``[%w_]``-valid.
+    """
+
+    def test_pickup_itemtype_with_spaces_stays_raw(self) -> None:
+        from converter.scene_converter import _apply_gameplay_attributes
+        from core.roblox_types import RbxPart
+        part = RbxPart(name="Red Key Pickup")
+        _apply_gameplay_attributes(part, "Red Key Pickup")
+        assert part.attributes["IsPickup"] is True
+        # "Red Key Pickup".replace("Pickup","").strip() == "Red Key" — RAW
+        # (the GetItem dispatch payload must keep the original label).
+        assert part.attributes["ItemType"] == "Red Key"
+
+    def test_pickup_itemtype_with_hyphen_stays_raw(self) -> None:
+        from converter.scene_converter import _apply_gameplay_attributes
+        from core.roblox_types import RbxPart
+        part = RbxPart(name="Health-Pack Pickup")
+        _apply_gameplay_attributes(part, "Health-Pack Pickup")
+        assert part.attributes["ItemType"] == "Health-Pack"
+
+    def test_clean_pickup_itemtype_is_byte_identical(self) -> None:
+        from converter.scene_converter import _apply_gameplay_attributes
+        from core.roblox_types import RbxPart
+        part = RbxPart(name="KeyPickup")
+        _apply_gameplay_attributes(part, "KeyPickup")
+        assert part.attributes["ItemType"] == "Key"
+
+    def test_empty_itemtype_falls_back_to_generic(self) -> None:
+        from converter.scene_converter import _apply_gameplay_attributes
+        from core.roblox_types import RbxPart
+        # Bare "Pickup" → "" → 'Generic' (pre-existing fallback, unchanged).
+        part = RbxPart(name="Pickup")
+        _apply_gameplay_attributes(part, "Pickup")
+        assert part.attributes["ItemType"] == "Generic"
+
+    def test_serialized_itemname_stays_raw(self) -> None:
+        import converter.scene_converter as sc
+        from core.roblox_types import RbxPart
+        part = RbxPart(name="Pickup")
+        sc._extract_monobehaviour_attributes(
+            {"itemName": "Red Key"}, part, guid_index=None
+        )
+        # RAW: forwarded to GetItem(itemName); only the derived flag is sanitized.
+        assert part.attributes["itemName"] == "Red Key"
+
+    def test_serialized_clean_itemname_is_byte_identical(self) -> None:
+        import converter.scene_converter as sc
+        from core.roblox_types import RbxPart
+        part = RbxPart(name="Pickup")
+        sc._extract_monobehaviour_attributes(
+            {"itemName": "Key"}, part, guid_index=None
+        )
+        assert part.attributes["itemName"] == "Key"

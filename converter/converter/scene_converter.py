@@ -3138,6 +3138,13 @@ def _extract_monobehaviour_attributes(
             part.attributes[attr_name] = value
         elif isinstance(value, str) and len(value) < 100:
             attr_name = key[2:] if key.startswith("m_") else key
+            # ``itemName`` is a gameplay payload, NOT a flag stem: pickup
+            # scripts forward it raw via ``PickupItemEvent:FireClient(.., itemName)``
+            # and the client listener calls ``GetItem(itemName)``. Sanitizing it
+            # here would corrupt that dispatch/label for dirty-name items. The
+            # cross-script shared-flag name (``"has" .. itemName``) is sanitized
+            # at the RUNTIME concat site instead (the emitted Luau gsub), so the
+            # raw value flows to gameplay unchanged while the flag stays valid.
             part.attributes[attr_name] = value
         elif isinstance(value, bool):
             attr_name = key[2:] if key.startswith("m_") else key
@@ -3937,6 +3944,10 @@ def _apply_gameplay_attributes(part: RbxPart, name: str) -> None:
         item_type = name.replace('Pickup', '').replace('pickup', '').strip()
         if not item_type:
             item_type = 'Generic'
+        # ItemType is a gameplay payload, NOT a flag stem: pickup_runtime.luau
+        # reads it and dispatches via ``SetAttribute("GetItem", itemType)``.
+        # Keep it RAW so dirty-name items dispatch correctly; the shared-flag
+        # name (``"has" .. ItemType``) is sanitized at the runtime concat site.
         part.attributes['IsPickup'] = True
         part.attributes['ItemType'] = item_type
         if part.class_name == 'Model' and part.children:
