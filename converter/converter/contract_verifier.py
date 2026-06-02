@@ -149,6 +149,14 @@ def _container_family(parent_path: str) -> str:
     ``StarterPlayer.StarterCharacterScripts`` forms and a bare
     ``ReplicatedFirst`` all classify as client.
     """
+    # Module ``parent_path`` values are always TOP-LEVEL container strings
+    # (the storage classifier + reachability path only ever emit
+    # "ServerScriptService"/"ServerStorage"/"ReplicatedStorage"/"ReplicatedFirst"
+    # /"StarterPlayer.Starter*Scripts"). A dotted "ServerStorage.Foo" would fall
+    # through to "other" and escape the check — that is intentional and
+    # currently unreachable for modules; do NOT "fix" it into a substring match
+    # on the server set (that would re-introduce false positives on names that
+    # merely contain a container token).
     if parent_path in _SERVER_ONLY_CONTAINERS:
         return "server"
     if parent_path in _NEUTRAL_CONTAINERS:
@@ -177,6 +185,12 @@ def _join_name(module: object) -> str:
     module_path = str(module.get("module_path") or "")
     if module_path:
         return module_path.rsplit(".", 1)[-1]
+    # Stem fallback: ``module_path`` is unstamped only when the module's
+    # ``RbxScript.parent_path`` was empty (``_stamp_container_and_path``
+    # requires a truthy container). Then ``stem`` may differ from the emitted
+    # ``RbxScript.name`` (C# class name ≠ file stem), risking a mis-join — but an
+    # empty ``parent_path`` also makes ``_container_family("") == "other"``, so
+    # only the container-independent type rules could fire. Low-risk edge.
     return str(module.get("stem") or "")
 
 
