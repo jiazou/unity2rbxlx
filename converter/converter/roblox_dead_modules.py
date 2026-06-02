@@ -25,9 +25,21 @@ The definition is **D3 (both-agree) + HARD VETO** (see
     and the inert-component-stub self-label) are strong signals.
 
   HARD VETO:  any single genuine Roblox effect in the body (``Instance.new``,
-    ``.Parent =``, a property write to a real instance, a RemoteEvent /
-    BindableEvent fire, a DataStore / real-service mutation, or a call that
-    resolves to a genuinely-mapped API) ⇒ NOT dead, regardless of fraction.
+    ``.Parent =``, a property write to a real instance -- including a CHAINED
+    receiver such as ``self.part.CFrame = ...`` or
+    ``workspace.CurrentCamera.FieldOfView = ...`` -- a RemoteEvent /
+    BindableEvent fire, or a DataStore / real-service mutation) ⇒ NOT dead,
+    regardless of fraction.
+
+    The brief also lists "a call that resolves to a genuinely-mapped API" as a
+    veto. That is SUBSUMED by the structural veto above plus output-inertness:
+    any genuinely-mapped Unity API the AI translates emits real Roblox code
+    (an ``Instance.new`` / property write / service call), which the structural
+    patterns already catch; a mapped call that translates to a pure value-read
+    or a comment stub is not an OUTPUT effect and correctly leaves the body
+    inert. So ``has_genuine_roblox_effect`` deliberately does NOT consult
+    ``API_CALL_MAP`` / ``TYPE_MAP`` -- the structural body veto is the decisive,
+    lower-false-positive signal.
 
 A module is dead iff INPUT-prior agrees AND OUTPUT is inert AND no veto.
 
@@ -159,11 +171,13 @@ def _extract_csharp_api_refs(csharp_source: str) -> tuple[set[str], set[str]]:
         if tok in namespace_roots:
             continue
         bare.add(tok)
-    # A dotted ref's leading type (``Shader`` in ``Shader.EnableKeyword``) is
-    # already represented by the dotted entry; drop it from bare to avoid
-    # double-counting.
-    dotted_leads = {d.split(".")[0] for d in dotted}
-    bare -= dotted_leads
+    # Every segment of a dotted ref (``Shader`` AND ``EnableKeyword`` in
+    # ``Shader.EnableKeyword``) is already represented by the dotted entry;
+    # drop the FULL dotted member chain from bare. Stripping only the lead
+    # leaked method-name tokens (``EnableKeyword``) into the bare-type surface,
+    # inflating the unmapped count (a method name has no TYPE_MAP entry).
+    dotted_segments = {seg for d in dotted for seg in d.split(".")}
+    bare -= dotted_segments
     return dotted, bare
 
 
@@ -292,10 +306,18 @@ _VETO_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r":Destroy\(\s*\w"),  # Destroying a real instance argument
 )
 
-# A property write to a real instance: ``obj.Prop = value`` where ``obj`` is
-# NOT being locally declared on the same line. Matched separately so we can
-# exclude ``local x = ...`` and ``Cls.__index = Cls`` boilerplate.
-_PROP_WRITE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([^=].*)$")
+# A property write to a real instance: ``obj.Prop = value`` where the receiver
+# is NOT being locally declared on the same line. The receiver may be a CHAINED
+# member access (``self.part.CFrame = ...``, ``workspace.CurrentCamera.FieldOfView
+# = ...``), so capture the whole dotted receiver chain plus the final written
+# property. Matched separately from the veto-pattern list so we can exclude
+# ``local x = ...``, ``Cls.__index = Cls`` boilerplate, and the injected
+# PrimaryPart fixup. Group 1 = receiver chain (may contain dots), group 2 =
+# written property, group 3 = RHS.
+_PROP_WRITE = re.compile(
+    r"^\s*([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)"
+    r"\.([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([^=].*)$"
+)
 
 # Boilerplate LHS targets that are class-table assignments, not instance writes.
 _BOILERPLATE_PROP = frozenset({"__index", "new"})
@@ -362,6 +384,18 @@ def has_genuine_roblox_effect(luau_source: str) -> bool:
 
     Operates on a comment/string-stripped copy so markers inside literals do
     not count. A single match vetoes the dead verdict.
+
+    Matches genuine effects structurally: ``Instance.new`` / ``.Parent =`` /
+    event fires / DataStore mutations (``_VETO_PATTERNS``) plus instance
+    property writes -- including CHAINED receivers (``self.part.CFrame = ...``,
+    ``workspace.CurrentCamera.FieldOfView = ...``) -- excluding class-table
+    boilerplate (``__index`` / ``new``), local declarations, and the
+    converter-injected PrimaryPart container fixup.
+
+    Deliberately does NOT consult ``API_CALL_MAP`` / ``TYPE_MAP``: a
+    genuinely-mapped Unity API the AI translates emits one of the structural
+    effects above, so the brief's "mapped-API call vetoes" rule is subsumed by
+    the structural test (see the module docstring).
     """
     code = _strip_luau_comments_and_strings(luau_source)
     for pat in _VETO_PATTERNS:
@@ -433,17 +467,79 @@ def csharp_source_has_gameplay_effect(csharp_source: str) -> bool:
     return any(p.search(src) for p in _CSHARP_GAMEPLAY_VETO)
 
 
+# ---------------------------------------------------------------------------
+# Positive rendering / visual-effect API signal (input-side gate).
+#
+# The transpile-time stub gate is DESTRUCTIVE (it replaces a script's body with
+# an inert stub BEFORE the AI ever sees it). Generic "low mapping coverage" is
+# NOT a safe trigger on its own: a portable menu / save / scene controller
+# (``PlayerPrefs`` + ``Application.Quit`` + ``SceneManager.LoadScene`` +
+# ``Cursor.lockState``) also has low coverage yet carries real, transpilable
+# behavior. So the gate additionally requires a POSITIVE rendering-API signal --
+# a token from the set of Unity GPU / shader / camera-effect / render-target
+# APIs that genuinely have no Roblox equivalent. These are behavioral API
+# surfaces, NOT class names, so a renamed rendering helper (``OceanShimmer``) is
+# still caught while a menu controller is left untouched.
+# ---------------------------------------------------------------------------
+
+_RENDERING_API_SIGNALS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bShader\."),
+    re.compile(r"\bMaterial\."),
+    # ``.material`` / ``.sharedMaterial`` shader-handle access.
+    re.compile(r"\.material\b"),
+    re.compile(r"\.sharedMaterial\b"),
+    re.compile(r"\bRenderer\b"),
+    re.compile(r"\bRenderTexture\b"),
+    re.compile(r"\bGL\."),
+    re.compile(r"\bGraphics\.Blit\b"),
+    re.compile(r"\bCommandBuffer\b"),
+    re.compile(r"\bOnWillRenderObject\b"),
+    re.compile(r"\bOnRenderImage\b"),
+    re.compile(r"\bOnPreRender\b"),
+    re.compile(r"\bOnPostRender\b"),
+    re.compile(r"\.depthTextureMode\b"),
+    re.compile(r"\.cullingMask\b"),
+    re.compile(r"\.targetTexture\b"),
+    re.compile(r"\bSkybox\b"),
+    re.compile(r"\.maximumLOD\b"),
+    re.compile(r"\bSupportsRenderTextureFormat\b"),
+    re.compile(r"\bRenderTextureFormat\b"),
+    re.compile(r"\.invertCulling\b"),
+    re.compile(r"\bCamera\.Render\b"),
+    re.compile(r"\bDepthTextureMode\b"),
+)
+
+
+def csharp_source_has_rendering_api(csharp_source: str) -> bool:
+    """True when the C# source touches a GPU / shader / camera-effect /
+    render-target API that has no Roblox equivalent (input-side POSITIVE
+    rendering signal). Comment-stripped so commented-out APIs do not count.
+    """
+    src = _strip_csharp_comments(csharp_source)
+    return any(p.search(src) for p in _RENDERING_API_SIGNALS)
+
+
 def is_input_side_dead(csharp_source: str) -> bool:
     """Transpile-time (input-only) dead verdict for the visual-only gate.
 
-    Dead-leaning iff the C# has no gameplay effect AND mapping coverage is
-    dead-leaning. This REPLACES the old hardcoded class-name list with the
-    generic mapping-coverage prior; the decisive output-side confirmation runs
-    later in ``classify_module_dead`` (post-coherence). A renamed rendering
-    helper (``OceanShimmer``) with the same body shape is caught here by
-    behavior, not name.
+    Dead-leaning iff ALL of: the C# has at least one POSITIVE rendering / visual
+    -effect API signal (a GPU/shader/camera-effect/render-target API with no
+    Roblox equivalent) AND no gameplay veto AND mapping coverage is dead-leaning.
+
+    The positive rendering signal is decisive for SAFETY: this gate is
+    destructive (it stubs the body before AI transpilation), so generic low
+    coverage alone is NOT enough -- a portable menu / save / scene controller
+    (``PlayerPrefs`` / ``SceneManager.LoadScene`` / ``Application.Quit`` /
+    ``Cursor.lockState``) also has low coverage but must NOT be stubbed. The
+    rendering signal isolates true rendering helpers. This REPLACES the old
+    hardcoded class-name list with a generic behavioral test; the decisive
+    output-side confirmation runs later in ``classify_module_dead``
+    (post-coherence). A renamed rendering helper (``OceanShimmer``) with the
+    same body shape is caught here by behavior, not name.
     """
     if csharp_source_has_gameplay_effect(csharp_source):
+        return False
+    if not csharp_source_has_rendering_api(csharp_source):
         return False
     return measure_input_coverage(csharp_source).dead_leaning
 
@@ -473,10 +569,13 @@ def classify_module_dead(
 ) -> DeadVerdict:
     """Decide whether a single module is Roblox-dead (D3 + hard veto).
 
-    Dead iff INPUT-prior agrees (dead-leaning OR abstained) AND OUTPUT is inert
-    AND no veto. The output confirmation is decisive: a module with a real
-    effect is never dead; a module whose input prior abstains (too few refs)
-    can still be dead on a fully-inert body.
+    Dead iff the INPUT prior is MEASURED AND dead-leaning AND OUTPUT is inert
+    AND no veto. The output confirmation is decisive in the negative direction
+    (a module with a real effect is never dead), but it is NOT sufficient on its
+    own: a module whose input prior ABSTAINS (too few API refs to measure)
+    returns ``is_dead=False`` even on a fully-inert body -- abstention never
+    licenses a dead verdict (it would over-flag content-free modules whose body
+    is a valid-but-trivial ``return M``).
     """
     coverage = measure_input_coverage(csharp_source)
     vetoed = has_genuine_roblox_effect(luau_source)
@@ -529,16 +628,29 @@ def classify_module_dead(
 # ---------------------------------------------------------------------------
 
 # Injected require edge shape (script_coherence._module_require_body +
-# contract pipeline resolve_requires): both forms reference the target module
-# name inside a ``FindFirstChild("Name"`` lookup wrapped in ``require(...)``.
+# contract pipeline resolve_requires + autogen / scaffolding emitted bodies):
+# all forms reference the target module name inside a lookup-method call
+# (``FindFirstChild`` / ``WaitForChild`` / ``FindFirstDescendant``) wrapped in
+# ``require(...)``. ``WaitForChild`` is a real emitted module-require shape
+# (shared_state_linter.py, autogen.py, scaffolding/fps.py), so the lookup method
+# must be generalized -- a hardcoded ``FindFirstChild(`` misses those edges and
+# a live module requiring a dead one via ``WaitForChild`` would be invisible
+# (false-prune -> ``require(nil)`` crash).
 _REQUIRE_EDGE = re.compile(
-    r"require\s*\([\s\S]*?FindFirstChild\(\s*[\"']([A-Za-z_][A-Za-z0-9_]*)[\"']"
+    r"require\s*\([\s\S]*?"
+    r"(?:FindFirstChild|WaitForChild|FindFirstDescendant)\("
+    r"\s*[\"']([A-Za-z_][A-Za-z0-9_]*)[\"']"
 )
-# Also catch dotted requires ``require(game.ReplicatedStorage.Name)`` used in
-# some legacy fixtures + emitted bodies.
+# Also catch dotted requires ``require(game.ReplicatedStorage.Name)`` /
+# ``require(workspace.Foo.Inner)`` used in some legacy fixtures + emitted bodies.
+# Capture EVERY dotted segment after the require root so the module-name segment
+# can be matched against ``known_names`` (``workspace.Foo.Inner`` captures both
+# ``Foo`` and ``Inner``; the ``known_names`` filter keeps only the real module
+# name, accepting the safe over-capture).
 _REQUIRE_DOTTED = re.compile(
-    r"require\s*\(\s*[A-Za-z_][\w.():\"'\s]*?\.([A-Za-z_][A-Za-z0-9_]*)\s*\)"
+    r"require\s*\(\s*[A-Za-z_][\w.():\"'\s]*?\)"
 )
+_DOTTED_SEGMENT = re.compile(r"\.([A-Za-z_][A-Za-z0-9_]*)")
 
 
 def extract_require_edges(luau_source: str, known_names: frozenset[str]) -> set[str]:
@@ -548,6 +660,9 @@ def extract_require_edges(luau_source: str, known_names: frozenset[str]) -> set[
     so post-transpile injected edges are captured (LOCKED DECISION: closure from
     emitted Luau). Only names present in ``known_names`` are returned (drops
     runtime / service requires like ``ReplicatedStorage`` or ``@scene_runtime/``).
+
+    Recognises every emitted lookup-method form -- ``FindFirstChild`` /
+    ``WaitForChild`` / ``FindFirstDescendant`` -- plus dotted-path requires.
 
     Strips comments only (NOT string literals) -- the module name lives inside a
     ``FindFirstChild("Name")`` string literal, so it must survive. Comments are
@@ -560,9 +675,14 @@ def extract_require_edges(luau_source: str, known_names: frozenset[str]) -> set[
         if nm in known_names:
             edges.add(nm)
     for m in _REQUIRE_DOTTED.finditer(code):
-        nm = m.group(1)
-        if nm in known_names:
-            edges.add(nm)
+        # Match each dotted segment against known module names. The require
+        # expression may name services / globals (``game``, ``workspace``,
+        # ``ReplicatedStorage``) interleaved with the module name; only the
+        # segment(s) in ``known_names`` register an edge.
+        for seg in _DOTTED_SEGMENT.finditer(m.group(0)):
+            nm = seg.group(1)
+            if nm in known_names:
+                edges.add(nm)
     return edges
 
 
@@ -580,9 +700,21 @@ def compute_prunable_dead(
 ) -> ClosurePruneResult:
     """Partition dead modules into safe-to-prune vs must-stay-inert.
 
-    A dead module is safe to prune ONLY when EVERY module that ``require``s it
-    is also dead (LOCKED DECISION / GF8): never drop a module with a live
-    (non-dead) requirer, or a surviving ``require()`` becomes ``require(nil)``.
+    A dead module is safe to prune ONLY when it is NOT (transitively) reachable
+    via require-edges from any NON-pruned module -- i.e. from any LIVE (non-dead)
+    module OR from any kept-inert dead module (LOCKED DECISION / GF8). Checking
+    only DIRECT callers is insufficient: with edges ``live->A->B`` (both dead),
+    A has a live caller so it stays kept-inert, but A still ``require``s B at
+    module scope -- pruning B would turn A's surviving require into
+    ``require(nil)`` and hard-crash. B must therefore be protected too.
+
+    Algorithm (transitive closure over forward require-edges):
+      1. Seed ``protected`` = dead modules DIRECTLY required by a live module.
+      2. Transitively add every dead module forward-required by a protected
+         module (a kept-inert module's requires must all survive).
+      3. ``keep_inert`` = protected set; ``prunable`` = dead modules not
+         protected (a fully-isolated dead closure with no live requirer
+         anywhere).
 
     Args:
         dead_names: the set of Roblox-dead module names.
@@ -591,21 +723,29 @@ def compute_prunable_dead(
 
     Returns:
         ClosurePruneResult: ``prunable`` (drop from output) +
-        ``keep_inert`` (dead but has a live requirer -> reroute/stay).
+        ``keep_inert`` (dead but transitively required by a surviving module).
     """
-    # Build the reverse graph: callee -> set(callers), over ALL modules so a
-    # live caller of a dead module is visible.
-    requirers: dict[str, set[str]] = {}
+    # Seed: dead modules DIRECTLY required by a LIVE (non-dead) module.
+    protected: set[str] = set()
     for caller, callees in require_edges.items():
+        if caller in dead_names:
+            continue  # only live callers seed protection
         for callee in callees:
-            requirers.setdefault(callee, set()).add(caller)
+            if callee in dead_names:
+                protected.add(callee)
+
+    # Transitively protect every dead module forward-required by a protected
+    # module: a kept-inert module keeps its module-scope ``require`` edges, so
+    # each callee it requires must also survive.
+    frontier = list(protected)
+    while frontier:
+        cur = frontier.pop()
+        for callee in require_edges.get(cur, set()):
+            if callee in dead_names and callee not in protected:
+                protected.add(callee)
+                frontier.append(callee)
 
     result = ClosurePruneResult()
-    for name in dead_names:
-        callers = requirers.get(name, set())
-        live_callers = [c for c in callers if c not in dead_names]
-        if live_callers:
-            result.keep_inert.add(name)
-        else:
-            result.prunable.add(name)
+    result.keep_inert = set(protected)
+    result.prunable = {name for name in dead_names if name not in protected}
     return result
