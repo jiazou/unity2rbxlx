@@ -700,9 +700,11 @@ public class FogTint : MonoBehaviour {
 }
 """
 
-# A lens-flare / projector visual helper using ONLY newly-added (previously
-# UNLISTED) rendering signals -- LensFlare, Projector, Graphics.DrawMesh,
-# ReflectionProbe. None of these were in the old allowlist (no gameplay).
+# A lens-flare / projector visual helper that makes a REAL rendering CALL
+# (``Graphics.DrawMesh``). The ``LensFlare`` / ``Projector`` / ``ReflectionProbe``
+# tokens here are type NAMES (declarations / generic args) -- after the R3
+# stricter gate they no longer count on their own; the decisive signal is the
+# ``Graphics.`` member-access call. No gameplay veto.
 _LENSFLARE_CSHARP = """
 using UnityEngine;
 public class SunGlare : MonoBehaviour {
@@ -712,6 +714,60 @@ public class SunGlare : MonoBehaviour {
         Projector proj = GetComponentInChildren<Projector>();
         ReflectionProbe probe = GetComponentInChildren<ReflectionProbe>();
         Graphics.DrawMesh(mesh, Matrix4x4.identity, mat, 0);
+    }
+}
+"""
+
+# A helper that ONLY declares a serialized rendering-component field and makes no
+# rendering CALL. After the R3 stricter gate this is NOT provably dead at
+# transpile time (a bare type token in a declaration is not usage) -- the gate
+# must leave it alone; the post-coherence detector catches it if its output is
+# inert.
+_PROJECTOR_FIELD_ONLY_CSHARP = """
+using UnityEngine;
+public class ShadowCaster : MonoBehaviour {
+    public Projector projector;
+    [SerializeField] private LensFlare flare;
+    void Start() {
+        PlayerPrefs.SetInt("shadows", 1);
+    }
+}
+"""
+
+# A MenuController that imports a rendering namespace but never CALLS a rendering
+# API. The import line must NOT count as usage.
+_MENU_WITH_RENDERING_IMPORT_CSHARP = """
+using UnityEngine;
+using UnityEngine.SceneManagement;
+using UnityEngine.Rendering.PostProcessing;
+public class MenuController : MonoBehaviour {
+    void Start() {
+        Cursor.lockState = CursorLockMode.None;
+    }
+    void OnPlay() {
+        PlayerPrefs.SetInt("started", 1);
+        SceneManager.LoadScene("Game");
+    }
+    void OnQuit() {
+        Application.Quit();
+    }
+}
+"""
+
+# A live gameplay controller that draws editor-only debug gizmos. ``Gizmos`` /
+# ``Handles`` are editor-only (scene-view debugging) and do NOT make the runtime
+# module Roblox-dead -- they must NOT be a rendering signal.
+_GIZMOS_GAMEPLAY_CSHARP = """
+using UnityEngine;
+public class PatrolZone : MonoBehaviour {
+    public float radius = 5f;
+    void Update() {
+        PlayerPrefs.SetFloat("radius", radius);
+        Application.targetFrameRate = 60;
+    }
+    void OnDrawGizmos() {
+        Gizmos.color = Color.red;
+        Gizmos.DrawWireCube(transform.position, Vector3.one * radius);
     }
 }
 """
@@ -736,26 +792,98 @@ def test_render_settings_helper_is_stubbed():
 
 
 def test_lens_flare_helper_is_stubbed():
-    """P2: a ``LensFlare`` visual helper -- a previously-UNLISTED rendering API --
-    now produces a positive rendering signal and is stubbed.
-
-    Fail-before-fix CONFIRMED: ``LensFlare`` was absent from the old signal list
-    (note: ``GetComponentInChildren`` is NOT a gameplay veto -- only
-    ``GetComponent`` is, and it does not match here), so the old gate returned
-    False on this body.
-    """
+    """A visual helper that makes a REAL rendering CALL (``Graphics.DrawMesh``)
+    is stubbed -- via the member-access ``Graphics.`` signal, NOT via the
+    ``LensFlare`` / ``Projector`` / ``ReflectionProbe`` type NAMES (which the R3
+    stricter gate no longer counts on their own)."""
     assert measure_input_coverage(_LENSFLARE_CSHARP).dead_leaning
     assert csharp_source_has_rendering_api(_LENSFLARE_CSHARP)
     assert is_input_side_dead(_LENSFLARE_CSHARP)
 
 
 def test_menu_controller_still_not_stubbed_after_broadening():
-    """P2: broadening the rendering allowlist must NOT regress the P1-a
+    """Broadening the rendering allowlist must NOT regress the P1-a
     guarantee -- a portable menu/save/scene controller (PlayerPrefs /
     SceneManager / Application.Quit / Cursor, NO rendering APIs) is still NOT
     stubbed at transpile time."""
     assert not csharp_source_has_rendering_api(_MENU_CSHARP)
     assert not is_input_side_dead(_MENU_CSHARP)
+
+
+# ---------------------------------------------------------------------------
+# R3 (Codex review): the destructive transpile-time gate must require ACTUAL
+# rendering-API USAGE -- never a bare type token in an import / namespace
+# directive or a serialized field declaration. The gate becoming STRICTER is
+# SAFE: a falsely-stubbed module silently drops LIVE code, while a missed real
+# dead module is still caught by the output-confirmed ``classify_module_dead``.
+# ---------------------------------------------------------------------------
+
+
+def test_menu_controller_with_rendering_import_not_stubbed():
+    """R3 P1: a MenuController that only IMPORTS a rendering namespace
+    (``using UnityEngine.Rendering.PostProcessing;``) but makes no rendering CALL
+    must NOT be stubbed -- the import line is not usage.
+
+    Fail-before-fix CONFIRMED: the OLD signal list had a bare
+    ``\\bPostProcess(?:ing)?\\b`` token and stripped only comments, so the
+    ``using ...PostProcessing;`` line matched -> ``csharp_source_has_rendering_api``
+    returned True -> this live menu controller was stubbed before the AI saw it.
+    The witness: coverage is dead-leaning with no gameplay veto, so only the
+    (now-removed) import-line match flipped the verdict.
+    """
+    assert measure_input_coverage(_MENU_WITH_RENDERING_IMPORT_CSHARP).dead_leaning
+    assert not csharp_source_has_rendering_api(_MENU_WITH_RENDERING_IMPORT_CSHARP)
+    assert not is_input_side_dead(_MENU_WITH_RENDERING_IMPORT_CSHARP)
+
+
+def test_field_declaration_only_helper_not_stubbed():
+    """R3 P1: a script that only DECLARES serialized rendering-component fields
+    (``public Projector projector;`` / ``[SerializeField] private LensFlare
+    flare;``) and makes no rendering CALL must NOT be stubbed.
+
+    Fail-before-fix CONFIRMED: the OLD signal list had bare ``\\bProjector\\b``
+    and ``\\bLensFlare\\b`` tokens, so a field DECLARATION matched ->
+    ``csharp_source_has_rendering_api`` returned True -> this module was stubbed
+    even though it never calls a rendering API. The R3 gate requires
+    member-access / call / lifecycle usage, so a declaration no longer matches.
+    """
+    assert measure_input_coverage(_PROJECTOR_FIELD_ONLY_CSHARP).dead_leaning
+    assert not csharp_source_has_rendering_api(_PROJECTOR_FIELD_ONLY_CSHARP)
+    assert not is_input_side_dead(_PROJECTOR_FIELD_ONLY_CSHARP)
+
+
+def test_type_name_only_helper_still_dead_when_output_inert():
+    """R3: dropping the type-NAME-only signals from the DESTRUCTIVE transpile
+    gate does NOT weaken the AUTHORITATIVE detector. A field-declaration-only
+    helper that the AI transpiles to an inert body is STILL flagged dead by the
+    output-confirmed ``classify_module_dead`` -- the post-coherence net catches
+    what the (now-stricter) input gate intentionally skips."""
+    inert = _INERT_LUAU.replace("WaterBase", "ShadowCaster")
+    verdict = classify_module_dead(
+        "ShadowCaster",
+        csharp_source=_PROJECTOR_FIELD_ONLY_CSHARP,
+        luau_source=inert,
+    )
+    assert verdict.is_dead, verdict.reason
+    assert verdict.output_inert
+    assert not verdict.vetoed
+
+
+def test_gizmos_gameplay_controller_not_stubbed():
+    """R3 P2: ``Gizmos`` / ``Handles`` are editor-only (scene-view debugging in
+    ``OnDrawGizmos`` / ``#if UNITY_EDITOR``) and do NOT make a runtime module
+    Roblox-dead. A live gameplay controller with an ``OnDrawGizmos`` body must
+    NOT be stubbed at transpile time.
+
+    Fail-before-fix CONFIRMED: the OLD signal list had ``\\bGizmos\\.`` and
+    ``\\bHandles\\.``, so ``Gizmos.DrawWireCube(...)`` produced a rendering
+    signal -> a low-coverage gameplay controller was stubbed. Removing the
+    editor-only tokens fixes it; the witness shows coverage is dead-leaning so
+    only the Gizmos signal flipped the verdict pre-fix.
+    """
+    assert measure_input_coverage(_GIZMOS_GAMEPLAY_CSHARP).dead_leaning
+    assert not csharp_source_has_rendering_api(_GIZMOS_GAMEPLAY_CSHARP)
+    assert not is_input_side_dead(_GIZMOS_GAMEPLAY_CSHARP)
 
 
 # ---------------------------------------------------------------------------
