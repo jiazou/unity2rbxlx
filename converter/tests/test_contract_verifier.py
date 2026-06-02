@@ -500,7 +500,8 @@ class TestCheckBComponentAvailability:
         allowlist -> resolves to nil -> flagged."""
         vs = _run_check_b('local c = self:GetComponent("Collider")')
         assert len(vs) == 1
-        assert vs[0].identity == "component_availability:S:Collider"
+        # identity carries name@parent_path:X (parent_path added in the P3 fix).
+        assert vs[0].identity == "component_availability:S@ReplicatedStorage:Collider"
 
     def test_mapped_unity_type_not_flagged(self) -> None:
         assert _run_check_b('self:GetComponent("Rigidbody")') == []
@@ -533,9 +534,16 @@ class TestCheckBComponentAvailability:
         assert _run_check_b('-- self:GetComponent("Collider")') == []
         assert _run_check_b('--[[ self:GetComponent("Collider") ]]') == []
 
-    def test_peer_reachable_by_script_id_key(self) -> None:
-        """The runtime peer lookup matches stem OR scriptId; scriptId is the
-        topology modules dict key, so a GetComponent on it is reachable."""
+    def test_hyphenated_scriptid_arg_is_matched_and_reachable(self) -> None:
+        """Codex slice-2 P2: a hyphenated scriptId literal must be MATCHED by
+        the regex (the old [A-Za-z_]\\w* class skipped it, so the prior version
+        of this test passed green-for-the-wrong-reason). It is reachable via the
+        peer scriptId set."""
+        # First prove the regex now matches the hyphenated arg at all: an
+        # UNKNOWN hyphenated arg must FIRE (so a green 'reachable' result below
+        # genuinely depends on the peer set, not on a non-match).
+        assert len(_run_check_b('self:GetComponent("no-such-id")')) == 1
+        # Now the same shape, but the id IS a module scriptId → reachable.
         topology = {"modules": {"the-guid": {"stem": "Foo", "domain": "client",
                     "module_path": "ReplicatedStorage.Foo"}}}
         scripts = [RbxScript(name="S", source='self:GetComponent("the-guid")',
@@ -543,6 +551,23 @@ class TestCheckBComponentAvailability:
         result = verify_contract(topology, scripts)  # type: ignore[arg-type]
         assert [v for v in result.violations
                 if v.check == "component_availability"] == []
+
+    def test_duplicate_named_scripts_each_surface(self) -> None:
+        """Codex slice-2 P3: two DIFFERENT scripts sharing a name must each
+        surface their GetComponent violation (identity keyed on parent_path too),
+        not collapse into one."""
+        topology = {"modules": {"g": {"stem": "Anchor", "domain": "client",
+                    "module_path": "ReplicatedStorage.Anchor"}}}
+        scripts = [
+            RbxScript(name="Door", source='self:GetComponent("Missing")',
+                      script_type="ModuleScript", parent_path="ReplicatedStorage"),
+            RbxScript(name="Door", source='self:GetComponent("Missing")',
+                      script_type="Script", parent_path="ServerScriptService"),
+        ]
+        result = verify_contract(topology, scripts)  # type: ignore[arg-type]
+        ca = [v for v in result.violations if v.check == "component_availability"]
+        assert len(ca) == 2
+        assert len({v.identity for v in ca}) == 2
 
     def test_non_literal_arg_is_skipped(self) -> None:
         """A variable arg cannot be resolved statically -> not flagged (the

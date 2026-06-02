@@ -393,8 +393,15 @@ def stash_violations(
 #     lowers those to a GetDescendants()/GetAncestors() hierarchy WALK
 #     (code_transpiler.py:1330), not a ``_UNITY_TO_ROBLOX_CLASS`` resolution, so
 #     check B's reachability model does not apply to them (review P3).
+# The arg char class is ``[\w-]+`` (not ``[A-Za-z_]\w*``) so a peer lookup by
+# scriptId is scannable too: runtime peer lookup matches ``m.stem == name or
+# m.scriptId == name`` (scene_runtime.luau:758), and scriptIds are Unity GUIDs /
+# ``<stem>-<idx>`` strings that contain ``-`` and may start with a digit. The
+# old identifier-only class silently skipped ``GetComponent("some-guid")``
+# (Codex slice-2 review P2). Real transpiler output passes C# class names
+# (identifier-shaped), so this only ADDS coverage; it never narrows it.
 _GETCOMPONENT_RE = re.compile(
-    r""":GetComponent\s*\(\s*['"]([A-Za-z_]\w*)['"]""",
+    r""":GetComponent\s*\(\s*['"]([\w-]+)['"]""",
 )
 
 
@@ -484,6 +491,18 @@ def _check_component_availability(
     # clause. A peer whose stem ≠ its C# class name genuinely does NOT resolve
     # by class name at runtime, so flagging such a GetComponent is correct, not
     # a false positive.)
+    # Peer reachability is GLOBAL (any module's stem/scriptId in the whole
+    # project), NOT scoped to the GameObject the call's ``self`` is on. The
+    # runtime peer branch only searches ``_componentsByGameObject[gameObjectId]``
+    # (scene_runtime.luau:754), so a global set is LENIENT — it can miss a real
+    # nil-return where the named peer exists elsewhere but not on this
+    # GameObject (Codex slice-2 review P1, a known FALSE NEGATIVE). This is
+    # intentional and not fixable here: the verifier's inputs (topology +
+    # scripts) carry NO per-GameObject component placement, and a
+    # GameObject-scoped check would otherwise have to flag every peer
+    # GetComponent (massive false positives). Abstain-on-peer-by-name is the
+    # safe bias for a check bound for a fail-closed flip; the per-GameObject
+    # tightening needs an instance→component map a future slice would add.
     peer: set[str] = set()
     modules = topology.get("modules") or {}
     for script_id, module in modules.items():
@@ -498,14 +517,18 @@ def _check_component_availability(
     reachable = peer | set(keys) | set(values) | _ROBLOX_CLASS_ALLOWLIST
 
     violations: list[ContractViolation] = []
-    seen: set[tuple[str, str]] = set()
+    # Dedup + identity key on (name, parent_path, X) so two DIFFERENT scripts
+    # that share a name (e.g. duplicate "Door") each surface their own
+    # violation instead of collapsing into one (Codex slice-2 review P3).
+    seen: set[tuple[str, str, str]] = set()
     for script in scripts:
         source = _strip_luau_comments(script.source or "")
+        ppath = script.parent_path or ""
         for match in _GETCOMPONENT_RE.finditer(source):
             x = match.group(1)
             if x in reachable:
                 continue
-            key = (script.name, x)
+            key = (script.name, ppath, x)
             if key in seen:
                 continue
             seen.add(key)
@@ -519,7 +542,7 @@ def _check_component_availability(
                         f"converted component, a mapped Unity type, or a known "
                         f"Roblox class; the result will error when used"
                     ),
-                    identity=f"component_availability:{script.name}:{x}",
+                    identity=f"component_availability:{script.name}@{ppath}:{x}",
                 )
             )
     return violations
