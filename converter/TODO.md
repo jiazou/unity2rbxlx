@@ -173,35 +173,57 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
   [`docs/FUTURE_IMPROVEMENTS.md`](docs/FUTURE_IMPROVEMENTS.md)
   § "Persistent prefab/asset cache".
 
-- [ ] **P1 — Upstream classifier misroutes Roblox-dead Unity-rendering
-  modules to server-only.** Phase 2a slice 7 audit, 2026-05-30.
-  `infer_module_domains` classifies Unity-rendering helpers (`WaterBase`,
-  `PlanarReflection`, `Displace`) as server-only because their only
-  observed callers happen to be server-side. But the modules' Unity APIs
-  (`OnWillRenderObject`, Camera-based reflection rendering,
-  `Shader.EnableKeyword`) have no Roblox equivalent — the modules
-  effectively run as dead code in the converted output. Routing them to
-  `ServerStorage` based on caller-graph evidence is technically correct
-  given the inputs, but ships dead modules to the wrong container.
-  Fix shape: either (a) a dead-code pruning pass that drops modules whose
-  bodies are dominated by Unity APIs without Roblox equivalents, or
-  (b) an upstream classifier signal that detects "Roblox-dead" modules
-  and short-circuits their domain inference. Option (a) is the more
-  general fix.
+- [x] **P1 — Upstream classifier misroutes Roblox-dead Unity-rendering
+  modules to server-only.** Phase 2a slice 7 audit, 2026-05-30. FIXED
+  2026-06-01 (`fix/roblox-dead-module-routing`). **Corrected root cause
+  (audit framing was imprecise, like sibling #9):** the misroute is NOT
+  `infer_module_domains` stamping these server — zero-signal modules hit
+  Rule 7 → `client` under `networking="none"`. It is the **caller-domain
+  storage routing** (`storage_classifier._decide_script_container_*`)
+  pulling a self-requiring cluster of Roblox-dead rendering modules into
+  `ServerStorage` because their callers default to server. Also found: the
+  existing `code_transpiler._is_visual_only_script` already classified
+  "visual-only" but via a **hardcoded game class-name list** (the only
+  reason `WaterBase`/`Displace` were caught) and never propagated the
+  verdict to routing. **Fix (hybrid C + D3 definition):** a generic,
+  behavior-based `roblox_dead_modules` detector (input mapping-coverage
+  prior + decisive post-coherence output-inertness + hard veto; NO class
+  names) replaces the hardcoded heuristic; dead modules are routed out of
+  `ServerStorage` to `ReplicatedStorage` (BOTH topology + legacy paths) and
+  a closure-safe prune pass drops fully-dead require-closures (never a
+  module with a live requirer; closure computed from emitted Luau). See
+  `docs/design/roblox-dead-module-routing-brief.md` (LOCKED DECISIONS) +
+  `docs/design/scene-runtime-architecture-ir.md` § "Roblox-dead module
+  handling" + `.claude/handoffs/task-8-roblox-dead-modules.md`.
 
-- [ ] **P1 — Transpiler false-positive `require()` injection poisons
-  storage classification.** Phase 2a slice 7 audit, 2026-05-30. The
-  converter's transpile / coherence-pack stage injects
-  `require(GameManager)` into `Plane.luau` even though the original
-  `Plane.cs` Unity source has no reference to `GameManager`. This
-  pollutes the caller_graph the storage classifier consumes —
-  `GameManager` (a cursor / scene-management singleton that should be
-  client-side) routes to `ServerStorage` because the spurious require
-  makes it look server-required. The right fix is at the injection
-  site, not the classifier: constrain require-injection to symbols
-  actually referenced in the transpiled body. Add a guard pass that
-  walks injected requires and drops any whose target symbol does not
-  appear elsewhere in the script.
+- [x] **P1 — Transpiler false-positive `require()` injection poisons
+  storage classification.** Phase 2a slice 7 audit, 2026-05-30. FIXED
+  2026-06-01 (`fix/dead-require-from-runtime-lookup-generics`).
+  **Corrected root cause (the audit's framing was incomplete):** the
+  `Plane→GameManager` false edge is NOT a phantom — `Plane.cs` references
+  `GameManager` via `FindObjectOfType<GameManager>()` (a RUNTIME scene
+  lookup → `self.host.findObjectOfType("GameManager")`). The reference
+  extractor's generic-type-arg regex (`script_analyzer.py`
+  `<\s*([A-Z]\w+)`) captured that runtime-lookup type arg as a
+  `referenced_type` → `dependency_map["Plane"]=[GameManager]`. That single
+  fault poisoned BOTH consumers: the legacy require-injector AND the
+  GENERIC-mode topology `caller_graph` (built directly from
+  `dependency_map`; the prescribed injection-site guard would NOT have
+  fixed generic mode, where `inject_require_calls` doesn't even run).
+  **Fix (at the source, helps both modes):** exclude the type args of
+  GLOBAL scene-lookup generics (`FindObjectOfType<T>` /
+  `FindObjectsOfType<T>`) from `referenced_types` — they locate an
+  already-existing instance, creating no dependency edge and no module
+  require. Genuine deps are still captured via the new/field/param/base
+  patterns. See `_GLOBAL_LOOKUP_GENERIC_METHODS` in `script_analyzer.py`.
+  **Scoped narrowly (Codex review):** COMPONENT-lookup generics
+  (`GetComponent<T>` / `AddComponent<T>` / `TryGetComponent<T>` / …) are
+  NOT excluded — they're real peer edges the caller_graph / reachability
+  consumers (`resolve_caller_graph`, `derive_reachability_requirements`,
+  `_compute_network_behaviour_reachable`) need; dropping them would orphan
+  a component referenced only that way. (Whether a component-lookup edge
+  should ALSO drive a `require()` is a separate, pre-existing concern at
+  the injection site.)
 
 ## Materials & meshes
 
