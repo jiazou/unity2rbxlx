@@ -475,72 +475,86 @@ def csharp_source_has_gameplay_effect(csharp_source: str) -> bool:
 # NOT a safe trigger on its own: a portable menu / save / scene controller
 # (``PlayerPrefs`` + ``Application.Quit`` + ``SceneManager.LoadScene`` +
 # ``Cursor.lockState``) also has low coverage yet carries real, transpilable
-# behavior. So the gate additionally requires a POSITIVE rendering-API signal --
-# a token from the set of Unity GPU / shader / camera-effect / render-target
-# APIs that genuinely have no Roblox equivalent. These are behavioral API
-# surfaces, NOT class names, so a renamed rendering helper (``OceanShimmer``) is
-# still caught while a menu controller is left untouched.
+# behavior. So the gate additionally requires a POSITIVE rendering-API signal.
+#
+# CRITICAL SAFETY PROPERTY: the signal must require ACTUAL RENDERING-API USAGE
+# -- a member access (``Type.member``), a method call, a render-target
+# constructor, or a render lifecycle hook -- NEVER a bare type token that can
+# appear in an ``using``/``namespace`` directive or a serialized FIELD
+# DECLARATION. A ``MenuController`` that merely does
+# ``using UnityEngine.Rendering.PostProcessing;`` or a gameplay script with only
+# a serialized ``public Projector projector;`` field makes NO rendering call and
+# is NOT provably dead at transpile time -- stubbing it would silently drop live
+# code. Such modules, if truly inert, are caught downstream by the
+# output-confirmed ``classify_module_dead``. Two layers enforce this:
+#   1. ``using ...;`` / ``namespace ...`` lines are stripped before matching.
+#   2. Every signal is a member-access / call / constructor / lifecycle form
+#      (it includes a ``.`` member, a ``(`` call, or a hook method name) -- so a
+#      bare ``Projector proj;`` declaration never matches.
+#
+# These are behavioral API surfaces, NOT class names, so a renamed rendering
+# helper (``OceanShimmer``) is still caught by its rendering CALLS while a menu
+# controller or a declaration-only field is left untouched.
 # ---------------------------------------------------------------------------
 
+# Lines whose only role is importing / namespacing a type. A bare rendering type
+# token here (``using UnityEngine.Rendering.PostProcessing;``) is NOT usage.
+_USING_OR_NAMESPACE_LINE = re.compile(
+    r"^[ \t]*(?:using|namespace)\b[^\n]*$", re.MULTILINE
+)
+
 _RENDERING_API_SIGNALS: tuple[re.Pattern[str], ...] = (
+    # --- Shader / material / low-level GPU member-access + call surfaces ------
     re.compile(r"\bShader\."),
     re.compile(r"\bMaterial\."),
+    re.compile(r"\bGraphics\."),
+    re.compile(r"\bGL\."),
     # ``.material`` / ``.sharedMaterial`` shader-handle access.
     re.compile(r"\.material\b"),
     re.compile(r"\.sharedMaterial\b"),
-    re.compile(r"\bRenderer\b"),
-    re.compile(r"\bRenderTexture\b"),
-    re.compile(r"\bGL\."),
-    # Whole ``Graphics.`` / ``CommandBuffer`` low-level draw surface (broadened
-    # from ``Graphics.Blit`` -- ``Graphics.DrawMesh`` / ``Graphics.SetRenderTarget``
-    # etc. are equally Roblox-dead).
-    re.compile(r"\bGraphics\."),
+    # Material rendering-mode handle access (opaque/transparent shader path).
+    re.compile(r"\.renderingMode\b"),
+    # --- Render-target / command-buffer construction & usage -----------------
+    # A RenderTexture CONSTRUCTOR (``new RenderTexture(`` / ``RenderTexture(``)
+    # -- the bare type name alone (a field declaration) must NOT match.
+    re.compile(r"\bRenderTexture\s*\("),
+    re.compile(r"\bnew\s+RenderTexture\b"),
     re.compile(r"\bCommandBuffer\b"),
+    re.compile(r"\.targetTexture\b"),
+    re.compile(r"\bSupportsRenderTextureFormat\b"),
+    # --- Camera / render-state member-access ---------------------------------
+    re.compile(r"\.depthTextureMode\b"),
+    re.compile(r"\.cullingMask\b"),
+    re.compile(r"\.invertCulling\b"),
+    re.compile(r"\.maximumLOD\b"),
+    re.compile(r"\bCamera\.Render\b"),
+    re.compile(r"\.Render\s*\("),
+    # Global render state / environment (fog, ambient, skybox material, etc.).
+    re.compile(r"\bRenderSettings\."),
+    re.compile(r"\bLightmapSettings\."),
+    # --- Render lifecycle hooks (declaring one IS rendering behavior) --------
     re.compile(r"\bOnWillRenderObject\b"),
     re.compile(r"\bOnRenderImage\b"),
     re.compile(r"\bOnPreRender\b"),
     re.compile(r"\bOnPostRender\b"),
     re.compile(r"\bOnPreCull\b"),
-    re.compile(r"\.depthTextureMode\b"),
-    re.compile(r"\.cullingMask\b"),
-    re.compile(r"\.targetTexture\b"),
-    re.compile(r"\bSkybox\b"),
-    re.compile(r"\.maximumLOD\b"),
-    re.compile(r"\bSupportsRenderTextureFormat\b"),
-    re.compile(r"\bRenderTextureFormat\b"),
-    re.compile(r"\.invertCulling\b"),
-    re.compile(r"\bCamera\.Render\b"),
-    re.compile(r"\bDepthTextureMode\b"),
-    # Global render state / environment (fog, ambient, skybox material, etc.).
-    re.compile(r"\bRenderSettings\."),
-    re.compile(r"\bLightmapSettings\b"),
-    # Lens flares / halos / projectors / occlusion / probes -- GPU/visual-only
-    # component surfaces with no Roblox equivalent.
-    re.compile(r"\bLensFlare\b"),
-    re.compile(r"\bFlare\b"),
-    re.compile(r"\bProjector\b"),
-    re.compile(r"\bHalo\b"),
-    re.compile(r"\bReflectionProbe\b"),
-    re.compile(r"\bOcclusionArea\b"),
-    re.compile(r"\bOcclusionPortal\b"),
-    re.compile(r"\bLightProbe\b"),
-    # Post-processing stack (``PostProcessVolume`` / ``PostProcessLayer`` / the
-    # ``PostProcessing`` namespace).
-    re.compile(r"\bPostProcess(?:ing)?\b"),
-    # Editor-only visual gizmo / handle drawing surfaces.
-    re.compile(r"\bGizmos\."),
-    re.compile(r"\bHandles\."),
-    # Material rendering-mode handle access (opaque/transparent shader path).
-    re.compile(r"\.renderingMode\b"),
 )
 
 
 def csharp_source_has_rendering_api(csharp_source: str) -> bool:
-    """True when the C# source touches a GPU / shader / camera-effect /
+    """True when the C# source actually USES a GPU / shader / camera-effect /
     render-target API that has no Roblox equivalent (input-side POSITIVE
-    rendering signal). Comment-stripped so commented-out APIs do not count.
+    rendering signal).
+
+    Requires real USAGE -- a member access, a method call, a render-target
+    constructor, or a render lifecycle hook -- NEVER a bare type token in an
+    ``using``/``namespace`` import or a serialized field DECLARATION. Comments
+    and import/namespace lines are stripped first, and every signal is a
+    member-access / call / lifecycle form, so a declaration-only field
+    (``public Projector projector;``) does not trip the gate. This is the
+    decisive safety property of the destructive transpile-time stub gate.
     """
-    src = _strip_csharp_comments(csharp_source)
+    src = _USING_OR_NAMESPACE_LINE.sub("", _strip_csharp_comments(csharp_source))
     return any(p.search(src) for p in _RENDERING_API_SIGNALS)
 
 
