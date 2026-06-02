@@ -680,6 +680,85 @@ def test_water_cluster_shapes_still_stub():
 
 
 # ---------------------------------------------------------------------------
+# P2 (re-review): the rendering-API allowlist must cover the broad Unity
+# rendering / visual-effect surface, not just the original narrow set. A
+# dead-leaning helper using an UNLISTED rendering API (RenderSettings, LensFlare,
+# ...) previously slipped the gate -> not stubbed -> generic-mode AI-unavailable
+# fail-close. The MenuController guarantee (P1-a) must still hold.
+# ---------------------------------------------------------------------------
+
+
+# A fog / global-render-state helper: RenderSettings.* only (no gameplay).
+_FOG_CSHARP = """
+using UnityEngine;
+public class FogTint : MonoBehaviour {
+    void Update() {
+        RenderSettings.fogColor = Color.gray;
+        RenderSettings.fogDensity = 0.02f;
+        RenderSettings.ambientIntensity = 0.5f;
+    }
+}
+"""
+
+# A lens-flare / projector visual helper using ONLY newly-added (previously
+# UNLISTED) rendering signals -- LensFlare, Projector, Graphics.DrawMesh,
+# ReflectionProbe. None of these were in the old allowlist (no gameplay).
+_LENSFLARE_CSHARP = """
+using UnityEngine;
+public class SunGlare : MonoBehaviour {
+    void Update() {
+        LensFlare flare = GetComponentInChildren<LensFlare>();
+        flare.brightness = 1.5f;
+        Projector proj = GetComponentInChildren<Projector>();
+        ReflectionProbe probe = GetComponentInChildren<ReflectionProbe>();
+        Graphics.DrawMesh(mesh, Matrix4x4.identity, mat, 0);
+    }
+}
+"""
+
+
+def test_render_settings_helper_is_stubbed():
+    """P2: a ``RenderSettings.*`` (fog / ambient) helper -- a previously-UNLISTED
+    rendering API -- now produces a positive rendering signal and is stubbed by
+    ``is_input_side_dead`` (no gameplay veto + dead-leaning coverage).
+
+    Fail-before-fix CONFIRMED: ``RenderSettings.`` was not in the old
+    ``_RENDERING_API_SIGNALS`` list, so ``csharp_source_has_rendering_api``
+    returned False -> ``is_input_side_dead`` returned False. The witness below
+    shows coverage is dead-leaning with no gameplay veto, so only the missing
+    rendering signal kept it un-stubbed.
+    """
+    # Witness: dead-leaning coverage, no gameplay veto -- only the rendering
+    # signal was missing pre-fix.
+    assert measure_input_coverage(_FOG_CSHARP).dead_leaning
+    assert csharp_source_has_rendering_api(_FOG_CSHARP)
+    assert is_input_side_dead(_FOG_CSHARP)
+
+
+def test_lens_flare_helper_is_stubbed():
+    """P2: a ``LensFlare`` visual helper -- a previously-UNLISTED rendering API --
+    now produces a positive rendering signal and is stubbed.
+
+    Fail-before-fix CONFIRMED: ``LensFlare`` was absent from the old signal list
+    (note: ``GetComponentInChildren`` is NOT a gameplay veto -- only
+    ``GetComponent`` is, and it does not match here), so the old gate returned
+    False on this body.
+    """
+    assert measure_input_coverage(_LENSFLARE_CSHARP).dead_leaning
+    assert csharp_source_has_rendering_api(_LENSFLARE_CSHARP)
+    assert is_input_side_dead(_LENSFLARE_CSHARP)
+
+
+def test_menu_controller_still_not_stubbed_after_broadening():
+    """P2: broadening the rendering allowlist must NOT regress the P1-a
+    guarantee -- a portable menu/save/scene controller (PlayerPrefs /
+    SceneManager / Application.Quit / Cursor, NO rendering APIs) is still NOT
+    stubbed at transpile time."""
+    assert not csharp_source_has_rendering_api(_MENU_CSHARP)
+    assert not is_input_side_dead(_MENU_CSHARP)
+
+
+# ---------------------------------------------------------------------------
 # P1-b: prune must protect TRANSITIVE dead deps of a kept-inert module.
 # ---------------------------------------------------------------------------
 

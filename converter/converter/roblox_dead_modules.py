@@ -491,12 +491,16 @@ _RENDERING_API_SIGNALS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bRenderer\b"),
     re.compile(r"\bRenderTexture\b"),
     re.compile(r"\bGL\."),
-    re.compile(r"\bGraphics\.Blit\b"),
+    # Whole ``Graphics.`` / ``CommandBuffer`` low-level draw surface (broadened
+    # from ``Graphics.Blit`` -- ``Graphics.DrawMesh`` / ``Graphics.SetRenderTarget``
+    # etc. are equally Roblox-dead).
+    re.compile(r"\bGraphics\."),
     re.compile(r"\bCommandBuffer\b"),
     re.compile(r"\bOnWillRenderObject\b"),
     re.compile(r"\bOnRenderImage\b"),
     re.compile(r"\bOnPreRender\b"),
     re.compile(r"\bOnPostRender\b"),
+    re.compile(r"\bOnPreCull\b"),
     re.compile(r"\.depthTextureMode\b"),
     re.compile(r"\.cullingMask\b"),
     re.compile(r"\.targetTexture\b"),
@@ -507,6 +511,27 @@ _RENDERING_API_SIGNALS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\.invertCulling\b"),
     re.compile(r"\bCamera\.Render\b"),
     re.compile(r"\bDepthTextureMode\b"),
+    # Global render state / environment (fog, ambient, skybox material, etc.).
+    re.compile(r"\bRenderSettings\."),
+    re.compile(r"\bLightmapSettings\b"),
+    # Lens flares / halos / projectors / occlusion / probes -- GPU/visual-only
+    # component surfaces with no Roblox equivalent.
+    re.compile(r"\bLensFlare\b"),
+    re.compile(r"\bFlare\b"),
+    re.compile(r"\bProjector\b"),
+    re.compile(r"\bHalo\b"),
+    re.compile(r"\bReflectionProbe\b"),
+    re.compile(r"\bOcclusionArea\b"),
+    re.compile(r"\bOcclusionPortal\b"),
+    re.compile(r"\bLightProbe\b"),
+    # Post-processing stack (``PostProcessVolume`` / ``PostProcessLayer`` / the
+    # ``PostProcessing`` namespace).
+    re.compile(r"\bPostProcess(?:ing)?\b"),
+    # Editor-only visual gizmo / handle drawing surfaces.
+    re.compile(r"\bGizmos\."),
+    re.compile(r"\bHandles\."),
+    # Material rendering-mode handle access (opaque/transparent shader path).
+    re.compile(r"\.renderingMode\b"),
 )
 
 
@@ -536,6 +561,18 @@ def is_input_side_dead(csharp_source: str) -> bool:
     output-side confirmation runs later in ``classify_module_dead``
     (post-coherence). A renamed rendering helper (``OceanShimmer``) with the
     same body shape is caught here by behavior, not name.
+
+    BEST-EFFORT GATE (NOT the decisive authority). This input-only test is a
+    transpile-time OPTIMIZATION: it lets the converter stub an obviously-dead
+    rendering helper before spending an AI transpile on it, and -- decisively --
+    it keeps the generic ``rule_based`` -> ``strategy="stub"`` fallback from
+    mislabeling a real visual helper as a non-visual stub when AI is unavailable
+    (the only edge this allowlist actually guards). The ``_RENDERING_API_SIGNALS``
+    allowlist is therefore broad-but-finite and WILL miss some rendering APIs.
+    That is acceptable: a rendering helper that slips this gate is still caught by
+    the post-coherence, output-confirmed ``classify_module_dead`` for routing /
+    prune. The decisive authority is ALWAYS the output-side D3 verdict, never this
+    input-only allowlist.
     """
     if csharp_source_has_gameplay_effect(csharp_source):
         return False
