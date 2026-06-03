@@ -1154,3 +1154,19 @@ class TestStripRequireCallsScanner:
     def test_nested_parens_in_require_fully_consumed(self) -> None:
         src = f'require(f(g({self._SS})) or h())'
         assert "ServerStorage" not in _strip_require_calls(src)
+
+    def test_colon_member_require_is_not_stripped(self) -> None:
+        # ``x:require(`` is a Luau method call, not the global require.
+        assert "ServerStorage" in _strip_require_calls(f'x:require({self._SS})')
+
+    def test_paren_inside_string_does_not_close_require_early(self) -> None:
+        # codex P2: ``)`` inside a string literal must not decrement depth.
+        src = f'require(foo(")") or {self._SS})'
+        assert "ServerStorage" not in _strip_require_calls(src)
+
+    def test_escaped_quote_in_require_string(self) -> None:
+        # A backslash-escaped quote inside the string must not terminate it
+        # early. Built via chr(92) so the escaping is unambiguous in this source.
+        bs = chr(92)
+        src = 'require(x("' + bs + '")") or ' + self._SS + ')'
+        assert "ServerStorage" not in _strip_require_calls(src)

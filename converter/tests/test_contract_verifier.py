@@ -687,7 +687,7 @@ class TestFailClosedErrors:
         scripts = [RbxScript(name="Mod", source="", script_type="Script", parent_path="ReplicatedStorage")]
         errs = fail_closed_errors(verify_contract(topo, scripts))  # type: ignore[arg-type]
         assert len(errs) == 1
-        assert errs[0].startswith("[contract:consumer_compliance]")
+        assert errs[0].startswith("[contract-verifier:consumer_compliance]")
 
     def test_shadow_check_warning_does_not_promote(self) -> None:
         # The ``smoke`` check is not in FAIL_CLOSED_CHECKS, so its warning
@@ -723,7 +723,7 @@ class TestFailClosedHookPromotion:
     def test_hook_promotes_flipped_warning_to_ctx_errors(self, tmp_path: Path) -> None:
         pipeline = self._seed(tmp_path)
         pipeline._run_contract_verifier({"topology": _topo_one_module("helper")})
-        assert any("[contract:consumer_compliance]" in e for e in pipeline.ctx.errors)
+        assert any("[contract-verifier:consumer_compliance]" in e for e in pipeline.ctx.errors)
         # Metric is still recorded alongside the promotion.
         assert pipeline.ctx.scene_runtime.get("contract_check_violations")
 
@@ -731,7 +731,7 @@ class TestFailClosedHookPromotion:
         pipeline = self._seed(tmp_path)
         pipeline._run_contract_verifier({"topology": _topo_one_module("helper")})
         pipeline._run_contract_verifier({"topology": _topo_one_module("helper")})
-        hits = [e for e in pipeline.ctx.errors if "[contract:consumer_compliance]" in e]
+        hits = [e for e in pipeline.ctx.errors if "[contract-verifier:consumer_compliance]" in e]
         assert len(hits) == 1
 
     def test_fail_open_hatch_suppresses_promotion(self, tmp_path: Path, monkeypatch) -> None:
@@ -739,7 +739,7 @@ class TestFailClosedHookPromotion:
         pipeline = self._seed(tmp_path)
         pipeline._run_contract_verifier({"topology": _topo_one_module("helper")})
         # Hatch suppresses the abort but the metric stays populated.
-        assert not any("[contract:consumer_compliance]" in e for e in pipeline.ctx.errors)
+        assert not any("[contract-verifier:consumer_compliance]" in e for e in pipeline.ctx.errors)
         assert pipeline.ctx.scene_runtime.get("contract_check_violations")
 
     def test_clean_topology_promotes_nothing(self, tmp_path: Path) -> None:
@@ -749,4 +749,76 @@ class TestFailClosedHookPromotion:
             RbxScript(name="Mod", source="", script_type="ModuleScript", parent_path="ReplicatedStorage")
         ]
         pipeline._run_contract_verifier({"topology": _topo_one_module("helper")})
-        assert not any("[contract:" in e for e in pipeline.ctx.errors)
+        assert not any("[contract-verifier:" in e for e in pipeline.ctx.errors)
+
+    # --- resume ownership (codex review P0) --------------------------------
+
+    def test_clean_resume_drops_stale_promotion(self, tmp_path: Path) -> None:
+        """A prior run promoted a verifier error; ``ctx.errors`` persists across
+        a materialize_and_classify resume. A now-CLEAN rerun must DROP the stale
+        verifier error (REPLACE, not append) so success isn't False forever."""
+        pipeline = self._seed(tmp_path)  # helper domain + Script -> violation
+        pipeline._run_contract_verifier({"topology": _topo_one_module("helper")})
+        assert any("[contract-verifier:" in e for e in pipeline.ctx.errors)
+        # Resume: same ctx, but the issue is now fixed (module is a ModuleScript).
+        pipeline.state.rbx_place.scripts = [
+            RbxScript(name="Mod", source="", script_type="ModuleScript", parent_path="ReplicatedStorage")
+        ]
+        pipeline._run_contract_verifier({"topology": _topo_one_module("helper")})
+        assert not any("[contract-verifier:" in e for e in pipeline.ctx.errors)
+
+    def test_fail_open_resume_drops_prior_promotion(self, tmp_path: Path, monkeypatch) -> None:
+        """Enabling the fail-open hatch on a rerun must clear a prior run's
+        promoted verifier errors (not just suppress new ones)."""
+        pipeline = self._seed(tmp_path)
+        pipeline._run_contract_verifier({"topology": _topo_one_module("helper")})
+        assert any("[contract-verifier:" in e for e in pipeline.ctx.errors)
+        monkeypatch.setenv("U2R_CONTRACT_VERIFIER_FAIL_OPEN", "1")
+        pipeline._run_contract_verifier({"topology": _topo_one_module("helper")})
+        assert not any("[contract-verifier:" in e for e in pipeline.ctx.errors)
+
+    def test_promotion_preserves_non_verifier_errors(self, tmp_path: Path) -> None:
+        """The REPLACE only touches verifier-prefixed errors; unrelated
+        ``ctx.errors`` (e.g. the transpile-time contract_fail_closed strings)
+        survive across the verifier rerun."""
+        pipeline = self._seed(tmp_path)
+        pipeline.ctx.errors.append("scene-runtime contract failed closed (x): y")
+        pipeline._run_contract_verifier({"topology": _topo_one_module("helper")})
+        assert "scene-runtime contract failed closed (x): y" in pipeline.ctx.errors
+        assert any("[contract-verifier:" in e for e in pipeline.ctx.errors)
+
+    # --- negative controls: B and C violations DO promote (codex P1) -------
+
+    def test_check_b_violation_promotes(self, tmp_path: Path) -> None:
+        """A real GetComponent-reachability (check B) violation promotes to
+        ctx.errors — proves the corpus path would catch a B breach, not just
+        that the corpus happens to be clean."""
+        pipeline = _make_pipeline(tmp_path)
+        pipeline.ctx.scene_runtime = {}
+        pipeline.state.rbx_place.scripts = [
+            RbxScript(
+                name="Mod",
+                source='obj:GetComponent("ZzzDefinitelyNotAClass")',
+                script_type="ModuleScript",
+                parent_path="ReplicatedStorage",
+            )
+        ]
+        pipeline._run_contract_verifier({"topology": _topo_one_module("client")})
+        assert any(
+            "[contract-verifier:component_availability]" in e
+            for e in pipeline.ctx.errors
+        )
+
+    def test_check_c_violation_promotes(self, tmp_path: Path) -> None:
+        """A real cross-domain-bridge (check C) violation promotes to
+        ctx.errors — an unbridged runtime client->server edge."""
+        pipeline = _make_pipeline(tmp_path)
+        pipeline.ctx.scene_runtime = {}
+        pipeline.state.rbx_place.scripts = []
+        pipeline._run_contract_verifier(
+            {"topology": _topo_edge("client", "server", "same_domain_no_bridge")}
+        )
+        assert any(
+            "[contract-verifier:cross_domain_attribute]" in e
+            for e in pipeline.ctx.errors
+        )

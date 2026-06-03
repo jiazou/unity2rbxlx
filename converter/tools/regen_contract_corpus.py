@@ -145,8 +145,46 @@ def _capture(project: str, project_path: Path, networking: str) -> dict[str, obj
         "project": project,
         "captured_via": "u2r.py convert --scene-runtime=generic (real AI)",
         "expected_counts": counts,  # info-severity rows allowed; warnings == 0
+        # Coverage facts the replay test asserts so a "0 violations" result can't
+        # be vacuous (codex review P1): a flipped check that silently scanned
+        # NOTHING would otherwise pass green-for-the-wrong-reason. Pins the
+        # number of constructs each check actually ran over.
+        "coverage": _coverage(captured["topology"], scripts),  # type: ignore[arg-type]
         "topology": captured["topology"],
         "scripts": captured["scripts"],
+    }
+
+
+def _coverage(topology: dict[str, object], scripts: list[object]) -> dict[str, int]:
+    """Count the constructs each flipped check actually scans, so the replay
+    test can prove the check ran (not just that it found nothing)."""
+    from converter.contract_verifier import _GETCOMPONENT_RE  # type: ignore[attr-defined]
+
+    # Check B: literal-arg GetComponent sites across emitted Luau.
+    getcomponent_sites = sum(
+        len(_GETCOMPONENT_RE.findall(getattr(s, "source", "") or ""))
+        for s in scripts
+    )
+    # Check C: runtime client<->server cross-domain edges.
+    runtime_edges = 0
+    for e in topology.get("cross_domain_edges") or []:  # type: ignore[union-attr]
+        if not isinstance(e, dict):
+            continue
+        fd, td = e.get("from_domain"), e.get("to_domain")
+        if fd in ("client", "server") and td in ("client", "server") and fd != td:
+            runtime_edges += 1
+    # Check A: modules carrying a real domain verdict.
+    modules = topology.get("modules") or {}  # type: ignore[union-attr]
+    domained_modules = sum(
+        1
+        for m in modules.values()
+        if isinstance(m, dict)
+        and m.get("domain") in ("client", "server", "helper", "excluded")
+    )
+    return {
+        "getcomponent_sites": getcomponent_sites,
+        "runtime_cross_domain_edges": runtime_edges,
+        "domained_modules": domained_modules,
     }
 
 

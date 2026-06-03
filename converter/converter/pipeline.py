@@ -4811,14 +4811,24 @@ script.Disabled = true
         # breach. The escape hatch is read AT THIS GATE
         # (compute-the-metric-but-don't-abort), distinct from the
         # shadow-disable hatch at entry — so the metric stays populated even
-        # when promotion is suppressed for a release. Deduped against
-        # ``ctx.errors`` to stay resume-idempotent (mirrors the
-        # ``contract_fail_closed`` promotion).
+        # when promotion is suppressed for a release.
+        #
+        # REPLACE the verifier-owned rows, don't append (codex review P0):
+        # ``ctx.errors`` persists + reloads across a ``materialize_and_classify``
+        # resume, so a prior run's promotion would survive a now-clean rerun (or
+        # a fail-open rerun) and keep ``success=False`` for the wrong reason —
+        # the same ownership bug the metric stash already fixed. Drop every prior
+        # verifier-prefixed error FIRST (both directions: clean + fail-open), then
+        # re-add the current run's (unless the hatch suppresses promotion).
+        prefix = contract_verifier.CONTRACT_ERROR_PREFIX
+        self.ctx.errors[:] = [
+            e for e in self.ctx.errors if not e.startswith(prefix)
+        ]
+        promotable = contract_verifier.fail_closed_errors(result)
         if os.environ.get(
             "U2R_CONTRACT_VERIFIER_FAIL_OPEN", "").strip().lower() in (
             "1", "true", "yes",
         ):
-            promotable = contract_verifier.fail_closed_errors(result)
             if promotable:
                 log.warning(
                     "[contract_verifier] %d fail-closed violation(s) suppressed "
@@ -4826,9 +4836,7 @@ script.Disabled = true
                     len(promotable),
                 )
         else:
-            for msg in contract_verifier.fail_closed_errors(result):
-                if msg not in self.ctx.errors:
-                    self.ctx.errors.append(msg)
+            self.ctx.errors.extend(promotable)
 
     def _maybe_run_topology_prepass(
         self,

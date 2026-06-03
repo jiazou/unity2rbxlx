@@ -309,13 +309,22 @@ FAIL_CLOSED_CHECKS: frozenset[str] = frozenset(
     {"consumer_compliance", "component_availability", "cross_domain_attribute"}
 )
 
+# Every promoted verifier error carries this prefix so the pipeline can REPLACE
+# its own rows on a rerun (drop prior, re-add current) — ``ctx.errors`` persists
+# across a ``materialize_and_classify`` resume, so an append-only promotion would
+# leave a stale ``success=False`` after the issue is fixed or the fail-open hatch
+# is set. Distinct from the transpile-time ``scene-runtime contract failed
+# closed`` strings, which this prefix must never match.
+CONTRACT_ERROR_PREFIX = "[contract-verifier:"
+
 
 def fail_closed_errors(result: ContractVerifierResult) -> list[str]:
     """Error strings the pipeline promotes to ``ctx.errors`` — one per real
     (``warning``) violation of a check in ``FAIL_CLOSED_CHECKS``. Shadow checks
-    and ``info`` rows produce nothing (they stay metric-only)."""
+    and ``info`` rows produce nothing (they stay metric-only). Each is prefixed
+    with ``CONTRACT_ERROR_PREFIX`` so the pipeline owns + replaces them."""
     return [
-        f"[contract:{v.check}] {v.script}: {v.detail}"
+        f"{CONTRACT_ERROR_PREFIX}{v.check}] {v.script}: {v.detail}"
         for v in result.violations
         if v.severity == "warning" and v.check in FAIL_CLOSED_CHECKS
     ]

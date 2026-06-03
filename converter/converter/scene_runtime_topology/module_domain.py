@@ -226,10 +226,11 @@ def _strip_require_calls(source: str) -> str:
         if m == -1:
             out.append(source[i:])
             return "".join(out)
-        # A match inside a larger identifier (``myRequire(``, ``x.require(``) is
-        # a different call — keep it (and its args) in the scan. Left-anchor on
-        # a non-word, non-dot boundary, mirroring the ``(?<![.\w])`` C# anchors.
-        if m > 0 and (source[m - 1].isalnum() or source[m - 1] in "_."):
+        # A match inside a larger identifier or a member call (``myRequire(``,
+        # ``x.require(``, ``x:require(``) is a different call — keep it (and its
+        # args) in the scan. Left-anchor on a non-word/dot/colon boundary,
+        # mirroring the ``(?<![.\w])`` C# anchors (``:`` added for Luau methods).
+        if m > 0 and (source[m - 1].isalnum() or source[m - 1] in "_.:"):
             out.append(source[i:m + 1])  # keep through the 'r'; re-search after
             i = m + 1
             continue
@@ -237,9 +238,23 @@ def _strip_require_calls(source: str) -> str:
         depth = 0
         j = m + len("require")  # positioned at the '('
         closed = False
+        in_str: str | None = None  # active string quote, or None
+        escaped = False
         while j < n:
             c = source[j]
-            if c == "(":
+            if in_str is not None:
+                # Inside a string literal: parens don't count toward depth
+                # (codex review: ``require(foo(")") or ...)`` must not close
+                # early on the ``)`` inside ``")"``).
+                if escaped:
+                    escaped = False
+                elif c == "\\":
+                    escaped = True
+                elif c == in_str:
+                    in_str = None
+            elif c in ("'", '"'):
+                in_str = c
+            elif c == "(":
                 depth += 1
             elif c == ")":
                 depth -= 1

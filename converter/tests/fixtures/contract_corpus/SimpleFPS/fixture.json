@@ -1,5 +1,10 @@
 {
   "captured_via": "u2r.py convert --scene-runtime=generic (real AI)",
+  "coverage": {
+    "domained_modules": 36,
+    "getcomponent_sites": 24,
+    "runtime_cross_domain_edges": 0
+  },
   "expected_counts": {
     "consumer_compliance": 1
   },

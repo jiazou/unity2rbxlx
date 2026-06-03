@@ -1,5 +1,10 @@
 {
   "captured_via": "u2r.py convert --scene-runtime=generic (real AI)",
+  "coverage": {
+    "domained_modules": 2,
+    "getcomponent_sites": 0,
+    "runtime_cross_domain_edges": 1
+  },
   "expected_counts": {},
   "project": "MiniNet",
   "scripts": [
