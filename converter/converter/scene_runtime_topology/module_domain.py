@@ -360,7 +360,7 @@ def _strip_require_calls(source: str) -> str:
             and (i == 0 or not (source[i - 1].isalnum() or source[i - 1] in "_.:"))
         ):
             k = i + len("require")
-            while k < n and source[k] in " \t":
+            while k < n and source[k].isspace():  # any whitespace, incl. newline
                 k += 1
             if k < n and source[k] == "(":
                 depth = 0

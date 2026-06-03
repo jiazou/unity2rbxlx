@@ -1178,6 +1178,11 @@ class TestStripRequireCallsScanner:
         SS = 'game:GetService("ServerStorage")'
         assert "ServerStorage" not in _strip_require_calls('require (' + SS + ')')
 
+    def test_require_with_newline_before_paren_is_stripped(self) -> None:
+        # codex round-4 P2: any whitespace (incl. newline) between require and (.
+        SS = 'game:GetService("ServerStorage")'
+        assert "ServerStorage" not in _strip_require_calls('require\n(' + SS + ')')
+
     def test_escaped_quote_in_require_string(self) -> None:
         # A backslash-escaped quote inside the string must not terminate it
         # early. Built via chr(92) so the escaping is unambiguous in this source.
