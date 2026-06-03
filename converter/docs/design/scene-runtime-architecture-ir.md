@@ -1277,6 +1277,17 @@ now in-scope Phase 3 work. (The HudControl signal fix is already shipped in #174
   `cross_domain_attribute` joined `FAIL_CLOSED_CHECKS`. All three contract checks
   (A/B/C) are now fail-closed; only the `smoke` wiring check stays shadow.
 
+**Post-implementation review follow-up (Claude code review 2026-06-03; codex was
+rate-limited, re-run before merge):** the two `_strip_require_calls` bugs it found
+(no left word-boundary → `myRequire(` over-stripped; unterminated `require(` blanked
+the tail) are FIXED with regression tests. DEFERRED (pre-existing, broader blast
+radius — own slice): the Luau domain-signal scan in `_collect_signals` runs the
+client/server API regexes over RAW source, so a commented-out `-- :FireServer(` or a
+string literal `"OnServerEvent"` counts as a real strong signal (same FP class the
+require fix addressed, never generalized). Fix = strip Luau comments/strings (reuse
+`contract_verifier._strip_luau_comments`, extended for strings) before the API scan;
+validate classification deltas across the corpus first.
+
 ## Migration discipline
 
 Per Codex round-2: **"Remove, not deprecate" is right, but per slice.**

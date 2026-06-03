@@ -214,7 +214,9 @@ def _strip_require_calls(source: str) -> str:
     in generic mode is a dead emit (the boot loop never constructs it). Strips
     for BOTH channels (a require path is never client- OR server-domain evidence).
     Balanced-paren aware so a nested ``GetService(...)`` inside the args is
-    consumed with it.
+    consumed with it. Matches only a STANDALONE ``require`` (not ``myRequire(``
+    / ``x.require(``), and on an unterminated ``require(`` keeps the remainder
+    verbatim rather than blanking every downstream signal.
     """
     out: list[str] = []
     i = 0
@@ -224,9 +226,17 @@ def _strip_require_calls(source: str) -> str:
         if m == -1:
             out.append(source[i:])
             return "".join(out)
+        # A match inside a larger identifier (``myRequire(``, ``x.require(``) is
+        # a different call — keep it (and its args) in the scan. Left-anchor on
+        # a non-word, non-dot boundary, mirroring the ``(?<![.\w])`` C# anchors.
+        if m > 0 and (source[m - 1].isalnum() or source[m - 1] in "_."):
+            out.append(source[i:m + 1])  # keep through the 'r'; re-search after
+            i = m + 1
+            continue
         out.append(source[i:m])
         depth = 0
         j = m + len("require")  # positioned at the '('
+        closed = False
         while j < n:
             c = source[j]
             if c == "(":
@@ -235,8 +245,14 @@ def _strip_require_calls(source: str) -> str:
                 depth -= 1
                 if depth == 0:
                     j += 1
+                    closed = True
                     break
             j += 1
+        if not closed:
+            # Unterminated require(...) (malformed/truncated Luau): don't drop
+            # the tail — keep it verbatim so downstream signals survive.
+            out.append(source[m:])
+            return "".join(out)
         i = j  # resume after the closing ')'
 
 

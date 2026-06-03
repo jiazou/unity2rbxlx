@@ -31,6 +31,7 @@ from converter.scene_runtime_domain import (  # noqa: E402
 from converter.scene_runtime_planner import SceneRuntimeArtifact  # noqa: E402
 from converter.scene_runtime_topology.module_domain import (  # noqa: E402
     _classify_module,
+    _strip_require_calls,
 )
 from converter.storage_classifier import (  # noqa: E402
     REPLICATED_STORAGE,
@@ -1123,3 +1124,33 @@ class TestExcludedSideOverrideAuditTrail:
         domain, signals, _ = self._classify("excluded")
         assert domain == "excluded"
         assert signals.get("override_routed_off_excluded") is None
+
+
+# ---------------------------------------------------------------------------
+# _strip_require_calls scanner robustness (codex/Claude review hardening)
+# ---------------------------------------------------------------------------
+
+class TestStripRequireCallsScanner:
+    _SS = 'game:GetService("ServerStorage")'
+
+    def test_bare_require_is_stripped(self) -> None:
+        assert "ServerStorage" not in _strip_require_calls(f'require({self._SS})')
+
+    def test_my_require_identifier_is_not_stripped(self) -> None:
+        # ``myRequire(`` is a different call; must not be consumed (word boundary).
+        assert "ServerStorage" in _strip_require_calls(f'myRequire({self._SS})')
+
+    def test_member_require_is_not_stripped(self) -> None:
+        assert "ServerStorage" in _strip_require_calls(f'x.require({self._SS})')
+
+    def test_unterminated_require_keeps_tail(self) -> None:
+        # No closing paren -> keep the remainder rather than blanking it.
+        assert "ServerStorage" in _strip_require_calls(f'require({self._SS}')
+
+    def test_interleaved_real_signal_survives(self) -> None:
+        src = f'require(a) {self._SS} require(b)'
+        assert "ServerStorage" in _strip_require_calls(src)
+
+    def test_nested_parens_in_require_fully_consumed(self) -> None:
+        src = f'require(f(g({self._SS})) or h())'
+        assert "ServerStorage" not in _strip_require_calls(src)
