@@ -200,6 +200,75 @@ _CLIENT_RX = tuple(re.compile(p) for p in _GENERIC_CLIENT_API_PATTERNS)
 _SERVER_RX = tuple(re.compile(p) for p in _GENERIC_SERVER_API_PATTERNS)
 
 
+def _long_bracket_open(source: str, i: int) -> int | None:
+    """If ``source[i:]`` opens a Luau long bracket ``[[`` / ``[=[`` / ``[==[`` …,
+    return the ``=`` level; else None. ``i`` must point at the first ``[``."""
+    if i >= len(source) or source[i] != "[":
+        return None
+    j = i + 1
+    while j < len(source) and source[j] == "=":
+        j += 1
+    if j < len(source) and source[j] == "[":
+        return j - (i + 1)  # number of ``=`` between the brackets
+    return None
+
+
+def _skip_long_bracket(source: str, i: int, level: int) -> int:
+    """Return the index just past the closing ``]=*]`` of the long bracket that
+    opens at ``i`` with ``level`` equals signs (unterminated → end of source)."""
+    close = "]" + "=" * level + "]"
+    end = source.find(close, i + level + 2)
+    return len(source) if end == -1 else end + len(close)
+
+
+def _strip_luau_noise(source: str) -> str:
+    """Replace Luau COMMENTS and LONG-BRACKET strings with spaces before the
+    domain-signal scan, KEEPING short quoted strings (the API patterns key off
+    their string args, e.g. ``GetService("ServerStorage")``).
+
+    A single lexical pass — so a ``--`` or paren inside a quoted string isn't
+    mistaken for a comment/grouping, and a ``require(`` / API token inside a
+    comment or ``[[..]]`` string is removed rather than scanned or (worse)
+    consumed across (codex review: the scan must not fire on, or
+    ``_strip_require_calls`` over-consume across, commented/long-bracket
+    regions)."""
+    out: list[str] = []
+    i, n = 0, len(source)
+    while i < n:
+        c = source[i]
+        if c == '"' or c == "'":  # quoted string — keep verbatim
+            out.append(c)
+            i += 1
+            while i < n:
+                d = source[i]
+                out.append(d)
+                i += 1
+                if d == "\\" and i < n:
+                    out.append(source[i])
+                    i += 1
+                elif d == c:
+                    break
+            continue
+        if c == "[":  # possible long-bracket string
+            level = _long_bracket_open(source, i)
+            if level is not None:
+                i = _skip_long_bracket(source, i, level)
+                out.append(" ")
+                continue
+        if c == "-" and i + 1 < n and source[i + 1] == "-":  # comment
+            level = _long_bracket_open(source, i + 2)
+            if level is not None:  # long comment --[[ ]]
+                i = _skip_long_bracket(source, i + 2, level)
+            else:  # line comment -- ...
+                while i < n and source[i] != "\n":
+                    i += 1
+            out.append(" ")
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
 def _strip_require_calls(source: str) -> str:
     """Blank out ``require(...)`` call expressions before the Luau domain-signal
     scan.
@@ -1502,10 +1571,12 @@ def _collect_signals(
     # Roblox-flavoured patterns are STRONG signals per the design doc
     # §"Strong client signals" / §"Strong server signals" tables.
     if luau_source:
-        # Module-resolution ``require(...)`` paths are not domain logic; strip
-        # them so a converter-emitted ServerStorage require-fallback can't pose
-        # as a strong server signal (see _strip_require_calls).
-        scan_src = _strip_require_calls(luau_source)
+        # Scan CODE only: strip comments + long-bracket strings (lexically, so
+        # quoted string args survive), then strip module-resolution
+        # ``require(...)`` paths — neither commented tokens nor a converter-
+        # emitted ServerStorage require-fallback should count as a signal
+        # (see _strip_luau_noise / _strip_require_calls).
+        scan_src = _strip_require_calls(_strip_luau_noise(luau_source))
         if any(rx.search(scan_src) for rx in _CLIENT_RX):
             luau_signals.append("roblox_client_api")
             strong_client_kinds.add("roblox_client_api")

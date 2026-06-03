@@ -31,6 +31,7 @@ from converter.scene_runtime_domain import (  # noqa: E402
 from converter.scene_runtime_planner import SceneRuntimeArtifact  # noqa: E402
 from converter.scene_runtime_topology.module_domain import (  # noqa: E402
     _classify_module,
+    _strip_luau_noise,
     _strip_require_calls,
 )
 from converter.storage_classifier import (  # noqa: E402
@@ -1170,3 +1171,44 @@ class TestStripRequireCallsScanner:
         bs = chr(92)
         src = 'require(x("' + bs + '")") or ' + self._SS + ')'
         assert "ServerStorage" not in _strip_require_calls(src)
+
+
+# ---------------------------------------------------------------------------
+# _strip_luau_noise: comments + long-bracket strings (codex re-review)
+# ---------------------------------------------------------------------------
+
+class TestStripLuauNoise:
+    _SS = 'remote.OnServerEvent:Connect(fn)'  # a real strong-server token
+
+    def _scan(self, s):
+        return _strip_require_calls(_strip_luau_noise(s))
+
+    def test_line_comment_removed(self) -> None:
+        assert self._SS not in self._scan('-- ' + self._SS)
+
+    def test_commented_require_does_not_consume_next_line(self) -> None:
+        # codex NEW P2: a commented require( must NOT eat the real next signal.
+        kept = self._scan('-- require(\n' + self._SS)
+        assert 'OnServerEvent' in kept
+
+    def test_long_comment_removed(self) -> None:
+        assert self._SS not in self._scan('--[[ ' + self._SS + ' ]] x = 1')
+
+    def test_long_bracket_string_removed(self) -> None:
+        assert self._SS not in self._scan('local x = [[ ' + self._SS + ' ]]')
+
+    def test_leveled_long_bracket_string_removed(self) -> None:
+        assert self._SS not in self._scan('local x = [=[ ' + self._SS + ' ]=]')
+
+    def test_dashes_inside_quoted_string_are_not_a_comment(self) -> None:
+        # The string must survive (not be truncated at "--"), and a real signal
+        # after it must still be seen.
+        out = self._scan('local s = "keep -- me"\n' + self._SS)
+        assert 'keep -- me' in out and 'OnServerEvent' in out
+
+    def test_quoted_arg_survives_for_signal_match(self) -> None:
+        # GetService("ServerStorage") must keep its arg (signals key off it).
+        assert 'ServerStorage' in _strip_luau_noise('game:GetService("ServerStorage")')
+
+    def test_unterminated_long_comment_consumes_to_eof(self) -> None:
+        assert self._SS not in self._scan('--[[ ' + self._SS)
