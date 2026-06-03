@@ -1234,8 +1234,45 @@ review against the merged code (original deliverable text preserved in git):**
     the FINAL artifact; a pre-coherence gate is the destructive-gate-before-
     decisive-check anti-pattern). The future Class-2 arm, if ever needed, is a
     store-aware orphan check on the final generic Luau, gated on a real uncovered
-    true-positive. SEPARATE follow-up (different bug class): the spike showed no
-    `SetAttribute("hasKey")` writer — a potential orphan-read (missing-write) bug.
+    true-positive. (Orphan-read check on the door: traced 2026-06-03 — NOT a bug.
+    `_setSharedFlag` writes `plr:SetAttribute(flag,…)` via a variable flag name, and
+    Door/Player/Pickup are all `domain=client`, so the write and read connect.)
+
+### Phase 3 continuation — emergent slices 5-7 (folded in 2026-06-03)
+
+Slice 4 surfaced three findings the original plan did not anticipate; all three are
+now in-scope Phase 3 work. (The HudControl signal fix is already shipped in #174.)
+
+- **Slice 5 — the `excluded` contract for unclassifiable runtime-bearing modules.**
+  DESIGN-DEBATABLE → resolve via Claude+Codex review BEFORE implementing.
+  Problem: classifier-v2 collapsed the contract's `legacy` verdict ("runs via the
+  un-split fallback") into inert `excluded`. In generic mode an `excluded`
+  runtime-bearing module is emitted but never constructed (the boot loop skips it)
+  → silent dead emit. With check A flipped (slice 4b) that silent drop is now a
+  LOUD build failure — good — but the operator has NO recourse: Rule-1 `excluded`
+  accepts only an `excluded` override (`module_domain.py` §"Operator override"), so
+  the only escape is editing the Unity source. Resolve the contract:
+  (1) reconcile the `legacy→excluded` collapse — define what generic mode does with
+  a genuinely-unclassifiable runtime-bearing module;
+  (2) give a recourse — let `domain_overrides` pin an `excluded` runtime-bearing
+  module to `client`/`server`. **Codex caveat to weigh in review:** pinning a
+  GENUINELY both-side module to one side ships a half-broken module (its other-side
+  API calls fail), which can be worse than a clean drop — so the override must be an
+  explicit operator opt-in ("I accept the half-broken risk"), not an automatic
+  re-route, and the default stays loud-fail. No auto-routing; no `excluded`
+  redefinition (helper already covers non-runtime-bearing).
+- **Slice 6 — networked corpus project (lift the single-domain ceiling).** The whole
+  bundled corpus is SimpleFPS, which is single-player / entirely `domain=client`
+  (0 cross-domain edges) — so checks A/B are validated on exactly one game and
+  check C is structurally unvalidatable. Add a MINIMAL networked Unity fixture
+  project to `test_projects/` (a couple of `NetworkBehaviour` scripts with a
+  `[Command]` + `[ClientRpc]` producing client→server and server→client edges),
+  get it through a generic-mode conversion, and add it to
+  `tools/regen_contract_corpus.py`'s `CORPUS`. Diversifies A/B coverage and is the
+  prerequisite for slice 7. Independent of slice 5.
+- **Slice 7 — flip check C.** Once slice 6's project yields real
+  `cross_domain_edges` and check C's metric is clean across the expanded corpus,
+  add `cross_domain_attribute` to `FAIL_CLOSED_CHECKS`. Depends on slice 6.
 
 ## Migration discipline
 
