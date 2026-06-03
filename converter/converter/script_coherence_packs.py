@@ -5224,3 +5224,125 @@ def _fix_turret_canonical_spatial_child(
                 n, s.name,
             )
     return fixes
+
+
+# ---------------------------------------------------------------------------
+# Pack: fps_camera_yaw_from_player_pivot
+# ---------------------------------------------------------------------------
+#
+# Unity FPS rigs parent the camera UNDER the player transform: the player
+# yaws (``transform.Rotate`` around up) and the camera inherits that world
+# yaw through the transform hierarchy, while the camera's own local rotation
+# is pitch-only (``camRotation.x``).
+#
+# The C#->Luau transpiler FLATTENS that hierarchy. The converted controller
+# yaws the player object via ``PivotTo`` but then rebuilds the camera's WORLD
+# CFrame every frame as ``CFrame.new(pos) * CFrame.Angles(pitch, 0, 0)`` with
+# the yaw (Y) and roll (Z) components literally ``0``. The player turns; the
+# camera never inherits it. Symptom: you can pitch up/down but cannot yaw
+# left/right (``mouse_yaw_rotates_camera`` is the known-failing e2e fixture).
+#
+# Fix: inject the yawing object's world rotation into the camera CFrame so it
+# inherits the player yaw, mirroring Unity's parent(yaw) -> child(pitch):
+#
+#   cam.CFrame = CFrame.new(pos) * <obj>:GetPivot().Rotation * CFrame.Angles(pitch, 0, 0)
+#
+# The camera POSITION (``pos``) and the PITCH term are preserved untouched;
+# only the missing yaw is added. ``<obj>`` is the object the SAME script yaws
+# via a yaw-only ``PivotTo(<obj>:GetPivot() * CFrame.Angles(0, <e>, 0))`` --
+# by FPS construction that pivot accumulates yaw only (the body stays
+# upright), so its full ``.Rotation`` is exactly the world yaw. Detection runs
+# on the comment/string-blanked view (offsets preserved) so ``CFrame.Angles``
+# inside a string/comment is never a signal; edits splice the real source at
+# the same offsets. Position-follow is deliberately out of scope -- the
+# reported symptom is yaw only, and pitch+position already behave.
+
+# Yaw-only body turn: ``<obj>:PivotTo(<obj>:GetPivot() * CFrame.Angles(0, ...``.
+# The literal ``0`` in the pitch (X) slot is the yaw-only fingerprint and the
+# backreference ties both ``<obj>`` mentions to the same object. We stop at
+# the ``0,`` -- matching the (possibly nested-paren) yaw expression and close
+# paren is unnecessary to establish the fingerprint or capture ``<obj>``.
+_FPS_BODY_YAW_RE = re.compile(
+    r"(?P<obj>[A-Za-z_][\w.]*)\s*:PivotTo\(\s*"
+    r"(?P=obj)\s*:GetPivot\(\)\s*\*\s*"
+    r"CFrame\.Angles\(\s*0\s*,"
+)
+
+# Pitch-only camera world rebuild:
+#   <cam>.CFrame = CFrame.new(<pos>) * CFrame.Angles(<pitch>, 0, 0)
+# The yaw (Y) and roll (Z) operands are literal ``0`` -- the flattened-
+# hierarchy fingerprint (and what excludes real 3-axis CFrame.Angles(a,b,c)
+# animation keyframes). ``pos`` tolerates one level of nested parens;
+# ``pitch`` is any comma-free expression (e.g. ``math.rad(self.camRotationX)``).
+_FPS_CAM_PITCH_ONLY_RE = re.compile(
+    r"(?P<pre>(?P<cam>[A-Za-z_][\w.]*)\.CFrame\s*=\s*"
+    r"CFrame\.new\((?P<pos>[^()]*(?:\([^()]*\)[^()]*)*)\)\s*\*\s*)"
+    r"(?P<angles>CFrame\.Angles\(\s*[^,]+?\s*,\s*0\s*,\s*0\s*\))"
+)
+
+
+def _fps_yaw_object(s: "RbxScript") -> str | None:
+    """Return the body object a script yaws (yaw-only) AND for which it
+    rebuilds a pitch-only camera CFrame -- i.e. the flattened FPS rig.
+
+    Both probes run on the comment/string-blanked view so tokens inside
+    string/comment literals are never signals. Returns the ``<obj>`` to
+    source the world yaw from, or ``None`` when the script isn't a
+    flattened FPS look controller.
+    """
+    blanked = _blank_lua_strings_and_comments(s.source or "")
+    body = _FPS_BODY_YAW_RE.search(blanked)
+    if not body:
+        return None
+    if not _FPS_CAM_PITCH_ONLY_RE.search(blanked):
+        return None
+    return body.group("obj")
+
+
+def _detect_fps_camera_yaw_lost(scripts: list["RbxScript"]) -> bool:
+    return any(_fps_yaw_object(s) is not None for s in scripts)
+
+
+@patch_pack(
+    name="fps_camera_yaw_from_player_pivot",
+    description="Restore lost mouse-yaw in converted Unity FPS controllers. "
+    "The transpiler flattens Unity's camera-child-of-player hierarchy: the "
+    "player yaws via PivotTo but the camera world CFrame is rebuilt pitch-only "
+    "(CFrame.new(pos) * CFrame.Angles(pitch, 0, 0), yaw hard-set to 0), so the "
+    "camera never inherits the player's yaw -- you can look up/down but not "
+    "turn left/right. Inject the yawing object's GetPivot().Rotation into the "
+    "camera CFrame so it inherits the world yaw, preserving position + pitch.",
+    # Run after the other FPS look packs so the camera line is in final form
+    # (they edit different lines -- the mouse-delta read and the pitch sign --
+    # but ordering keeps the transform deterministic).
+    after=("fps_camera_pitch_inversion", "fps_e2e_mouse_channel"),
+    detect=_detect_fps_camera_yaw_lost,
+)
+def _fix_fps_camera_yaw_from_player_pivot(scripts: list["RbxScript"]) -> int:
+    fixes = 0
+    for s in scripts:
+        obj = _fps_yaw_object(s)
+        if obj is None:
+            continue
+        raw = s.source or ""
+        blanked = _blank_lua_strings_and_comments(raw)
+        # Collect insert points (start of each pitch-only ``CFrame.Angles``)
+        # from the blanked view; offsets are valid in the real source too.
+        # Once rewritten the camera line reads
+        # ``CFrame.new(pos) * obj:GetPivot().Rotation * CFrame.Angles(...)``,
+        # which no longer matches (the regex requires ``CFrame.Angles``
+        # immediately after the ``new(...) *``), so the pack is idempotent.
+        points = [m.start("angles") for m in _FPS_CAM_PITCH_ONLY_RE.finditer(blanked)]
+        if not points:
+            continue
+        new_src = raw
+        for at in sorted(points, reverse=True):
+            new_src = new_src[:at] + f"{obj}:GetPivot().Rotation * " + new_src[at:]
+        if new_src != raw:
+            s.source = new_src
+            fixes += len(points)
+            log.info(
+                "  Restored FPS camera yaw in '%s' (%d site(s), from %s)",
+                s.name, len(points), obj,
+            )
+    return fixes
