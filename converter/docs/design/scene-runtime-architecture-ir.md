@@ -1186,11 +1186,114 @@ review against the merged code (original deliverable text preserved in git):**
   shared-flag literal mirrors (modeled in `shared_flag_channels`, not edges)
   and (P2) the writer×reader Cartesian over reused field names (the emitted
   Luau carries no instance identity to match the edge granularity). **Class-2
-  store-mismatch DEFERRED** (phantom post-coherence + brittle + the
-  `present==False` alternative is vacuous) — known deferred false-negative,
-  needs a pre-coherence hook + adversarial review.
-- **Slice 4** — corpus shadow audit (AI transpile) + per-check flip behind the
-  env-var hatch.
+  store-mismatch DEFERRED** as a backstop-only check with no corpus true-positive
+  — see slice 4d for the corrected rationale (the earlier "phantom /
+  pre-coherence hook" framing was wrong).
+- **Slice 4** — corpus shadow audit + per-check fail-closed flip behind the
+  env-var hatch. Decomposed (Claude+Codex review 2026-06-03):
+  - **4a — fast corpus harness.** `tools/regen_contract_corpus.py` captures
+    `(topology, scripts)` from a REAL generic-mode AI conversion per runnable
+    bundled project (the topology dict only exists in the in-scope merged
+    `scene_runtime`, so capture is via a hook monkeypatch, not a JSON
+    reconstruct). `tests/test_contract_corpus.py` replays each committed fixture
+    through the LIVE `_run_contract_verifier` hook (NOT the bare `verify_contract`
+    pure fn — the flip lands in the hook, so a pure-fn gate is
+    green-for-the-wrong-reason on wiring drift). Anti-tautology: regen REFUSES to
+    write a fixture with any real (`warning`) violation, and the test pins
+    per-check counts — so a dirty baseline or a new-violation regression both
+    fail loudly. This is the gate each flip must pass.
+  - **4b — per-check flip gate + flip A.** `contract_verifier.FAIL_CLOSED_CHECKS`
+    (a frozenset; `consumer_compliance` joins it) + `fail_closed_errors(result)`.
+    The promotion gate in `_run_contract_verifier` appends a flipped check's
+    `warning` rows to `ctx.errors` (→ `conversion_report.success=False`), reading
+    the slice-4 hatch `U2R_CONTRACT_VERIFIER_FAIL_OPEN` AT the gate
+    (compute-the-metric-but-don't-abort; distinct from the entry-level
+    `U2R_CONTRACT_VERIFIER_DISABLE`). Deduped against `ctx.errors`
+    (resume-idempotent). `info` rows and shadow checks never promote. Flip check A
+    first (stub-validatable, producer bug fixed via the require-fallback signal fix
+    + #172, lowest FP risk). NOTE: flipping A required a producer fix first — the
+    `_strip_require_calls` signal fix in `module_domain.py` (a converter-emitted
+    `require(...ServerStorage...)` fallback was posing as a strong server signal,
+    fail-closing the HUD to a dead-emit `excluded`); the corpus gate (4a) caught it.
+  - **4c — flip check B** (component_availability). Validated on real AI Luau via
+    4a: the SimpleFPS fixture has 20 literal-arg `GetComponent` sites, all
+    reachable (B is exercised, not vacuously clean). Added to `FAIL_CLOSED_CHECKS`.
+  - **4d — check C deferred to slice 7 (now done).** SimpleFPS has **0
+    cross-domain edges**, so check C's "0 violations" on it is vacuous — it could
+    not flip on the single-domain corpus. C flips in slice 7 once slice 6 adds a
+    project with real runtime client↔server edges (no silent cap; the gap was
+    logged, then closed). Document Class-2
+    store-mismatch as a DEFERRED backstop. **Corrected rationale (empirical,
+    2026-06-03):** a real generic-mode SimpleFPS conversion emits the door read
+    as `plr:GetAttribute("hasKey")` where `plr = host.playerFromTouch(other)` =
+    the Player instance = the CORRECT store. Generic mode steers every touch
+    script through the `playerFromTouch` host helper — structural store-correctness
+    at transpile time. So Class-2 has no corpus true-positive. It is NOT a phantom
+    (the door packs are off in generic — `pipeline.py` `_subphase_cohere_scripts`
+    early-returns) and does NOT need a pre-coherence hook (verification belongs on
+    the FINAL artifact; a pre-coherence gate is the destructive-gate-before-
+    decisive-check anti-pattern). The future Class-2 arm, if ever needed, is a
+    store-aware orphan check on the final generic Luau, gated on a real uncovered
+    true-positive. (Orphan-read check on the door: traced 2026-06-03 — NOT a bug.
+    `_setSharedFlag` writes `plr:SetAttribute(flag,…)` via a variable flag name, and
+    Door/Player/Pickup are all `domain=client`, so the write and read connect.)
+
+### Phase 3 continuation — emergent slices 5-7 (folded in 2026-06-03)
+
+Slice 4 surfaced three findings the original plan did not anticipate; all three are
+now in-scope Phase 3 work. (The HudControl signal fix is already shipped in #174.)
+
+- **Slice 5 — the `excluded` contract for unclassifiable runtime-bearing modules.**
+  DESIGN-DEBATABLE → resolve via Claude+Codex review BEFORE implementing.
+  Problem: classifier-v2 collapsed the contract's `legacy` verdict ("runs via the
+  un-split fallback") into inert `excluded`. In generic mode an `excluded`
+  runtime-bearing module is emitted but never constructed (the boot loop skips it)
+  → silent dead emit. With check A flipped (slice 4b) that silent drop is now a
+  LOUD build failure — good — but the operator has NO recourse: Rule-1 `excluded`
+  accepts only an `excluded` override (`module_domain.py` §"Operator override"), so
+  the only escape is editing the Unity source. Resolve the contract:
+  (1) reconcile the `legacy→excluded` collapse — define what generic mode does with
+  a genuinely-unclassifiable runtime-bearing module;
+  (2) give a recourse — let `domain_overrides` pin an `excluded` runtime-bearing
+  module to `client`/`server`. **Codex caveat to weigh in review:** pinning a
+  GENUINELY both-side module to one side ships a half-broken module (its other-side
+  API calls fail), which can be worse than a clean drop — so the override must be an
+  explicit operator opt-in ("I accept the half-broken risk"), not an automatic
+  re-route, and the default stays loud-fail. No auto-routing; no `excluded`
+  redefinition (helper already covers non-runtime-bearing).
+- **Slice 6 — networked corpus project (DONE).** The bundled corpus was only
+  SimpleFPS — single-player, entirely `domain=client` (0 cross-domain edges) — so
+  A/B were validated on one game and C was structurally unvalidatable. Added a
+  minimal networked fixture, `tests/fixtures/corpus_projects/MiniNet`: a
+  client-domain `ClientCtl` (UI MonoBehaviour) holding a serialized reference to a
+  server-domain `ServerCtl` (`NetworkBehaviour` + `[Command]`/`[SyncVar]`). Under
+  `--networking=mirror` the converter classifies them client/server and the
+  serialized component reference yields one runtime client↔server
+  `cross_domain_edge` (auto-bridged → `remote_event_bridge`). `CORPUS` in
+  `regen_contract_corpus.py` now carries per-project `networking` + path (in-repo
+  fixture vs submodule projects-root). MiniNet's captured fixture exercises check C
+  (1 edge) with 0 violations.
+- **Slice 7 — flip check C (DONE).** With MiniNet exercising C cleanly,
+  `cross_domain_attribute` joined `FAIL_CLOSED_CHECKS`. All three contract checks
+  (A/B/C) are now fail-closed; only the `smoke` wiring check stays shadow.
+
+**Post-implementation review (Claude + codex, 2026-06-03 — multiple rounds).**
+Findings and resolutions:
+- Claude: two `_strip_require_calls` bugs (no left word-boundary; unterminated
+  `require(` blanked the tail) — FIXED + tests.
+- Codex round 1 (NO-SHIP): **P0** the fail-closed promotion was append-only into the
+  persisted `ctx.errors` (stale `success=False` across a clean/fail-open resume) —
+  FIXED with REPLACE semantics (`CONTRACT_ERROR_PREFIX`) + resume tests. **P1** the
+  corpus gate was vacuous for B/C — FIXED with pinned coverage facts + a corpus-wide
+  non-vacuity assertion + B/C negative controls. **P2** `_strip_require_calls`
+  over-stripped `x:require(` and miscounted `)` in strings — FIXED.
+- Codex round 2 (NO-SHIP): the regex scanner still didn't understand Luau comments
+  or long-bracket strings, and the partial fix over-consumed across a commented
+  `require(`. RESOLVED by replacing the regex approach with a single-pass lexer
+  (`_strip_luau_noise`): strips comments + `[[..]]`/`[=[..]=]` strings (keeping short
+  quoted strings) before the require-strip and the API scan. This also closes the
+  earlier deferred item (the raw-source comment/string FP). Zero corpus
+  classification drift; lexer regression tests added.
 
 ## Migration discipline
 

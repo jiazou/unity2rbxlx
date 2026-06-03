@@ -29,6 +29,13 @@ from converter.scene_runtime_domain import (  # noqa: E402
     migrate_legacy_domain_values,
 )
 from converter.scene_runtime_planner import SceneRuntimeArtifact  # noqa: E402
+from converter.scene_runtime_topology.module_domain import (  # noqa: E402
+    _api_pattern_fires,
+    _classify_module,
+    _strip_luau_noise,
+    _strip_require_calls,
+    _string_content_mask,
+)
 from converter.storage_classifier import (  # noqa: E402
     REPLICATED_STORAGE,
     SERVER_SCRIPT_SERVICE,
@@ -1032,3 +1039,236 @@ class TestStrictModeEarlyGate:
         # And the original artifact must NOT have been mutated (the dry
         # run was on a deep copy).
         assert "domain" not in artifact["modules"]["g"]
+
+
+# ---------------------------------------------------------------------------
+# require(...) module-resolution paths are not domain signals (slice-4 fix)
+# ---------------------------------------------------------------------------
+
+class TestRequireFallbackNotAServerSignal:
+    """A converter-emitted ``require(... or game:GetService("ServerStorage")
+    :FindFirstChild("X"))`` fallback is MODULE RESOLUTION, not server logic. It
+    must not contribute a server signal — else an obvious client module (the HUD)
+    fail-closes to ``excluded`` and dead-emits (the boot loop never constructs it).
+    See ``module_domain._strip_require_calls``."""
+
+    _REQUIRE_FALLBACK = (
+        'local Player = require(game:GetService("ReplicatedStorage")'
+        ':FindFirstChild("Player", true) or game:GetService("ServerStorage")'
+        ':FindFirstChild("Player", true))\n'
+    )
+
+    def test_require_serverstorage_fallback_is_not_a_server_signal(self) -> None:
+        _, mod = _mk_module("g", "Hud")
+        artifact = _mk_artifact({"g": mod})
+        # The require fallback is the ONLY server-ish text; plus a clear client
+        # signal so the module has a real domain to resolve to.
+        src = self._REQUIRE_FALLBACK + (
+            'game:GetService("UserInputService").InputBegan:Connect(function() end)\n'
+        )
+        classify_scene_runtime_domains(artifact, [_mk_script("Hud", src)])
+        sig = artifact["modules"]["g"]["domain_signals"]
+        assert "roblox_server_api" not in sig["luau_signals"]
+        assert sig["strong_server"] == 0
+        assert artifact["modules"]["g"]["domain"] == "client"
+
+    def test_real_serverstorage_usage_outside_require_still_fires(self) -> None:
+        # Positive control: a ServerStorage access that is NOT a require path is
+        # real server logic and must still count.
+        _, mod = _mk_module("g", "Vault")
+        artifact = _mk_artifact({"g": mod})
+        src = 'local s = game:GetService("ServerStorage")\ns.Data.Value = 1\n'
+        classify_scene_runtime_domains(artifact, [_mk_script("Vault", src)])
+        sig = artifact["modules"]["g"]["domain_signals"]
+        assert "roblox_server_api" in sig["luau_signals"]
+
+
+# ---------------------------------------------------------------------------
+# excluded -> side override preserves the audit trail (slice-5 contract)
+# ---------------------------------------------------------------------------
+
+class TestExcludedSideOverrideAuditTrail:
+    """When an operator pins a formerly-`excluded` (ambiguity-class) module to a
+    side, the original fail-closed reason must be PRESERVED as an audit trail
+    (not silently dropped) + a warning surfaced — the opposite-side behavior
+    won't run. Rule-1 both_side_api is NOT reachable here (rejected upstream)."""
+
+    def _classify(self, override, networking="none"):
+        # Camera.main -> moderate-client; extra_moderate_server -> moderate-server
+        # => Rule 4 (moderate-only ambiguity) -> excluded, then override.
+        return _classify_module(
+            "g",
+            {"stem": "Cam", "class_name": "Cam", "runtime_bearing": True},
+            {},  # scripts_by_class
+            [],  # instance_evidence
+            override,
+            "void Update() { var c = Camera.main; }",  # cs_source
+            networking,
+            extra_moderate_server=("network_behaviour_reachable",),
+        )
+
+    def test_rule4_excluded_baseline(self) -> None:
+        domain, signals, _ = self._classify(None)
+        assert domain == "excluded"
+        assert signals["fail_closed_reason"] == "moderate_only_ambiguity"
+
+    def test_side_override_preserves_reason_and_warns(self) -> None:
+        domain, signals, _ = self._classify("server")
+        assert domain == "server"
+        assert signals.get("override_applied") is True
+        # Audit trail preserved off the excluded-only fail_closed_reason field.
+        assert signals.get("override_routed_off_excluded") is True
+        assert signals.get("overridden_excluded_reason") == "moderate_only_ambiguity"
+        # fail_closed_reason must NOT linger on a now-runnable module.
+        assert "fail_closed_reason" not in signals
+
+    def test_excluded_override_keeps_excluded_no_audit_flag(self) -> None:
+        # Pinning back to excluded is not "routing off excluded" — no audit flag.
+        domain, signals, _ = self._classify("excluded")
+        assert domain == "excluded"
+        assert signals.get("override_routed_off_excluded") is None
+
+
+# ---------------------------------------------------------------------------
+# _strip_require_calls scanner robustness (codex/Claude review hardening)
+# ---------------------------------------------------------------------------
+
+class TestStripRequireCallsScanner:
+    _SS = 'game:GetService("ServerStorage")'
+
+    def test_bare_require_is_stripped(self) -> None:
+        assert "ServerStorage" not in _strip_require_calls(f'require({self._SS})')
+
+    def test_my_require_identifier_is_not_stripped(self) -> None:
+        # ``myRequire(`` is a different call; must not be consumed (word boundary).
+        assert "ServerStorage" in _strip_require_calls(f'myRequire({self._SS})')
+
+    def test_member_require_is_not_stripped(self) -> None:
+        assert "ServerStorage" in _strip_require_calls(f'x.require({self._SS})')
+
+    def test_unterminated_require_keeps_tail(self) -> None:
+        # No closing paren -> keep the remainder rather than blanking it.
+        assert "ServerStorage" in _strip_require_calls(f'require({self._SS}')
+
+    def test_interleaved_real_signal_survives(self) -> None:
+        src = f'require(a) {self._SS} require(b)'
+        assert "ServerStorage" in _strip_require_calls(src)
+
+    def test_nested_parens_in_require_fully_consumed(self) -> None:
+        src = f'require(f(g({self._SS})) or h())'
+        assert "ServerStorage" not in _strip_require_calls(src)
+
+    def test_colon_member_require_is_not_stripped(self) -> None:
+        # ``x:require(`` is a Luau method call, not the global require.
+        assert "ServerStorage" in _strip_require_calls(f'x:require({self._SS})')
+
+    def test_paren_inside_string_does_not_close_require_early(self) -> None:
+        # codex P2: ``)`` inside a string literal must not decrement depth.
+        src = f'require(foo(")") or {self._SS})'
+        assert "ServerStorage" not in _strip_require_calls(src)
+
+    def test_require_inside_string_literal_is_not_stripped(self) -> None:
+        # codex round-3 P2: a ``require(`` that lives inside a string literal is
+        # data, not a call — it must not strip the real GetService after it.
+        SS = 'game:GetService("ServerStorage")'
+        kept = _strip_require_calls('local s = "require(" .. ' + SS + ' .. ")"')
+        assert "ServerStorage" in kept
+
+    def test_require_with_whitespace_before_paren_is_stripped(self) -> None:
+        SS = 'game:GetService("ServerStorage")'
+        assert "ServerStorage" not in _strip_require_calls('require (' + SS + ')')
+
+    def test_require_with_newline_before_paren_is_stripped(self) -> None:
+        # codex round-4 P2: any whitespace (incl. newline) between require and (.
+        SS = 'game:GetService("ServerStorage")'
+        assert "ServerStorage" not in _strip_require_calls('require\n(' + SS + ')')
+
+    def test_escaped_quote_in_require_string(self) -> None:
+        # A backslash-escaped quote inside the string must not terminate it
+        # early. Built via chr(92) so the escaping is unambiguous in this source.
+        bs = chr(92)
+        src = 'require(x("' + bs + '")") or ' + self._SS + ')'
+        assert "ServerStorage" not in _strip_require_calls(src)
+
+
+# ---------------------------------------------------------------------------
+# _strip_luau_noise: comments + long-bracket strings (codex re-review)
+# ---------------------------------------------------------------------------
+
+class TestStripLuauNoise:
+    _SS = 'remote.OnServerEvent:Connect(fn)'  # a real strong-server token
+
+    def _scan(self, s):
+        return _strip_require_calls(_strip_luau_noise(s))
+
+    def test_line_comment_removed(self) -> None:
+        assert self._SS not in self._scan('-- ' + self._SS)
+
+    def test_commented_require_does_not_consume_next_line(self) -> None:
+        # codex NEW P2: a commented require( must NOT eat the real next signal.
+        kept = self._scan('-- require(\n' + self._SS)
+        assert 'OnServerEvent' in kept
+
+    def test_long_comment_removed(self) -> None:
+        assert self._SS not in self._scan('--[[ ' + self._SS + ' ]] x = 1')
+
+    def test_long_bracket_string_removed(self) -> None:
+        assert self._SS not in self._scan('local x = [[ ' + self._SS + ' ]]')
+
+    def test_leveled_long_bracket_string_removed(self) -> None:
+        assert self._SS not in self._scan('local x = [=[ ' + self._SS + ' ]=]')
+
+    def test_dashes_inside_quoted_string_are_not_a_comment(self) -> None:
+        # The string must survive (not be truncated at "--"), and a real signal
+        # after it must still be seen.
+        out = self._scan('local s = "keep -- me"\n' + self._SS)
+        assert 'keep -- me' in out and 'OnServerEvent' in out
+
+    def test_quoted_arg_survives_for_signal_match(self) -> None:
+        # GetService("ServerStorage") must keep its arg (signals key off it).
+        assert 'ServerStorage' in _strip_luau_noise('game:GetService("ServerStorage")')
+
+    def test_unterminated_long_comment_consumes_to_eof(self) -> None:
+        assert self._SS not in self._scan('--[[ ' + self._SS)
+
+
+# ---------------------------------------------------------------------------
+# Token-aware API scan: string CONTENTS aren't signals (codex round-3 #2)
+# ---------------------------------------------------------------------------
+
+class TestTokenAwareApiScan:
+    def _fires(self, src, patterns):
+        text = _strip_require_calls(_strip_luau_noise(src))
+        mask = _string_content_mask(text)
+        return any(_api_pattern_fires(rx, text, mask) for rx in patterns)
+
+    def _server(self, src):
+        from converter.scene_runtime_topology.module_domain import _SERVER_RX
+        return self._fires(src, _SERVER_RX)
+
+    def _client(self, src):
+        from converter.scene_runtime_topology.module_domain import _CLIENT_RX
+        return self._fires(src, _CLIENT_RX)
+
+    def test_api_token_inside_string_is_not_a_signal(self) -> None:
+        assert not self._server('local s = "x.OnServerEvent"')
+        assert not self._client('local s = "Players.LocalPlayer"')
+
+    def test_whole_call_as_string_literal_is_not_a_signal(self) -> None:
+        # The GetService("ServerStorage") text inside an OUTER (single-quoted)
+        # Luau string is data, not a call.
+        src = "local s = 'game:GetService(\"ServerStorage\")'"
+        assert not self._server(src)
+
+    def test_real_call_still_fires(self) -> None:
+        assert self._server('remote.OnServerEvent:Connect(fn)')
+        assert self._server('local s = game:GetService("ServerStorage")')
+        assert self._client('local p = game.Players.LocalPlayer')
+
+    def test_code_signal_beside_decoy_string_still_fires(self) -> None:
+        assert self._server('local s = "x.OnServerEvent"\nremote.OnServerEvent:Connect(f)')
+
+    def test_string_content_mask_marks_only_inside(self) -> None:
+        text = 'a"bc"d'
+        # positions: a=0 "=1 b=2 c=3 "=4 d=5 -> inside = b,c (2,3)
+        assert _string_content_mask(text) == [False, False, True, True, False, False]

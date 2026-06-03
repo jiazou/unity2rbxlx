@@ -4804,6 +4804,40 @@ script.Disabled = true
             result.counts_by_check(),
         )
 
+        # Slice-4 per-check fail-closed promotion. The metric above is always
+        # recorded (shadow). Here a FLIPPED check's ``warning`` rows
+        # (``FAIL_CLOSED_CHECKS``) promote to ``ctx.errors``, so
+        # ``conversion_report.success`` becomes False on a real contract
+        # breach. The escape hatch is read AT THIS GATE
+        # (compute-the-metric-but-don't-abort), distinct from the
+        # shadow-disable hatch at entry — so the metric stays populated even
+        # when promotion is suppressed for a release.
+        #
+        # REPLACE the verifier-owned rows, don't append (codex review P0):
+        # ``ctx.errors`` persists + reloads across a ``materialize_and_classify``
+        # resume, so a prior run's promotion would survive a now-clean rerun (or
+        # a fail-open rerun) and keep ``success=False`` for the wrong reason —
+        # the same ownership bug the metric stash already fixed. Drop every prior
+        # verifier-prefixed error FIRST (both directions: clean + fail-open), then
+        # re-add the current run's (unless the hatch suppresses promotion).
+        prefix = contract_verifier.CONTRACT_ERROR_PREFIX
+        self.ctx.errors[:] = [
+            e for e in self.ctx.errors if not e.startswith(prefix)
+        ]
+        promotable = contract_verifier.fail_closed_errors(result)
+        if os.environ.get(
+            "U2R_CONTRACT_VERIFIER_FAIL_OPEN", "").strip().lower() in (
+            "1", "true", "yes",
+        ):
+            if promotable:
+                log.warning(
+                    "[contract_verifier] %d fail-closed violation(s) suppressed "
+                    "via U2R_CONTRACT_VERIFIER_FAIL_OPEN (metric only)",
+                    len(promotable),
+                )
+        else:
+            self.ctx.errors.extend(promotable)
+
     def _maybe_run_topology_prepass(
         self,
         scene_runtime: dict[str, object],

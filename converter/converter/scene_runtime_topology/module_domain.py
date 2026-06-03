@@ -200,6 +200,206 @@ _CLIENT_RX = tuple(re.compile(p) for p in _GENERIC_CLIENT_API_PATTERNS)
 _SERVER_RX = tuple(re.compile(p) for p in _GENERIC_SERVER_API_PATTERNS)
 
 
+def _long_bracket_open(source: str, i: int) -> int | None:
+    """If ``source[i:]`` opens a Luau long bracket ``[[`` / ``[=[`` / ``[==[`` …,
+    return the ``=`` level; else None. ``i`` must point at the first ``[``."""
+    if i >= len(source) or source[i] != "[":
+        return None
+    j = i + 1
+    while j < len(source) and source[j] == "=":
+        j += 1
+    if j < len(source) and source[j] == "[":
+        return j - (i + 1)  # number of ``=`` between the brackets
+    return None
+
+
+def _skip_long_bracket(source: str, i: int, level: int) -> int:
+    """Return the index just past the closing ``]=*]`` of the long bracket that
+    opens at ``i`` with ``level`` equals signs (unterminated → end of source)."""
+    close = "]" + "=" * level + "]"
+    end = source.find(close, i + level + 2)
+    return len(source) if end == -1 else end + len(close)
+
+
+def _strip_luau_noise(source: str) -> str:
+    """Replace Luau COMMENTS and LONG-BRACKET strings with spaces before the
+    domain-signal scan, KEEPING short quoted strings (the API patterns key off
+    their string args, e.g. ``GetService("ServerStorage")``).
+
+    A single lexical pass — so a ``--`` or paren inside a quoted string isn't
+    mistaken for a comment/grouping, and a ``require(`` / API token inside a
+    comment or ``[[..]]`` string is removed rather than scanned or (worse)
+    consumed across (codex review: the scan must not fire on, or
+    ``_strip_require_calls`` over-consume across, commented/long-bracket
+    regions)."""
+    out: list[str] = []
+    i, n = 0, len(source)
+    while i < n:
+        c = source[i]
+        if c == '"' or c == "'":  # quoted string — keep verbatim
+            out.append(c)
+            i += 1
+            while i < n:
+                d = source[i]
+                out.append(d)
+                i += 1
+                if d == "\\" and i < n:
+                    out.append(source[i])
+                    i += 1
+                elif d == c:
+                    break
+            continue
+        if c == "[":  # possible long-bracket string
+            level = _long_bracket_open(source, i)
+            if level is not None:
+                i = _skip_long_bracket(source, i, level)
+                out.append(" ")
+                continue
+        if c == "-" and i + 1 < n and source[i + 1] == "-":  # comment
+            level = _long_bracket_open(source, i + 2)
+            if level is not None:  # long comment --[[ ]]
+                i = _skip_long_bracket(source, i + 2, level)
+            else:  # line comment -- ...
+                while i < n and source[i] != "\n":
+                    i += 1
+            out.append(" ")
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _string_content_mask(text: str) -> list[bool]:
+    """Mark every character that lies INSIDE a quoted-string literal's content
+    (between the delimiters, escapes included) as ``True``; code positions and
+    the quote delimiters themselves are ``False``.
+
+    Callers pass text that has already had comments + long-bracket strings
+    removed (``_strip_luau_noise``); only short ``"..."`` / ``'...'`` strings
+    remain. The mask lets the API scan count a pattern only when its match
+    STARTS in code — so a literal like ``"x.OnServerEvent"`` or
+    ``'GetService("ServerStorage")'`` is data, not a signal, while a real
+    ``GetService("ServerStorage")`` CALL (which starts at the ``G`` in code,
+    its string arg merely nested) still fires."""
+    mask = [False] * len(text)
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == '"' or c == "'":
+            i += 1
+            while i < n:
+                d = text[i]
+                if d == "\\" and i + 1 < n:
+                    mask[i] = True
+                    mask[i + 1] = True
+                    i += 2
+                    continue
+                if d == c:
+                    break
+                mask[i] = True
+                i += 1
+            i += 1  # past the closing delimiter
+            continue
+        i += 1
+    return mask
+
+
+def _api_pattern_fires(rx: "re.Pattern[str]", text: str, in_string: list[bool]) -> bool:
+    """True iff ``rx`` matches ``text`` with the match starting in CODE (not
+    inside a string literal). Token-aware replacement for a bare
+    ``rx.search(text)`` so string CONTENTS never manufacture an API signal."""
+    return any(not in_string[m.start()] for m in rx.finditer(text))
+
+
+def _strip_require_calls(source: str) -> str:
+    """Blank out ``require(...)`` call expressions before the Luau domain-signal
+    scan.
+
+    A ``require`` argument is a MODULE-RESOLUTION path, not domain logic — and
+    the generic transpiler routinely emits a defensive
+    ``require(RS:FindFirstChild("X") or game:GetService("ServerStorage")
+    :FindFirstChild("X"))`` fallback for a cross-script require. Scanning that
+    fallback for API signals is a category error: the ``GetService("ServerStorage")``
+    in it would otherwise count as a STRONG server signal and fail-close an
+    obvious client module (e.g. ``HudControl``, a UI HUD) to ``excluded`` — which
+    in generic mode is a dead emit (the boot loop never constructs it). Strips
+    for BOTH channels (a require path is never client- OR server-domain evidence).
+    Balanced-paren aware so a nested ``GetService(...)`` inside the args is
+    consumed with it. Matches only a STANDALONE ``require`` (not ``myRequire(``
+    / ``x.require(``), and on an unterminated ``require(`` keeps the remainder
+    verbatim rather than blanking every downstream signal.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(source)
+    while i < n:
+        c = source[i]
+        # Skip quoted strings verbatim: a ``require(`` (or its args) that lives
+        # INSIDE a string literal is data, not a call (codex review: a literal
+        # ``"require(" .. game:GetService("ServerStorage")`` must not strip the
+        # real GetService). Comments / long brackets are already gone via
+        # _strip_luau_noise, so only short strings remain to guard here.
+        if c == '"' or c == "'":
+            out.append(c)
+            i += 1
+            while i < n:
+                d = source[i]
+                out.append(d)
+                i += 1
+                if d == "\\" and i < n:
+                    out.append(source[i])
+                    i += 1
+                elif d == c:
+                    break
+            continue
+        # Standalone ``require`` identifier (not ``myRequire`` / ``x.require`` /
+        # ``x:require``), optional whitespace, then ``(``.
+        if (
+            c == "r"
+            and source.startswith("require", i)
+            and (i == 0 or not (source[i - 1].isalnum() or source[i - 1] in "_.:"))
+        ):
+            k = i + len("require")
+            while k < n and source[k].isspace():  # any whitespace, incl. newline
+                k += 1
+            if k < n and source[k] == "(":
+                depth = 0
+                j = k
+                closed = False
+                in_str: str | None = None
+                escaped = False
+                while j < n:
+                    d = source[j]
+                    if in_str is not None:
+                        if escaped:
+                            escaped = False
+                        elif d == "\\":
+                            escaped = True
+                        elif d == in_str:
+                            in_str = None
+                    elif d in ("'", '"'):
+                        in_str = d
+                    elif d == "(":
+                        depth += 1
+                    elif d == ")":
+                        depth -= 1
+                        if depth == 0:
+                            j += 1
+                            closed = True
+                            break
+                    j += 1
+                if not closed:
+                    # Unterminated require(...): keep the tail verbatim so
+                    # downstream signals survive.
+                    out.append(source[i:])
+                    return "".join(out)
+                i = j  # drop the whole require(...) span
+                continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
 # ---------------------------------------------------------------------------
 # C# signal tables (v2 classifier).
 #
@@ -1336,9 +1536,28 @@ def _classify_module(
                 return override, signals, displaced
             # Clear low_confidence flag when an operator pin replaces it.
             signals.pop("low_confidence", None)
-            # Clear fail_closed_reason if we're routing off excluded.
+            # Routing a formerly-``excluded`` module onto a side: the runtime
+            # only constructs ``client``/``server``, so the pin is what makes it
+            # ship. PRESERVE the original fail-closed reason as an audit trail
+            # (do NOT silently drop it — the operator forced a side onto a
+            # verdict the classifier couldn't resolve, and the opposite-side
+            # behavior will NOT run). Move it off ``fail_closed_reason`` (which
+            # is excluded-only by contract) onto a sticky field + warn. Rule-1
+            # never reaches here (rejected above), so this only covers the
+            # ambiguity classes (Rule-4 moderate-only, Rule-7 low-confidence).
             if override != "excluded":
-                signals.pop("fail_closed_reason", None)
+                reason = signals.pop("fail_closed_reason", None)
+                if base_verdict == "excluded":
+                    signals["override_routed_off_excluded"] = True
+                    if reason is not None:
+                        signals["overridden_excluded_reason"] = reason
+                    log.warning(
+                        "[scene_runtime] %s: operator override pinned a "
+                        "formerly-excluded module (%s) to %r; opposite-side "
+                        "behavior will not run — confirm the source is not "
+                        "genuinely dual-domain",
+                        script_id, reason or "unresolved", override,
+                    )
             return override, signals, []
         # Unknown override value: ignore (treat as no override). Should
         # have been validated upstream.
@@ -1412,10 +1631,19 @@ def _collect_signals(
     # Roblox-flavoured patterns are STRONG signals per the design doc
     # §"Strong client signals" / §"Strong server signals" tables.
     if luau_source:
-        if any(rx.search(luau_source) for rx in _CLIENT_RX):
+        # Scan CODE only: strip comments + long-bracket strings (lexically, so
+        # quoted string args survive), then strip module-resolution
+        # ``require(...)`` paths — neither commented tokens nor a converter-
+        # emitted ServerStorage require-fallback should count as a signal
+        # (see _strip_luau_noise / _strip_require_calls).
+        scan_src = _strip_require_calls(_strip_luau_noise(luau_source))
+        # Token-aware: a pattern only counts when its match starts in CODE, so
+        # an API token sitting inside a string literal (data) is not a signal.
+        in_string = _string_content_mask(scan_src)
+        if any(_api_pattern_fires(rx, scan_src, in_string) for rx in _CLIENT_RX):
             luau_signals.append("roblox_client_api")
             strong_client_kinds.add("roblox_client_api")
-        if any(rx.search(luau_source) for rx in _SERVER_RX):
+        if any(_api_pattern_fires(rx, scan_src, in_string) for rx in _SERVER_RX):
             luau_signals.append("roblox_server_api")
             strong_server_kinds.add("roblox_server_api")
 

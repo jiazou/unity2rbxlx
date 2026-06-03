@@ -285,6 +285,52 @@ def stash_violations(
 
 
 # ---------------------------------------------------------------------------
+# Per-check fail-closed flip (slice 4)
+# ---------------------------------------------------------------------------
+#
+# A check flips from shadow (warning-only metric) to fail-closed PER-CHECK, on
+# its own cadence, only after its metric is clean across the runnable corpus
+# (``tests/test_contract_corpus.py``). A flipped check's ``warning`` violations
+# promote to ``ctx.errors`` at the pipeline gate (``conversion_report.success``
+# becomes False). ``info`` rows (unverifiable joins) and shadow checks never
+# promote. Add a check name here ONLY once its corpus gate is green AND the
+# corpus actually EXERCISES it (a vacuous "0 violations because 0 relevant
+# constructs" is not validation).
+#   * consumer_compliance (A): flipped — SimpleFPS exercises it (module domains);
+#     clean after the require-fallback signal fix.
+#   * component_availability (B): flipped — SimpleFPS exercises it (20 literal-arg
+#     GetComponent sites); all reachable.
+#   * cross_domain_attribute (C): flipped — the MiniNet networked corpus project
+#     (slice 6) exercises it (1 runtime client<->server edge, correctly bridged);
+#     SimpleFPS alone has 0 edges, which is why a second project was needed.
+#     (Class-2 store-mismatch is a separate deferred backstop — see the design
+#     doc §"Phase 3" slice 4d.)
+FAIL_CLOSED_CHECKS: frozenset[str] = frozenset(
+    {"consumer_compliance", "component_availability", "cross_domain_attribute"}
+)
+
+# Every promoted verifier error carries this prefix so the pipeline can REPLACE
+# its own rows on a rerun (drop prior, re-add current) — ``ctx.errors`` persists
+# across a ``materialize_and_classify`` resume, so an append-only promotion would
+# leave a stale ``success=False`` after the issue is fixed or the fail-open hatch
+# is set. Distinct from the transpile-time ``scene-runtime contract failed
+# closed`` strings, which this prefix must never match.
+CONTRACT_ERROR_PREFIX = "[contract-verifier:"
+
+
+def fail_closed_errors(result: ContractVerifierResult) -> list[str]:
+    """Error strings the pipeline promotes to ``ctx.errors`` — one per real
+    (``warning``) violation of a check in ``FAIL_CLOSED_CHECKS``. Shadow checks
+    and ``info`` rows produce nothing (they stay metric-only). Each is prefixed
+    with ``CONTRACT_ERROR_PREFIX`` so the pipeline owns + replaces them."""
+    return [
+        f"{CONTRACT_ERROR_PREFIX}{v.check}] {v.script}: {v.detail}"
+        for v in result.violations
+        if v.severity == "warning" and v.check in FAIL_CLOSED_CHECKS
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Check B — component availability (GetComponent reachability)
 # ---------------------------------------------------------------------------
 #
