@@ -1,7 +1,7 @@
 # Execution design — reaching PR#127's goal (AI-editable mega-files) alongside the scene-runtime recut
 
 **Status:** execution design · 2026-06-04 · no code
-**Inputs:** [`scene-runtime-pr5-8-recut-plan.md`](scene-runtime-pr5-8-recut-plan.md) (the scene-runtime work that remains) + PR#127's [`refactor_plan.md`](refactor_plan.md) / [`architecture_critique.md`](architecture_critique.md) (the 8-PR mega-file split, eng-reviewed + codex-vetted, 9 locked decisions).
+**Inputs:** [`scene-runtime-pr5-8-recut-plan.md`](scene-runtime-pr5-8-recut-plan.md) (the scene-runtime work that remains) + the refactor [`refactor_plan.md`](../refactor_plan.md) / [`architecture_critique.md`](../architecture_critique.md) (the 8-PR mega-file split, eng-reviewed + codex-vetted, 9 locked decisions; migrated here from the closed PR #127).
 **Scope of this doc:** the *interleaving / gating* of the two efforts. It does **not** redesign any PR-B…PR-H internals — those 9 locked decisions stand. It changes only the **gate**, which PR#127 itself flags as a user decision (codex round-4 P1: "a compressed plan silently reverted the user-locked 'all held' decision" — so the gate change here is surfaced explicitly, not baked in).
 
 ## The reframe — why the blanket hold is now partly stale
