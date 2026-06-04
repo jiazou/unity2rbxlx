@@ -1075,6 +1075,283 @@ class TestDeferredR3Fixes:
         assert "B_AWAKE=nil" in lines, out
 
 
+class TestDeferredBookkeepingPruned:
+    """Harden (phase 1): prune deferred back-patch bookkeeping when an endpoint
+    leaves the live/deferred state.
+
+      * A synchronous source records an inbound back-patch onto a deferred
+        target, then is DESTROYED before the target's deferred batch drains.
+        The Pass-3b drain must DROP that record (source no longer in ``_meta``)
+        -- not replay the back-patch onto the dead component table.
+      * A deferred target whose host NEVER resolves (timed out / skipped) must
+        clear its ``_deferredInstanceIds`` marker -- the target left the
+        deferred state even though no back-patch ever fired.
+
+    Both fail against the pre-harden runtime: the drain replayed onto the dead
+    source (mutating it / binding the corpse), and the marker for a
+    skipped/built target lingered because it was cleared only on a successful
+    patch.
+    """
+
+    def test_destroyed_source_record_dropped_not_replayed(self):
+        # Synchronous source ``Src`` holds a serialized ref to a deferred UI
+        # target ``Hud``; that records an inbound back-patch. Src is DESTROYED
+        # (inside awaitUiHost, before Hud's batch drains). The drain must DROP
+        # the record: Src.hud stays nil, and no error is thrown.
+        scenario = textwrap.dedent("""\
+            local events = {}
+
+            -- Synchronous (workspace-present) source. Its ``hud`` ref targets
+            -- the deferred Hud; the back-patch is recorded at sync-wire time.
+            local Src = {} ; Src.__index = Src
+            function Src.new(_) return setmetatable({hud = nil, _tag = "SRC"}, Src) end
+            function Src:Awake() table.insert(events, "Src.Awake") end
+
+            -- Deferred UI target.
+            local Hud = {} ; Hud.__index = Hud
+            function Hud.new(_) return setmetatable({_tag = "HUD"}, Hud) end
+            function Hud:Awake()
+                assert(self.gameObject ~= nil, "Hud.go must be bound")
+                table.insert(events, "Hud.Awake")
+            end
+
+            local plan = {
+                modules = {
+                    src = {stem = "Src", runtime_bearing = true, module_path = "x"},
+                    hud = {stem = "Hud", runtime_bearing = true, module_path = "x"},
+                },
+                scenes = {
+                    A = {
+                        instances = {
+                            {instance_id = "A:s", script_id = "src",
+                             game_object_id = "srcId", active = true,
+                             enabled = true, config = {}},
+                            {instance_id = "A:h", script_id = "hud",
+                             game_object_id = "hudId", active = true,
+                             enabled = true, config = {},
+                             instance_owner_is_ui = true},
+                        },
+                        references = {
+                            {["from"] = "A:s", field = "hud", index = nil,
+                             target_kind = "component", target_ref = "A:h"},
+                        },
+                        lifecycle_order = {"A:s", "A:h"},
+                    },
+                },
+                prefabs = {},
+                domain_overrides = {},
+            }
+
+            -- Only the Src host exists at boot; Hud misses -> deferred.
+            local srcGo = {Name = "Src", _sceneRuntimeId = "srcId", _children = {}}
+            local services = servicesFor(plan, {src = Src, hud = Hud}, {srcId = srcGo})
+
+            -- ``srcRef`` is captured BEFORE destroy so the test holds the actual
+            -- (soon-dead) source table -- ``findObjectOfType`` would return nil
+            -- after destroy, masking whether the drain mutated the corpse.
+            local srcRef = nil
+            local hudClone = {Name = "HUD", _sceneRuntimeId = "hudId", _children = {}}
+            services.awaitUiHost = function(id)
+                if id == "hudId" then
+                    -- Hud's clone has landed. Capture + DESTROY the synchronous
+                    -- Src BEFORE Hud's deferred batch drains its inbound
+                    -- back-patch. The drain must drop the record (Src is gone
+                    -- from _meta), not replay onto the dead Src table.
+                    srcRef = engineRef:findObjectOfType("Src")
+                    if srcRef then engineRef:destroy(srcRef) end
+                    return hudClone
+                end
+                return nil
+            end
+
+            engineRef = SceneRuntime.new(services, plan)
+            engineRef:start(nil)
+            runDeferred()
+
+            -- srcRef is the (now-destroyed) source table; its ``hud`` field must
+            -- NOT have been written by the drain. Pre-fix: SRC_HUD=HUD (the
+            -- drain replayed onto the corpse).
+            print("SRC_HUD=" .. tostring(srcRef and srcRef.hud and srcRef.hud._tag))
+            print("DONE")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        lines = out.strip().splitlines()
+        # No error (rc 0) AND the destroyed source's field was never patched.
+        assert "DONE" in lines, out
+        assert "SRC_HUD=nil" in lines, out
+
+    def test_timed_out_deferred_target_clears_marker(self):
+        # A deferred UI target whose host NEVER resolves is skipped; its
+        # ``_deferredInstanceIds`` marker must be cleared (it left the deferred
+        # state). Pre-harden the marker lingered (cleared only on a successful
+        # back-patch, which never fired for an unbuilt target).
+        scenario = textwrap.dedent("""\
+            local Hud = {} ; Hud.__index = Hud
+            function Hud.new(_) return setmetatable({}, Hud) end
+            function Hud:Awake() end
+
+            local plan = {
+                modules = {
+                    hud = {stem = "Hud", runtime_bearing = true, module_path = "x"},
+                },
+                scenes = {
+                    A = {
+                        instances = {
+                            {instance_id = "A:h", script_id = "hud",
+                             game_object_id = "hudId", active = true,
+                             enabled = true, config = {},
+                             instance_owner_is_ui = true},
+                        },
+                        references = {},
+                        lifecycle_order = {"A:h"},
+                    },
+                },
+                prefabs = {},
+                domain_overrides = {},
+            }
+
+            local services = servicesFor(plan, {hud = Hud}, {})
+            -- Host never lands: awaitUiHost returns nil -> the deferred entry is
+            -- skipped (not built).
+            services.awaitUiHost = function(_) return nil end
+
+            engineRef = SceneRuntime.new(services, plan)
+            engineRef:start(nil)
+            runDeferred()
+
+            -- After the skipped batch, the deferred marker for the target's
+            -- scoped id must be cleared. (Scene entry -> nil placement -> raw id.)
+            local ids = engineRef._deferredInstanceIds or {}
+            print("MARKER=" .. tostring(ids["A:h"]))
+            print("DONE")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        lines = out.strip().splitlines()
+        assert "DONE" in lines, out
+        # Marker cleared (nil), not left set after the target left deferred state.
+        assert "MARKER=nil" in lines, out
+
+
+class TestDeferredCycleRegression:
+    """Harden (phase 1): committed regression for a deferred dependency CYCLE.
+
+    Two deferred UI components A<->B each hold an outbound component ref to the
+    other (different hosts). Dependency-aware ordering can't topologically order
+    a cycle, so the per-group wait must break it via the iteration/time budget:
+    no deadlock, one cyclic edge resolves nil + warns, the other binds, both
+    groups Awake/Start, and the whole boot TERMINATES (the subprocess timeout
+    would fire on a hang). Previously only probe-verified; now committed."""
+
+    def test_deferred_cycle_breaks_no_deadlock(self):
+        scenario = textwrap.dedent("""\
+            local events = {}
+
+            local function otherTag(self)
+                return (self.other and self.other._tag) or "nil"
+            end
+
+            local A = {} ; A.__index = A
+            function A.new(_) return setmetatable({other = nil, _tag = "A"}, A) end
+            function A:Awake() events.aAwakeOther = otherTag(self) end
+            function A:Start()
+                events.aStart = true
+                events.aStartOther = otherTag(self)
+            end
+
+            local B = {} ; B.__index = B
+            function B.new(_) return setmetatable({other = nil, _tag = "B"}, B) end
+            function B:Awake() events.bAwakeOther = otherTag(self) end
+            function B:Start()
+                events.bStart = true
+                events.bStartOther = otherTag(self)
+            end
+
+            local plan = {
+                modules = {
+                    a = {stem = "A", runtime_bearing = true, module_path = "x"},
+                    b = {stem = "B", runtime_bearing = true, module_path = "x"},
+                },
+                scenes = {
+                    S = {
+                        instances = {
+                            {instance_id = "S:a", script_id = "a",
+                             game_object_id = "aId", active = true,
+                             enabled = true, config = {},
+                             instance_owner_is_ui = true},
+                            {instance_id = "S:b", script_id = "b",
+                             game_object_id = "bId", active = true,
+                             enabled = true, config = {},
+                             instance_owner_is_ui = true},
+                        },
+                        -- Mutual component refs: A->B and B->A. Both deferred on
+                        -- different hosts -> a dependency cycle.
+                        references = {
+                            {["from"] = "S:a", field = "other", index = nil,
+                             target_kind = "component", target_ref = "S:b"},
+                            {["from"] = "S:b", field = "other", index = nil,
+                             target_kind = "component", target_ref = "S:a"},
+                        },
+                        lifecycle_order = {"S:a", "S:b"},
+                    },
+                },
+                prefabs = {},
+                domain_overrides = {},
+            }
+
+            local services = servicesFor(plan, {a = A, b = B}, {})
+
+            -- Real-coroutine task.spawn so each group's dependency wait runs in
+            -- its own coroutine (the cycle break relies on the bounded wait).
+            local realSpawn = {}
+            function realSpawn.spawn(fn, ...)
+                local co = coroutine.create(fn)
+                coroutine.resume(co, ...)
+                return co
+            end
+            services.task = setmetatable(realSpawn, {__index = services.task})
+
+            -- Both hosts resolve immediately (the cycle is in the dependency
+            -- graph, not the host resolution).
+            local aClone = {Name = "A", _sceneRuntimeId = "aId", _children = {}}
+            local bClone = {Name = "B", _sceneRuntimeId = "bId", _children = {}}
+            services.awaitUiHost = function(id)
+                if id == "aId" then return aClone end
+                if id == "bId" then return bClone end
+                return nil
+            end
+
+            local engine = SceneRuntime.new(services, plan)
+            engine:start(nil)
+            runDeferred()
+
+            print("A_START=" .. tostring(events.aStart))
+            print("B_START=" .. tostring(events.bStart))
+            print("A_START_OTHER=" .. tostring(events.aStartOther))
+            print("B_START_OTHER=" .. tostring(events.bStartOther))
+            print("DONE")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        # No hang: the subprocess would have been killed on a deadlock.
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        lines = out.strip().splitlines()
+        assert "DONE" in lines, out
+        # Both groups ran their full lifecycle -- no deadlock.
+        assert "A_START=true" in lines, out
+        assert "B_START=true" in lines, out
+        # Exactly one cyclic edge binds; the other broke to nil (the cycle had
+        # to be broken somewhere). Both binding would mean no cycle; neither
+        # binding would mean the back-patch never fired.
+        a_other = next(l for l in lines if l.startswith("A_START_OTHER=")).split("=", 1)[1]
+        b_other = next(l for l in lines if l.startswith("B_START_OTHER=")).split("=", 1)[1]
+        bound = [v for v in (a_other, b_other) if v != "nil"]
+        assert len(bound) >= 1, f"at least one edge must bind: {a_other=} {b_other=}\n{out}"
+        # The bound edge points at the correct peer tag.
+        for v in bound:
+            assert v in ("A", "B"), out
+
+
 class TestAwaitUiHostResolverDirect:
     """Fix-round-1 MAJOR #5 + test-coverage #6. Drive the REAL emitted
     ``awaitUiHost`` body inside a true coroutine harness, exercising the

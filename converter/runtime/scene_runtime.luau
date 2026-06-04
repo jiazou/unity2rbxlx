@@ -2229,6 +2229,16 @@ function SceneRuntime:_completeDeferredBatch(pending)
 	for _, entry in ipairs(ordered) do
 		local inst = entry.inst
 		local goInst = entry.goInst
+		-- Clear the deferred marker as the target leaves the deferred state
+		-- (built below, OR skipped on a nil host). The marker is set in
+		-- ``_deferUiInstance`` and only consumed by the synchronous wire pass
+		-- (already finished); keeping it honest means a never-built/destroyed
+		-- target is no longer flagged as deferred. (harden: clear on every
+		-- exit from deferred state, not only on a successful back-patch.)
+		if engine._deferredInstanceIds ~= nil then
+			engine._deferredInstanceIds[
+				_idWithPlacement(entry.placement_id, inst.instance_id)] = nil
+		end
 		if goInst == nil then
 			-- Fail-closed diagnostics: never bind nil silently. The
 			-- component is simply not built (matches "UI legitimately
@@ -2312,20 +2322,25 @@ function SceneRuntime:_completeDeferredBatch(pending)
 	if engine._inboundRefsToDeferred then
 		local kept = {}
 		for _, rec in ipairs(engine._inboundRefsToDeferred) do
-			-- ``rec.target_ref`` is the PLACEMENT-SCOPED key (codex r3); resolve
-			-- against the engine union registry (also scoped) rather than the
-			-- batch-local ``builtByInstanceId`` (raw-keyed) so the record binds
-			-- the correct placement's clone -- and so a target built by ANY
-			-- batch (cross-host) resolves, not only this one.
-			local target = engine._componentByInstanceId[rec.target_ref]
-			if target ~= nil then
-				engine:_assignFieldOnComponent(
-					rec.source, rec.field, rec.index, target)
-				engine._deferredInstanceIds[rec.target_ref] = nil
-			else
-				-- Target not yet built (host never landed, or a multi-batch
-				-- shape) -- keep the record for a later batch.
-				table.insert(kept, rec)
+			-- harden: drop records whose source component has left ``_meta``
+			-- (destroyed before this drain). Replaying the stored back-patch
+			-- would mutate a dead component table -- the source is gone, so the
+			-- record is garbage (neither replayed nor kept).
+			if engine._meta[rec.source] ~= nil then
+				-- ``rec.target_ref`` is the PLACEMENT-SCOPED key (codex r3); resolve
+				-- against the engine union registry (also scoped) rather than the
+				-- batch-local ``builtByInstanceId`` (raw-keyed) so the record binds
+				-- the correct placement's clone -- and so a target built by ANY
+				-- batch (cross-host) resolves, not only this one.
+				local target = engine._componentByInstanceId[rec.target_ref]
+				if target ~= nil then
+					engine:_assignFieldOnComponent(
+						rec.source, rec.field, rec.index, target)
+				else
+					-- Target not yet built (host never landed, or a multi-batch
+					-- shape) -- keep the record for a later batch.
+					table.insert(kept, rec)
+				end
 			end
 		end
 		engine._inboundRefsToDeferred = (#kept > 0) and kept or nil
