@@ -173,6 +173,35 @@ runtime-library injection, `_subphase_patch_setup_sounds`) — all off. The
 host runtime replaces them wholesale; the only library injected is
 `runtime/scene_runtime.luau`.
 
+**The allowlist is a permanent deterministic lowering layer — not "zero
+post-transpile transforms."** Asset-reference rewriting and
+module-require-path resolution both transform emitted module source; they
+are allowlisted because they are *deterministic, spec-owned lowering*, not
+*ad-hoc identity-gated repair*. That distinction — **not** "does it touch
+emitted Luau" — is the boundary generic enforces:
+
+- **Coherence packs** (`script_coherence_packs.py`, `run_packs()`):
+  ad-hoc, often per-game identity-gated (`s.name == "Door"`), regex
+  surgery over AI output. This is the mechanism generic eliminates.
+- **Lowering passes** (the allowlist): deterministic, generic
+  (structural-fingerprint-gated, never per-game), spec-owned transforms
+  that bridge a *stable, statically-recognizable* Unity→Roblox primitive.
+  This layer is **permanent and expected to grow modestly.**
+
+Generic retires the *coherence-pack mechanism*, not all post-transpile
+fidelity logic. There is no behavioral oracle (the verifier is structural
+only — §"verify + reprompt"), and some semantic-fidelity gaps are
+statically recognizable but **not preventable by prompt + structural
+verifier alone** (prompt teaching is a hint, not enforcement). Those gaps
+get a deterministic home — a lowering pass and/or a host-runtime service —
+never a per-game pack. Planned additions to this layer: `unity_instantiate`
+object-ref lowering (see `FUTURE_IMPROVEMENTS.md`) and the camera/input
+facet lowering that backs the camera/input runtime service (PR8, below).
+A new allowlist entry must clear the bar: *deterministic, generic,
+anchored to a named stable primitive.* If it can only be expressed as
+identity-gated output-spelling repair, it is a pack and does not belong
+in generic.
+
 **Enforcement = verify + reprompt + fail-closed.** No mechanical
 relocation of module-scope side-effects (that's semantic rewriting).
 Instead `runtime_contract.py`:
@@ -639,7 +668,7 @@ landable (inert by default); PR3b onward form a chain.
 | PR5 | `auto` mode + canary: trash-dash (state-machine, ~12 cross-domain edges expected) + SimpleFPS (~6–8 edges) + one cross-domain-heavy project (UI-controller / server-gameplay split — stresses Piece 6 policy + report) + one trigger/collision-driven project (regresses rule-(f) emission and the `host:connect`-in-`Awake` pattern, per Mode-semantics vector 3) + one multi-scene project under `generic`, MCP-verify, compare against legacy. | PR4 | Med |
 | PR6 | **Hard guard rail (lands before default flip):** `write_output` fails if runtime-bearing MonoBehaviours exist with no valid plan+host — generic/auto only; `--allow-nonplayable-output` escape. | PR5 | Low |
 | PR7 | **Flip default to `auto`:** legacy retained as per-run escape hatch. PR6 lands first so the guard rail protects the default before it flips. | PR6 | Med |
-| PR8 | Retire FPS scaffolding + dependency web: `--scaffolding=fps`, `converter/scaffolding/`, `detect_fps_game`, `is_fps_game` and its `LockFirstPerson` camera wiring, three FPS coherence packs. Rewrite skill Phases 4a/4c as structured plan overrides. | PR7 | Med |
+| PR8 | **Land the minimal first-person camera/input runtime service + camera-facet lowering pass (the retirement target), THEN** retire FPS scaffolding + dependency web: `--scaffolding=fps`, `converter/scaffolding/`, `detect_fps_game`, `is_fps_game` and its `LockFirstPerson` camera wiring, three FPS coherence packs (`fps_camera_yaw_from_player_pivot`, `fps_camera_pitch_inversion`, `fps_default_controls_off`) — their jobs move into the service so generic SimpleFPS stays playable across the cut. Rewrite skill Phases 4a/4c as structured plan overrides. Service scope is capped (see "Camera / input" under NOT in scope). | PR7 | Med |
 
 **PR3a → PR3b/PR4 gate.** The verifier pass rate is the single biggest
 unquantified risk; PR4 is the largest build. PR3a ends with a compliance
@@ -760,9 +789,30 @@ compliance uncontaminated by the new classifier tables.
 
 ## NOT in scope (deferred)
 
-- **Camera / input platform-divergence** — host runtime ships first with
-  MonoBehaviour wiring only; character/camera/input is a generic config
-  layer after PR8.
+- **Camera / input platform-divergence** — split. The MonoBehaviour host
+  runtime ships first (Pieces 1–6) with no camera/input surface. But the
+  **minimal first-person camera/input fidelity service is a PR8
+  prerequisite, not a post-PR8 deferral** (see contradiction resolved
+  below): retiring the three FPS coherence packs (`fps_camera_yaw_from_player_pivot`,
+  `fps_camera_pitch_inversion`, `fps_default_controls_off`) requires their
+  jobs to have a generic home *first*, or generic SimpleFPS regresses to
+  non-yawing at the moment of retirement. Scope of the minimal service is
+  capped (camera pose composition world-yaw∘local-pitch, pitch clamp,
+  recoil API, default-controls-off + body-hide + spawn-snap, rig/viewmodel
+  anchoring, read-only `CurrentCamera.CFrame`, the E2E mouse channel) — it
+  must NOT absorb movement, weapon, or CharacterController logic ("owning
+  locomotion = rebuilding Unity"). The **broader** camera/input config
+  surface (full input remapping, camera modes beyond first-person,
+  third-person follow) stays deferred past PR8.
+
+  **Timing contradiction (resolved).** Earlier drafts said camera/input is
+  "a generic config layer after PR8," yet PR5/PR7 require SimpleFPS
+  *playable* under generic and PR8 retires the FPS scaffolding + three FPS
+  packs that currently provide first-person fidelity. Those cannot all
+  hold: retiring the packs after their replacement leaves a non-playable
+  gap. Since generic is intended to *replace* legacy, the resolution is
+  that the minimal first-person service lands **as the retirement target of
+  PR8** (the packs/scaffolding retire *into* it), not after it.
 - **A bundled Luau AST parser** — verifier uses lexical detection; AST
   would only sharpen edge cases, separate evaluation.
 - **In-place scene transitions (`SceneManager.LoadScene`)** — one place
