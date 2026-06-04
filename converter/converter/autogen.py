@@ -701,6 +701,58 @@ local function workspaceFind(sceneRuntimeId)
     return nil
 end
 
+-- Event-driven resolve for a UI-owned host whose StarterGui->PlayerGui
+-- clone may not have landed yet at boot. The synchronous ``workspaceFind``
+-- above is one-shot (it must never yield -- the host build loop relies on
+-- ``start()`` never yielding to preserve Awake-before-Start); this helper
+-- is the YIELDING counterpart the host calls ONLY for UI-owned instances
+-- that missed, from an already-spawned coroutine (never the main build
+-- loop). It does an initial scan, then waits on ``PlayerGui.DescendantAdded``
+-- for the matching ``_SceneRuntimeId`` rather than polling on a fixed
+-- timer -- a timeout is fail-closed diagnostics (return nil; the host
+-- ``warn``s the id), never a silent nil correctness assumption, because
+-- PlayerGui can exist before the StarterGui copy lands (and
+-- ``CharacterAutoLoads=false`` delays the copy until ``LoadCharacterAsync``).
+local function awaitUiHost(sceneRuntimeId)
+    if not PlayerGui then
+        -- No live PlayerGui: nothing to wait on. Fall back to the one-shot
+        -- scan (covers the StarterGui-template edge) and return its result.
+        return workspaceFind(sceneRuntimeId)
+    end
+    -- Initial scan: the clone may already be present by the time the host
+    -- gets here (the build loop ran first).
+    for _, gui in PlayerGui:GetDescendants() do
+        if gui:GetAttribute("_SceneRuntimeId") == sceneRuntimeId then
+            return gui
+        end
+    end
+    -- Event-driven wait. Resolve the first matching descendant added under
+    -- PlayerGui, OR bail after a bounded window (fail-closed diagnostics).
+    local resolved = nil
+    local done = false
+    local thread = coroutine.running()
+    local conn
+    conn = PlayerGui.DescendantAdded:Connect(function(desc)
+        if done then return end
+        if desc:GetAttribute("_SceneRuntimeId") == sceneRuntimeId then
+            resolved = desc
+            done = true
+            if conn then conn:Disconnect(); conn = nil end
+            task.spawn(thread)
+        end
+    end)
+    -- Timeout guard: if the clone never lands, wake the waiter so the host
+    -- can warn rather than hang forever.
+    task.delay(10, function()
+        if done then return end
+        done = true
+        if conn then conn:Disconnect(); conn = nil end
+        task.spawn(thread)
+    end)
+    coroutine.yield()
+    return resolved
+end
+
 local function resolveModule(scriptId, modulePath)
     -- modulePath is the live DataModel path, dot-joined
     -- (``"ReplicatedStorage.Foo"`` /
@@ -742,6 +794,7 @@ local services = {
     warn = warn,
     resolveModule = resolveModule,
     workspaceFind = workspaceFind,
+    awaitUiHost = awaitUiHost,
     findFirstChildWhichIsA = function(inst, class)
         -- ``GetComponent("Rigidbody")`` etc. should hit a built-in
         -- attached directly to the GameObject AS WELL as nested

@@ -1701,34 +1701,35 @@ function SceneRuntime:_constructPrefabClone(clone, prefab, prefab_id, includeScr
 					end
 				end
 			end
-			local comp = self:_buildComponent(
-				inst.script_id, goInst, ns_goid,
-				(goInst and goInst.Name) or "", inst.config or {},
-				"prefab", prefab_id)
-			if comp then
-				componentByInstanceId[inst.instance_id] = comp
-				table.insert(componentList, comp)
-				-- Honor planner-supplied active/enabled/tag for prefab
-				-- instances exactly as the scene boot path does (R3-P1.1).
-				-- ``_injectHostSurface`` reads ``m.activeSelf`` /
-				-- ``m.enabled`` to decide whether to overwrite with
-				-- defaults; mirror the scene path so a prefab instance
-				-- booted dormant (``enabled=false`` / ``active=false``)
-				-- stays dormant until ``setEnabled`` / ``setActive``.
-				local m = self._meta[comp]
-				m.activeSelf = inst.active ~= false
-				m.enabled = inst.enabled ~= false
-				if inst.tag and inst.tag ~= "" then
-					m.tag = inst.tag
-					local list = self._byTag[inst.tag]
-					if not list then list = {}; self._byTag[inst.tag] = list end
-					local present = false
-					for _, x in ipairs(list) do
-						if x == goInst then present = true; break end
-					end
-					if goInst ~= nil and not present then
-						table.insert(list, goInst)
-					end
+			-- Slice 1.1: a UI-owned prefab instance whose host lookup missed
+			-- defers to event-driven PlayerGui resolution, identical to the
+			-- scene-boot path. Non-UI misses keep the one-shot behaviour.
+			if goInst == nil and self:_isUiOwned(inst) then
+				self:_deferUiInstance({
+					inst = inst,
+					gameObjectId = ns_goid,
+					ownerKind = "prefab",
+					ownerRef = prefab_id,
+					references = prefab.references or {},
+					byInstanceId = instanceById,
+					placement_id = placement_id,
+				})
+			else
+				local comp = self:_buildComponent(
+					inst.script_id, goInst, ns_goid,
+					(goInst and goInst.Name) or "", inst.config or {},
+					"prefab", prefab_id)
+				if comp then
+					componentByInstanceId[inst.instance_id] = comp
+					table.insert(componentList, comp)
+					-- Honor planner-supplied active/enabled/tag for prefab
+					-- instances exactly as the scene boot path does (R3-P1.1).
+					-- ``_injectHostSurface`` reads ``m.activeSelf`` /
+					-- ``m.enabled`` to decide whether to overwrite with
+					-- defaults; mirror the scene path so a prefab instance
+					-- booted dormant (``enabled=false`` / ``active=false``)
+					-- stays dormant until ``setEnabled`` / ``setActive``.
+					self:_applyPlannerFlagsAndTag(comp, inst, goInst)
 				end
 			end
 		end
@@ -1783,6 +1784,136 @@ function SceneRuntime:instantiatePrefab(prefab_id, parent, cframe, externalRefs)
 		clone, prefab, prefab_id, nil, externalRefs, placement_id)
 	self:_runAwakeEnableStart(componentList)
 	return clone
+end
+
+-- ---------------------------------------------------------------------
+-- Slice 1.1: deferred UI-host gameObject resolution (generic boot race)
+-- ---------------------------------------------------------------------
+-- A UI-owned instance (``inst.instance_owner_is_ui == true``) binds its
+-- host GameObject to a ScreenGui that Roblox clones StarterGui->PlayerGui
+-- at spawn. At client boot the synchronous build loop can run BEFORE that
+-- clone lands, so the one-shot ``workspaceFind`` returns nil. Building the
+-- component with a nil gameObject crashes UI controllers (HudControl:46).
+--
+-- Rather than yield inside the build loop (which would break the
+-- ``start() never yields`` invariant that keeps every batch's Awake/OnEnable
+-- ahead of any deferred Start), we DEFER such missed UI instances entirely:
+-- they are collected during the synchronous pass, then constructed +
+-- lifecycled in their OWN batch from a spawned coroutine that waits
+-- event-driven (``awaitUiHost`` -> ``PlayerGui.DescendantAdded``) for the
+-- clone. Non-UI misses keep their current one-shot behaviour (built now
+-- with a nil gameObject, no waiting, no timeout penalty).
+--
+-- SCOPE: initial boot only. ``instance.gameObject`` is bound once; the HUD
+-- is ResetOnSpawn=false so its clone persists across respawns and no
+-- rebind is needed. Respawn re-clone rebind (ResetOnSpawn=true GUIs) is an
+-- explicit out-of-scope followup (see RUN_DIR/followups.md).
+
+function SceneRuntime:_isUiOwned(inst)
+	-- The planner stamps ``instance_owner_is_ui = true`` only on UI-subtree
+	-- instances (the field is absent otherwise), so a strict ``== true``
+	-- gate keeps every non-UI instance on the fast one-shot path.
+	return inst ~= nil and inst.instance_owner_is_ui == true
+end
+
+function SceneRuntime:_applyPlannerFlagsAndTag(comp, inst, goInst)
+	-- Honor planner-supplied active/enabled/tag for a freshly built
+	-- component. Shared by the synchronous scene/prefab loops and the
+	-- deferred-UI completion path so they stay byte-identical.
+	local m = self._meta[comp]
+	m.activeSelf = inst.active ~= false
+	m.enabled = inst.enabled ~= false
+	if inst.tag and inst.tag ~= "" then
+		m.tag = inst.tag
+		local list = self._byTag[inst.tag]
+		if not list then list = {}; self._byTag[inst.tag] = list end
+		local present = false
+		for _, x in ipairs(list) do
+			if x == goInst then present = true; break end
+		end
+		if goInst ~= nil and not present then
+			table.insert(list, goInst)
+		end
+	end
+end
+
+function SceneRuntime:_deferUiInstance(entry)
+	-- Collect a UI-owned instance whose synchronous ``workspaceFind``
+	-- missed; ``_resolveDeferredUiInstances`` completes it after the
+	-- synchronous boot.
+	self._deferredUiInstances = self._deferredUiInstances or {}
+	table.insert(self._deferredUiInstances, entry)
+end
+
+function SceneRuntime:_resolveDeferredUiInstances()
+	-- Called AFTER the whole synchronous boot (all scene + prefab batches'
+	-- Awake/OnEnable have run and their Starts are armed via task.defer).
+	-- Each deferred UI instance is completed in its own spawned coroutine
+	-- so the wait is event-driven and never blocks the others. Because the
+	-- component was NOT built during the synchronous pass, its own
+	-- Awake/OnEnable/Start all run together in a late batch once its clone
+	-- resolves -- the ordering invariant for the synchronously-built
+	-- components is untouched.
+	local pending = self._deferredUiInstances
+	if not pending or #pending == 0 then return end
+	self._deferredUiInstances = nil
+
+	local resolver = self._services.awaitUiHost
+	local engine = self
+	for _, entry in ipairs(pending) do
+		local spawn = self._services.task and self._services.task.spawn
+		local function complete()
+			local goInst = nil
+			if resolver then
+				goInst = resolver(entry.gameObjectId)
+			end
+			if goInst == nil then
+				-- Fail-closed diagnostics: never bind nil silently. The
+				-- component is simply not built (matches "UI legitimately
+				-- absent"); a downstream nil-gameObject crash is avoided.
+				engine._warn(string.format(
+					"[scene_runtime] UI host clone for %q never landed; "
+					.. "skipping deferred component %q",
+					tostring(entry.gameObjectId),
+					tostring(entry.inst.script_id)))
+				return
+			end
+			local inst = entry.inst
+			local comp = engine:_buildComponent(
+				inst.script_id, goInst, entry.gameObjectId,
+				goInst.Name or "", inst.config or {},
+				entry.ownerKind, entry.ownerRef)
+			if not comp then return end
+			engine:_applyPlannerFlagsAndTag(comp, inst, goInst)
+			local m = engine._meta[comp]
+			-- Scope: initial boot only. ``instance.gameObject`` is bound
+			-- once here; the HUD is ResetOnSpawn=false so its clone persists
+			-- across respawns and no rebind is needed. Respawn re-clone
+			-- rebind (ResetOnSpawn=true GUIs) is an out-of-scope followup.
+			engine:_injectHostSurface(comp, m.gameObjectInstance, m.gameObjectId)
+			-- Wire this component's OWN outbound references now that it
+			-- exists. ``_wireReferences`` only acts on refs whose source
+			-- component is present in the map, so a single-element map
+			-- wires exactly this component's outbound refs. Inbound refs
+			-- (peers that reference this deferred UI component) are an
+			-- explicit followup (see RUN_DIR/followups.md) -- UI
+			-- controllers are reference SOURCES, not targets, in practice.
+			if entry.references then
+				engine:_wireReferences(
+					entry.references, {[inst.instance_id] = comp},
+					engine._crossDomainEdges, entry.byInstanceId,
+					entry.placement_id)
+			end
+			engine:_runAwakeEnableStart({comp})
+		end
+		if spawn then
+			spawn(complete)
+		else
+			-- No task.spawn (harness without one): run inline. The resolver
+			-- itself is responsible for not yielding in that environment.
+			complete()
+		end
+	end
 end
 
 -- ---------------------------------------------------------------------
@@ -1859,29 +1990,30 @@ function SceneRuntime:start(domainFilter)
 			local inst = byInstanceId[instId]
 			if inst and includeScriptId[inst.script_id] then
 				local goInst = self._services.workspaceFind(inst.game_object_id)
-				local comp = self:_buildComponent(
-					inst.script_id, goInst, inst.game_object_id,
-					(goInst and goInst.Name) or "", inst.config or {},
-					"scene", sceneKey)
-				if comp then
-					componentByInstanceId[instId] = comp
-					table.insert(lifecycleList, comp)
-					-- Honor planner-supplied active/enabled/tag.
-					local m = self._meta[comp]
-					m.activeSelf = inst.active ~= false
-					m.enabled = inst.enabled ~= false
-					if inst.tag and inst.tag ~= "" then
-						m.tag = inst.tag
-						-- Late-bind the tag into the by-tag index.
-						local list = self._byTag[inst.tag]
-						if not list then list = {}; self._byTag[inst.tag] = list end
-						local present = false
-						for _, x in ipairs(list) do
-							if x == goInst then present = true; break end
-						end
-						if goInst ~= nil and not present then
-							table.insert(list, goInst)
-						end
+				-- Slice 1.1: a UI-owned instance whose one-shot lookup
+				-- missed defers to event-driven resolution (its
+				-- StarterGui->PlayerGui clone may not have landed yet).
+				-- Do NOT build it now with a nil gameObject. Non-UI misses
+				-- fall through to the one-shot path below unchanged.
+				if goInst == nil and self:_isUiOwned(inst) then
+					self:_deferUiInstance({
+						inst = inst,
+						gameObjectId = inst.game_object_id,
+						ownerKind = "scene",
+						ownerRef = sceneKey,
+						references = scene.references or {},
+						byInstanceId = byInstanceId,
+						placement_id = nil,
+					})
+				else
+					local comp = self:_buildComponent(
+						inst.script_id, goInst, inst.game_object_id,
+						(goInst and goInst.Name) or "", inst.config or {},
+						"scene", sceneKey)
+					if comp then
+						componentByInstanceId[instId] = comp
+						table.insert(lifecycleList, comp)
+						self:_applyPlannerFlagsAndTag(comp, inst, goInst)
 					end
 				end
 			end
@@ -2040,6 +2172,15 @@ function SceneRuntime:start(domainFilter)
 	end
 
 	self._crossDomainEdges = crossDomainEdges
+
+	-- Slice 1.1: complete any UI-owned instances whose host clone hadn't
+	-- landed during the synchronous boot. This runs AFTER every
+	-- synchronous batch's Awake/OnEnable+armed Start, so the
+	-- start()-never-yields invariant for those components is preserved; the
+	-- deferred components run their own complete late lifecycle batch once
+	-- their PlayerGui clone resolves event-driven.
+	self:_resolveDeferredUiInstances()
+
 	return crossDomainEdges
 end
 
