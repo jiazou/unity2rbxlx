@@ -85,8 +85,7 @@ def _luau_pos_is_code(source: str, pos: int) -> bool:
     Scans from the start of ``pos``'s line, tracking single/double-quoted
     strings (with backslash escapes) and ``--`` line comments -- the only forms
     the transpiler emits. Multi-line ``[[ ]]`` strings/comments and backtick
-    interpolation strings aren't modeled; they don't occur in transpiled
-    output.
+    interpolation strings aren't modeled (parity with the legacy pack).
     """
     i = source.rfind("\n", 0, pos) + 1
     quote: str | None = None
@@ -133,9 +132,25 @@ def rewrite_child_index_source(source: str) -> tuple[str, int]:
     new_source = _GETCHILDREN_INDEX_RE.sub(_repl, source)
     if count == 0:
         return source, 0
-    if "local function __unityChild(" not in new_source:
+    # Code-aware presence check: a ``local function __unityChild(`` occurrence
+    # inside a comment/string (or a stray non-code position) does NOT count as
+    # the helper being defined -- otherwise we'd suppress injection while the
+    # call sites are rewritten to ``__unityChild(...)`` -> undefined helper at
+    # runtime. Only a definition at a real code position counts.
+    if not _has_helper_definition_at_code(new_source):
         new_source = _UNITY_CHILD_HELPER + "\n" + new_source
     return new_source, count
+
+
+def _has_helper_definition_at_code(source: str) -> bool:
+    """True if ``local function __unityChild(`` appears at a real code position
+    (not inside a string/comment) -- the real helper definition."""
+    idx = source.find("local function __unityChild(")
+    while idx != -1:
+        if _luau_pos_is_code(source, idx):
+            return True
+        idx = source.find("local function __unityChild(", idx + 1)
+    return False
 
 
 def lower_child_index(scripts: list[_HasLuauSource]) -> int:
