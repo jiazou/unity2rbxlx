@@ -719,20 +719,15 @@ local function awaitUiHost(sceneRuntimeId)
         -- scan (covers the StarterGui-template edge) and return its result.
         return workspaceFind(sceneRuntimeId)
     end
-    -- Initial scan: the clone may already be present by the time the host
-    -- gets here (the build loop ran first).
-    for _, gui in PlayerGui:GetDescendants() do
-        if gui:GetAttribute("_SceneRuntimeId") == sceneRuntimeId then
-            return gui
-        end
-    end
-    -- Event-driven wait. Resolve the first matching descendant added under
-    -- PlayerGui, OR bail after a bounded window (fail-closed diagnostics).
     local resolved = nil
     local done = false
     local thread = coroutine.running()
     local conn
-    conn = PlayerGui.DescendantAdded:Connect(function(desc)
+    -- The DescendantAdded handler resumes the (yielded) waiter. ``done`` is a
+    -- check-then-set within one cooperative coroutine (events dispatch only
+    -- at resumption points, never between two synchronous statements here),
+    -- so the guard is atomic -- no double-resolve / double-resume.
+    local function onAdded(desc)
         if done then return end
         if desc:GetAttribute("_SceneRuntimeId") == sceneRuntimeId then
             resolved = desc
@@ -740,9 +735,30 @@ local function awaitUiHost(sceneRuntimeId)
             if conn then conn:Disconnect(); conn = nil end
             task.spawn(thread)
         end
-    end)
+    end
+    -- CONNECT FIRST, then scan: connecting before the initial
+    -- ``GetDescendants`` scan closes the scan-vs-connect race -- a clone that
+    -- lands after the connect but before/during the scan still fires the
+    -- event, so it can't fall into a gap that would force a false 10s timeout
+    -- (codex r1 MAJOR #5). The handler is a no-op until we yield (its
+    -- ``task.spawn(thread)`` resume only takes effect once ``thread`` is
+    -- suspended), and the ``done`` guard prevents a double-resolve if the
+    -- initial scan also finds it.
+    conn = PlayerGui.DescendantAdded:Connect(onAdded)
+    -- Initial scan: the clone may already be present by the time the host
+    -- gets here (the build loop ran first). Resolve inline + return WITHOUT
+    -- yielding -- the thread hasn't suspended, so it must not be resumed.
+    -- Setting ``done`` neutralises any event the connect above latched.
+    for _, gui in PlayerGui:GetDescendants() do
+        if not done and gui:GetAttribute("_SceneRuntimeId") == sceneRuntimeId then
+            done = true
+            if conn then conn:Disconnect(); conn = nil end
+            return gui
+        end
+    end
     -- Timeout guard: if the clone never lands, wake the waiter so the host
-    -- can warn rather than hang forever.
+    -- can warn rather than hang forever. Fail-closed diagnostics, never a
+    -- silent nil correctness assumption.
     task.delay(10, function()
         if done then return end
         done = true

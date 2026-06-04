@@ -958,6 +958,26 @@ function SceneRuntime:_wireReferences(refs, componentByInstanceId,
 					end
 				end
 			end
+			-- Slice 1.1 r1: back-patch bookkeeping. When a component-kind ref
+			-- targets an instance that was DEFERRED (its UI host clone hadn't
+			-- landed, so it wasn't built in this synchronous pass), the
+			-- resolve above yields nil. Record the (source, field, index,
+			-- target_instance_id) so ``_completeDeferredBatch`` can set the
+			-- field once the deferred target is built. Only when this wiring
+			-- pass is the synchronous boot (target genuinely absent + known
+			-- deferred) -- the deferred batch's own re-wire passes a present
+			-- map so this branch is skipped.
+			if ref.target_kind == "component" and target == nil
+			   and self._deferredInstanceIds
+			   and self._deferredInstanceIds[ref.target_ref] then
+				self._inboundRefsToDeferred = self._inboundRefsToDeferred or {}
+				table.insert(self._inboundRefsToDeferred, {
+					source = sourceComp,
+					field = ref.field,
+					index = ref.index,
+					target_ref = ref.target_ref,
+				})
+			end
 			self:_assignFieldOnComponent(sourceComp, ref.field, ref.index, target)
 		end
 	end
@@ -1560,7 +1580,17 @@ local function _idWithPlacement(placement_id, goid)
 	return goid
 end
 
-function SceneRuntime:_constructPrefabClone(clone, prefab, prefab_id, includeScriptId, externalRefs, placement_id)
+function SceneRuntime:_constructPrefabClone(clone, prefab, prefab_id, includeScriptId, externalRefs, placement_id, deferUiMisses)
+	-- ``deferUiMisses`` (optional, default false): when true, a UI-owned
+	-- instance whose host lookup misses is DEFERRED to event-driven PlayerGui
+	-- resolution (the scene/prefab BOOT path, which races the
+	-- StarterGui->PlayerGui clone). The runtime-spawn path
+	-- (``instantiatePrefab``) leaves it false: a runtime-spawned prefab
+	-- resolves its UI host against the LOCAL clone via ``resolveCloneChild``
+	-- (no PlayerGui boot race), so deferral is the wrong tool -- waiting on
+	-- ``PlayerGui.DescendantAdded`` would never fire for a host under the
+	-- clone and the component would silently drop. With it false the UI miss
+	-- falls through to the one-shot build (pre-slice behaviour).
 	-- Build a per-instance map for the prefab subplan; references are
 	-- prefab-local so the same logic applies as for scenes.
 	--
@@ -1704,7 +1734,7 @@ function SceneRuntime:_constructPrefabClone(clone, prefab, prefab_id, includeScr
 			-- Slice 1.1: a UI-owned prefab instance whose host lookup missed
 			-- defers to event-driven PlayerGui resolution, identical to the
 			-- scene-boot path. Non-UI misses keep the one-shot behaviour.
-			if goInst == nil and self:_isUiOwned(inst) then
+			if goInst == nil and deferUiMisses and self:_isUiOwned(inst) then
 				self:_deferUiInstance({
 					inst = inst,
 					gameObjectId = ns_goid,
@@ -1713,6 +1743,7 @@ function SceneRuntime:_constructPrefabClone(clone, prefab, prefab_id, includeScr
 					references = prefab.references or {},
 					byInstanceId = instanceById,
 					placement_id = placement_id,
+					externalRefs = externalRefs,
 				})
 			else
 				local comp = self:_buildComponent(
@@ -1843,77 +1874,229 @@ function SceneRuntime:_deferUiInstance(entry)
 	-- synchronous boot.
 	self._deferredUiInstances = self._deferredUiInstances or {}
 	table.insert(self._deferredUiInstances, entry)
+	-- Record the deferred instance_id so the synchronous ``_wireReferences``
+	-- pass can flag inbound refs (peers that target this not-yet-built
+	-- component) for back-patch once the deferred batch builds it.
+	self._deferredInstanceIds = self._deferredInstanceIds or {}
+	self._deferredInstanceIds[entry.inst.instance_id] = true
 end
 
 function SceneRuntime:_resolveDeferredUiInstances()
 	-- Called AFTER the whole synchronous boot (all scene + prefab batches'
 	-- Awake/OnEnable have run and their Starts are armed via task.defer).
-	-- Each deferred UI instance is completed in its own spawned coroutine
-	-- so the wait is event-driven and never blocks the others. Because the
-	-- component was NOT built during the synchronous pass, its own
-	-- Awake/OnEnable/Start all run together in a late batch once its clone
-	-- resolves -- the ordering invariant for the synchronously-built
-	-- components is untouched.
+	--
+	-- The deferred UI instances are completed as a SINGLE late batch (NOT
+	-- one independent lifecycle per component): we resolve every host clone
+	-- first, then build/inject/wire the whole resolved set, then run
+	-- ``_runAwakeEnableStart`` over it once -- so the batch's Awake/OnEnable
+	-- all precede the batch's Start (Unity's intra-batch ordering), and the
+	-- batch respects ``lifecycle_order`` among its own members. The batch is
+	-- inherently LATE versus the synchronous batches (its hosts genuinely
+	-- didn't exist at boot); that lateness is acceptable -- the ordering
+	-- guarantee we must keep is intra-batch.
 	local pending = self._deferredUiInstances
 	if not pending or #pending == 0 then return end
 	self._deferredUiInstances = nil
 
 	local resolver = self._services.awaitUiHost
 	local engine = self
+
+	-- MAJOR (codex r1 #3): the defer branch is unconditional in the generic
+	-- runtime, but ``awaitUiHost`` is injected only on the CLIENT services
+	-- table. With no resolver (server domain, or any partition lacking the
+	-- host-surface helper) we must NOT defer-then-never-build -- that
+	-- regresses a server-domain UI-owned miss from "one-shot build (possibly
+	-- nil gameObject)" to "never constructed". Restore the prior synchronous
+	-- one-shot build for every deferred entry. We still resolve each host
+	-- one-shot via ``workspaceFind`` in case the clone landed during the
+	-- boot; on a miss the component is built with a nil gameObject exactly
+	-- as the pre-slice one-shot path did.
+	if not resolver then
+		local oneShot = self._services.workspaceFind
+		for _, entry in ipairs(pending) do
+			local goInst = oneShot and oneShot(entry.gameObjectId) or nil
+			entry.goInst = goInst
+		end
+		engine:_completeDeferredBatch(pending)
+		return
+	end
+
+	-- Resolve every host clone first (each in its own coroutine so the
+	-- event-driven waits run concurrently and never block one another),
+	-- then complete the whole set as one batch via a barrier: each resolver
+	-- decrements ``remaining``; the last one to finish runs the batch.
+	local spawn = self._services.task and self._services.task.spawn
+	local remaining = #pending
+	local function onOneResolved()
+		remaining = remaining - 1
+		if remaining == 0 then
+			engine:_completeDeferredBatch(pending)
+		end
+	end
 	for _, entry in ipairs(pending) do
-		local spawn = self._services.task and self._services.task.spawn
-		local function complete()
-			local goInst = nil
-			if resolver then
-				goInst = resolver(entry.gameObjectId)
+		local function resolveOne()
+			entry.goInst = resolver(entry.gameObjectId)
+			onOneResolved()
+		end
+		if spawn then
+			spawn(resolveOne)
+		else
+			-- No task.spawn (harness without one): run inline. The resolver
+			-- is responsible for not yielding in that environment.
+			resolveOne()
+		end
+	end
+end
+
+function SceneRuntime:_completeDeferredBatch(pending)
+	-- Build/inject/wire every resolved deferred entry, then run the WHOLE
+	-- set through ``_runAwakeEnableStart`` once. ``pending`` entries each
+	-- carry their resolved ``entry.goInst`` (nil = host clone never landed).
+	local engine = self
+	-- Order the batch by the planner's ``lifecycle_order`` so deferred peers
+	-- Awake in the authored order (and same-GO peers can see each other via
+	-- GetComponent in Awake). ``lifecycle_order`` is per-scene; deferred
+	-- entries may span scenes/prefabs, so we group-stable-sort: primary key
+	-- the entry's position in its owner's ``lifecycle_order`` (missing =
+	-- end), secondary the original defer order (stable).
+	local orderIndex = {}
+	for i, entry in ipairs(pending) do
+		entry._deferSeq = i
+		local lo = engine:_lifecycleOrderFor(entry)
+		local idx = nil
+		if lo then
+			for pos, instId in ipairs(lo) do
+				if instId == entry.inst.instance_id then idx = pos; break end
 			end
-			if goInst == nil then
-				-- Fail-closed diagnostics: never bind nil silently. The
-				-- component is simply not built (matches "UI legitimately
-				-- absent"); a downstream nil-gameObject crash is avoided.
+		end
+		orderIndex[entry] = idx
+	end
+	local ordered = {}
+	for _, entry in ipairs(pending) do table.insert(ordered, entry) end
+	table.sort(ordered, function(a, b)
+		local ia, ib = orderIndex[a], orderIndex[b]
+		if ia ~= nil and ib ~= nil and ia ~= ib then return ia < ib end
+		if ia ~= nil and ib == nil then return true end
+		if ia == nil and ib ~= nil then return false end
+		return a._deferSeq < b._deferSeq
+	end)
+
+	-- Pass 1: build every entry whose host resolved; collect the batch.
+	local batch = {}
+	local builtByInstanceId = {}
+	for _, entry in ipairs(ordered) do
+		local inst = entry.inst
+		local goInst = entry.goInst
+		if goInst == nil then
+			-- Fail-closed diagnostics: never bind nil silently. The
+			-- component is simply not built (matches "UI legitimately
+			-- absent"); a downstream nil-gameObject crash is avoided. (Only
+			-- reached on the resolver path -- the no-resolver one-shot path
+			-- builds even with nil to preserve the pre-slice behaviour.)
+			if engine._services.awaitUiHost then
 				engine._warn(string.format(
 					"[scene_runtime] UI host clone for %q never landed; "
 					.. "skipping deferred component %q",
 					tostring(entry.gameObjectId),
-					tostring(entry.inst.script_id)))
-				return
+					tostring(inst.script_id)))
 			end
-			local inst = entry.inst
+		end
+		if goInst ~= nil or not engine._services.awaitUiHost then
 			local comp = engine:_buildComponent(
 				inst.script_id, goInst, entry.gameObjectId,
-				goInst.Name or "", inst.config or {},
+				(goInst and goInst.Name) or "", inst.config or {},
 				entry.ownerKind, entry.ownerRef)
-			if not comp then return end
-			engine:_applyPlannerFlagsAndTag(comp, inst, goInst)
-			local m = engine._meta[comp]
-			-- Scope: initial boot only. ``instance.gameObject`` is bound
-			-- once here; the HUD is ResetOnSpawn=false so its clone persists
-			-- across respawns and no rebind is needed. Respawn re-clone
-			-- rebind (ResetOnSpawn=true GUIs) is an out-of-scope followup.
-			engine:_injectHostSurface(comp, m.gameObjectInstance, m.gameObjectId)
-			-- Wire this component's OWN outbound references now that it
-			-- exists. ``_wireReferences`` only acts on refs whose source
-			-- component is present in the map, so a single-element map
-			-- wires exactly this component's outbound refs. Inbound refs
-			-- (peers that reference this deferred UI component) are an
-			-- explicit followup (see RUN_DIR/followups.md) -- UI
-			-- controllers are reference SOURCES, not targets, in practice.
-			if entry.references then
-				engine:_wireReferences(
-					entry.references, {[inst.instance_id] = comp},
-					engine._crossDomainEdges, entry.byInstanceId,
-					entry.placement_id)
+			if comp then
+				entry.comp = comp
+				builtByInstanceId[inst.instance_id] = comp
+				table.insert(batch, comp)
 			end
-			engine:_runAwakeEnableStart({comp})
-		end
-		if spawn then
-			spawn(complete)
-		else
-			-- No task.spawn (harness without one): run inline. The resolver
-			-- itself is responsible for not yielding in that environment.
-			complete()
 		end
 	end
+	if #batch == 0 then return end
+
+	-- Pass 2: inject host surface for every built component (mirrors the
+	-- synchronous step 2: inject all before wiring any peer).
+	for _, comp in ipairs(batch) do
+		local m = engine._meta[comp]
+		-- Scope: initial boot only. ``instance.gameObject`` is bound once
+		-- here; the HUD is ResetOnSpawn=false so its clone persists across
+		-- respawns. Respawn re-clone rebind is an out-of-scope followup.
+		engine:_injectHostSurface(comp, m.gameObjectInstance, m.gameObjectId)
+	end
+
+	-- Pass 3a: wire each built component's OWN outbound references. Group by
+	-- owner (references list + byInstanceId + placement) so a multi-entry
+	-- batch wires every member's outbound refs in one pass per owner, with
+	-- the full set of built peers visible (intra-batch component refs
+	-- resolve to their freshly-built peer).
+	local wiredOwners = {}
+	for _, entry in ipairs(ordered) do
+		if entry.comp and entry.references and not wiredOwners[entry.references] then
+			wiredOwners[entry.references] = true
+			engine:_wireReferences(
+				entry.references, builtByInstanceId,
+				engine._crossDomainEdges, entry.byInstanceId,
+				entry.placement_id)
+		end
+	end
+
+	-- Pass 3b: back-patch INBOUND references -- synchronous (or earlier
+	-- batch) sources whose serialized ref targeted a now-built deferred
+	-- component got ``nil`` in the original ``_wireReferences`` pass and
+	-- were recorded in ``_inboundRefsToDeferred``. Set the stored field on
+	-- each source now. (A source that already CACHED the value in its Awake
+	-- won't re-read it -- inherent; we ensure the field/ref is populated so
+	-- re-reading consumers and the deferred component's own path work.)
+	if engine._inboundRefsToDeferred then
+		local kept = {}
+		for _, rec in ipairs(engine._inboundRefsToDeferred) do
+			local target = builtByInstanceId[rec.target_ref]
+			if target ~= nil then
+				engine:_assignFieldOnComponent(
+					rec.source, rec.field, rec.index, target)
+				engine._deferredInstanceIds[rec.target_ref] = nil
+			else
+				-- Target wasn't built in THIS batch (host never landed, or
+				-- a multi-batch shape) -- keep the record for a later batch.
+				table.insert(kept, rec)
+			end
+		end
+		engine._inboundRefsToDeferred = (#kept > 0) and kept or nil
+	end
+	-- Pass 3c: prefab-side externalRefs override matching wired fields,
+	-- mirroring ``_constructPrefabClone``'s post-wire override.
+	for _, entry in ipairs(ordered) do
+		if entry.comp and type(entry.externalRefs) == "table" then
+			local fields = entry.externalRefs[entry.inst.instance_id]
+			if type(fields) == "table" then
+				for k, v in pairs(fields) do
+					entry.comp[k] = v
+				end
+			end
+		end
+	end
+
+	-- Steps 3-5 over the WHOLE batch: Awake (all) -> OnEnable (all) ->
+	-- Start (next tick). Running the whole batch through one
+	-- ``_runAwakeEnableStart`` is what guarantees the batch's Awake/OnEnable
+	-- precede its Start and that ``lifecycle_order`` holds among the batch.
+	engine:_runAwakeEnableStart(batch)
+end
+
+function SceneRuntime:_lifecycleOrderFor(entry)
+	-- Resolve the planner ``lifecycle_order`` list for a deferred entry's
+	-- owner (scene or prefab) so ``_completeDeferredBatch`` can order the
+	-- batch by it. Returns nil when no order is available (then defer order
+	-- is used as a stable fallback).
+	if entry.ownerKind == "scene" then
+		local scene = (self._plan.scenes or {})[entry.ownerRef]
+		return scene and scene.lifecycle_order
+	elseif entry.ownerKind == "prefab" then
+		local prefab = (self._plan.prefabs or {})[entry.ownerRef]
+		return prefab and prefab.lifecycle_order
+	end
+	return nil
 end
 
 -- ---------------------------------------------------------------------
@@ -2158,7 +2341,7 @@ function SceneRuntime:start(domainFilter)
 
 			local componentList = self:_constructPrefabClone(
 				placement_clone, prefab, prefab_id, includeScriptId, nil,
-				p_placement_id)
+				p_placement_id, true)
 			self:_runAwakeEnableStart(componentList)
 		end
 	end
