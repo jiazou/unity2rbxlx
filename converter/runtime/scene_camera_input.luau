@@ -210,6 +210,13 @@ function SceneCameraInput:step(dt)
 
 	local cam = workspace.CurrentCamera
 	if cam then
+		-- Re-assert authoritative control every frame: Roblox's default
+		-- PlayerModule camera otherwise reclaims CameraType to Custom and
+		-- renders its own CFrame on RenderStepped, fighting this write (the
+		-- view would flicker between the two). Idempotent.
+		if cam.CameraType ~= Enum.CameraType.Scriptable then
+			cam.CameraType = Enum.CameraType.Scriptable
+		end
 		cam.CFrame = composeLook(eyePos, self._yaw, self._pitch)
 	end
 end
