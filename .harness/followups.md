@@ -28,3 +28,30 @@
 
 - **[Pause panel]** `HUD.Pause` not converted (`_pauseMenu()` nil) — UI-conversion completeness,
   pre-existing, out of scope.
+
+## Run hudbind-20260604-223428 (2026-06-05)
+
+# Followups (out of scope for the run)
+
+## Slice 1.1 — UI-host deferred resolution
+- **Respawn re-clone rebind (ResetOnSpawn=true GUIs).** Slice 1.1 binds
+  `instance.gameObject` once at initial boot. The confirmed HUD is
+  ResetOnSpawn=false so its clone persists across respawns and no rebind is
+  needed. A ResetOnSpawn=true GUI gets a NEW PlayerGui clone on respawn that
+  no component rebinds to today (true regardless of this slice). Rebinding
+  deferred UI components on respawn is a separate concern — out of scope here.
+  (Marked with a code comment in `scene_runtime.luau:_resolveDeferredUiInstances`.)
+- **Inbound references to a deferred UI component.** RESOLVED in fix-round 1
+  (codex BLOCKING #2). The synchronous `_wireReferences` pass now records
+  inbound refs whose target is a deferred instance (`_inboundRefsToDeferred`);
+  `_completeDeferredBatch` back-patches the stored field on each source once the
+  deferred target is built (including prefab-side `externalRefs`). Inherent
+  residual: a source that already CACHED the value in its own Awake won't
+  re-read it — the field is populated, but a consumer that snapshotted nil in
+  Awake keeps nil. Not fixable without a re-Awake of the source (out of scope).
+- **awaitUiHost connect-vs-scan gap (MAJOR #5) is only structurally tested.**
+  The connect-first fix is exercised by a coroutine test (initial-scan hit,
+  DescendantAdded-after-miss, timeout→nil), but the microscopic real-Roblox
+  window where a clone lands between connect and scan cannot be reproduced
+  deterministically under standalone luau. The Studio canary (acceptance 4) is
+  the real-environment guard for that window.

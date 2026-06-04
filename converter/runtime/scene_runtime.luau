@@ -214,6 +214,18 @@ function SceneRuntime.new(services, plan)
 	self._byName = {}       -- gameObjectName -> list[component]
 	self._byTag = {}        -- tag -> list[component]
 
+	-- Engine-level ``instance_id -> component`` registry. Populated by
+	-- BOTH the synchronous build passes (scene + prefab) AND the deferred
+	-- batch. The per-owner ``componentByInstanceId`` locals are discarded
+	-- when ``start()`` returns, so a deferred component completing late has
+	-- no other way to resolve a ``component``-kind outbound ref to a
+	-- SYNCHRONOUSLY-built peer (the symmetric mirror of the inbound
+	-- back-patch). instance_ids are planner-namespaced
+	-- (``<scene|prefab>:<file_id>``) so they're globally unique across
+	-- owners; the deferred wire pass resolves against the UNION of this
+	-- registry and the batch-built set.
+	self._componentByInstanceId = {}
+
 	-- Track which prefab instances we've spawned, keyed by clone
 	-- Instance (so ``destroy(clone)`` can find the descendants to tear
 	-- down without re-walking).
@@ -311,6 +323,16 @@ function SceneRuntime:_unregister(componentInstance)
 			ripValue(self._byName, meta.gameObjectName or "", goInst)
 			ripValue(self._byTag, meta.tag or "", goInst)
 		end
+	end
+	-- Clear the engine union registry entry (codex r3 BLOCKING): without this
+	-- a destroyed component lingered in ``_componentByInstanceId`` and a later
+	-- deferred wire pass could bind a peer's ref to the dead comp.
+	-- ``registryKey`` is the EXACT placement-scoped key written at build time;
+	-- only drop it when it still points at THIS component (a later placement /
+	-- runtime spawn may have legitimately overwritten the key).
+	if meta.registryKey ~= nil
+	   and self._componentByInstanceId[meta.registryKey] == componentInstance then
+		self._componentByInstanceId[meta.registryKey] = nil
 	end
 	self._meta[componentInstance] = nil
 end
@@ -832,6 +854,20 @@ function SceneRuntime:_resolveReferenceTarget(refRow, componentByInstanceId, pla
 	local target_kind = refRow.target_kind
 	local target_ref = refRow.target_ref
 	if target_kind == "component" then
+		-- The engine union registry (``_componentByInstanceId``) is keyed by
+		-- the PLACEMENT-SCOPED instance_id for prefab clones (``<placement>:
+		-- <instance_id>``) so multiple placements of the same prefab don't
+		-- collide (codex r3 BLOCKING). The per-owner LOCAL map is keyed by the
+		-- raw ``instance_id``. Mirror the gameobject branch: when wiring inside
+		-- a placement, try the namespaced key first (hits the engine map), then
+		-- fall back to the raw key (hits the local map / scene-boot map, whose
+		-- ids are already globally unique). A nil/empty placement_id is the
+		-- scene-boot / harness path and resolves raw directly.
+		if placement_id ~= nil and placement_id ~= "" then
+			local ns_ref = placement_id .. ":" .. target_ref
+			local hit = componentByInstanceId[ns_ref]
+			if hit ~= nil then return hit end
+		end
 		return componentByInstanceId[target_ref]
 	elseif target_kind == "gameobject" then
 		-- Resolve to the Roblox Instance via _SceneRuntimeId attribute.
@@ -897,7 +933,16 @@ end
 
 function SceneRuntime:_wireReferences(refs, componentByInstanceId,
                                        crossDomainEdges, instanceById,
-                                       placement_id)
+                                       placement_id, targetResolveMap)
+	-- ``targetResolveMap`` (optional): when wiring a deferred-UI group, a
+	-- ``component``-kind ref's SOURCE must be in this group (gated by
+	-- ``componentByInstanceId``, the group-built set), but its TARGET may be
+	-- a SYNCHRONOUSLY-built peer or an earlier deferred group. Pass the
+	-- engine-level union map here so those outbound refs resolve instead of
+	-- silently staying nil (codex r2 BLOCKING -- the mirror of the inbound
+	-- back-patch). nil (sync/prefab callers) => resolve targets against
+	-- ``componentByInstanceId``, preserving prior behaviour.
+	local resolveMap = targetResolveMap or componentByInstanceId
 	-- ``instanceById`` is the planner's per-scene/prefab
 	-- instance_id -> instance row map, used to resolve a target's
 	-- ``script_id`` (and therefore its domain via plan.modules) even
@@ -918,7 +963,7 @@ function SceneRuntime:_wireReferences(refs, componentByInstanceId,
 		local sourceComp = componentByInstanceId[ref["from"]]
 		if sourceComp ~= nil then
 			local target = self:_resolveReferenceTarget(
-				ref, componentByInstanceId, placement_id)
+				ref, resolveMap, placement_id)
 			-- Cross-domain policy: if both source module and target
 			-- module have assigned non-legacy domains and they differ,
 			-- inject ``nil`` and surface the edge. Resolve via the plan
@@ -956,6 +1001,36 @@ function SceneRuntime:_wireReferences(refs, componentByInstanceId,
 							to_domain = tgtDomain,
 						})
 					end
+				end
+			end
+			-- Slice 1.1 r1: back-patch bookkeeping. When a component-kind ref
+			-- targets an instance that was DEFERRED (its UI host clone hadn't
+			-- landed, so it wasn't built in this synchronous pass), the
+			-- resolve above yields nil. Record the (source, field, index,
+			-- target_instance_id) so ``_completeDeferredBatch`` can set the
+			-- field once the deferred target is built. Only when this wiring
+			-- pass is the synchronous boot (target genuinely absent + known
+			-- deferred) -- the deferred batch's own re-wire passes a present
+			-- map so this branch is skipped.
+			if ref.target_kind == "component" and target == nil then
+				-- The deferred-id set + back-patch records use the PLACEMENT-
+				-- SCOPED target key (codex r3 BLOCKING) so a multi-placed
+				-- deferred prefab's inbound refs bind to the correct placement.
+				-- ``ref.target_ref`` is the raw prefab-local id within THIS
+				-- placement; scope it with the wiring pass's placement_id.
+				local scopedTarget = ref.target_ref
+				if placement_id ~= nil and placement_id ~= "" then
+					scopedTarget = placement_id .. ":" .. ref.target_ref
+				end
+				if self._deferredInstanceIds
+				   and self._deferredInstanceIds[scopedTarget] then
+					self._inboundRefsToDeferred = self._inboundRefsToDeferred or {}
+					table.insert(self._inboundRefsToDeferred, {
+						source = sourceComp,
+						field = ref.field,
+						index = ref.index,
+						target_ref = scopedTarget,
+					})
 				end
 			end
 			self:_assignFieldOnComponent(sourceComp, ref.field, ref.index, target)
@@ -1560,7 +1635,17 @@ local function _idWithPlacement(placement_id, goid)
 	return goid
 end
 
-function SceneRuntime:_constructPrefabClone(clone, prefab, prefab_id, includeScriptId, externalRefs, placement_id)
+function SceneRuntime:_constructPrefabClone(clone, prefab, prefab_id, includeScriptId, externalRefs, placement_id, deferUiMisses)
+	-- ``deferUiMisses`` (optional, default false): when true, a UI-owned
+	-- instance whose host lookup misses is DEFERRED to event-driven PlayerGui
+	-- resolution (the scene/prefab BOOT path, which races the
+	-- StarterGui->PlayerGui clone). The runtime-spawn path
+	-- (``instantiatePrefab``) leaves it false: a runtime-spawned prefab
+	-- resolves its UI host against the LOCAL clone via ``resolveCloneChild``
+	-- (no PlayerGui boot race), so deferral is the wrong tool -- waiting on
+	-- ``PlayerGui.DescendantAdded`` would never fire for a host under the
+	-- clone and the component would silently drop. With it false the UI miss
+	-- falls through to the one-shot build (pre-slice behaviour).
 	-- Build a per-instance map for the prefab subplan; references are
 	-- prefab-local so the same logic applies as for scenes.
 	--
@@ -1701,34 +1786,46 @@ function SceneRuntime:_constructPrefabClone(clone, prefab, prefab_id, includeScr
 					end
 				end
 			end
-			local comp = self:_buildComponent(
-				inst.script_id, goInst, ns_goid,
-				(goInst and goInst.Name) or "", inst.config or {},
-				"prefab", prefab_id)
-			if comp then
-				componentByInstanceId[inst.instance_id] = comp
-				table.insert(componentList, comp)
-				-- Honor planner-supplied active/enabled/tag for prefab
-				-- instances exactly as the scene boot path does (R3-P1.1).
-				-- ``_injectHostSurface`` reads ``m.activeSelf`` /
-				-- ``m.enabled`` to decide whether to overwrite with
-				-- defaults; mirror the scene path so a prefab instance
-				-- booted dormant (``enabled=false`` / ``active=false``)
-				-- stays dormant until ``setEnabled`` / ``setActive``.
-				local m = self._meta[comp]
-				m.activeSelf = inst.active ~= false
-				m.enabled = inst.enabled ~= false
-				if inst.tag and inst.tag ~= "" then
-					m.tag = inst.tag
-					local list = self._byTag[inst.tag]
-					if not list then list = {}; self._byTag[inst.tag] = list end
-					local present = false
-					for _, x in ipairs(list) do
-						if x == goInst then present = true; break end
-					end
-					if goInst ~= nil and not present then
-						table.insert(list, goInst)
-					end
+			-- Slice 1.1: a UI-owned prefab instance whose host lookup missed
+			-- defers to event-driven PlayerGui resolution, identical to the
+			-- scene-boot path. Non-UI misses keep the one-shot behaviour.
+			if goInst == nil and deferUiMisses and self:_isUiOwned(inst) then
+				self:_deferUiInstance({
+					inst = inst,
+					gameObjectId = ns_goid,
+					ownerKind = "prefab",
+					ownerRef = prefab_id,
+					references = prefab.references or {},
+					byInstanceId = instanceById,
+					placement_id = placement_id,
+					externalRefs = externalRefs,
+				})
+			else
+				local comp = self:_buildComponent(
+					inst.script_id, goInst, ns_goid,
+					(goInst and goInst.Name) or "", inst.config or {},
+					"prefab", prefab_id)
+				if comp then
+					componentByInstanceId[inst.instance_id] = comp
+					-- Engine union key is PLACEMENT-SCOPED (codex r3 BLOCKING):
+					-- ``inst.instance_id`` is prefab-LOCAL (``<prefab>:<file>``)
+					-- and shared by every placement of the prefab, so an
+					-- un-namespaced engine key let the last placement overwrite
+					-- the others and the deferred wire pass could bind to the
+					-- wrong clone. Stash the exact key in meta so ``_unregister``
+					-- clears THIS entry on destroy.
+					local regKey = _idWithPlacement(placement_id, inst.instance_id)
+					self._componentByInstanceId[regKey] = comp
+					self._meta[comp].registryKey = regKey
+					table.insert(componentList, comp)
+					-- Honor planner-supplied active/enabled/tag for prefab
+					-- instances exactly as the scene boot path does (R3-P1.1).
+					-- ``_injectHostSurface`` reads ``m.activeSelf`` /
+					-- ``m.enabled`` to decide whether to overwrite with
+					-- defaults; mirror the scene path so a prefab instance
+					-- booted dormant (``enabled=false`` / ``active=false``)
+					-- stays dormant until ``setEnabled`` / ``setActive``.
+					self:_applyPlannerFlagsAndTag(comp, inst, goInst)
 				end
 			end
 		end
@@ -1783,6 +1880,504 @@ function SceneRuntime:instantiatePrefab(prefab_id, parent, cframe, externalRefs)
 		clone, prefab, prefab_id, nil, externalRefs, placement_id)
 	self:_runAwakeEnableStart(componentList)
 	return clone
+end
+
+-- ---------------------------------------------------------------------
+-- Slice 1.1: deferred UI-host gameObject resolution (generic boot race)
+-- ---------------------------------------------------------------------
+-- A UI-owned instance (``inst.instance_owner_is_ui == true``) binds its
+-- host GameObject to a ScreenGui that Roblox clones StarterGui->PlayerGui
+-- at spawn. At client boot the synchronous build loop can run BEFORE that
+-- clone lands, so the one-shot ``workspaceFind`` returns nil. Building the
+-- component with a nil gameObject crashes UI controllers (HudControl:46).
+--
+-- Rather than yield inside the build loop (which would break the
+-- ``start() never yields`` invariant that keeps every batch's Awake/OnEnable
+-- ahead of any deferred Start), we DEFER such missed UI instances entirely:
+-- they are collected during the synchronous pass, then constructed +
+-- lifecycled in their OWN batch from a spawned coroutine that waits
+-- event-driven (``awaitUiHost`` -> ``PlayerGui.DescendantAdded``) for the
+-- clone. Non-UI misses keep their current one-shot behaviour (built now
+-- with a nil gameObject, no waiting, no timeout penalty).
+--
+-- SCOPE: initial boot only. ``instance.gameObject`` is bound once; the HUD
+-- is ResetOnSpawn=false so its clone persists across respawns and no
+-- rebind is needed. Respawn re-clone rebind (ResetOnSpawn=true GUIs) is an
+-- explicit out-of-scope followup (see RUN_DIR/followups.md).
+
+function SceneRuntime:_isUiOwned(inst)
+	-- The planner stamps ``instance_owner_is_ui = true`` only on UI-subtree
+	-- instances (the field is absent otherwise), so a strict ``== true``
+	-- gate keeps every non-UI instance on the fast one-shot path.
+	return inst ~= nil and inst.instance_owner_is_ui == true
+end
+
+function SceneRuntime:_applyPlannerFlagsAndTag(comp, inst, goInst)
+	-- Honor planner-supplied active/enabled/tag for a freshly built
+	-- component. Shared by the synchronous scene/prefab loops and the
+	-- deferred-UI completion path so they stay byte-identical.
+	local m = self._meta[comp]
+	m.activeSelf = inst.active ~= false
+	m.enabled = inst.enabled ~= false
+	if inst.tag and inst.tag ~= "" then
+		m.tag = inst.tag
+		local list = self._byTag[inst.tag]
+		if not list then list = {}; self._byTag[inst.tag] = list end
+		local present = false
+		for _, x in ipairs(list) do
+			if x == goInst then present = true; break end
+		end
+		if goInst ~= nil and not present then
+			table.insert(list, goInst)
+		end
+	end
+end
+
+function SceneRuntime:_deferUiInstance(entry)
+	-- Collect a UI-owned instance whose synchronous ``workspaceFind``
+	-- missed; ``_resolveDeferredUiInstances`` completes it after the
+	-- synchronous boot.
+	self._deferredUiInstances = self._deferredUiInstances or {}
+	table.insert(self._deferredUiInstances, entry)
+	-- Record the deferred instance_id (PLACEMENT-SCOPED, codex r3 BLOCKING) so
+	-- the synchronous ``_wireReferences`` pass can flag inbound refs (peers
+	-- that target this not-yet-built component) for back-patch once the
+	-- deferred batch builds it. The key mirrors the engine registry key so a
+	-- multi-placed deferred prefab tracks each placement separately.
+	self._deferredInstanceIds = self._deferredInstanceIds or {}
+	self._deferredInstanceIds[_idWithPlacement(entry.placement_id, entry.inst.instance_id)] = true
+end
+
+function SceneRuntime:_resolveDeferredUiInstances()
+	-- Called AFTER the whole synchronous boot (all scene + prefab batches'
+	-- Awake/OnEnable have run and their Starts are armed via task.defer).
+	--
+	-- The deferred UI instances are completed as a SINGLE late batch (NOT
+	-- one independent lifecycle per component): we resolve every host clone
+	-- first, then build/inject/wire the whole resolved set, then run
+	-- ``_runAwakeEnableStart`` over it once -- so the batch's Awake/OnEnable
+	-- all precede the batch's Start (Unity's intra-batch ordering), and the
+	-- batch respects ``lifecycle_order`` among its own members. The batch is
+	-- inherently LATE versus the synchronous batches (its hosts genuinely
+	-- didn't exist at boot); that lateness is acceptable -- the ordering
+	-- guarantee we must keep is intra-batch.
+	local pending = self._deferredUiInstances
+	if not pending or #pending == 0 then return end
+	self._deferredUiInstances = nil
+
+	local resolver = self._services.awaitUiHost
+	local engine = self
+
+	-- Group deferred entries by host (``gameObjectId``). Each host group is
+	-- completed INDEPENDENTLY (codex r2 BLOCKING): the prior global barrier
+	-- waited for ``remaining == 0`` across ALL pending entries, so one
+	-- never-landing host stalled every already-resolved peer up to the 10s
+	-- timeout. Per-host completion means a host that resolves promptly
+	-- Awakes/Starts its own group right away, and a host that times out
+	-- drops only its own group.
+	--
+	-- WITHIN a host group, the components still complete together as ONE
+	-- ordered ``_runAwakeEnableStart`` mini-batch (r1 batching requirement):
+	-- same-GO ``GetComponent``-in-Awake and ``lifecycle_order`` are
+	-- preserved among same-host peers. Cross-host ordering is inherently
+	-- best-effort -- different hosts resolve at different times.
+	local groupOrder = {}
+	local groups = {}
+	for _, entry in ipairs(pending) do
+		local key = entry.gameObjectId
+		local group = groups[key]
+		if not group then
+			group = {}
+			groups[key] = group
+			table.insert(groupOrder, key)
+		end
+		table.insert(group, entry)
+	end
+
+	-- MAJOR (codex r3): dependency-aware ordering. With pure per-host grouping
+	-- a group that holds an OUTBOUND ``component``-ref to a deferred component
+	-- on ANOTHER host could Awake/Start with that ref nil (it only got
+	-- eventually back-patched once the target's group reached Pass 3b). So
+	-- before a group runs its lifecycle, it must wait for the groups that own
+	-- its still-deferred component targets to complete. We compute the
+	-- inter-group dependency edges here, then (1) topologically order the spawn
+	-- so dependencies launch first (makes the synchronous-spawn harness path
+	-- and the common case resolve without yielding) and (2) have each group's
+	-- resolver WAIT for its dependency groups to finish before completing.
+	-- KEY INVARIANT (do not regress the r2 BLOCKING fix): a group only waits on
+	-- groups it actually references; UNRELATED groups never gate each other, so
+	-- a never-resolving unrelated host cannot stall a resolved host.
+	--
+	-- ``instToGroup``: scoped deferred instance_id -> owning group key. Built
+	-- from the same placement-scoped key as the engine registry so the
+	-- target-ref lookup matches.
+	local instToGroup = {}
+	for key, group in pairs(groups) do
+		for _, entry in ipairs(group) do
+			local scoped = _idWithPlacement(
+				entry.placement_id, entry.inst.instance_id)
+			instToGroup[scoped] = key
+		end
+	end
+	-- ``groupDeps[key]``: set of OTHER group keys this group depends on.
+	local groupDeps = {}
+	for key, group in pairs(groups) do
+		-- The raw source instance_ids owned by this group (refs key ``from`` by
+		-- raw prefab-local id). ``srcPresent`` is a membership set; ``srcPid``
+		-- carries each source's placement_id to scope its targets (a nil
+		-- placement_id -- scene entries -- must still register as present, so
+		-- presence and placement are tracked separately).
+		local srcPresent = {}
+		local srcPid = {}
+		for _, entry in ipairs(group) do
+			srcPresent[entry.inst.instance_id] = true
+			srcPid[entry.inst.instance_id] = entry.placement_id
+		end
+		local deps = {}
+		for _, entry in ipairs(group) do
+			for _, ref in ipairs(entry.references or {}) do
+				if ref.target_kind == "component"
+				   and srcPresent[ref["from"]] then
+					local pid = srcPid[ref["from"]]
+					local scopedTarget = ref.target_ref
+					if pid ~= nil and pid ~= "" then
+						scopedTarget = pid .. ":" .. ref.target_ref
+					end
+					local depKey = instToGroup[scopedTarget]
+					if depKey ~= nil and depKey ~= key and not deps[depKey] then
+						deps[depKey] = true
+					end
+				end
+			end
+		end
+		groupDeps[key] = deps
+	end
+
+	-- Topologically order ``groupOrder`` so a group's dependencies spawn before
+	-- it (Kahn's algorithm). A dependency CYCLE (or any leftover) is appended
+	-- in the original stable order -- the per-group wait loop's timeout breaks
+	-- the cycle at runtime (fail-closed: proceed with nil + warn, never hang).
+	do
+		local indeg = {}
+		for _, key in ipairs(groupOrder) do indeg[key] = 0 end
+		-- An edge dep -> key means key depends on dep; key's in-degree counts
+		-- how many of its deps are still unscheduled.
+		for key, deps in pairs(groupDeps) do
+			for dep in pairs(deps) do
+				if indeg[key] ~= nil then indeg[key] = indeg[key] + 1 end
+			end
+		end
+		local queue = {}
+		for _, key in ipairs(groupOrder) do
+			if indeg[key] == 0 then table.insert(queue, key) end
+		end
+		local sorted = {}
+		local scheduled = {}
+		local qi = 1
+		while qi <= #queue do
+			local key = queue[qi]
+			qi = qi + 1
+			table.insert(sorted, key)
+			scheduled[key] = true
+			-- Relax every group that depends on ``key``.
+			for other, deps in pairs(groupDeps) do
+				if deps[key] and not scheduled[other] and indeg[other] ~= nil then
+					indeg[other] = indeg[other] - 1
+					if indeg[other] == 0 then table.insert(queue, other) end
+				end
+			end
+		end
+		-- Append any cycle remnant in the original order (stable).
+		for _, key in ipairs(groupOrder) do
+			if not scheduled[key] then table.insert(sorted, key) end
+		end
+		groupOrder = sorted
+	end
+
+	-- MAJOR (codex r1 #3): the defer branch is unconditional in the generic
+	-- runtime, but ``awaitUiHost`` is injected only on the CLIENT services
+	-- table. With no resolver (server domain, or any partition lacking the
+	-- host-surface helper) we must NOT defer-then-never-build -- that
+	-- regresses a server-domain UI-owned miss from "one-shot build (possibly
+	-- nil gameObject)" to "never constructed". Restore the prior synchronous
+	-- one-shot build for every deferred entry. We still resolve each host
+	-- one-shot via ``workspaceFind`` in case the clone landed during the
+	-- boot; on a miss the component is built with a nil gameObject exactly
+	-- as the pre-slice one-shot path did.
+	if not resolver then
+		local oneShot = self._services.workspaceFind
+		for _, key in ipairs(groupOrder) do
+			local group = groups[key]
+			local goInst = oneShot and oneShot(key) or nil
+			for _, entry in ipairs(group) do
+				entry.goInst = goInst
+			end
+			engine:_completeDeferredBatch(group)
+		end
+		return
+	end
+
+	-- Resolve each host clone in its own coroutine so the event-driven
+	-- waits run concurrently and never block one another. When a host
+	-- resolves, complete ITS group immediately as one mini-batch -- no
+	-- cross-host barrier (except the explicit dependency wait below).
+	--
+	-- ``groupDone[key]`` flips true once a group has completed (or been
+	-- skipped). A dependent group's resolver waits for its dependency groups'
+	-- flags before completing, so its outbound ``component``-refs to deferred
+	-- peers resolve in Pass 3a (non-nil at Awake/Start) instead of relying on
+	-- the eventual inbound back-patch (codex r3 MAJOR).
+	local groupDone = {}
+	local task = self._services.task
+	local spawn = task and task.spawn
+	local waitFn = task and task.wait
+	local nowFn = self._services.now
+	-- Dependency wait budget. ``DEP_TIMEOUT`` bounds the real-time wait (a
+	-- never-resolving dependency / cycle proceeds with nil + warn rather than
+	-- hanging). ``DEP_MAX_ITERS`` is a harness-safe hard cap: the unit harness'
+	-- ``task.wait`` returns without advancing ``now()``, so a clock-only
+	-- deadline would spin forever there -- the iteration cap guarantees
+	-- termination regardless of clock behaviour.
+	local DEP_TIMEOUT = 10
+	local DEP_MAX_ITERS = 200000
+	local function waitForDeps(key)
+		local deps = groupDeps[key]
+		if not deps then return end
+		local deadline = nowFn and (nowFn() + DEP_TIMEOUT) or nil
+		for dep in pairs(deps) do
+			local iters = 0
+			while not groupDone[dep] do
+				if deadline and nowFn and nowFn() >= deadline then
+					engine._warn(string.format(
+						"[scene_runtime] deferred group %q timed out waiting "
+						.. "on dependency group %q; proceeding with nil refs",
+						tostring(key), tostring(dep)))
+					break
+				end
+				iters = iters + 1
+				if iters >= DEP_MAX_ITERS then
+					engine._warn(string.format(
+						"[scene_runtime] deferred group %q exceeded wait budget "
+						.. "on dependency group %q; proceeding with nil refs",
+						tostring(key), tostring(dep)))
+					break
+				end
+				if waitFn then waitFn(0.05) else break end
+			end
+		end
+	end
+	for _, key in ipairs(groupOrder) do
+		local group = groups[key]
+		local function resolveGroup()
+			local goInst = resolver(key)
+			for _, entry in ipairs(group) do
+				entry.goInst = goInst
+			end
+			-- Wait for dependency groups to complete so this group's outbound
+			-- component refs resolve before its lifecycle runs. Unrelated
+			-- groups are NOT in ``groupDeps[key]`` so they never gate us.
+			waitForDeps(key)
+			engine:_completeDeferredBatch(group)
+			groupDone[key] = true
+		end
+		if spawn then
+			spawn(resolveGroup)
+		else
+			-- No task.spawn (harness without one): run inline. The resolver
+			-- is responsible for not yielding in that environment.
+			resolveGroup()
+		end
+	end
+end
+
+function SceneRuntime:_completeDeferredBatch(pending)
+	-- Build/inject/wire every resolved deferred entry, then run the WHOLE
+	-- set through ``_runAwakeEnableStart`` once. ``pending`` entries each
+	-- carry their resolved ``entry.goInst`` (nil = host clone never landed).
+	local engine = self
+	-- Order the batch by the planner's ``lifecycle_order`` so deferred peers
+	-- Awake in the authored order (and same-GO peers can see each other via
+	-- GetComponent in Awake). ``lifecycle_order`` is per-scene; deferred
+	-- entries may span scenes/prefabs, so we group-stable-sort: primary key
+	-- the entry's position in its owner's ``lifecycle_order`` (missing =
+	-- end), secondary the original defer order (stable).
+	local orderIndex = {}
+	for i, entry in ipairs(pending) do
+		entry._deferSeq = i
+		local lo = engine:_lifecycleOrderFor(entry)
+		local idx = nil
+		if lo then
+			for pos, instId in ipairs(lo) do
+				if instId == entry.inst.instance_id then idx = pos; break end
+			end
+		end
+		orderIndex[entry] = idx
+	end
+	local ordered = {}
+	for _, entry in ipairs(pending) do table.insert(ordered, entry) end
+	table.sort(ordered, function(a, b)
+		local ia, ib = orderIndex[a], orderIndex[b]
+		if ia ~= nil and ib ~= nil and ia ~= ib then return ia < ib end
+		if ia ~= nil and ib == nil then return true end
+		if ia == nil and ib ~= nil then return false end
+		return a._deferSeq < b._deferSeq
+	end)
+
+	-- Pass 1: build every entry whose host resolved; collect the batch.
+	local batch = {}
+	local builtByInstanceId = {}
+	for _, entry in ipairs(ordered) do
+		local inst = entry.inst
+		local goInst = entry.goInst
+		-- Clear the deferred marker as the target leaves the deferred state
+		-- (built below, OR skipped on a nil host). The marker is set in
+		-- ``_deferUiInstance`` and only consumed by the synchronous wire pass
+		-- (already finished); keeping it honest means a never-built/destroyed
+		-- target is no longer flagged as deferred. (harden: clear on every
+		-- exit from deferred state, not only on a successful back-patch.)
+		if engine._deferredInstanceIds ~= nil then
+			engine._deferredInstanceIds[
+				_idWithPlacement(entry.placement_id, inst.instance_id)] = nil
+		end
+		if goInst == nil then
+			-- Fail-closed diagnostics: never bind nil silently. The
+			-- component is simply not built (matches "UI legitimately
+			-- absent"); a downstream nil-gameObject crash is avoided. (Only
+			-- reached on the resolver path -- the no-resolver one-shot path
+			-- builds even with nil to preserve the pre-slice behaviour.)
+			if engine._services.awaitUiHost then
+				engine._warn(string.format(
+					"[scene_runtime] UI host clone for %q never landed; "
+					.. "skipping deferred component %q",
+					tostring(entry.gameObjectId),
+					tostring(inst.script_id)))
+			end
+		end
+		if goInst ~= nil or not engine._services.awaitUiHost then
+			local comp = engine:_buildComponent(
+				inst.script_id, goInst, entry.gameObjectId,
+				(goInst and goInst.Name) or "", inst.config or {},
+				entry.ownerKind, entry.ownerRef)
+			if comp then
+				entry.comp = comp
+				builtByInstanceId[inst.instance_id] = comp
+				-- MAJOR (codex r2): record in the engine-level registry so
+				-- this deferred component is visible to later groups'
+				-- outbound refs and inbound back-patches. PLACEMENT-SCOPED key
+				-- (codex r3 BLOCKING) so a multi-placed deferred prefab doesn't
+				-- collide; stash it in meta for ``_unregister``.
+				local regKey = _idWithPlacement(entry.placement_id, inst.instance_id)
+				engine._componentByInstanceId[regKey] = comp
+				engine._meta[comp].registryKey = regKey
+				-- MAJOR (codex r2): reapply planner ``active``/``enabled``/
+				-- ``tag`` BEFORE ``_injectHostSurface``, matching the
+				-- synchronous scene/prefab paths. Without this an authored
+				-- ``enabled=false`` deferred UI woke ENABLED and ran
+				-- OnEnable/Start, and its tag never entered ``_byTag``.
+				engine:_applyPlannerFlagsAndTag(comp, inst, goInst)
+				table.insert(batch, comp)
+			end
+		end
+	end
+	if #batch == 0 then return end
+
+	-- Pass 2: inject host surface for every built component (mirrors the
+	-- synchronous step 2: inject all before wiring any peer).
+	for _, comp in ipairs(batch) do
+		local m = engine._meta[comp]
+		-- Scope: initial boot only. ``instance.gameObject`` is bound once
+		-- here; the HUD is ResetOnSpawn=false so its clone persists across
+		-- respawns. Respawn re-clone rebind is an out-of-scope followup.
+		engine:_injectHostSurface(comp, m.gameObjectInstance, m.gameObjectId)
+	end
+
+	-- Pass 3a: wire each built component's OWN outbound references. Group by
+	-- owner (references list + byInstanceId + placement) so a multi-entry
+	-- batch wires every member's outbound refs in one pass per owner, with
+	-- the full set of built peers visible (intra-batch component refs
+	-- resolve to their freshly-built peer). The SOURCE gate stays
+	-- ``builtByInstanceId`` (only THIS group's components get wired), but
+	-- the TARGET resolve map is the engine-level union
+	-- (``_componentByInstanceId``) so an outbound ``component``-kind ref to a
+	-- SYNCHRONOUSLY-built peer (or an earlier deferred group) resolves --
+	-- the mirror of the inbound back-patch (codex r2 BLOCKING).
+	local wiredOwners = {}
+	for _, entry in ipairs(ordered) do
+		if entry.comp and entry.references and not wiredOwners[entry.references] then
+			wiredOwners[entry.references] = true
+			engine:_wireReferences(
+				entry.references, builtByInstanceId,
+				engine._crossDomainEdges, entry.byInstanceId,
+				entry.placement_id, engine._componentByInstanceId)
+		end
+	end
+
+	-- Pass 3b: back-patch INBOUND references -- synchronous (or earlier
+	-- batch) sources whose serialized ref targeted a now-built deferred
+	-- component got ``nil`` in the original ``_wireReferences`` pass and
+	-- were recorded in ``_inboundRefsToDeferred``. Set the stored field on
+	-- each source now. (A source that already CACHED the value in its Awake
+	-- won't re-read it -- inherent; we ensure the field/ref is populated so
+	-- re-reading consumers and the deferred component's own path work.)
+	if engine._inboundRefsToDeferred then
+		local kept = {}
+		for _, rec in ipairs(engine._inboundRefsToDeferred) do
+			-- harden: drop records whose source component has left ``_meta``
+			-- (destroyed before this drain). Replaying the stored back-patch
+			-- would mutate a dead component table -- the source is gone, so the
+			-- record is garbage (neither replayed nor kept).
+			if engine._meta[rec.source] ~= nil then
+				-- ``rec.target_ref`` is the PLACEMENT-SCOPED key (codex r3); resolve
+				-- against the engine union registry (also scoped) rather than the
+				-- batch-local ``builtByInstanceId`` (raw-keyed) so the record binds
+				-- the correct placement's clone -- and so a target built by ANY
+				-- batch (cross-host) resolves, not only this one.
+				local target = engine._componentByInstanceId[rec.target_ref]
+				if target ~= nil then
+					engine:_assignFieldOnComponent(
+						rec.source, rec.field, rec.index, target)
+				else
+					-- Target not yet built (host never landed, or a multi-batch
+					-- shape) -- keep the record for a later batch.
+					table.insert(kept, rec)
+				end
+			end
+		end
+		engine._inboundRefsToDeferred = (#kept > 0) and kept or nil
+	end
+	-- Pass 3c: prefab-side externalRefs override matching wired fields,
+	-- mirroring ``_constructPrefabClone``'s post-wire override.
+	for _, entry in ipairs(ordered) do
+		if entry.comp and type(entry.externalRefs) == "table" then
+			local fields = entry.externalRefs[entry.inst.instance_id]
+			if type(fields) == "table" then
+				for k, v in pairs(fields) do
+					entry.comp[k] = v
+				end
+			end
+		end
+	end
+
+	-- Steps 3-5 over the WHOLE batch: Awake (all) -> OnEnable (all) ->
+	-- Start (next tick). Running the whole batch through one
+	-- ``_runAwakeEnableStart`` is what guarantees the batch's Awake/OnEnable
+	-- precede its Start and that ``lifecycle_order`` holds among the batch.
+	engine:_runAwakeEnableStart(batch)
+end
+
+function SceneRuntime:_lifecycleOrderFor(entry)
+	-- Resolve the planner ``lifecycle_order`` list for a deferred entry's
+	-- owner (scene or prefab) so ``_completeDeferredBatch`` can order the
+	-- batch by it. Returns nil when no order is available (then defer order
+	-- is used as a stable fallback).
+	if entry.ownerKind == "scene" then
+		local scene = (self._plan.scenes or {})[entry.ownerRef]
+		return scene and scene.lifecycle_order
+	elseif entry.ownerKind == "prefab" then
+		local prefab = (self._plan.prefabs or {})[entry.ownerRef]
+		return prefab and prefab.lifecycle_order
+	end
+	return nil
 end
 
 -- ---------------------------------------------------------------------
@@ -1859,29 +2454,35 @@ function SceneRuntime:start(domainFilter)
 			local inst = byInstanceId[instId]
 			if inst and includeScriptId[inst.script_id] then
 				local goInst = self._services.workspaceFind(inst.game_object_id)
-				local comp = self:_buildComponent(
-					inst.script_id, goInst, inst.game_object_id,
-					(goInst and goInst.Name) or "", inst.config or {},
-					"scene", sceneKey)
-				if comp then
-					componentByInstanceId[instId] = comp
-					table.insert(lifecycleList, comp)
-					-- Honor planner-supplied active/enabled/tag.
-					local m = self._meta[comp]
-					m.activeSelf = inst.active ~= false
-					m.enabled = inst.enabled ~= false
-					if inst.tag and inst.tag ~= "" then
-						m.tag = inst.tag
-						-- Late-bind the tag into the by-tag index.
-						local list = self._byTag[inst.tag]
-						if not list then list = {}; self._byTag[inst.tag] = list end
-						local present = false
-						for _, x in ipairs(list) do
-							if x == goInst then present = true; break end
-						end
-						if goInst ~= nil and not present then
-							table.insert(list, goInst)
-						end
+				-- Slice 1.1: a UI-owned instance whose one-shot lookup
+				-- missed defers to event-driven resolution (its
+				-- StarterGui->PlayerGui clone may not have landed yet).
+				-- Do NOT build it now with a nil gameObject. Non-UI misses
+				-- fall through to the one-shot path below unchanged.
+				if goInst == nil and self:_isUiOwned(inst) then
+					self:_deferUiInstance({
+						inst = inst,
+						gameObjectId = inst.game_object_id,
+						ownerKind = "scene",
+						ownerRef = sceneKey,
+						references = scene.references or {},
+						byInstanceId = byInstanceId,
+						placement_id = nil,
+					})
+				else
+					local comp = self:_buildComponent(
+						inst.script_id, goInst, inst.game_object_id,
+						(goInst and goInst.Name) or "", inst.config or {},
+						"scene", sceneKey)
+					if comp then
+						componentByInstanceId[instId] = comp
+						-- Scene instance_ids are already globally unique (no
+						-- placement namespacing needed); still record the key so
+						-- ``_unregister`` clears the entry on destroy (codex r3).
+						self._componentByInstanceId[instId] = comp
+						self._meta[comp].registryKey = instId
+						table.insert(lifecycleList, comp)
+						self:_applyPlannerFlagsAndTag(comp, inst, goInst)
 					end
 				end
 			end
@@ -2026,7 +2627,7 @@ function SceneRuntime:start(domainFilter)
 
 			local componentList = self:_constructPrefabClone(
 				placement_clone, prefab, prefab_id, includeScriptId, nil,
-				p_placement_id)
+				p_placement_id, true)
 			self:_runAwakeEnableStart(componentList)
 		end
 	end
@@ -2040,6 +2641,15 @@ function SceneRuntime:start(domainFilter)
 	end
 
 	self._crossDomainEdges = crossDomainEdges
+
+	-- Slice 1.1: complete any UI-owned instances whose host clone hadn't
+	-- landed during the synchronous boot. This runs AFTER every
+	-- synchronous batch's Awake/OnEnable+armed Start, so the
+	-- start()-never-yields invariant for those components is preserved; the
+	-- deferred components run their own complete late lifecycle batch once
+	-- their PlayerGui clone resolves event-driven.
+	self:_resolveDeferredUiInstances()
+
 	return crossDomainEdges
 end
 
