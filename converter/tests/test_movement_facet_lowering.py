@@ -294,6 +294,32 @@ class TestNegative:
         assert lower_movement_facet(players) == 0
         assert "hum:Move" not in s.luau_source
 
+    def test_nonplayer_camera_emits_followfalse_when_player_exists(self) -> None:
+        """Phase-review stickiness fix: when a conversion has BOTH a player and a
+        non-player camera (drone), the drone's configure emits
+        ``followCharacter = false`` (explicit) so it can never inherit a stale
+        singleton ``true`` from the player. The player emits ``true``. (When NO
+        player exists the drone still omits the key — byte-identical — covered by
+        test_drone_not_a_player.)"""
+        drone_rotate = _ROTATE.replace("Player:Rotate", "Drone:Rotate")
+        drone_src = (
+            "local Drone = {}\nDrone.__index = Drone\n\n" + drone_rotate + "\nreturn Drone\n"
+        )
+        player = _S(_player_src(), name="Player")
+        drone = _S(drone_src, name="Drone")
+        scripts = [player, drone]
+
+        players = find_player_controllers(scripts)
+        assert players == [player]
+
+        # Both camera-facet scripts lower; the flag is deterministic per script.
+        assert lower_camera_facet(scripts, follow_character_paths=players) == 2
+        assert "self._cam:configure({rig = self.gameObject, followCharacter = true})" in player.luau_source
+        assert "self._cam:configure({rig = self.gameObject, followCharacter = false})" in drone.luau_source
+        # The drone must NOT carry true and must NOT silently omit the flag here.
+        assert "followCharacter = true" not in drone.luau_source
+        assert "self._cam:configure({rig = self.gameObject})" not in drone.luau_source
+
     def test_two_candidates_fail_closed(self) -> None:
         """(5) TWO all-three scripts -> [] (fail-closed)."""
         a = _S(_player_src(), name="PlayerA")

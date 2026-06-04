@@ -105,17 +105,24 @@ def _recoil_re(pitch_field: str) -> re.Pattern[str]:
     )
 
 
-def _step_body(param: str | None, follow_character: bool = False) -> str:
+def _step_body(param: str | None, follow_character: bool | None = None) -> str:
     arg = param or "0"
-    # The player controller's camera carries ``followCharacter = true`` so the
-    # eye follows the Roblox character (the movement pass set the same flag on
-    # its own lazy-acquire); every other camera-facet rig (drone/turret) keeps
-    # the byte-identical rig-following ``configure``.
-    config = (
-        "{rig = self.gameObject, followCharacter = true}"
-        if follow_character
-        else "{rig = self.gameObject}"
-    )
+    # Tri-state ``followCharacter`` so the singleton's eye state is deterministic
+    # and never leaks across camera controllers (the service is one camera per
+    # client):
+    #   True  -> the player controller: eye follows the Roblox character.
+    #   False -> a non-player camera (drone/turret) IN A CONVERSION THAT ALSO HAS
+    #            a player: emit the flag explicitly so a later configure clears
+    #            any prior player ``true`` instead of inheriting it (the phase-
+    #            review stickiness finding).
+    #   None  -> no player identified in this conversion: omit the key entirely
+    #            so the emit stays byte-identical to the pre-followCharacter pass.
+    if follow_character is None:
+        config = "{rig = self.gameObject}"
+    elif follow_character:
+        config = "{rig = self.gameObject, followCharacter = true}"
+    else:
+        config = "{rig = self.gameObject, followCharacter = false}"
     return (
         "\n"
         '\tif not self._cam then\n'
@@ -153,7 +160,16 @@ def lower_camera_facet(
             continue
         body_start, body_len, param, pitch_field = found
 
-        follow = id(s) in follow_ids
+        # Tri-state: the player -> True; a non-player camera when a player
+        # exists in this conversion -> False (explicit, so it can't inherit a
+        # stale singleton ``true``); no player at all -> None (byte-identical
+        # omit, so non-FPS conversions are unchanged).
+        if id(s) in follow_ids:
+            follow: bool | None = True
+        elif follow_ids:
+            follow = False
+        else:
+            follow = None
         new_src = src[:body_start] + _step_body(param, follow) + src[body_start + body_len:]
 
         # Recoil writes (outside the now-replaced look body) -> applyRecoil.
