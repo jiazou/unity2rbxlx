@@ -401,11 +401,30 @@ def transpile_with_contract(
     # SceneCameraInput runtime service so generic-mode FPS games yaw, not just
     # pitch. Structure-gated, never per-game; see camera_facet_lowering.py and
     # docs/design/camera-input-fidelity-plan.md.
+    # Player identity is computed BEFORE camera lowering: lower_camera_facet
+    # erases the camera fingerprint that find_player_controllers' camera
+    # co-signal (_find_look_method) relies on, so the ORDER here is
+    # load-bearing -- identify first, then lower.
+    from converter.movement_facet_lowering import (
+        find_player_controllers,
+        lower_movement_facet,
+    )
+    players = find_player_controllers(transpilation.scripts)
+
     from converter.camera_facet_lowering import lower_camera_facet
-    lowered = lower_camera_facet(transpilation.scripts)
+    lowered = lower_camera_facet(
+        transpilation.scripts, follow_character_paths=players,
+    )
     if lowered:
         log.info("[contract] camera-facet lowering routed %d controller(s) "
                  "to SceneCameraInput", lowered)
+
+    # Movement-facet lowering: retarget the identified player controller's WASD
+    # method from the vestigial scene rig onto the character's Humanoid:Move.
+    moved = lower_movement_facet(players)
+    if moved:
+        log.info("[contract] movement-facet lowering retargeted %d player "
+                 "controller(s) to the character Humanoid", moved)
 
     # Aggregate fail-closed reasons. Verifier failures are recorded per
     # module via warnings; convert them to FailClosed rows here so the

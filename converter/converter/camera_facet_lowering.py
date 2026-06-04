@@ -28,7 +28,7 @@ Idempotent: after lowering, neither fingerprint matches, so re-runs no-op.
 from __future__ import annotations
 
 import re
-from typing import Protocol
+from typing import Collection, Protocol
 
 from converter.runtime_contract import (
     _extract_function_body,
@@ -105,23 +105,45 @@ def _recoil_re(pitch_field: str) -> re.Pattern[str]:
     )
 
 
-def _step_body(param: str | None) -> str:
+def _step_body(param: str | None, follow_character: bool = False) -> str:
     arg = param or "0"
+    # The player controller's camera carries ``followCharacter = true`` so the
+    # eye follows the Roblox character (the movement pass set the same flag on
+    # its own lazy-acquire); every other camera-facet rig (drone/turret) keeps
+    # the byte-identical rig-following ``configure``.
+    config = (
+        "{rig = self.gameObject, followCharacter = true}"
+        if follow_character
+        else "{rig = self.gameObject}"
+    )
     return (
         "\n"
         '\tif not self._cam then\n'
         '\t\tself._cam = require(game:GetService("ReplicatedStorage")'
         ':WaitForChild("SceneCameraInput")).acquire()\n'
-        "\t\tself._cam:configure({rig = self.gameObject})\n"
+        f"\t\tself._cam:configure({config})\n"
         "\tend\n"
         f"\tself._cam:step({arg})\n"
     )
 
 
-def lower_camera_facet(scripts: list[_HasLuauSource]) -> int:
+def lower_camera_facet(
+    scripts: list[_HasLuauSource],
+    follow_character_paths: "Collection[_HasLuauSource] | None" = None,
+) -> int:
     """Lower the look facet of any flattened first-person controller in
     ``scripts`` onto the SceneCameraInput service. Returns the number of
-    scripts modified."""
+    scripts modified.
+
+    ``follow_character_paths`` is the (identity) collection of scripts
+    identified as the player controller (from
+    ``movement_facet_lowering.find_player_controllers``). For a script in that
+    set, the emitted ``configure`` carries ``followCharacter = true`` (eye
+    follows the Roblox character); for every other script the emit is
+    byte-identical to before."""
+    follow_ids = (
+        {id(s) for s in follow_character_paths} if follow_character_paths else set()
+    )
     changed = 0
     for s in scripts:
         src = s.luau_source or ""
@@ -131,7 +153,8 @@ def lower_camera_facet(scripts: list[_HasLuauSource]) -> int:
             continue
         body_start, body_len, param, pitch_field = found
 
-        new_src = src[:body_start] + _step_body(param) + src[body_start + body_len:]
+        follow = id(s) in follow_ids
+        new_src = src[:body_start] + _step_body(param, follow) + src[body_start + body_len:]
 
         # Recoil writes (outside the now-replaced look body) -> applyRecoil.
         if pitch_field:
