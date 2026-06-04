@@ -28,7 +28,7 @@ Idempotent: after lowering, neither fingerprint matches, so re-runs no-op.
 from __future__ import annotations
 
 import re
-from typing import Protocol
+from typing import Collection, Protocol
 
 from converter.runtime_contract import (
     _extract_function_body,
@@ -105,23 +105,52 @@ def _recoil_re(pitch_field: str) -> re.Pattern[str]:
     )
 
 
-def _step_body(param: str | None) -> str:
+def _step_body(param: str | None, follow_character: bool | None = None) -> str:
     arg = param or "0"
+    # Tri-state ``followCharacter`` so the singleton's eye state is deterministic
+    # and never leaks across camera controllers (the service is one camera per
+    # client):
+    #   True  -> the player controller: eye follows the Roblox character.
+    #   False -> a non-player camera (drone/turret) IN A CONVERSION THAT ALSO HAS
+    #            a player: emit the flag explicitly so a later configure clears
+    #            any prior player ``true`` instead of inheriting it (the phase-
+    #            review stickiness finding).
+    #   None  -> no player identified in this conversion: omit the key entirely
+    #            so the emit stays byte-identical to the pre-followCharacter pass.
+    if follow_character is None:
+        config = "{rig = self.gameObject}"
+    elif follow_character:
+        config = "{rig = self.gameObject, followCharacter = true}"
+    else:
+        config = "{rig = self.gameObject, followCharacter = false}"
     return (
         "\n"
         '\tif not self._cam then\n'
         '\t\tself._cam = require(game:GetService("ReplicatedStorage")'
         ':WaitForChild("SceneCameraInput")).acquire()\n'
-        "\t\tself._cam:configure({rig = self.gameObject})\n"
+        f"\t\tself._cam:configure({config})\n"
         "\tend\n"
         f"\tself._cam:step({arg})\n"
     )
 
 
-def lower_camera_facet(scripts: list[_HasLuauSource]) -> int:
+def lower_camera_facet(
+    scripts: list[_HasLuauSource],
+    follow_character_paths: "Collection[_HasLuauSource] | None" = None,
+) -> int:
     """Lower the look facet of any flattened first-person controller in
     ``scripts`` onto the SceneCameraInput service. Returns the number of
-    scripts modified."""
+    scripts modified.
+
+    ``follow_character_paths`` is the (identity) collection of scripts
+    identified as the player controller (from
+    ``movement_facet_lowering.find_player_controllers``). For a script in that
+    set, the emitted ``configure`` carries ``followCharacter = true`` (eye
+    follows the Roblox character); for every other script the emit is
+    byte-identical to before."""
+    follow_ids = (
+        {id(s) for s in follow_character_paths} if follow_character_paths else set()
+    )
     changed = 0
     for s in scripts:
         src = s.luau_source or ""
@@ -131,7 +160,17 @@ def lower_camera_facet(scripts: list[_HasLuauSource]) -> int:
             continue
         body_start, body_len, param, pitch_field = found
 
-        new_src = src[:body_start] + _step_body(param) + src[body_start + body_len:]
+        # Tri-state: the player -> True; a non-player camera when a player
+        # exists in this conversion -> False (explicit, so it can't inherit a
+        # stale singleton ``true``); no player at all -> None (byte-identical
+        # omit, so non-FPS conversions are unchanged).
+        if id(s) in follow_ids:
+            follow: bool | None = True
+        elif follow_ids:
+            follow = False
+        else:
+            follow = None
+        new_src = src[:body_start] + _step_body(param, follow) + src[body_start + body_len:]
 
         # Recoil writes (outside the now-replaced look body) -> applyRecoil.
         if pitch_field:
