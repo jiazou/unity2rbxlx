@@ -27,6 +27,20 @@ from typing import TYPE_CHECKING
 
 from core.flag_names import luau_flag_sanitize_expr
 
+# The Unity child-index lowering logic (the ``__unityChild`` helper, the
+# simple-receiver regex, the string/comment guard, and the core rewrite) lives
+# in ``child_index_lowering`` so the generic scene-runtime path
+# (``contract_pipeline.transpile_with_contract``) reuses the SAME proven logic.
+# Re-exported here so existing imports of these names off this module still
+# resolve and the legacy pack stays byte-identical for the same input.
+from converter.child_index_lowering import (
+    _GETCHILDREN_INDEX_RE,  # noqa: F401  (re-export)
+    _UNITY_CHILD_HELPER,  # noqa: F401  (re-export)
+    _luau_pos_is_code,  # noqa: F401  (re-export)
+    rewrite_child_index_source,
+    source_has_child_index,
+)
+
 if TYPE_CHECKING:
     from core.roblox_types import RbxScript
 
@@ -1226,71 +1240,8 @@ def _fix_pickup_visual_target(scripts: list["RbxScript"]) -> int:
 # (absent from the current corpus, and a blanket rewrite risks false hits) —
 # tracked as follow-ups.
 
-_GETCHILDREN_INDEX_RE = re.compile(
-    r"([A-Za-z_][A-Za-z0-9_.]*):GetChildren\(\)\s*\[\s*(\d+)\s*\]"
-)
-
-_UNITY_CHILD_HELPER = """\
--- _AutoUnityTransformChild: Unity transform.GetChild(n) indexes only child
--- GameObjects (Transforms); Roblox GetChildren() also returns injected Sounds/
--- Scripts/etc., so raw GetChildren()[n] grabs the wrong instance. Authored
--- GameObject hosts carry a _SceneRuntimeId attribute -- index those (1-based,
--- mirroring the GetChildren()[n] call sites this replaces).
-local function __unityChild(parent, i)
-\tif not parent then return nil end
-\tlocal n = 0
-\tfor _, c in ipairs(parent:GetChildren()) do
-\t\tif c:GetAttribute("_SceneRuntimeId") ~= nil then
-\t\t\tn += 1
-\t\t\tif n == i then return c end
-\t\tend
-\tend
-\t-- Fallback for unstamped/legacy output: nth Model/BasePart child.
-\tn = 0
-\tfor _, c in ipairs(parent:GetChildren()) do
-\t\tif c:IsA("Model") or c:IsA("BasePart") then
-\t\t\tn += 1
-\t\t\tif n == i then return c end
-\t\tend
-\tend
-\treturn nil
-end
-"""
-
-
-def _luau_pos_is_code(source: str, pos: int) -> bool:
-    """True if char index ``pos`` is real code, not inside a string or a
-    ``--`` comment.
-
-    Scans from the start of ``pos``'s line, tracking single/double-quoted
-    strings (with backslash escapes) and ``--`` line comments — the only forms
-    the transpiler emits. Multi-line ``[[ ]]`` strings/comments aren't modeled;
-    they don't occur in transpiled output.
-    """
-    i = source.rfind("\n", 0, pos) + 1
-    quote: str | None = None
-    while i < pos:
-        ch = source[i]
-        if quote is not None:
-            if ch == "\\":
-                i += 2
-                continue
-            if ch == quote:
-                quote = None
-        elif ch in ("'", '"'):
-            quote = ch
-        elif ch == "-" and i + 1 < pos and source[i + 1] == "-":
-            return False  # rest of the line (incl. pos) is a comment
-        i += 1
-    return quote is None
-
-
 def _detect_unity_transform_child_index(scripts: list["RbxScript"]) -> bool:
-    return any(
-        _luau_pos_is_code(s.source, m.start())
-        for s in scripts
-        for m in _GETCHILDREN_INDEX_RE.finditer(s.source)
-    )
+    return any(source_has_child_index(s.source) for s in scripts)
 
 
 @patch_pack(
@@ -1301,23 +1252,14 @@ def _detect_unity_transform_child_index(scripts: list["RbxScript"]) -> bool:
     detect=_detect_unity_transform_child_index,
 )
 def _fix_unity_transform_child_index(scripts: list["RbxScript"]) -> int:
+    # Shared logic in ``child_index_lowering.rewrite_child_index_source``; the
+    # generic path (``contract_pipeline``) calls the same helper. Behavior is
+    # byte-identical to the prior inline implementation.
     fixes = 0
     for s in scripts:
-        count = 0
-
-        def _repl(m: "re.Match[str]", _src: str = s.source) -> str:
-            nonlocal count
-            # Skip matches inside string literals / comments.
-            if not _luau_pos_is_code(_src, m.start()):
-                return m.group(0)
-            count += 1
-            return f"__unityChild({m.group(1)}, {m.group(2)})"
-
-        new_source = _GETCHILDREN_INDEX_RE.sub(_repl, s.source)
+        new_source, count = rewrite_child_index_source(s.source)
         if count == 0:
             continue
-        if "local function __unityChild(" not in new_source:
-            new_source = _UNITY_CHILD_HELPER + "\n" + new_source
         s.source = new_source
         fixes += count
         log.info("  %s: rewrote %d GetChildren()[n] -> __unityChild()", s.name, count)
