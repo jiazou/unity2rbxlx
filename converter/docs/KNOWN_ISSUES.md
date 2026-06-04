@@ -156,6 +156,44 @@ flushes the context to disk and exits cleanly.
 
 ---
 
+## Scene-runtime generic mode
+
+These surfaced during the camera/input fidelity work (PR #175) and are
+**pre-existing generic-mode gaps**, not regressions from it. They are
+instances of the same root pattern: the generic path retired the coherence-pack
+layer but several semantic-fidelity jobs have not yet been relocated to the
+deterministic lowering layer / host-runtime services (see
+`docs/design/camera-input-fidelity-plan.md` and the "deterministic lowering
+layer" section of `scene-runtime-contract.md`).
+
+### Player rig vs character binding (camera follows a possibly-mis-placed rig)
+
+**Files:** `converter/converter/scene_runtime_*`, the converted `Player` controller.
+
+In generic SimpleFPS, `Player:Move` logs *"called, but player currently has no
+character"* and bails, so the scene player `gameObject` never moves from its
+authored scene position. The PR #175 camera/input service sources the eye
+position from that rig (`self.gameObject`), so the camera's X/Z track the spawn
+but its **Y follows the rig** (observed ~-635 vs spawn Y~26). The deeper issue
+is that the converted "player" is a scene Model not bound to a moving Roblox
+character — a player/character-binding gap distinct from the (now-fixed) look bug.
+
+**Fix direction:** decide the canonical player representation in generic
+(scene rig vs Roblox character) and bind movement + camera eye to it
+consistently; likely part of the post-PR8 character/input config layer.
+
+### Turret / HudControl have no generic fidelity home
+
+**Files:** converted `Turret` (`GetPivot` on a `Sound` child, runtime error
+spam), `HudControl` (`attempt to index nil with 'FindFirstChild'`).
+
+In legacy these are handled by coherence packs (`turret_canonical_spatial_child`
+etc.); generic runs no packs, so the errors recur. These are the next
+candidates for relocation to the deterministic lowering layer (structure-gated)
+or a host-runtime helper — NOT new per-game packs.
+
+---
+
 ## Top 5 most impactful
 
 For a quick triage view:
