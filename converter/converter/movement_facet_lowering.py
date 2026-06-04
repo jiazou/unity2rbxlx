@@ -47,7 +47,19 @@ from converter.runtime_contract import (
 # anchoring the match END just after the ``(`` (NO ``\s*`` past it, so the
 # offset is stable regardless of the blanked arg), then confirm the RAW
 # argument starting at that offset is the ``CharacterController`` literal.
-_GET_COMPONENT_RE = re.compile(r"GetComponent\(")
+#
+# The ``(?<![A-Za-z0-9_])`` lookbehind requires a non-identifier char before
+# ``GetComponent`` so ``TryGetComponent(`` / ``FooGetComponent(`` (a longer
+# identifier that merely ENDS with ``GetComponent``) does NOT count -- only a
+# real ``:GetComponent(`` / ``.GetComponent(`` method call satisfies the
+# signal.
+_GET_COMPONENT_RE = re.compile(r"(?<![A-Za-z0-9_])GetComponent\(")
+# Optional leading whitespace AND/OR a blanked-out inline comment (the strip
+# nulls comment bytes to spaces, so on the STRIPPED source a comment between
+# ``(`` and the string is just whitespace; on the RAW source it is real
+# comment text -- but we only ever ``match`` _CC_ARG_RE against the STRIPPED
+# source's offset on the RAW source, and the literal arg's quotes survive on
+# raw). ``\s*`` already absorbs the blanked comment run on the stripped side.
 _CC_ARG_RE = re.compile(r"""\s*['"]CharacterController['"]\s*\)""")
 
 # A WASD key read: ``IsKeyDown(Enum.KeyCode.W|A|S|D)``. Counted body-wide on
@@ -57,11 +69,14 @@ _WASD_RE = re.compile(
 )
 
 
-def _wasd_method_body(stripped: str):
-    """Return ``(body_start, body_len, param)`` for the colon-method whose
-    body reads >=3 distinct WASD key codes, or ``None``. Scans the
-    comment/string-stripped source so reads inside literals never count;
-    offsets map 1:1 to the real source (the strip is length-preserving)."""
+def _wasd_method_bodies(stripped: str) -> list[tuple[int, int, str | None]]:
+    """Return ``(body_start, body_len, param)`` for EVERY colon-method whose
+    body reads >=3 distinct WASD key codes. Scans the comment/string-stripped
+    source so reads inside literals never count; offsets map 1:1 to the real
+    source (the strip is length-preserving). Returning ALL such methods (not
+    just the first) lets the caller fail closed when a script has more than one
+    -- an ambiguous shape we refuse to guess at (D5 abstain-on-ambiguity)."""
+    out: list[tuple[int, int, str | None]] = []
     for m in _METHOD_RE.finditer(stripped):
         body, body_start = _extract_function_body(stripped, m.end())
         if body is None:
@@ -76,8 +91,19 @@ def _wasd_method_body(stripped: str):
             pm = re.match(r"\s*([A-Za-z_]\w*)", stripped[m.end():close])
             if pm:
                 param = pm.group(1)
-        return body_start, len(body), param
-    return None
+        out.append((body_start, len(body), param))
+    return out
+
+
+def _wasd_method_body(stripped: str):
+    """Return the SINGLE WASD method ``(body_start, body_len, param)``, or
+    ``None`` if zero OR more than one colon-method reads >=3 distinct WASD
+    keys. More-than-one is fail-closed: a script with two move methods is
+    ambiguous, so we lower neither (and, upstream, it is not a player)."""
+    bodies = _wasd_method_bodies(stripped)
+    if len(bodies) != 1:
+        return None
+    return bodies[0]
 
 
 def _has_character_controller_ref(src: str, stripped: str) -> bool:
@@ -154,20 +180,35 @@ def _move_body(param: str | None) -> str:
 
 def lower_movement_facet(players: list[_HasLuauSource]) -> int:
     """Whole-body-replace each player's WASD method with the canonical
-    character-Humanoid move body. Idempotent: if the body already calls
-    ``getYawBasis():VectorToWorldSpace`` + ``:Move(``, skip. Returns the number
-    of scripts modified."""
+    character-Humanoid move body. Returns the number of scripts modified.
+
+    Idempotency is **method-scoped**, NOT file-global: we locate the WASD
+    method first, then skip the rewrite only if THAT method's body already
+    carries both lowered markers (``getYawBasis():VectorToWorldSpace`` +
+    ``:Move(``). A file-global scan would let an unrelated ``:Move(`` (e.g. on
+    some other instance) suppress a needed first lowering -- a false skip the
+    method-scoped check cannot make.
+
+    Fail-closed on multiple WASD methods: ``_wasd_method_body`` returns
+    ``None`` when a script has >1 colon-method reading >=3 distinct WASD keys,
+    so that script is left untouched (the same ambiguity gate
+    ``find_player_controllers`` already applies)."""
     changed = 0
     for s in players:
         src = s.luau_source or ""
-        # Idempotency: already-lowered body carries both markers.
-        if "getYawBasis():VectorToWorldSpace" in src and ":Move(" in src:
-            continue
         stripped = _strip_strings_and_comments(src)
         found = _wasd_method_body(stripped)
         if found is None:
             continue
         body_start, body_len, param = found
+        # Method-scoped idempotency: only skip if the WASD method's OWN body
+        # already carries both lowered markers.
+        method_body = src[body_start:body_start + body_len]
+        if (
+            "getYawBasis():VectorToWorldSpace" in method_body
+            and ":Move(" in method_body
+        ):
+            continue
         new_src = src[:body_start] + _move_body(param) + src[body_start + body_len:]
         if new_src != src:
             s.luau_source = new_src
