@@ -4,6 +4,8 @@ Date: 2026-05-21
 Branch: `arch-critique`
 Reviewer: Claude Opus 4.7, with independent second opinion from Codex (GPT-5, high reasoning).
 
+> **⚠️ Numbers below are 2026-05-21 and STALE — the conclusions still hold (more so).** Current `main` (2026-06-04): `pipeline.py` **6495** LOC / ~**65** methods (not 3897 / 49), `scene_converter.py` **5553** (not 4856), `script_coherence_packs.py` **5373** / **30** packs (not 4667), `_ctx()` **58** sites (not 50), suite ~**1340+** tests. Two clean modules landed since (`scene_runtime_topology/`, `contract_verifier.py`) — not split targets. The mega-files grew, so the refactor is *more* urgent. Current figures + the live plan: `refactor_plan.md` (2026-06-04 banner) and `docs/design/scene-runtime-and-refactor-execution.md`.
+
 This is not a human-ergonomics review. The lens is: **does the shape of this codebase let an AI agent edit it reliably?** That question has a specific, measurable answer because the cost function is well-defined — context tokens consumed per useful edit, attention budget used per file, cache hits per session.
 
 ---

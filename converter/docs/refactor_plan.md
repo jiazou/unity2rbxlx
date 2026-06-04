@@ -141,7 +141,7 @@ New `phases/services.py` with `PipelineServices` dataclass (decision #7). New `p
 
 **Dispatch:** `phases/__init__.py` defines `PHASE_FUNCS: dict[str, Callable]`. `PHASES = list(PHASE_FUNCS.keys())` derives from it (CQ-1 fold). `Pipeline._run_phase` and new public `Pipeline.run_phase(name)` both look up `PHASE_FUNCS[name]`.
 
-**Frozen `Pipeline` public API after PR-D:** `__init__`, `apply_scaffolding`, `scaffolding`, `_find_unity_root`, `context`, `run_all`, `run_all_scenes`, `run_through`, `resume`, `run_phase`, `_run_phase`. All per-phase methods DELETED.
+**Frozen `Pipeline` public API after PR-D:** `__init__`, `apply_scaffolding`, `scaffolding`, `_find_unity_root`, `context`, `run_all`, `run_all_scenes`, `run_through`, `resume`, `run_phase`, `_run_phase`. All per-phase methods DELETED. **⚠️ PR8 deletes `apply_scaffolding` + `scaffolding` (+ `_init_scaffolding`)** — so PR-C/PR-D must be authored *after* PR8 and this API list drops those two. See the gate in `docs/design/scene-runtime-and-refactor-execution.md`.
 
 **Test call-site rewrites** (decision #8):
 - `tests/test_resolve_assets_id_contract.py` — 6 sites
@@ -229,7 +229,7 @@ Old `scene_converter.py` → back-compat shim.
 - `tests/test_pipeline_e2e.py` — 7-project end-to-end harness. Baselines plug in.
 - `tests/_project_paths.py` — `_has_project(...)` skipif pattern.
 - `converter/converter/scaffolding/` — precedent for the `phases/` directory layout.
-- `PHASES` list at `pipeline.py:40` — single source of truth, PR-D derives from `PHASE_FUNCS.keys()`.
+- `PHASES` list at `pipeline.py:49` — single source of truth, PR-D derives from `PHASE_FUNCS.keys()`.
 - `@patch_pack` decorator + `_topological_order` machinery — unchanged, only file boundaries move.
 - `bash converter/tools/check_no_any.sh` — existing CI gate.
 

@@ -28,7 +28,7 @@ Net: the file PR#127 flagged as the **worst** (`scene_converter.py`, 5553 LOC, `
 
 The blanket "hold everything" collapses to **one** surgical gate, not two: **both the pipeline split and the pack split wait for PR8.**
 
-> **Correction (parallel-review, 2026-06-04):** the first draft gated the pipeline split behind **PR6**. That is wrong. PR8 — not PR6 — is the dominant `pipeline.py` churn from the recut: it rewrites the file **365+/516−** and **deletes `apply_scaffolding` + the `scaffolding` property + `_init_scaffolding`**, which PR-D's *frozen `Pipeline` public API* (refactor_plan.md:138) and `PipelineServices` *bound helpers* (refactor_plan.md:54) both retain. PR-C/PR-D authored before PR8 would bake deleted methods into the dispatch contract. **Gate the pipeline split behind PR8.** PR6's guard (+1 method) is absorbed into the same post-PR8 baseline.
+> **Correction (parallel-review, 2026-06-04):** the first draft gated the pipeline split behind **PR6**. That is wrong. PR8 — not PR6 — is the dominant `pipeline.py` churn from the recut: it rewrites the file **365+/516−** and **deletes `apply_scaffolding` + the `scaffolding` property + `_init_scaffolding`**, which PR-D's *frozen `Pipeline` public API* (refactor_plan.md:144) and `PipelineServices` *bound helpers* (refactor_plan.md:60) both retain. PR-C/PR-D authored before PR8 would bake deleted methods into the dispatch contract. **Gate the pipeline split behind PR8.** PR6's guard (+1 method) is absorbed into the same post-PR8 baseline.
 >
 > **Third collision surface:** the `plan_scene_runtime` **phase** (pipeline.py:57) calls `scene_runtime_planner`, and the domain classifier (`scene_runtime_topology/module_domain.py` — **Slice H's file**) runs in the classify/`materialize_and_classify` phase. PR-D's phase-module enumeration mentions `plan_scene_runtime` **zero** times (also omits `materialize_and_classify`). So PR-D's table is stale *and* its phase split brushes the same phases Slice H edits — sequence PR-D **after Slice H**, and refresh the enumeration at re-baseline.
 
@@ -89,7 +89,7 @@ All 9 locked eng-review decisions stand: `PHASE_FUNCS` dispatch table + `pipelin
 
 ## The one decision this changes — DECIDED 2026-06-04
 
-PR#127's blanket hold was a **user decision, reaffirmed**. This plan keeps the hold for the two collision files (`pipeline.py` → after PR6; `script_coherence_packs.py` → after PR8) but **lifts it for `scene_converter.py`**.
+PR#127's blanket hold was a **user decision, reaffirmed**. This plan keeps the hold for the two collision files (**both** the `pipeline.py` split *and* the `script_coherence_packs.py` split → **after PR8** — see the collision matrix and the Correction above) but **lifts it for `scene_converter.py`**.
 
 **Decision (jiazou, 2026-06-04): Parallelize `scene_converter` now.** Track 2 (PR-B → PR-G → PR-H) runs in its own worktree concurrently with Track 1 (the scene-runtime recut). The two efforts touch disjoint files, so the reintroduced concurrency costs only review attention, not merge risk. This supersedes the blanket-hold reaffirmation of 2026-05-23 **for `scene_converter.py` only**; the collision-file gates stand.
 
