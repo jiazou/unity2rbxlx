@@ -107,9 +107,10 @@ function SceneCameraInput:configure(opts)
 	if opts.minPitch ~= nil then self._minPitch = opts.minPitch end
 	if opts.maxPitch ~= nil then self._maxPitch = opts.maxPitch end
 	if opts.eyeHeight ~= nil then self._eyeHeight = opts.eyeHeight end
-	-- Opt-in (sticky): only the identified player controller sets this true, so
-	-- non-player camera rigs (drones/turrets) keep rig-following. Assigned only
-	-- when present, so a later plain configure cannot unset it.
+	-- Default false; set true only for the identified player controller; the
+	-- camera service is a one-camera-per-client singleton, so multi-camera-
+	-- controller games are out of scope (movement lowering fail-closes on them).
+	-- Set-when-present (like the other opts): a plain configure leaves it as-is.
 	if opts.followCharacter ~= nil then self._followChar = opts.followCharacter end
 	self:_ensureInit()
 	return self
