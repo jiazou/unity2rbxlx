@@ -98,6 +98,332 @@ class TestAdvanceLookState:
 
 
 # ---------------------------------------------------------------------------
+# step() eye-source under luau (acceptance #9: followCharacter)
+#
+# step() uses CFrame/Vector3/Enum (Roblox datatypes absent from standalone
+# luau), so we provide minimal math/engine shims and a configurable engine
+# surface (workspace.CurrentCamera, Players.LocalPlayer.Character.HRP, the rig).
+# The shims record PivotTo calls and the final camera eye so we can assert the
+# eye source and that the character is NOT PivotTo'd.
+# ---------------------------------------------------------------------------
+
+_STEP_SHIMS = textwrap.dedent("""\
+    -- loadstring chunks see GLOBALS, not the enclosing locals, so these
+    -- math/engine shims must be global for the loaded service to use them.
+    -- Minimal Vector3 (records component math the eye composition needs).
+    Vector3 = {}
+    Vector3.__index = Vector3
+    function Vector3.new(x, y, z)
+        return setmetatable({x = x or 0, y = y or 0, z = z or 0}, Vector3)
+    end
+    Vector3.__add = function(a, b)
+        return Vector3.new(a.x + b.x, a.y + b.y, a.z + b.z)
+    end
+    Vector3.zero = Vector3.new(0, 0, 0)
+
+    -- Minimal CFrame carrying only a Position (Vector3); rotation is opaque.
+    CFrame = {}
+    CFrame.__index = CFrame
+    function CFrame.new(a, b, c)
+        local pos
+        if type(a) == "table" then pos = a
+        elseif a ~= nil then pos = Vector3.new(a, b, c)
+        else pos = Vector3.new(0, 0, 0) end
+        return setmetatable({Position = pos}, CFrame)
+    end
+    function CFrame.Angles(_x, _y, _z)
+        return setmetatable({Position = Vector3.new(0, 0, 0), _angles = true}, CFrame)
+    end
+    CFrame.__mul = function(a, _b)
+        -- Position-preserving for our assertions (rotation is opaque here).
+        return setmetatable({Position = a.Position}, CFrame)
+    end
+    function CFrame:ToEulerAnglesYXZ() return 0, 0, 0 end
+
+    Enum = {
+        CameraType = {Scriptable = "Scriptable", Custom = "Custom"},
+        MouseBehavior = {LockCenter = "LockCenter"},
+    }
+""")
+
+
+def _run_step(scenario: str) -> tuple[int, str, str]:
+    """Load the service with full math/engine shims so step() can run, then
+    execute `scenario` (which builds the configured engine surface)."""
+    src = SERVICE_PATH.read_text(encoding="utf-8")
+    delim = "==="
+    while f"]{delim}]" in src or f"[{delim}[" in src:
+        delim += "="
+    embedded = f"[{delim}[\n{src}\n]{delim}]"
+    preamble = textwrap.dedent(f"""\
+        {_STEP_SHIMS}
+
+        -- Configurable engine surface, mutated by the scenario before loading.
+        local ENV = {{
+            mouseDelta = {{X = 0, Y = 0}},
+            isClient = false,           -- keep _ensureInit a no-op
+            camera = {{CFrame = CFrame.new(0, 0, 0), CameraType = "Custom"}},
+            localPlayer = nil,          -- Players.LocalPlayer
+        }}
+        _ENV = ENV
+
+        local function noop() end
+        local UserInputService = {{
+            GetMouseDelta = function() return ENV.mouseDelta end,
+        }}
+        local RunService = {{ IsClient = function() return ENV.isClient end }}
+        local Players = setmetatable({{}}, {{__index = function(_, k)
+            if k == "LocalPlayer" then return ENV.localPlayer end
+            return noop
+        end}})
+        local services = {{
+            RunService = RunService,
+            UserInputService = UserInputService,
+            Players = Players,
+        }}
+        game = {{ GetService = function(_, n) return services[n] end }}
+        -- Backing store for instance attributes so the E2E mouse channel
+        -- (E2EMouseSeq / E2EMouseDeltaX/Y) the scenario sets is readable by
+        -- _readDelta exactly as production consumes it.
+        ENV.attrs = {{}}
+        workspace = setmetatable({{
+            GetAttribute = function(_, k) return ENV.attrs[k] end,
+            SetAttribute = function(_, k, v) ENV.attrs[k] = v end,
+        }}, {{__index = function(_, k)
+            if k == "CurrentCamera" then return ENV.camera end
+            return nil
+        end}})
+
+        local SRC = {embedded}
+        local chunk, err = loadstring(SRC, "scene_camera_input")
+        assert(chunk, "load failed: " .. tostring(err))
+        SceneCameraInput = chunk()
+    """)
+    script = preamble + "\n" + scenario + "\n"
+    with tempfile.NamedTemporaryFile(suffix=".luau", mode="w", delete=False) as f:
+        f.write(script)
+        path = f.name
+    try:
+        r = subprocess.run(["luau", path], capture_output=True, text=True, timeout=15)
+        return r.returncode, r.stdout, r.stderr
+    finally:
+        Path(path).unlink(missing_ok=True)
+
+
+@pytest.mark.skipif(
+    not _luau_available() or not SERVICE_PATH.exists(),
+    reason="needs standalone luau + service file",
+)
+class TestStepEyeSource:
+    def test_follow_character_sets_eye_from_hrp_no_pivot(self) -> None:
+        # followCharacter=true + a live HRP => eye = HRP.Position + (0, eyeH, 0),
+        # and the character HRP is NEVER PivotTo'd (Humanoid owns its CFrame).
+        rc, out, err = _run_step(textwrap.dedent("""\
+            local function approx(a, b) return math.abs(a - b) < 1e-6 end
+            local hrpPivoted = false
+            local hrp = setmetatable({
+                Position = _ENV.camera.CFrame.Position, -- placeholder, overwritten
+                PivotTo = function() hrpPivoted = true end,
+            }, {})
+            -- give the HRP a known position
+            local Vec = getmetatable(_ENV.camera.CFrame.Position)
+            hrp.Position = setmetatable({x = 10, y = 5, z = -3}, Vec)
+            local char = { HumanoidRootPart = hrp }
+            function char:FindFirstChild(n)
+                if n == "HumanoidRootPart" then return hrp end
+                return nil
+            end
+            _ENV.localPlayer = { Character = char }
+
+            local svc = SceneCameraInput.acquire()
+            svc:configure({ eyeHeight = 1.5, followCharacter = true })
+            svc:step(0)
+
+            local eye = _ENV.camera.CFrame.Position
+            assert(approx(eye.x, 10), "eye.x should be HRP.x, got " .. tostring(eye.x))
+            assert(approx(eye.y, 6.5), "eye.y should be HRP.y + 1.5, got " .. tostring(eye.y))
+            assert(approx(eye.z, -3), "eye.z should be HRP.z, got " .. tostring(eye.z))
+            assert(not hrpPivoted, "character HRP must NOT be PivotTo'd")
+            print("DONE")
+        """))
+        assert rc == 0, f"luau failed: {err or out}"
+        assert "DONE" in out
+
+    def test_followchar_unset_uses_rig_path_and_pivots_rig(self) -> None:
+        # followCharacter unset => the existing rig-follow path: the rig IS
+        # PivotTo'd (yaw) and the eye comes from the rig pivot + eyeHeight.
+        rc, out, err = _run_step(textwrap.dedent("""\
+            local function approx(a, b) return math.abs(a - b) < 1e-6 end
+            local rigPivoted = false
+            local Vec = getmetatable(_ENV.camera.CFrame.Position)
+            local rigPos = setmetatable({x = 1, y = 2, z = 3}, Vec)
+            local CF = getmetatable(_ENV.camera.CFrame)
+            local rig = {
+                CFrame = setmetatable({Position = rigPos}, CF),
+                GetPivot = function(self) return setmetatable({Position = rigPos}, CF) end,
+                PivotTo = function() rigPivoted = true end,
+            }
+            -- a character exists, but followCharacter is unset => ignored
+            local hrp = { Position = setmetatable({x = 99, y = 99, z = 99}, Vec) }
+            local char = {}
+            function char:FindFirstChild(n)
+                if n == "HumanoidRootPart" then return hrp end
+            end
+            _ENV.localPlayer = { Character = char }
+
+            local svc = SceneCameraInput.acquire()
+            svc:configure({ rig = rig, eyeHeight = 1.5 })  -- no followCharacter
+            svc:step(0)
+
+            assert(rigPivoted, "rig must be PivotTo'd in the base path")
+            local eye = _ENV.camera.CFrame.Position
+            assert(approx(eye.x, 1), "eye.x from rig pivot, got " .. tostring(eye.x))
+            assert(approx(eye.y, 3.5), "eye.y = rig.y + 1.5, got " .. tostring(eye.y))
+            assert(approx(eye.z, 3), "eye.z from rig pivot, got " .. tostring(eye.z))
+            print("DONE")
+        """))
+        assert rc == 0, f"luau failed: {err or out}"
+        assert "DONE" in out
+
+    def test_followchar_set_but_no_character_falls_through_to_rig(self) -> None:
+        # followCharacter=true but no character yet => _playerRoot() nil =>
+        # fall through to the rig path with no error.
+        rc, out, err = _run_step(textwrap.dedent("""\
+            local function approx(a, b) return math.abs(a - b) < 1e-6 end
+            local rigPivoted = false
+            local Vec = getmetatable(_ENV.camera.CFrame.Position)
+            local rigPos = setmetatable({x = 7, y = 8, z = 9}, Vec)
+            local CF = getmetatable(_ENV.camera.CFrame)
+            local rig = {
+                CFrame = setmetatable({Position = rigPos}, CF),
+                GetPivot = function(self) return setmetatable({Position = rigPos}, CF) end,
+                PivotTo = function() rigPivoted = true end,
+            }
+            _ENV.localPlayer = { Character = nil }  -- no character spawned yet
+
+            local svc = SceneCameraInput.acquire()
+            svc:configure({ rig = rig, eyeHeight = 1.5, followCharacter = true })
+            svc:step(0)
+
+            assert(rigPivoted, "with no character, the rig path runs (no error)")
+            local eye = _ENV.camera.CFrame.Position
+            assert(approx(eye.y, 9.5), "eye.y = rig.y + 1.5, got " .. tostring(eye.y))
+            print("DONE")
+        """))
+        assert rc == 0, f"luau failed: {err or out}"
+        assert "DONE" in out
+
+    def _drive_mouse(self, dx: int, dy: int, seq: int) -> str:
+        """Luau snippet that pushes one mouse delta through the E2E channel
+        (E2EMouseSeq / E2EMouseDeltaX/Y) the way _readDelta consumes it."""
+        return textwrap.dedent(f"""\
+            workspace:SetAttribute("E2EMouseDeltaX", {dx})
+            workspace:SetAttribute("E2EMouseDeltaY", {dy})
+            workspace:SetAttribute("E2EMouseSeq", {seq})
+        """)
+
+    def test_step_advances_yaw_pitch_follow_path(self) -> None:
+        # The shim's CFrame.__mul discards rotation, so assert on the service's
+        # own _yaw/_pitch state (the source of truth for the camera pose) and
+        # that CurrentCamera was written. followCharacter path: non-zero mouse
+        # delta must advance yaw (unbounded) and pitch (Roblox Y is +down, so a
+        # positive dy lowers pitch). sensitivity is configured to a round value.
+        rc, out, err = _run_step(
+            self._drive_mouse(100, 50, 1)
+            + textwrap.dedent("""\
+            local function approx(a, b) return math.abs(a - b) < 1e-6 end
+            local Vec = getmetatable(_ENV.camera.CFrame.Position)
+            local hrp = { Position = setmetatable({x = 0, y = 4, z = 0}, Vec) }
+            local char = {}
+            function char:FindFirstChild(n)
+                if n == "HumanoidRootPart" then return hrp end
+            end
+            _ENV.localPlayer = { Character = char }
+            _ENV.camera.CFrame = nil  -- prove step() writes a fresh camera CFrame
+
+            local svc = SceneCameraInput.acquire()
+            svc:configure({ sensitivity = 0.01, followCharacter = true, eyeHeight = 1.5 })
+            svc:step(0)
+
+            -- yaw = 0 - dx*sens = -100*0.01 = -1 (unbounded); pitch = 0 - dy*sens
+            -- = -50*0.01 = -0.5 (clamped well within +/-80deg).
+            assert(approx(svc._yaw, -1), "yaw must advance to -1, got " .. tostring(svc._yaw))
+            assert(approx(svc._pitch, -0.5), "pitch must advance to -0.5, got " .. tostring(svc._pitch))
+            assert(_ENV.camera.CFrame ~= nil, "step() must write CurrentCamera.CFrame")
+            print("DONE")
+        """))
+        assert rc == 0, f"luau failed: {err or out}"
+        assert "DONE" in out
+
+    def test_step_advances_yaw_pitch_rig_path(self) -> None:
+        # Same yaw/pitch advance + CurrentCamera write, but in the rig-follow
+        # path (followCharacter unset): a non-zero mouse delta advances state and
+        # the camera is written.
+        rc, out, err = _run_step(
+            self._drive_mouse(-200, -100, 1)
+            + textwrap.dedent("""\
+            local function approx(a, b) return math.abs(a - b) < 1e-6 end
+            local Vec = getmetatable(_ENV.camera.CFrame.Position)
+            local CF = getmetatable(_ENV.camera.CFrame)
+            local rigPos = setmetatable({x = 1, y = 2, z = 3}, Vec)
+            local rig = {
+                CFrame = setmetatable({Position = rigPos}, CF),
+                GetPivot = function(self) return setmetatable({Position = rigPos}, CF) end,
+                PivotTo = function() end,
+            }
+            _ENV.camera.CFrame = nil
+
+            local svc = SceneCameraInput.acquire()
+            svc:configure({ rig = rig, sensitivity = 0.01 })  -- no followCharacter
+            svc:step(0)
+
+            -- yaw = 0 - (-200)*0.01 = 2; pitch = 0 - (-100)*0.01 = 1 (up).
+            assert(approx(svc._yaw, 2), "yaw must advance to 2, got " .. tostring(svc._yaw))
+            assert(approx(svc._pitch, 1), "pitch must advance to 1, got " .. tostring(svc._pitch))
+            assert(_ENV.camera.CFrame ~= nil, "step() must write CurrentCamera.CFrame")
+            print("DONE")
+        """))
+        assert rc == 0, f"luau failed: {err or out}"
+        assert "DONE" in out
+
+    def test_follow_character_rebinds_to_new_hrp_on_respawn(self) -> None:
+        # The reason _playerRoot() re-resolves each call: with followCharacter,
+        # swapping Players.LocalPlayer.Character to a NEW HRP between two step()
+        # calls (a respawn) must move the eye to the new HRP, no stale cache.
+        rc, out, err = _run_step(textwrap.dedent("""\
+            local function approx(a, b) return math.abs(a - b) < 1e-6 end
+            local Vec = getmetatable(_ENV.camera.CFrame.Position)
+            local function makeChar(x, y, z)
+                local hrp = { Position = setmetatable({x = x, y = y, z = z}, Vec) }
+                local char = {}
+                function char:FindFirstChild(n)
+                    if n == "HumanoidRootPart" then return hrp end
+                end
+                return char
+            end
+
+            _ENV.localPlayer = { Character = makeChar(10, 5, -3) }
+            local svc = SceneCameraInput.acquire()
+            svc:configure({ eyeHeight = 1.5, followCharacter = true })
+            svc:step(0)
+            local eye1 = _ENV.camera.CFrame.Position
+            assert(approx(eye1.x, 10) and approx(eye1.y, 6.5) and approx(eye1.z, -3),
+                "first eye should follow the original HRP")
+
+            -- Respawn: swap in a brand-new Character/HRP at a new position.
+            _ENV.localPlayer.Character = makeChar(-7, 20, 8)
+            svc:step(0)
+            local eye2 = _ENV.camera.CFrame.Position
+            assert(approx(eye2.x, -7), "eye.x must rebind to new HRP, got " .. tostring(eye2.x))
+            assert(approx(eye2.y, 21.5), "eye.y must rebind to new HRP+1.5, got " .. tostring(eye2.y))
+            assert(approx(eye2.z, 8), "eye.z must rebind to new HRP, got " .. tostring(eye2.z))
+            print("DONE")
+        """))
+        assert rc == 0, f"luau failed: {err or out}"
+        assert "DONE" in out
+
+
+# ---------------------------------------------------------------------------
 # Scope-cap guard (pure Python — no luau needed)
 # ---------------------------------------------------------------------------
 
