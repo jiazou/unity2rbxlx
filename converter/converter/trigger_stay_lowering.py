@@ -96,7 +96,7 @@ _CONNECT_TOUCHED_RE = re.compile(
         (?P<head>
             self\.host[:.]connectGameObjectSignal
             \s*\(\s*
-            .+?                          # <go> -- minimal text up to ", \"Touched\","
+            (?P<go>.+?)                  # <go> -- minimal text up to ", \"Touched\","
             \s*,\s*
         )
         ['"]Touched['"]\s*,\s*           # the "Touched" arg + separator (dropped)
@@ -109,6 +109,50 @@ _CONNECT_TOUCHED_RE = re.compile(
 # ``OnTriggerEnter`` do not. A trailing word-boundary stops it from matching a
 # hypothetical ``OnTriggerStayLonger``.
 _STAY_COMMENT_RE = re.compile(r"^--\s*OnTriggerStay\b")
+
+
+def _is_balanced_first_arg(go: str) -> bool:
+    """True if ``go`` is a *complete, balanced* first argument: all ``()``,
+    ``[]``, ``{}`` are balanced AND every quote is closed (no unterminated
+    string), with delimiters inside string literals ignored.
+
+    The widened ``.+?`` go-capture anchors on the *first* ``, "Touched",`` it
+    sees. If the go expression itself contains an internal ``, "Touched",``
+    (e.g. ``self:pick("foo", "Touched", x)``), the non-greedy capture stops at
+    the INTERNAL anchor and over-captures a short, UNBALANCED fragment
+    (``self:pick("foo"``). Rewriting that fragment drops the wrong ``"Touched"``
+    and corrupts the call. Guarding on balance lets the real captures
+    (``self.gameObject``, ``self.parts[1]``, ``self:getTriggerPart()``,
+    ``self:pick("Touched", x)``) through while the pathological internal-anchor
+    fragment -- which is necessarily unbalanced -- ABSTAINS (bias-to-abstain:
+    the safe degrade, never corrupt).
+    """
+    depth = 0
+    quote: str | None = None
+    i = 0
+    n = len(go)
+    while i < n:
+        ch = go[i]
+        if quote is not None:
+            # Inside a string: only a backslash-escape or the matching close
+            # quote is meaningful; bracket chars are literal text.
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+        elif ch in ("(", "[", "{"):
+            depth += 1
+        elif ch in (")", "]", "}"):
+            depth -= 1
+            if depth < 0:
+                return False  # a close with no matching open
+        i += 1
+    return depth == 0 and quote is None
 
 
 def _luau_pos_is_code(source: str, pos: int) -> bool:
@@ -259,6 +303,12 @@ def rewrite_trigger_stay_source(source: str) -> tuple[str, int]:
         line_start = m.start("indent")
         comment = _preceding_comment_line(source, line_start)
         if comment is None or not _STAY_COMMENT_RE.match(comment):
+            return m.group(0)
+        # The non-greedy ``<go>`` capture can anchor on an INTERNAL ``, "Touched",``
+        # inside the go expression, over-capturing a short unbalanced fragment.
+        # Only rewrite when the captured go is a balanced, complete first arg;
+        # otherwise ABSTAIN (return the match unchanged) -- never corrupt.
+        if not _is_balanced_first_arg(m.group("go")):
             return m.group(0)
         count += 1
         # Drop ``"Touched", `` and rename the method to the Stay variant; the

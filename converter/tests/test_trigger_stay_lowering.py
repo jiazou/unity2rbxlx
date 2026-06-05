@@ -278,6 +278,57 @@ def test_complex_go_expressions_are_lowered() -> None:
         assert '"Touched"' not in s.luau_source
 
 
+def test_go_with_internal_touched_abstains_no_corruption() -> None:
+    """(FINDING MAJOR) A go expression that itself contains an internal
+    ``, "Touched",`` (``self:pick("foo", "Touched", x)``) makes the non-greedy
+    ``<go>`` capture anchor on the INTERNAL ``"Touched"`` and over-capture a
+    short UNBALANCED fragment (``self:pick("foo"``). The balance guard ABSTAINS
+    (count 0, source UNCHANGED) rather than corrupt the call. RED against the
+    pre-guard code (which produced ``connectGameObjectSignalStay(self:pick("foo",
+    x), "Touched", ...)``)."""
+    src = textwrap.dedent("""\
+        function Turret:Awake()
+            -- OnTriggerStay(other)
+            self.host:connectGameObjectSignal(self:pick("foo", "Touched", x), "Touched", function(other) end)
+        end
+    """)
+    s = _S(src)
+    before = s.luau_source
+    n = lower_trigger_stay([s])
+    assert n == 0
+    assert s.luau_source == before
+    assert "connectGameObjectSignalStay" not in s.luau_source
+
+
+def test_balanced_go_expressions_still_lower() -> None:
+    """(FINDING MAJOR, complement) The balanced first-arg cases -- including a
+    call whose arg list legitimately contains a ``"Touched"`` string literal
+    (``self:pick("Touched", x)``) -- remain balanced and STILL lower correctly
+    (count 1). Only the pathological internal-anchor fragment abstains."""
+    cases = [
+        "self.gameObject",
+        "self.parts[1]",
+        "self:getTriggerPart()",
+        'self:pick("Touched", x)',
+    ]
+    for go in cases:
+        src = textwrap.dedent(f"""\
+            function Turret:Awake()
+                -- OnTriggerStay(other)
+                self.host:connectGameObjectSignal({go}, "Touched", function(other)
+                    self:_engage(other)
+                end)
+            end
+        """)
+        s = _S(src)
+        n = lower_trigger_stay([s])
+        assert n == 1, f"go={go!r} should lower"
+        assert (
+            f"self.host:connectGameObjectSignalStay({go}, function(other)"
+            in s.luau_source
+        ), f"go={go!r} not preserved verbatim"
+
+
 def test_binding_inside_long_string_is_not_lowered() -> None:
     """(FINDING 1) A binding inside a MULTI-LINE ``[[ ... ]]`` long string
     (opened on an earlier line, with a ``-- OnTriggerStay`` line inside the
