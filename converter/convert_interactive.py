@@ -461,8 +461,41 @@ def status(output_dir: str) -> None:
 @click.argument("output_dir", type=click.Path())
 @click.option("--scene", type=str, default=None,
               help="Specific .unity scene to select (path relative to project).")
-def discover(unity_project_path: str, output_dir: str, scene: str | None) -> None:
+@click.option("--scene-runtime",
+              type=click.Choice(["legacy", "auto", "generic"]),
+              default="legacy",
+              show_default=True,
+              help="Scene-runtime contract mode. Stamps the output dir at "
+                   "this FIRST front door so the later transpile/assemble "
+                   "guards match. 'auto' is reserved for PR5 and rejected.")
+@click.option("--clean", is_flag=True,
+              help="Wipe + re-stamp the output dir before discovery "
+              "(mode-mismatch remediation).")
+def discover(unity_project_path: str, output_dir: str, scene: str | None,
+             scene_runtime: str, clean: bool) -> None:
     """Phase 1: parse Unity scenes and prefabs (pipeline phase: parse)."""
+    if scene_runtime == "auto":
+        _emit({
+            "phase": "discover",
+            "success": False,
+            "errors": [
+                "--scene-runtime=auto is not yet supported. Use "
+                "--scene-runtime=generic for the contract pipeline.",
+            ],
+        })
+        sys.exit(1)
+
+    # Stamp the mode at the FIRST front door. ``discover`` creates the
+    # output dir; without stamping it here, the dir is left unstamped and
+    # the next front door (``transpile``) reads an absent stamp -> defaults
+    # to 'legacy' -> mismatches a requested 'generic' and aborts. Stamping
+    # here keeps the whole phase flow (discover -> transpile -> assemble)
+    # mode-consistent. Runs BEFORE ``_make_pipeline`` (which mkdir's the
+    # dir), mirroring the ``transpile`` front door's ordering.
+    _guard_scene_runtime_mode_or_emit(
+        "discover", Path(output_dir).resolve(), scene_runtime, clean,
+    )
+
     pipeline = _make_pipeline(unity_project_path, output_dir)
     if scene:
         pipeline.ctx.selected_scene = scene
@@ -510,8 +543,28 @@ def discover(unity_project_path: str, output_dir: str, scene: str | None) -> Non
 @cli.command()
 @click.argument("unity_project_path", type=click.Path(exists=True, file_okay=False))
 @click.argument("output_dir", type=click.Path())
-def inventory(unity_project_path: str, output_dir: str) -> None:
+@click.option("--scene-runtime",
+              type=click.Choice(["legacy", "auto", "generic"]),
+              default="legacy", show_default=True,
+              help="Scene-runtime contract mode. Stamps the output dir so the "
+                   "later transpile/assemble guards match (this command also "
+                   "creates the dir as an alternate first entrypoint).")
+@click.option("--clean", is_flag=True,
+              help="Wipe + re-stamp the output dir (mode-mismatch remediation).")
+def inventory(unity_project_path: str, output_dir: str,
+              scene_runtime: str, clean: bool) -> None:
     """Phase 2: extract assets and build the asset manifest."""
+    if scene_runtime == "auto":
+        _emit({"phase": "inventory", "success": False, "errors": [
+            "--scene-runtime=auto is not yet supported. Use "
+            "--scene-runtime=generic for the contract pipeline."]})
+        sys.exit(1)
+    # Stamp at this front door too: ``inventory`` also creates the output dir
+    # (``_make_pipeline``), so if it runs before any stamping command the dir is
+    # left unstamped and a later generic ``transpile`` aborts on the mismatch.
+    _guard_scene_runtime_mode_or_emit(
+        "inventory", Path(output_dir).resolve(), scene_runtime, clean,
+    )
     pipeline = _make_pipeline(unity_project_path, output_dir)
     try:
         _run_through(pipeline, "extract_assets")
@@ -557,8 +610,27 @@ def inventory(unity_project_path: str, output_dir: str) -> None:
 @cli.command()
 @click.argument("unity_project_path", type=click.Path(exists=True, file_okay=False))
 @click.argument("output_dir", type=click.Path())
-def materials(unity_project_path: str, output_dir: str) -> None:
+@click.option("--scene-runtime",
+              type=click.Choice(["legacy", "auto", "generic"]),
+              default="legacy", show_default=True,
+              help="Scene-runtime contract mode. Stamps the output dir so the "
+                   "later transpile/assemble guards match (this command also "
+                   "creates the dir as an alternate first entrypoint).")
+@click.option("--clean", is_flag=True,
+              help="Wipe + re-stamp the output dir (mode-mismatch remediation).")
+def materials(unity_project_path: str, output_dir: str,
+              scene_runtime: str, clean: bool) -> None:
     """Phase 3a: map Unity materials to Roblox SurfaceAppearance."""
+    if scene_runtime == "auto":
+        _emit({"phase": "materials", "success": False, "errors": [
+            "--scene-runtime=auto is not yet supported. Use "
+            "--scene-runtime=generic for the contract pipeline."]})
+        sys.exit(1)
+    # Stamp at this front door too (see ``inventory``): ``materials`` also
+    # creates the dir, so an unstamped dir here would trip the later guard.
+    _guard_scene_runtime_mode_or_emit(
+        "materials", Path(output_dir).resolve(), scene_runtime, clean,
+    )
     pipeline = _make_pipeline(unity_project_path, output_dir)
     try:
         _run_through(pipeline, "convert_materials")

@@ -41,6 +41,15 @@ python3 convert_interactive.py status <output_dir> 2>/dev/null
 python3 convert_interactive.py discover <unity_project_path> <output_dir> 2>/dev/null
 ```
 
+For a **generic** scene-runtime conversion, pass the mode to discover too —
+it is the first front door and stamps the output dir, so the later
+`transpile`/`assemble` guards match (omitting it stamps `legacy`, and the
+generic `transpile` then aborts with a mode mismatch):
+
+```bash
+python3 convert_interactive.py discover <unity_project_path> <output_dir> --scene-runtime=generic 2>/dev/null
+```
+
 ### Step 2: Asset Inventory — `references/phase-2-inventory.md`
 
 ```bash
