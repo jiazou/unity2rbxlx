@@ -297,7 +297,10 @@ legacy. **`discover` is the FIRST front door and MUST carry the mode:**
 it creates the output dir and stamps it; if it runs without
 `--scene-runtime=generic`, the dir is stamped `legacy` and the
 `transpile` front door then aborts with a `scene-runtime mode mismatch`
-(loud failure, no place produced). Pass the mode to discover at Step 3.1.
+(loud failure, no place produced). Pass `--scene-runtime=generic` to the
+`discover` command under Step 3 (Phases 1–3). (`inventory`/`materials`
+also accept `--scene-runtime` for the same reason, but in the normal
+discover-first flow they inherit the stamp discover already wrote.)
 
 #### Outcome capture
 

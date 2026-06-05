@@ -1175,37 +1175,51 @@ class TestDiscoverE2E:
         assert status_payload["status"] == "in_progress"
         assert status_payload["next_skill_phase"] == "inventory"
 
-    def test_discover_stamps_scene_runtime_mode(self, tmp_path, simplefps_project):
-        """``discover`` is the first front door: it must stamp the output dir
-        with the requested mode so the later ``transpile``/``assemble`` guards
-        match. Without this (pre-fix), discover left the dir unstamped ->
-        guard defaults 'legacy' -> a generic ``transpile`` aborts with a loud
-        mode mismatch (no place produced)."""
+
+class TestFrontDoorSceneRuntimeStamp:
+    """Fast, fixture-free CI guard for the front-door stamping fix.
+
+    Every dir-creating front door (``discover``/``inventory``/``materials``)
+    must stamp the output dir with the requested mode BEFORE creating it, so a
+    later generic ``transpile``/``assemble`` guard matches instead of aborting
+    with ``scene-runtime mode mismatch`` (the "loud failure, no place" bug).
+    The stamp is written by the guard *before* ``parse``/``extract_assets``,
+    so an empty project dir is enough — parse fails, but the stamp we assert is
+    already on disk. No ``simplefps_project`` fixture, not ``slow`` → runs in
+    the ``-m "not slow"`` CI suite. Fails pre-fix (the commands had no
+    ``--scene-runtime`` option, so the dir was left unstamped == legacy)."""
+
+    @pytest.mark.parametrize("cmd", ["discover", "inventory", "materials"])
+    def test_generic_front_door_stamps_generic(self, tmp_path, cmd):
         from utils.scene_runtime_stamp import (
-            read_scene_runtime_stamp,
-            check_scene_runtime_mode_match,
+            read_scene_runtime_stamp, check_scene_runtime_mode_match,
+        )
+        proj = tmp_path / "empty_proj"
+        proj.mkdir()
+        out = tmp_path / f"{cmd}_out"
+        # parse/extract may fail on an empty project; the front-door stamp is
+        # written first, which is what we assert.
+        CliRunner().invoke(
+            cli, [cmd, str(proj), str(out), "--scene-runtime=generic"],
+            catch_exceptions=False,
+        )
+        assert read_scene_runtime_stamp(out) == "generic"
+        # the next generic front door (transpile/assemble) would now MATCH.
+        assert check_scene_runtime_mode_match(out, "generic") == "generic"
+
+    @pytest.mark.parametrize("cmd", ["discover", "inventory", "materials"])
+    def test_default_front_door_stays_legacy(self, tmp_path, cmd):
+        from utils.scene_runtime_stamp import (
+            read_scene_runtime_stamp, check_scene_runtime_mode_match,
             SceneRuntimeModeMismatch,
         )
-        runner = CliRunner()
-
-        # generic discover stamps generic -> the next front door's guard matches.
-        out_g = tmp_path / "gen_out"
-        code, _ = _invoke_json(
-            runner,
-            ["discover", str(simplefps_project), str(out_g),
-             "--scene-runtime=generic"],
+        proj = tmp_path / "empty_proj"
+        proj.mkdir()
+        out = tmp_path / f"{cmd}_out"
+        CliRunner().invoke(
+            cli, [cmd, str(proj), str(out)], catch_exceptions=False,
         )
-        assert code == 0
-        assert read_scene_runtime_stamp(out_g) == "generic"
-        assert check_scene_runtime_mode_match(out_g, "generic") == "generic"
-
-        # default (no flag) stays legacy (back-compat) -> a generic front door
-        # still refuses, so the guard contract is intact.
-        out_l = tmp_path / "leg_out"
-        code, _ = _invoke_json(
-            runner, ["discover", str(simplefps_project), str(out_l)]
-        )
-        assert code == 0
-        assert read_scene_runtime_stamp(out_l) == "legacy"
+        # back-compat: no flag => legacy, and a generic front door still refuses.
+        assert read_scene_runtime_stamp(out) == "legacy"
         with pytest.raises(SceneRuntimeModeMismatch):
-            check_scene_runtime_mode_match(out_l, "generic")
+            check_scene_runtime_mode_match(out, "generic")
