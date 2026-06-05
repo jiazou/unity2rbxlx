@@ -290,9 +290,14 @@ should pre-decide for /convert-unity are:
     /e2e-test).
 
 **Scene-runtime mode.** When `--generic` was passed to /e2e-test,
-ensure /convert-unity's `transpile` and `assemble` phases run with
-`--scene-runtime=generic` (and the planning in 4a accounts for the
-generic ModuleScript + host contract). Default is legacy.
+ensure /convert-unity's **`discover`**, `transpile`, and `assemble`
+phases ALL run with `--scene-runtime=generic` (and the planning in 4a
+accounts for the generic ModuleScript + host contract). Default is
+legacy. **`discover` is the FIRST front door and MUST carry the mode:**
+it creates the output dir and stamps it; if it runs without
+`--scene-runtime=generic`, the dir is stamped `legacy` and the
+`transpile` front door then aborts with a `scene-runtime mode mismatch`
+(loud failure, no place produced). Pass the mode to discover at Step 3.1.
 
 #### Outcome capture
 

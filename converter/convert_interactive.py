@@ -461,8 +461,41 @@ def status(output_dir: str) -> None:
 @click.argument("output_dir", type=click.Path())
 @click.option("--scene", type=str, default=None,
               help="Specific .unity scene to select (path relative to project).")
-def discover(unity_project_path: str, output_dir: str, scene: str | None) -> None:
+@click.option("--scene-runtime",
+              type=click.Choice(["legacy", "auto", "generic"]),
+              default="legacy",
+              show_default=True,
+              help="Scene-runtime contract mode. Stamps the output dir at "
+                   "this FIRST front door so the later transpile/assemble "
+                   "guards match. 'auto' is reserved for PR5 and rejected.")
+@click.option("--clean", is_flag=True,
+              help="Wipe + re-stamp the output dir before discovery "
+              "(mode-mismatch remediation).")
+def discover(unity_project_path: str, output_dir: str, scene: str | None,
+             scene_runtime: str, clean: bool) -> None:
     """Phase 1: parse Unity scenes and prefabs (pipeline phase: parse)."""
+    if scene_runtime == "auto":
+        _emit({
+            "phase": "discover",
+            "success": False,
+            "errors": [
+                "--scene-runtime=auto is not yet supported. Use "
+                "--scene-runtime=generic for the contract pipeline.",
+            ],
+        })
+        sys.exit(1)
+
+    # Stamp the mode at the FIRST front door. ``discover`` creates the
+    # output dir; without stamping it here, the dir is left unstamped and
+    # the next front door (``transpile``) reads an absent stamp -> defaults
+    # to 'legacy' -> mismatches a requested 'generic' and aborts. Stamping
+    # here keeps the whole phase flow (discover -> transpile -> assemble)
+    # mode-consistent. Runs BEFORE ``_make_pipeline`` (which mkdir's the
+    # dir), mirroring the ``transpile`` front door's ordering.
+    _guard_scene_runtime_mode_or_emit(
+        "discover", Path(output_dir).resolve(), scene_runtime, clean,
+    )
+
     pipeline = _make_pipeline(unity_project_path, output_dir)
     if scene:
         pipeline.ctx.selected_scene = scene

@@ -1174,3 +1174,38 @@ class TestDiscoverE2E:
         _, status_payload = _invoke_json(runner, ["status", str(out_dir)])
         assert status_payload["status"] == "in_progress"
         assert status_payload["next_skill_phase"] == "inventory"
+
+    def test_discover_stamps_scene_runtime_mode(self, tmp_path, simplefps_project):
+        """``discover`` is the first front door: it must stamp the output dir
+        with the requested mode so the later ``transpile``/``assemble`` guards
+        match. Without this (pre-fix), discover left the dir unstamped ->
+        guard defaults 'legacy' -> a generic ``transpile`` aborts with a loud
+        mode mismatch (no place produced)."""
+        from utils.scene_runtime_stamp import (
+            read_scene_runtime_stamp,
+            check_scene_runtime_mode_match,
+            SceneRuntimeModeMismatch,
+        )
+        runner = CliRunner()
+
+        # generic discover stamps generic -> the next front door's guard matches.
+        out_g = tmp_path / "gen_out"
+        code, _ = _invoke_json(
+            runner,
+            ["discover", str(simplefps_project), str(out_g),
+             "--scene-runtime=generic"],
+        )
+        assert code == 0
+        assert read_scene_runtime_stamp(out_g) == "generic"
+        assert check_scene_runtime_mode_match(out_g, "generic") == "generic"
+
+        # default (no flag) stays legacy (back-compat) -> a generic front door
+        # still refuses, so the guard contract is intact.
+        out_l = tmp_path / "leg_out"
+        code, _ = _invoke_json(
+            runner, ["discover", str(simplefps_project), str(out_l)]
+        )
+        assert code == 0
+        assert read_scene_runtime_stamp(out_l) == "legacy"
+        with pytest.raises(SceneRuntimeModeMismatch):
+            check_scene_runtime_mode_match(out_l, "generic")
