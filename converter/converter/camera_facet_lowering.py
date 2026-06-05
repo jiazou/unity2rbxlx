@@ -85,6 +85,12 @@ _MOUSE_DELTA_RE = re.compile(r"GetMouseDelta\(")
 _CAM_OWNER_RE = re.compile(
     r"CurrentCamera|CameraType\s*=\s*Enum\.CameraType\.Scriptable",
 )
+# The broad look method must also WRITE a camera orientation (``CFrame.Angles``)
+# -- this is what separates the real mouse-look from an aim-down-sights / zoom
+# method that reads ``GetMouseDelta`` and touches the camera only to change
+# ``FieldOfView`` (codex adversarial finding: without it, an ``Aim()``/
+# ``PrimeMouse()`` method declared before ``Rotate`` was mis-bound).
+_CAM_ANGLES_RE = re.compile(r"CFrame\.Angles\(")
 
 
 def _find_look_method(stripped: str, broadened: bool = False):
@@ -94,10 +100,21 @@ def _find_look_method(stripped: str, broadened: bool = False):
     real source (the strip preserves length).
 
     ``broadened`` (set ONLY for the upstream-identified player script) ALSO
-    accepts a method that reads ``GetMouseDelta()`` and owns the camera, so an
-    AI-emitted CFrame shape the strict pitch-rebuild regex misses is still
-    located. Non-player scripts pass ``broadened=False`` and keep the exact
-    strict shape (byte-identical behavior; no new false positives)."""
+    accepts a method that reads ``GetMouseDelta()``, owns the camera, AND
+    writes a camera orientation (``CFrame.Angles``), so an AI-emitted CFrame
+    shape the strict pitch-rebuild regex misses is still located. Non-player
+    scripts pass ``broadened=False`` and keep the exact strict shape
+    (byte-identical behavior; no new false positives).
+
+    Uniqueness is enforced (mirroring the WASD move locator): collect every
+    matching method, PREFER the canonical strict shape when present, and
+    fail-closed (``None``) when more than one method qualifies with no single
+    strict winner -- so a player script with a second mouse-look-ish method
+    (aim/lean) abstains rather than letting first-match-wins splice the wrong
+    body (codex: the wrong-method bind + the ``self._cam:step(`` false
+    reassurance)."""
+    matches: list[tuple[int, int, str | None, str | None]] = []
+    strict_matches: list[tuple[int, int, str | None, str | None]] = []
     for m in _METHOD_RE.finditer(stripped):
         body, body_start = _extract_function_body(stripped, m.end())
         if body is None:
@@ -107,6 +124,7 @@ def _find_look_method(stripped: str, broadened: bool = False):
             broadened
             and _MOUSE_DELTA_RE.search(body)
             and _CAM_OWNER_RE.search(body)
+            and _CAM_ANGLES_RE.search(body)
         )
         if not (strict or broad):
             continue
@@ -119,7 +137,18 @@ def _find_look_method(stripped: str, broadened: bool = False):
                 param = pm.group(1)
         pitch_m = _PITCH_CLAMP_RE.search(body) or _PITCH_IN_CAM_RE.search(body)
         pitch_field = pitch_m.group("pitch") if pitch_m else None
-        return body_start, len(body), param, pitch_field
+        result = (body_start, len(body), param, pitch_field)
+        matches.append(result)
+        if strict:
+            strict_matches.append(result)
+    # Prefer the canonical strict look method; else the unique broad one; else
+    # fail-closed on ambiguity.
+    if len(strict_matches) == 1:
+        return strict_matches[0]
+    if len(strict_matches) > 1:
+        return None
+    if len(matches) == 1:
+        return matches[0]
     return None
 
 

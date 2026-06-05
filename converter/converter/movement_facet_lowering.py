@@ -1,9 +1,9 @@
 """movement_facet_lowering.py -- generic-allowlist player movement lowering.
 
 A deterministic, structure-gated lowering on the generic scene-runtime
-allowlist (called from ``contract_pipeline.transpile_with_contract``, AFTER
-identifying the player but BEFORE ``lower_camera_facet`` erases the camera
-fingerprint). It retargets the converted player controller's WASD movement
+allowlist (called from ``contract_pipeline.transpile_with_contract`` on the
+upstream-identified player, AFTER ``lower_camera_facet``). It retargets the
+converted player controller's WASD movement
 from the vestigial scene rig Part (``self.gameObject:PivotTo(...)``) onto the
 Roblox character's ``Humanoid:Move(...)``, so Roblox physics owns
 gravity/collision/floor (required by the ``FloorMaterial`` spawn oracle and to
@@ -57,13 +57,17 @@ _WASD_RE = re.compile(
     r"Enum\.KeyCode\.(?P<key>[WASD])\b",
 )
 
-# A locomotion side-effect: the move method DOES something with movement
-# (drives a Humanoid / jumps / pivots the rig / reads ground state). Required
-# alongside the WASD reads so a pure-input helper (``ReadMoveInput()`` that only
-# reads keys and returns a vector) cannot steal the match from the method that
-# actually moves the character (codex adversarial finding).
+# A locomotion side-effect: the move method DRIVES movement (Humanoid:Move /
+# sets Jump / pivots the rig). Required alongside the WASD reads so a pure-input
+# helper that only reads keys and returns a vector cannot steal the match from
+# the method that actually moves the character (codex adversarial finding).
+# NOTE: ``.FloorMaterial`` is intentionally NOT here -- it's a ground-state
+# READ (a grounded check), present in input-reader helpers too, so counting it
+# let a helper masquerade as the move method (codex: a ``ReadMovementIntent()``
+# that reads FloorMaterial + WASD and returns a vector was mis-bound). The real
+# move method always also drives via one of these three.
 _LOCOMOTION_RE = re.compile(
-    r":Move\(|\.Jump\b|:PivotTo\(|\.FloorMaterial\b",
+    r":Move\(|\.Jump\b|:PivotTo\(",
 )
 
 

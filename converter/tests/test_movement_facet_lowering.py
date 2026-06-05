@@ -516,6 +516,101 @@ class TestMoveLocatorFailClosed:
         assert s.luau_source == before
 
 
+class TestLookLocatorAmbiguity:
+    """The broadened look locator must not first-match-win onto the wrong method
+    inside the player script (codex P1.2)."""
+
+    def test_ads_method_before_rotate_binds_rotate(self) -> None:
+        """An aim/zoom method that reads GetMouseDelta + owns the camera but does
+        NOT write a camera orientation (no CFrame.Angles) must NOT be mistaken
+        for the look method -- the real Rotate (which writes CFrame.Angles) is
+        bound instead, even though the aim method is declared first."""
+        prime = textwrap.dedent("""\
+            function Player:PrimeMouse()
+                local d = self.uis:GetMouseDelta()
+                local cam = workspace.CurrentCamera
+                if cam then cam.CameraType = Enum.CameraType.Scriptable end
+                self.fov = 70
+            end
+        """)
+        src = (
+            "local Player = {}\nPlayer.__index = Player\n\n"
+            + _AWAKE + "\n" + prime + "\n" + _REAL_ROTATE + "\nreturn Player\n"
+        )
+        s = _S(src)
+        players = find_player_controllers([s], _modules(cc=("Player",)))
+        assert lower_camera_facet([s], follow_character_paths=players) == 1
+        out = s.luau_source
+        # PrimeMouse untouched (still reads the mouse), Rotate routed to step.
+        assert "self.fov = 70" in out and "function Player:PrimeMouse()" in out
+        assert "self._cam:step(dt)" in out
+        assert "(basePivot - basePivot.Position)" not in out  # Rotate replaced
+
+    def test_two_broad_look_methods_fail_closed(self) -> None:
+        """A player with TWO genuine mouse-look methods (each GetMouseDelta +
+        camera-owner + CFrame.Angles) is ambiguous -> the look locator abstains
+        rather than first-match-win onto one."""
+        lean = _REAL_ROTATE.replace("Player:Rotate", "Player:Lean")
+        src = (
+            "local Player = {}\nPlayer.__index = Player\n\n"
+            + _AWAKE + "\n" + _REAL_ROTATE + "\n" + lean + "\nreturn Player\n"
+        )
+        s = _S(src)
+        before = s.luau_source
+        players = find_player_controllers([s], _modules(cc=("Player",)))
+        # Two broad matches, no strict winner -> abstain -> nothing lowered.
+        assert lower_camera_facet([s], follow_character_paths=players) == 0
+        assert s.luau_source == before
+
+    def test_strict_preferred_over_broad(self) -> None:
+        """When a player has the canonical strict look method AND a broad-only
+        aim method, the strict one is bound (prefer-strict)."""
+        aim = _REAL_ROTATE.replace("Player:Rotate", "Player:Aim")
+        src = (
+            "local Player = {}\nPlayer.__index = Player\n\n"
+            + _AWAKE + "\n" + _ROTATE + "\n" + aim + "\nreturn Player\n"
+        )
+        s = _S(src)
+        players = find_player_controllers([s], _modules(cc=("Player",)))
+        assert lower_camera_facet([s], follow_character_paths=players) == 1
+        # The strict Rotate was replaced; the broad-only Aim still has its mouse read.
+        assert "self._cam:step(dt)" in s.luau_source
+        assert "(basePivot - basePivot.Position)" in s.luau_source  # Aim untouched
+
+
+class TestMoveLocatorHelperGuard:
+    def test_floormaterial_reader_helper_not_move_method(self) -> None:
+        """A helper that reads WASD + FloorMaterial but only RETURNS a vector
+        (no Humanoid:Move / Jump / PivotTo drive) must not be taken as the move
+        method; with the real Move's WASD factored into the helper, neither
+        method qualifies -> abstain (codex P1.3: FloorMaterial is a read)."""
+        intent = textwrap.dedent("""\
+            function Player:ReadMovementIntent()
+                local grounded = self.control and self.control.FloorMaterial ~= Enum.Material.Air
+                local h = self:_axis(Enum.KeyCode.D, Enum.KeyCode.A)
+                local v = self:_axis(Enum.KeyCode.W, Enum.KeyCode.S)
+                return Vector3.new(h, 0, -v)
+            end
+        """)
+        move = textwrap.dedent("""\
+            function Player:Move(dt)
+                local dir = self:ReadMovementIntent()
+                self.gameObject:PivotTo(self.gameObject:GetPivot() + dir)
+            end
+        """)
+        src = (
+            "local Player = {}\nPlayer.__index = Player\n\n"
+            + _AWAKE + "\n" + _ROTATE + "\n" + intent + "\n" + move + "\nreturn Player\n"
+        )
+        s = _S(src)
+        before = s.luau_source
+        players = find_player_controllers([s], _modules(cc=("Player",)))
+        # The reader helper (no drive) and Move (no WASD literals) both fail the
+        # combined gate -> nothing lowered (surfaced as player_move_unbound).
+        assert lower_movement_facet(players) == 0
+        assert s.luau_source == before
+
+
 # --- Pipeline-invocation integration ---------------------------------------
 
 
@@ -601,6 +696,56 @@ class TestPipelineInvocation:
             "player_ambiguous", "player_unresolved",
             "player_move_unbound", "player_look_unbound",
         })
+
+    def test_pipeline_surfaces_player_look_unbound(self) -> None:
+        """Player identified, movement bound, but the look method is ambiguous
+        (two broad look methods) -> the pipeline surfaces player_look_unbound
+        instead of silently shipping an unbound camera."""
+        lean = _REAL_ROTATE.replace("Player:Rotate", "Player:Lean")
+        src = (
+            "local Player = {}\nPlayer.__index = Player\n\n"
+            + _AWAKE + "\n" + _REAL_ROTATE + "\n" + lean + "\n" + _REAL_MOVE
+            + "\n" + _HELPERS + "\nreturn Player\n"
+        )
+        result = self._run(src)
+        kinds = {fc.kind for fc in result.fail_closed}
+        assert "player_look_unbound" in kinds
+        assert "player_move_unbound" not in kinds  # movement still bound
+
+    def test_pipeline_surfaces_player_signal_absent(self) -> None:
+        """A scene_runtime artifact that predates the upstream signal (no
+        has_character_controller key on any module) surfaces player_signal_absent
+        rather than silently skipping player binding."""
+        from converter import contract_pipeline
+
+        player_path = Path("/proj/Assets/Player.cs")
+        infos = [_PInfo(player_path, "Player")]
+        # Module row WITHOUT the has_character_controller key (pre-fix shape).
+        stale_row = {
+            "stem": "Player", "class_name": "Player", "runtime_bearing": True,
+            "is_component_class": True, "character_attached": False,
+            "is_loader": False,
+        }
+        scene_runtime = {
+            "modules": {"guid-player": stale_row},
+            "scenes": {}, "prefabs": {}, "domain_overrides": {},
+        }
+        ps = TranspiledScript(
+            source_path=str(player_path), output_filename="Player.luau",
+            csharp_source="", luau_source=_player_src(), strategy="ai",
+            confidence=1.0, script_type="ModuleScript",
+        )
+        stub = TranspilationResult()
+        stub.total_transpiled = 1
+        stub.scripts.append(ps)
+        with patch(
+            "converter.contract_pipeline.transpile_scripts", return_value=stub,
+        ):
+            result = contract_pipeline.transpile_with_contract(
+                "/proj", infos, scene_runtime=scene_runtime, use_ai=False,
+            )
+        kinds = {fc.kind for fc in result.fail_closed}
+        assert "player_signal_absent" in kinds
 
     def test_pipeline_surfaces_player_ambiguous(self) -> None:
         """>1 CharacterController-bearing script -> a player_ambiguous row, and
