@@ -47,9 +47,13 @@ EXACT, BINDING-LOCAL match (BLOCKING design requirement):
     matches, so a second pass is a no-op.
 
 The matcher is string-span / structural (consistent with the other facet
-transforms), and ``_luau_pos_is_code`` skips matches inside string literals or
-``--`` comments so the rewrite never fires on a binding that lives inside a Lua
-string.
+transforms). ``<go>`` is captured as the whole first argument (a name, an
+index, or a call -- not just ``self.gameObject``) and preserved verbatim.
+Two abstain guards stop a rewrite inside a Lua string/comment so source is
+never corrupted: ``_luau_pos_is_code`` skips short quoted strings and ``--``
+line comments (line-local), and ``_luau_pos_in_long_bracket`` skips multi-line
+long-bracket strings (``[[ ... ]]``/``[=[ ... ]=]``) and block comments
+(``--[[ ... ]]``) opened on an earlier line.
 """
 
 from __future__ import annotations
@@ -66,22 +70,33 @@ class _HasLuauSource(Protocol):
 # binding:  ``self.host:connectGameObjectSignal(<go>, "Touched",``
 #
 # Groups:
-#   1 = leading indentation on the call's own line (used to find the line start)
-#   2 = receiver+method+open-paren+<go>+comma, e.g.
+#   indent = leading indentation on the call's own line (used to find line start)
+#   head   = receiver+method+open-paren+<go>+comma, e.g.
 #       ``self.host:connectGameObjectSignal(self.gameObject, ``  -- everything
 #       up to (and including) the comma+space before the "Touched" literal.
 #
-# ``<go>`` is a simple dotted name (no ``()``/``[]``/``,``) -- the contract
-# emits ``self.gameObject`` here. Both ``:`` (method) and ``.`` (field) call
-# forms are accepted. ``"Touched"`` may use single or double quotes. The
-# trailing ``,\s*`` is consumed so the rewrite drops the literal AND its
-# separator, leaving the function expression as the (now first) argument.
+# ``<go>`` is captured NON-GREEDILY (``.+?``) as the minimal text up to the
+# ``, "Touched",`` separator. The anchor ``,\s*['"]Touched['"]`` forces the
+# capture to extend past any internal commas inside the go expression (a call
+# ``self:getTriggerPart()`` or an index ``self.parts[1]`` with a ``foo(a, b)``
+# subexpression is captured whole), so a local alias ``trigger``, an index,
+# or a call -- not just the contract default ``self.gameObject`` -- all match
+# and are preserved verbatim in the rewrite. Both ``:`` (method) and ``.``
+# (field) call forms are accepted. ``"Touched"`` may use single or double
+# quotes. The trailing ``,\s*`` is consumed so the rewrite drops the literal
+# AND its separator, leaving the function expression as the (now first) arg.
+#
+# NO ``re.DOTALL``: ``.`` excludes newlines, so the whole ``connect...(...,
+# "Touched",`` match stays on one physical line. The transpiler always emits
+# the ``<go>, "Touched",`` head on a single line; keeping ``.`` line-local
+# means the non-greedy ``<go>`` can never run past the binding's line to
+# swallow a ``"Touched"`` on some later line.
 _CONNECT_TOUCHED_RE = re.compile(
     r"""(?P<indent>[ \t]*)
         (?P<head>
             self\.host[:.]connectGameObjectSignal
             \s*\(\s*
-            [A-Za-z_][A-Za-z0-9_.]*      # <go> -- simple dotted name
+            .+?                          # <go> -- minimal text up to ", \"Touched\","
             \s*,\s*
         )
         ['"]Touched['"]\s*,\s*           # the "Touched" arg + separator (dropped)
@@ -122,29 +137,103 @@ def _luau_pos_is_code(source: str, pos: int) -> bool:
     return quote is None
 
 
-def _preceding_comment_line(source: str, line_start: int) -> str | None:
-    """Return the stripped text of the non-blank line IMMEDIATELY preceding the
-    line that begins at ``line_start``, or ``None`` if there is no such line.
+def _luau_pos_in_long_bracket(source: str, pos: int) -> bool:
+    """True if char index ``pos`` is inside an OPEN Luau long-bracket string
+    (``[[ ... ]]``, ``[=[ ... ]=]`` and higher level forms) or long block
+    comment (``--[[ ... ]]``) opened earlier in ``source`` and not yet closed.
 
-    "Immediately preceding" skips over blank/whitespace-only lines so a binding
-    annotated with a comment and a blank line still keys off that comment, but
-    does NOT skip a non-blank intervening line (e.g. another statement) -- in
-    that case the preceding line is that statement, not a comment, and the
-    binding is left as an edge.
+    ``_luau_pos_is_code`` only scans from the start of ``pos``'s own line, so a
+    binding inside a MULTI-LINE long-string/comment payload (opened on an
+    earlier line) looks like live code to it and would be corrupted. This scans
+    the WHOLE source up to ``pos`` and reports whether we are inside such a
+    span, biasing the rewrite to ABSTAIN (the safe degrade -- never corrupt a
+    string). Single/double-quoted strings and ``--`` line comments are handled
+    by ``_luau_pos_is_code``; this only adds the long-bracket forms.
     """
-    # ``line_start`` is the index of the first char of the binding's line. Walk
-    # backwards over preceding physical lines.
-    end = line_start  # exclusive upper bound of the previous line's newline
-    while end > 0:
-        # ``end - 1`` is the newline terminating the previous line.
-        prev_nl = source.rfind("\n", 0, end - 1)
-        prev_line = source[prev_nl + 1:end - 1]
-        if prev_line.strip() == "":
-            # Blank line -- keep walking to the line above it.
-            end = prev_nl + 1
+    i = 0
+    n = len(source)
+    while i < pos:
+        ch = source[i]
+        # ``--`` may begin a line comment or, if immediately followed by a long
+        # bracket, a long block comment. A long block comment shares the same
+        # ``[=*[ ... ]=*]`` delimiters as a long string.
+        if ch == "-" and i + 1 < n and source[i + 1] == "-":
+            j = i + 2
+            level = _long_bracket_open_level(source, j)
+            if level is not None:
+                # ``--[=*[`` long block comment: skip to its closing ``]=*]``.
+                close = source.find("]" + "=" * level + "]", j)
+                if close == -1 or close >= pos:
+                    return True  # pos is inside this open block comment
+                i = close + level + 2
+                continue
+            # Plain ``--`` line comment: skip to end of line (or pos).
+            nl = source.find("\n", j)
+            if nl == -1 or nl >= pos:
+                return False  # line comment runs through pos -> not a long span
+            i = nl + 1
             continue
-        return prev_line.strip()
+        if ch in ("'", '"'):
+            # Short quoted string: skip to its matching close (honor escapes).
+            quote = ch
+            i += 1
+            while i < n:
+                c = source[i]
+                if c == "\\":
+                    i += 2
+                    continue
+                if c == quote or c == "\n":
+                    break
+                i += 1
+            i += 1
+            continue
+        if ch == "[":
+            level = _long_bracket_open_level(source, i)
+            if level is not None:
+                # Long string ``[=*[``: skip to its closing ``]=*]``.
+                close = source.find("]" + "=" * level + "]", i + level + 2)
+                if close == -1 or close >= pos:
+                    return True  # pos is inside this open long string
+                i = close + level + 2
+                continue
+        i += 1
+    return False
+
+
+def _long_bracket_open_level(source: str, i: int) -> int | None:
+    """If ``source[i:]`` begins a Luau long-bracket opener ``[=*[``, return the
+    number of ``=`` signs (the bracket level: 0 for ``[[``, 1 for ``[=[`` ...).
+    Otherwise return ``None``."""
+    if i >= len(source) or source[i] != "[":
+        return None
+    j = i + 1
+    while j < len(source) and source[j] == "=":
+        j += 1
+    if j < len(source) and source[j] == "[":
+        return j - (i + 1)
     return None
+
+
+def _preceding_comment_line(source: str, line_start: int) -> str | None:
+    """Return the stripped text of the LITERAL immediately-preceding physical
+    line (the one ending at the newline just before ``line_start``), or ``None``
+    if there is no preceding line.
+
+    "Immediately preceding" is STRICT: it does NOT skip blank/whitespace-only
+    lines. The design contract emits the ``-- OnTriggerStay`` origin comment
+    directly above its binding, so requiring the comment on the literal previous
+    line is both correct and safe. A blank line OR a non-blank statement between
+    the comment and the binding therefore returns that (blank/statement) line --
+    not the comment -- and the binding is left as an edge.
+    """
+    if line_start == 0:
+        return None
+    # ``line_start - 1`` is the newline terminating the previous physical line.
+    # (If the char before the binding's line isn't a newline, ``line_start``
+    # wasn't a line start -- but the matcher always anchors on a line start.)
+    prev_nl = source.rfind("\n", 0, line_start - 1)
+    prev_line = source[prev_nl + 1:line_start - 1]
+    return prev_line.strip()
 
 
 def rewrite_trigger_stay_source(source: str) -> tuple[str, int]:
@@ -158,8 +247,13 @@ def rewrite_trigger_stay_source(source: str) -> tuple[str, int]:
 
     def _repl(m: "re.Match[str]") -> str:
         nonlocal count
-        # Skip matches that live inside a string literal / comment.
+        # Skip matches that live inside a short string literal / ``--`` line
+        # comment (scanned line-locally) OR inside a multi-line long-bracket
+        # string / block comment opened on an earlier line (scanned from source
+        # start). Either => ABSTAIN, never corrupt the payload.
         if not _luau_pos_is_code(source, m.start("head")):
+            return m.group(0)
+        if _luau_pos_in_long_bracket(source, m.start("head")):
             return m.group(0)
         # The binding's own line begins after the captured indent.
         line_start = m.start("indent")

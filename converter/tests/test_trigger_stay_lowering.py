@@ -188,11 +188,51 @@ def test_dot_call_form_is_lowered() -> None:
     )
 
 
-def test_comment_not_immediately_preceding_is_not_lowered() -> None:
-    """Binding-local anchoring: an ``-- OnTriggerStay`` comment that is NOT the
-    line immediately above the binding (a non-blank statement intervenes) does
-    NOT trigger the rewrite -- the matcher anchors on the immediately-preceding
-    line only."""
+def test_comment_directly_above_is_lowered() -> None:
+    """(FINDING 3a) The origin comment on the LITERAL immediately-preceding line
+    (no blank, no statement between) authorizes the rewrite."""
+    src = textwrap.dedent("""\
+        function Turret:Awake()
+            -- OnTriggerStay(other)
+            self.host:connectGameObjectSignal(self.gameObject, "Touched", function(other)
+                self:_engage(other)
+            end)
+        end
+    """)
+    s = _S(src)
+    n = lower_trigger_stay([s])
+    assert n == 1
+    assert (
+        "self.host:connectGameObjectSignalStay(self.gameObject, function(other)"
+        in s.luau_source
+    )
+
+
+def test_blank_line_between_comment_and_binding_is_not_lowered() -> None:
+    """(FINDING 3b) The contract emits the comment DIRECTLY above the binding.
+    A blank line between the origin comment and the binding means the comment is
+    NOT the literal immediately-preceding line -> the binding is left an edge
+    (strict immediately-preceding, no blank-line skip)."""
+    src = textwrap.dedent("""\
+        function Turret:Awake()
+            -- OnTriggerStay(other)
+
+            self.host:connectGameObjectSignal(self.gameObject, "Touched", function(other)
+                self:_engage(other)
+            end)
+        end
+    """)
+    s = _S(src)
+    before = s.luau_source
+    n = lower_trigger_stay([s])
+    assert n == 0
+    assert s.luau_source == before
+    assert "connectGameObjectSignalStay" not in s.luau_source
+
+
+def test_intervening_statement_is_not_lowered() -> None:
+    """(FINDING 3c) A non-blank statement between the comment and the binding
+    blocks the rewrite -- the immediately-preceding line is the statement."""
     src = textwrap.dedent("""\
         function Turret:Awake()
             -- OnTriggerStay(other)
@@ -209,13 +249,93 @@ def test_comment_not_immediately_preceding_is_not_lowered() -> None:
     assert s.luau_source == before
 
 
-def test_blank_line_between_comment_and_binding_still_lowered() -> None:
-    """A blank line between the origin comment and the binding still keys off
-    the comment (blank lines are skipped, non-blank lines are not)."""
+def test_complex_go_expressions_are_lowered() -> None:
+    """(FINDING 2) A non-trivial first arg -- a local alias, an index, or a call
+    (even with an internal comma) -- is captured whole and preserved verbatim,
+    not silently skipped."""
+    cases = [
+        "trigger",
+        "self.parts[1]",
+        "self:getTriggerPart()",
+        "self.host.findPart(a, b)",  # internal comma -> captured whole
+    ]
+    for go in cases:
+        src = textwrap.dedent(f"""\
+            function Turret:Awake()
+                -- OnTriggerStay(other)
+                self.host:connectGameObjectSignal({go}, "Touched", function(other)
+                    self:_engage(other)
+                end)
+            end
+        """)
+        s = _S(src)
+        n = lower_trigger_stay([s])
+        assert n == 1, f"go={go!r} should lower"
+        assert (
+            f"self.host:connectGameObjectSignalStay({go}, function(other)"
+            in s.luau_source
+        ), f"go={go!r} not preserved verbatim"
+        assert '"Touched"' not in s.luau_source
+
+
+def test_binding_inside_long_string_is_not_lowered() -> None:
+    """(FINDING 1) A binding inside a MULTI-LINE ``[[ ... ]]`` long string
+    (opened on an earlier line, with a ``-- OnTriggerStay`` line inside the
+    payload) is NOT real code -> abstain, source unchanged."""
+    src = textwrap.dedent("""\
+        local doc = [[
+        -- OnTriggerStay(other)
+        self.host:connectGameObjectSignal(self.gameObject, "Touched", function(other) return other end)
+        ]]
+        return doc
+    """)
+    s = _S(src)
+    before = s.luau_source
+    n = lower_trigger_stay([s])
+    assert n == 0
+    assert s.luau_source == before
+    assert "connectGameObjectSignalStay" not in s.luau_source
+
+
+def test_binding_inside_long_block_comment_is_not_lowered() -> None:
+    """(FINDING 1) The same, inside a ``--[[ ... ]]`` long block comment."""
+    src = textwrap.dedent("""\
+        --[[
+        -- OnTriggerStay(other)
+        self.host:connectGameObjectSignal(self.gameObject, "Touched", function(other) return other end)
+        ]]
+        local x = 1
+    """)
+    s = _S(src)
+    before = s.luau_source
+    n = lower_trigger_stay([s])
+    assert n == 0
+    assert s.luau_source == before
+
+
+def test_binding_inside_leveled_long_string_is_not_lowered() -> None:
+    """(FINDING 1) A leveled ``[=[ ... ]=]`` long string is also respected."""
+    src = textwrap.dedent("""\
+        local doc = [=[
+        -- OnTriggerStay(other)
+        self.host:connectGameObjectSignal(self.gameObject, "Touched", function(other) return other end)
+        ]=]
+        return doc
+    """)
+    s = _S(src)
+    before = s.luau_source
+    n = lower_trigger_stay([s])
+    assert n == 0
+    assert s.luau_source == before
+
+
+def test_real_code_after_closed_long_string_still_lowered() -> None:
+    """Guard the abstain isn't over-broad: a closed ``[[ ... ]]`` above the
+    binding must NOT suppress a legitimate later lowering."""
     src = textwrap.dedent("""\
         function Turret:Awake()
+            local doc = [[ harmless ]]
             -- OnTriggerStay(other)
-
             self.host:connectGameObjectSignal(self.gameObject, "Touched", function(other)
                 self:_engage(other)
             end)
@@ -224,7 +344,10 @@ def test_blank_line_between_comment_and_binding_still_lowered() -> None:
     s = _S(src)
     n = lower_trigger_stay([s])
     assert n == 1
-    assert "connectGameObjectSignalStay" in s.luau_source
+    assert (
+        "self.host:connectGameObjectSignalStay(self.gameObject, function(other)"
+        in s.luau_source
+    )
 
 
 def test_binding_inside_string_is_not_lowered() -> None:
