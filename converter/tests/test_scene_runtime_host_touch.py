@@ -65,9 +65,14 @@ local function newInstance(spec)
     inst.CanTouch = spec.CanTouch
     inst._children = spec.children or {}
     inst._isa = spec.isa or {}
+    inst._attrs = spec.attrs or {}
     inst._signals = {}
     inst.Parent = nil
     for _, c in ipairs(inst._children) do c.Parent = inst end
+
+    function inst:GetAttribute(name)
+        return self._attrs[name]
+    end
 
     function inst:IsA(class)
         if self.ClassName == class then return true end
@@ -125,6 +130,27 @@ local function newInstance(spec)
     return inst
 end
 
+-- Fireable signal (Roblox-shaped: ``:Connect`` returns a ``:Disconnect``
+-- handle). Used to drive the engine Heartbeat the OnTriggerStay poll arms.
+local function newSignal()
+    local sig = { _conns = {}, _id = 0 }
+    function sig:Connect(fn)
+        self._id = self._id + 1
+        local id = self._id
+        self._conns[id] = fn
+        return {Disconnect = function() self._conns[id] = nil end}
+    end
+    function sig:fire(...)
+        for _, fn in pairs(self._conns) do fn(...) end
+    end
+    function sig:count()
+        local n = 0
+        for _ in pairs(self._conns) do n = n + 1 end
+        return n
+    end
+    return sig
+end
+
 -- Mock Players service ----------------------------------------------------
 local function newPlayers(map)
     return {
@@ -156,6 +182,32 @@ local function baseServices(players)
         now = function() return 0 end,
         players = players,
     }
+end
+
+-- Services with a controllable Heartbeat + clock for OnTriggerStay poll
+-- tests. ``svc.heartbeat:fire()`` drives one poll tick; ``svc.setClock(t)``
+-- advances the throttle clock the poll reads via ``services.now``.
+local function stayServices(players)
+    local hb = newSignal()
+    local clk = 0
+    local svc = baseServices(players)
+    svc.heartbeat = hb
+    svc.now = function() return clk end
+    svc.setClock = function(t) clk = t end
+    return svc, hb
+end
+
+-- Stub ``workspace`` global with a settable ``GetPartsInPart`` result so
+-- the poll can be driven deterministically. Set ``workspace._overlap`` to
+-- the list of overlapping parts a sweep returns.
+local function installWorkspace(parts)
+    workspace = {
+        _overlap = parts or {},
+        GetPartsInPart = function(self, _part)
+            return self._overlap
+        end,
+    }
+    return workspace
 end
 """
 
@@ -207,6 +259,60 @@ class TestGetTouchPart:
         rc, out, err = _run(scenario)
         assert rc == 0, f"luau failed: {err}\n{out}"
         assert "SAME" in out
+
+    def test_basepart_root_with_marked_trigger_child_returns_child(self):
+        # Slice 1.1 Layer C: a BasePart-root go (e.g. a turret body Part)
+        # with a ``_IsTriggerVolume``-marked descendant resolves to that
+        # marked detection volume, NOT the small visible body — so the
+        # OnTriggerStay poll overlap-tests the 285-stud Collider radius.
+        scenario = textwrap.dedent("""\
+            local engine = SceneRuntime.new(baseServices(nil), {})
+            local trig = newInstance{Name = "Collider", ClassName = "Part",
+                isa = {BasePart = true}, CanTouch = true, Transparency = 1,
+                attrs = {_IsTriggerVolume = true}}
+            -- The root IS a BasePart (turret body) AND carries the marked
+            -- trigger child as a descendant.
+            local body = newInstance{Name = "Turret", ClassName = "Part",
+                isa = {BasePart = true}, CanTouch = true, children = {trig}}
+            local got = engine:getTouchPart(body)
+            print(got == trig and "MARKED" or ("WRONG:" .. tostring(got and got.Name)))
+        """)
+        rc, out, err = _run(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "MARKED" in out
+
+    def test_childless_basepart_still_passes_through(self):
+        # Slice 1.1 Layer C regression: a BasePart go with NO marked
+        # trigger volume must STILL return itself (passthrough preserved).
+        scenario = textwrap.dedent("""\
+            local engine = SceneRuntime.new(baseServices(nil), {})
+            local part = newInstance{Name = "Body", ClassName = "Part",
+                isa = {BasePart = true}, CanTouch = true}
+            local got = engine:getTouchPart(part)
+            print(got == part and "SAME" or "DIFF")
+        """)
+        rc, out, err = _run(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "SAME" in out
+
+    def test_model_prefers_marked_descendant_over_named_trigger(self):
+        # A Model go prefers a ``_IsTriggerVolume``-marked descendant even
+        # when an (unmarked) named trigger child is also present.
+        scenario = textwrap.dedent("""\
+            local engine = SceneRuntime.new(baseServices(nil), {})
+            local named = newInstance{Name = "TriggerZone", ClassName = "Part",
+                isa = {BasePart = true}, CanTouch = true, Transparency = 1}
+            local marked = newInstance{Name = "Detector", ClassName = "Part",
+                isa = {BasePart = true}, CanTouch = true, Transparency = 1,
+                attrs = {_IsTriggerVolume = true}}
+            local model = newInstance{Name = "Turret", ClassName = "Model",
+                isa = {Model = true}, children = {named, marked}}
+            local got = engine:getTouchPart(model)
+            print(got == marked and "MARKED" or ("WRONG:" .. tostring(got and got.Name)))
+        """)
+        rc, out, err = _run(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "MARKED" in out
 
     def test_model_with_triggerzone_child(self):
         scenario = textwrap.dedent("""\
@@ -318,6 +424,214 @@ class TestConnectGameObjectSignal:
         assert "NILCONN" in out
         # Fail-soft warning emitted.
         assert "no touch part" in out
+
+
+# ---------------------------------------------------------------------------
+# connectGameObjectSignalStay (OnTriggerStay overlap poll)
+# ---------------------------------------------------------------------------
+
+class TestConnectGameObjectSignalStay:
+
+    def test_fires_for_part_already_overlapping_at_arm_time(self):
+        # Teleport-inside analog: the player is ALREADY inside the trigger
+        # volume when the poll arms (no ``.Touched`` edge ever fires). The
+        # poll must still detect it on the first throttled tick.
+        scenario = textwrap.dedent("""\
+            local services, hb = stayServices(nil)
+            local engine = SceneRuntime.new(services, {})
+            local limb = newInstance{Name = "RightFoot", ClassName = "Part",
+                isa = {BasePart = true}}
+            installWorkspace({limb})
+            local trig = newInstance{Name = "Collider", ClassName = "Part",
+                isa = {BasePart = true}, CanTouch = true, Transparency = 1,
+                attrs = {_IsTriggerVolume = true}}
+            local body = newInstance{Name = "Turret", ClassName = "Part",
+                isa = {BasePart = true}, CanTouch = true, children = {trig}}
+            local comp = {}
+            engine._meta[comp] = {activeInHierarchy = true, enabled = true}
+            local hits = {}
+            local conn = engine:connectGameObjectSignalStay(comp, body,
+                function(other) table.insert(hits, other) end)
+            print(conn ~= nil and "CONNECTED" or "NOCONN")
+            -- First tick at t=1 (past the throttle from t=0 arm).
+            services.setClock(1)
+            hb:fire(0.016)
+            print("HITS " .. tostring(#hits))
+            print((hits[1] == limb) and "ISLIMB" or "WRONGHIT")
+        """)
+        rc, out, err = _run(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "CONNECTED" in out
+        assert "HITS 1" in out
+        assert "ISLIMB" in out
+
+    def test_throttle_skips_ticks_inside_interval(self):
+        # Two Heartbeat ticks within the throttle window => only ONE sweep
+        # fires fn (the per-tick analog is throttled, not per-frame-raw).
+        scenario = textwrap.dedent("""\
+            local services, hb = stayServices(nil)
+            local engine = SceneRuntime.new(services, {})
+            local limb = newInstance{Name = "Foot", ClassName = "Part",
+                isa = {BasePart = true}}
+            installWorkspace({limb})
+            local trig = newInstance{Name = "Collider", ClassName = "Part",
+                isa = {BasePart = true}, CanTouch = true,
+                attrs = {_IsTriggerVolume = true}}
+            local body = newInstance{Name = "Turret", ClassName = "Part",
+                isa = {BasePart = true}, CanTouch = true, children = {trig}}
+            local comp = {}
+            engine._meta[comp] = {activeInHierarchy = true, enabled = true}
+            local hits = 0
+            engine:connectGameObjectSignalStay(comp, body,
+                function() hits = hits + 1 end)
+            services.setClock(1)   ; hb:fire(0.016)  -- fires (past throttle)
+            services.setClock(1.05); hb:fire(0.016)  -- within 0.13s -> skip
+            print("HITS " .. tostring(hits))
+        """)
+        rc, out, err = _run(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "HITS 1" in out
+
+    def test_disarms_on_disable_rearms_on_enable_no_leak(self):
+        # The poll is routed through the lifecycle ``connect`` machinery, so
+        # disabling the component disconnects the Heartbeat subscription (no
+        # leak), and re-enabling rearms it. Proven by the signal's live
+        # connection count AND by fn firing only while enabled.
+        scenario = textwrap.dedent("""\
+            local services, hb = stayServices(nil)
+            local engine = SceneRuntime.new(services, {})
+            local limb = newInstance{Name = "Foot", ClassName = "Part",
+                isa = {BasePart = true}}
+            installWorkspace({limb})
+            local trig = newInstance{Name = "Collider", ClassName = "Part",
+                isa = {BasePart = true}, CanTouch = true,
+                attrs = {_IsTriggerVolume = true}}
+            local body = newInstance{Name = "Turret", ClassName = "Part",
+                isa = {BasePart = true}, CanTouch = true, children = {trig}}
+            -- Register the component with the gate machinery so disarm/rearm
+            -- runs through the real _meta + _goActiveInHierarchy paths.
+            local comp = {}
+            engine._meta[comp] = {activeInHierarchy = true, enabled = true,
+                                  gameObjectId = "go1"}
+            engine._goActiveSelf["go1"] = true
+            engine._goActiveInHierarchy["go1"] = true
+            local hits = 0
+            engine:connectGameObjectSignalStay(comp, body,
+                function() hits = hits + 1 end)
+            print("ARMED " .. tostring(hb:count()))   -- 1 live conn
+            -- Disable: disarm the subscription.
+            engine._meta[comp].enabled = false
+            engine:_disarmSubs(comp)
+            print("DISARMED " .. tostring(hb:count())) -- 0 live conns (no leak)
+            -- A tick while disabled fires nothing.
+            services.setClock(1); hb:fire(0.016)
+            print("WHILE_DISABLED " .. tostring(hits))
+            -- Re-enable: rearm.
+            engine._meta[comp].enabled = true
+            engine:_rearmSubs(comp)
+            print("REARMED " .. tostring(hb:count()))  -- 1 live conn again
+            services.setClock(2); hb:fire(0.016)
+            print("AFTER_REARM " .. tostring(hits))
+        """)
+        rc, out, err = _run(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "ARMED 1" in out
+        assert "DISARMED 0" in out, f"Heartbeat connection leaked on disable\n{out}"
+        assert "WHILE_DISABLED 0" in out
+        assert "REARMED 1" in out
+        assert "AFTER_REARM 1" in out
+
+    def test_player_from_touch_resolves_poll_discovered_limb(self):
+        # The poll-discovered BasePart must normalize to the owning Player
+        # via playerFromTouch (ancestor walk) — the load-bearing claim that
+        # the poll path feeds the same detection as a .Touched edge.
+        scenario = textwrap.dedent("""\
+            local hum = newInstance{Name = "Humanoid", ClassName = "Humanoid",
+                isa = {Humanoid = true}}
+            local character = newInstance{Name = "Char", ClassName = "Model",
+                isa = {Model = true}, children = {hum}}
+            local limb = newInstance{Name = "LeftLeg", ClassName = "Part",
+                isa = {BasePart = true}}
+            limb.Parent = character
+            local fakePlayer = {Name = "Player1"}
+            local services, hb = stayServices(
+                newPlayers({[character] = fakePlayer}))
+            local engine = SceneRuntime.new(services, {})
+            installWorkspace({limb})
+            local trig = newInstance{Name = "Collider", ClassName = "Part",
+                isa = {BasePart = true}, CanTouch = true,
+                attrs = {_IsTriggerVolume = true}}
+            local body = newInstance{Name = "Turret", ClassName = "Part",
+                isa = {BasePart = true}, CanTouch = true, children = {trig}}
+            local comp = {}
+            engine._meta[comp] = {activeInHierarchy = true, enabled = true}
+            local resolved = nil
+            engine:connectGameObjectSignalStay(comp, body, function(other)
+                resolved = engine:playerFromTouch(other)
+            end)
+            services.setClock(1); hb:fire(0.016)
+            print((resolved == fakePlayer) and "PLAYER" or "NOPLAYER")
+        """)
+        rc, out, err = _run(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "PLAYER" in out
+
+    def test_fail_soft_when_no_trigger_part(self):
+        # No resolvable touch part => warn + nil, no throw (mirrors
+        # connectGameObjectSignal).
+        scenario = textwrap.dedent("""\
+            local services, hb = stayServices(nil)
+            local engine = SceneRuntime.new(services, {})
+            installWorkspace({})
+            local child = newInstance{Name = "Folder", ClassName = "Folder"}
+            local model = newInstance{Name = "Empty", ClassName = "Model",
+                isa = {Model = true}, children = {child}}
+            local comp = {}
+            engine._meta[comp] = {activeInHierarchy = true, enabled = true}
+            local ok, conn = pcall(function()
+                return engine:connectGameObjectSignalStay(comp, model,
+                    function() end)
+            end)
+            print(ok and "NOTHROW" or "THREW")
+            print(conn == nil and "NILCONN" or "GOTCONN")
+        """)
+        rc, out, err = _run(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "NOTHROW" in out
+        assert "NILCONN" in out
+        assert "no touch part" in out
+
+    def test_liveness_guard_stops_callbacks_after_destroy(self):
+        # Re-entrancy guard: a callback that destroys the component
+        # mid-iteration stops further fn calls in the same sweep.
+        scenario = textwrap.dedent("""\
+            local services, hb = stayServices(nil)
+            local engine = SceneRuntime.new(services, {})
+            local limbA = newInstance{Name = "A", ClassName = "Part",
+                isa = {BasePart = true}}
+            local limbB = newInstance{Name = "B", ClassName = "Part",
+                isa = {BasePart = true}}
+            installWorkspace({limbA, limbB})
+            local trig = newInstance{Name = "Collider", ClassName = "Part",
+                isa = {BasePart = true}, CanTouch = true,
+                attrs = {_IsTriggerVolume = true}}
+            local body = newInstance{Name = "Turret", ClassName = "Part",
+                isa = {BasePart = true}, CanTouch = true, children = {trig}}
+            local comp = {}
+            engine._meta[comp] = {activeInHierarchy = true, enabled = true}
+            local hits = 0
+            engine:connectGameObjectSignalStay(comp, body, function(other)
+                hits = hits + 1
+                -- Destroy mid-iteration after the first overlapping part.
+                engine._destroyed[comp] = true
+            end)
+            services.setClock(1); hb:fire(0.016)
+            -- Only the first part fires; the guard short-circuits the rest.
+            print("HITS " .. tostring(hits))
+        """)
+        rc, out, err = _run(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "HITS 1" in out
 
 
 # ---------------------------------------------------------------------------
