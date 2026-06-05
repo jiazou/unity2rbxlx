@@ -265,11 +265,13 @@ class TestGetTouchPart:
         assert rc == 0, f"luau failed: {err}\n{out}"
         assert "SAME" in out
 
-    def test_basepart_root_with_marked_trigger_child_returns_child(self):
+    def test_basepart_root_with_marked_trigger_child_prefers_child_when_requested(self):
         # Slice 1.1 Layer C: a BasePart-root go (e.g. a turret body Part)
         # with a ``_IsTriggerVolume``-marked descendant resolves to that
         # marked detection volume, NOT the small visible body — so the
         # OnTriggerStay poll overlap-tests the 285-stud Collider radius.
+        # The trigger preference is OPT-IN (preferTriggerVolume=true), as the
+        # stay poll passes; the edge resolver (default) keeps the body.
         scenario = textwrap.dedent("""\
             local engine = SceneRuntime.new(baseServices(nil), {})
             local trig = newInstance{Name = "Collider", ClassName = "Part",
@@ -279,24 +281,51 @@ class TestGetTouchPart:
             -- trigger child as a descendant.
             local body = newInstance{Name = "Turret", ClassName = "Part",
                 isa = {BasePart = true}, CanTouch = true, children = {trig}}
-            local got = engine:getTouchPart(body)
+            local got = engine:getTouchPart(body, true)
             print(got == trig and "MARKED" or ("WRONG:" .. tostring(got and got.Name)))
         """)
         rc, out, err = _run(scenario)
         assert rc == 0, f"luau failed: {err}\n{out}"
         assert "MARKED" in out
 
+    def test_basepart_root_with_marked_trigger_child_edge_keeps_body(self):
+        # codex ship-review BLOCKING regression guard: the EDGE resolver
+        # (preferTriggerVolume omitted, as connectGameObjectSignal passes for
+        # Touched/TouchEnded — OnTriggerEnter/Exit/OnCollision*) must keep the
+        # ORIGINAL ddde088 behavior: a BasePart-root go passes through to
+        # ITSELF (the body), NOT the marked trigger volume. RED against the
+        # buggy code that preferred the marked volume in the shared resolver.
+        scenario = textwrap.dedent("""\
+            local engine = SceneRuntime.new(baseServices(nil), {})
+            local trig = newInstance{Name = "Collider", ClassName = "Part",
+                isa = {BasePart = true}, CanTouch = true, Transparency = 1,
+                attrs = {_IsTriggerVolume = true}}
+            local body = newInstance{Name = "Turret", ClassName = "Part",
+                isa = {BasePart = true}, CanTouch = true, children = {trig}}
+            -- Default (no preferTriggerVolume): original passthrough.
+            local got = engine:getTouchPart(body)
+            print(got == body and "BODY" or ("WRONG:" .. tostring(got and got.Name)))
+        """)
+        rc, out, err = _run(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "BODY" in out, (
+            "edge getTouchPart must keep ORIGINAL body passthrough, not the "
+            f"marked trigger volume\n{out}"
+        )
+
     def test_basepart_root_itself_marked_returns_self(self):
         # MINOR-2: ``_findMarkedTriggerVolume`` checks ``go`` ITSELF before
         # descendants — a BasePart go that is itself ``_IsTriggerVolume``
-        # marked resolves to itself (the marked-volume preference applies to
-        # the root, not only its children).
+        # marked resolves to itself under preferTriggerVolume. (Here the
+        # marked volume and the passthrough are the SAME part, so the edge
+        # default would also return it — the preference is exercised, the
+        # result is unambiguous.)
         scenario = textwrap.dedent("""\
             local engine = SceneRuntime.new(baseServices(nil), {})
             local vol = newInstance{Name = "TriggerVol", ClassName = "Part",
                 isa = {BasePart = true}, CanTouch = true, Transparency = 1,
                 attrs = {_IsTriggerVolume = true}}
-            local got = engine:getTouchPart(vol)
+            local got = engine:getTouchPart(vol, true)
             print(got == vol and "SELF" or ("WRONG:" .. tostring(got and got.Name)))
         """)
         rc, out, err = _run(scenario)
@@ -317,9 +346,32 @@ class TestGetTouchPart:
         assert rc == 0, f"luau failed: {err}\n{out}"
         assert "SAME" in out
 
-    def test_model_prefers_marked_descendant_over_named_trigger(self):
-        # A Model go prefers a ``_IsTriggerVolume``-marked descendant even
-        # when an (unmarked) named trigger child is also present.
+    def test_model_prefers_marked_descendant_over_named_trigger_when_requested(self):
+        # Under preferTriggerVolume (the stay poll), a Model go prefers a
+        # ``_IsTriggerVolume``-marked descendant even when an (unmarked) named
+        # trigger child is also present.
+        scenario = textwrap.dedent("""\
+            local engine = SceneRuntime.new(baseServices(nil), {})
+            local named = newInstance{Name = "TriggerZone", ClassName = "Part",
+                isa = {BasePart = true}, CanTouch = true, Transparency = 1}
+            local marked = newInstance{Name = "Detector", ClassName = "Part",
+                isa = {BasePart = true}, CanTouch = true, Transparency = 1,
+                attrs = {_IsTriggerVolume = true}}
+            local model = newInstance{Name = "Turret", ClassName = "Model",
+                isa = {Model = true}, children = {named, marked}}
+            local got = engine:getTouchPart(model, true)
+            print(got == marked and "MARKED" or ("WRONG:" .. tostring(got and got.Name)))
+        """)
+        rc, out, err = _run(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "MARKED" in out
+
+    def test_model_edge_resolution_ignores_marked_descendant(self):
+        # codex ship-review regression guard: the EDGE resolver (default,
+        # no preferTriggerVolume) must use the ORIGINAL ddde088 tiered search
+        # — a named trigger child (tier 1) wins over a later marked
+        # descendant. The ``_IsTriggerVolume`` mark is NOT consulted on the
+        # shared edge path. RED against the buggy marked-first resolver.
         scenario = textwrap.dedent("""\
             local engine = SceneRuntime.new(baseServices(nil), {})
             local named = newInstance{Name = "TriggerZone", ClassName = "Part",
@@ -330,11 +382,14 @@ class TestGetTouchPart:
             local model = newInstance{Name = "Turret", ClassName = "Model",
                 isa = {Model = true}, children = {named, marked}}
             local got = engine:getTouchPart(model)
-            print(got == marked and "MARKED" or ("WRONG:" .. tostring(got and got.Name)))
+            print(got == named and "NAMED" or ("WRONG:" .. tostring(got and got.Name)))
         """)
         rc, out, err = _run(scenario)
         assert rc == 0, f"luau failed: {err}\n{out}"
-        assert "MARKED" in out
+        assert "NAMED" in out, (
+            "edge getTouchPart must use original tier-1 named-trigger search, "
+            f"not the _IsTriggerVolume mark\n{out}"
+        )
 
     def test_model_with_triggerzone_child(self):
         scenario = textwrap.dedent("""\

@@ -421,12 +421,8 @@ local function _findMarkedTriggerVolume(go): BasePart?
 	return nil
 end
 
--- ``getTouchPart(go) -> BasePart?``: resolve a representative part to
--- host a Touched/TouchEnded signal for a GameObject.
---   * any go with a ``_IsTriggerVolume``-marked descendant (or which is
---     itself so marked) -> that marked volume (preferred over a bare
---     BasePart passthrough so a BasePart-root turret resolves its
---     detection-radius Collider child, not the small visible body).
+-- ``getTouchPart(go, preferTriggerVolume) -> BasePart?``: resolve a
+-- representative part to host a Touched/TouchEnded signal for a GameObject.
 --   * BasePart  -> itself.
 --   * Model     -> tiered descendant search:
 --       (1) a named trigger child (TriggerZone / *TouchDetector* /
@@ -436,15 +432,27 @@ end
 --       (3) the first BasePart descendant.
 --     PrimaryPart is never the primary key.
 --   * anything else / no part -> nil.
-function SceneRuntime:getTouchPart(go)
+--
+-- ``preferTriggerVolume`` (default false): when true, a converter-stamped
+-- ``_IsTriggerVolume`` volume on ``go`` (itself or a descendant) wins over
+-- the bare-BasePart passthrough and tier search -- so a BasePart-root turret
+-- resolves its detection-radius Collider child, not the small visible body.
+-- ONLY the OnTriggerStay proximity poll (``connectGameObjectSignalStay``)
+-- passes this; the shared edge resolver (``connectGameObjectSignal`` for
+-- ``Touched``/``TouchEnded`` -- OnTriggerEnter/Exit/OnCollision*) omits it so
+-- those callbacks keep binding to the physical body / original tier result.
+function SceneRuntime:getTouchPart(go, preferTriggerVolume)
 	if go == nil then return nil end
-	-- Prefer an explicit, converter-stamped trigger volume over any other
-	-- resolution (including the bare-BasePart passthrough below). A
-	-- childless BasePart with no marked volume still falls through to the
-	-- passthrough, so the existing passthrough behavior is preserved.
-	local marked = _findMarkedTriggerVolume(go)
-	if marked ~= nil then
-		return marked
+	-- Stay-poll only: prefer an explicit, converter-stamped trigger volume
+	-- over any other resolution (including the bare-BasePart passthrough
+	-- below). A childless BasePart with no marked volume still falls through
+	-- to the passthrough, so the passthrough behavior is preserved. The edge
+	-- resolver passes nil/false here -> ORIGINAL pre-PR resolution.
+	if preferTriggerVolume then
+		local marked = _findMarkedTriggerVolume(go)
+		if marked ~= nil then
+			return marked
+		end
 	end
 	if _isBasePart(go) then
 		return go
@@ -530,7 +538,9 @@ local _STAY_POLL_INTERVAL = 0.13
 function SceneRuntime:connectGameObjectSignalStay(comp, go, fn)
 	assert(type(fn) == "function",
 		"connectGameObjectSignalStay: fn must be function")
-	local part = self:getTouchPart(go)
+	-- The proximity poll genuinely wants the large sight volume: prefer the
+	-- converter-stamped ``_IsTriggerVolume`` over the small visible body.
+	local part = self:getTouchPart(go, true)
 	if part == nil then
 		self._warn(string.format(
 			"[scene_runtime] connectGameObjectSignalStay: no touch part on %s",
