@@ -72,17 +72,61 @@ _PITCH_IN_CAM_RE = re.compile(
     r"CFrame\.Angles\(\s*math\.rad\(\s*self\.(?P<pitch>\w+)",
 )
 
+# Broadened look-method signals (used ONLY on the upstream-identified player
+# script, never globally -- a non-player camera keeps the strict shape below).
+# The strict ``_CAM_PITCH_RE`` requires an EXACT ``CFrame.new(...) *
+# CFrame.Angles(...)`` rebuild, which the AI defeats with an intervening yaw
+# term (``CFrame.new(pos) * (basePivot - basePivot.Position) * CFrame.Angles
+# (pitch)``). Instead, key on two INVARIANTS of a mouse-look method that are
+# robust to CFrame-composition shape: it reads the mouse delta AND it owns the
+# camera. Requiring BOTH (not GetMouseDelta alone) excludes a "consume the
+# first-frame spike" helper that reads the delta but never writes the camera.
+_MOUSE_DELTA_RE = re.compile(r"GetMouseDelta\(")
+_CAM_OWNER_RE = re.compile(
+    r"CurrentCamera|CameraType\s*=\s*Enum\.CameraType\.Scriptable",
+)
+# The broad look method must also WRITE a camera orientation (``CFrame.Angles``)
+# -- this is what separates the real mouse-look from an aim-down-sights / zoom
+# method that reads ``GetMouseDelta`` and touches the camera only to change
+# ``FieldOfView`` (codex adversarial finding: without it, an ``Aim()``/
+# ``PrimeMouse()`` method declared before ``Rotate`` was mis-bound).
+_CAM_ANGLES_RE = re.compile(r"CFrame\.Angles\(")
 
-def _find_look_method(stripped: str):
+
+def _find_look_method(stripped: str, broadened: bool = False):
     """Return ``(body_start, body_len, param, pitch_field)`` for the look
     method, or ``None``. Scans on the comment/string-stripped source so
     fingerprints inside literals are never signals; offsets map 1:1 to the
-    real source (the strip preserves length)."""
+    real source (the strip preserves length).
+
+    ``broadened`` (set ONLY for the upstream-identified player script) ALSO
+    accepts a method that reads ``GetMouseDelta()``, owns the camera, AND
+    writes a camera orientation (``CFrame.Angles``), so an AI-emitted CFrame
+    shape the strict pitch-rebuild regex misses is still located. Non-player
+    scripts pass ``broadened=False`` and keep the exact strict shape
+    (byte-identical behavior; no new false positives).
+
+    Uniqueness is enforced (mirroring the WASD move locator): collect every
+    matching method, PREFER the canonical strict shape when present, and
+    fail-closed (``None``) when more than one method qualifies with no single
+    strict winner -- so a player script with a second mouse-look-ish method
+    (aim/lean) abstains rather than letting first-match-wins splice the wrong
+    body (codex: the wrong-method bind + the ``self._cam:step(`` false
+    reassurance)."""
+    matches: list[tuple[int, int, str | None, str | None]] = []
+    strict_matches: list[tuple[int, int, str | None, str | None]] = []
     for m in _METHOD_RE.finditer(stripped):
         body, body_start = _extract_function_body(stripped, m.end())
         if body is None:
             continue
-        if not (_YAW_TURN_RE.search(body) and _CAM_PITCH_RE.search(body)):
+        strict = bool(_YAW_TURN_RE.search(body) and _CAM_PITCH_RE.search(body))
+        broad = bool(
+            broadened
+            and _MOUSE_DELTA_RE.search(body)
+            and _CAM_OWNER_RE.search(body)
+            and _CAM_ANGLES_RE.search(body)
+        )
+        if not (strict or broad):
             continue
         # First identifier in the (already-passed) arg list, if any.
         close = stripped.find(")", m.end())
@@ -93,7 +137,18 @@ def _find_look_method(stripped: str):
                 param = pm.group(1)
         pitch_m = _PITCH_CLAMP_RE.search(body) or _PITCH_IN_CAM_RE.search(body)
         pitch_field = pitch_m.group("pitch") if pitch_m else None
-        return body_start, len(body), param, pitch_field
+        result = (body_start, len(body), param, pitch_field)
+        matches.append(result)
+        if strict:
+            strict_matches.append(result)
+    # Prefer the canonical strict look method; else the unique broad one; else
+    # fail-closed on ambiguity.
+    if len(strict_matches) == 1:
+        return strict_matches[0]
+    if len(strict_matches) > 1:
+        return None
+    if len(matches) == 1:
+        return matches[0]
     return None
 
 
@@ -155,7 +210,10 @@ def lower_camera_facet(
     for s in scripts:
         src = s.luau_source or ""
         stripped = _strip_strings_and_comments(src)
-        found = _find_look_method(stripped)
+        # The player controller gets the broadened locator (its look method may
+        # carry an AI CFrame shape the strict regex misses); every other script
+        # keeps the strict shape so non-player cameras are byte-identical.
+        found = _find_look_method(stripped, broadened=id(s) in follow_ids)
         if found is None:
             continue
         body_start, body_len, param, pitch_field = found
