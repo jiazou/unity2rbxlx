@@ -1,5 +1,10 @@
 # Phase 3 — Contract verifier: design brief (for parallel arch review)
 
+> **SUPERSEDED (2026-06-06):** the decisions this brief solicited (DQ1–DQ4) are now recorded in
+> `scene-runtime-execution-log.md` §"Phase 3 — Contract verifier" (new `contract_verifier.py`, A1 hook,
+> slices 0–7 shipped). Kept only as the historical grounding-fact (GF1–GF11) snapshot. Architecture context
+> now lives in `generic-converter-architecture.md` (umbrella) + `scene-runtime-architecture-ir.md` (topology).
+
 **Status:** brief for review (2026-06-01). NOT yet approved. Reviewers: Claude
 design subagent + `codex exec`, same brief to both.
 

@@ -1,5 +1,9 @@
 # Merge Plan Phase 3 — Augmented (2026-04-17, refreshed 2026-05-02 for Phase 6 closeout)
 
+> **HISTORICAL / CLOSED (2026-06-06):** all 12 items landed/closed. NOTE: this "Phase 3" is the OLD
+> vertex-baking/sprite/SO-conversion port — **unrelated** to the scene-runtime "Phase 3" (contract
+> verifier). Naming collision only. Current architecture: `generic-converter-architecture.md`.
+
 Source: `https://github.com/jiazou/unity-roblox-game-converter/blob/main/MERGE_PLAN.md`.
 
 The Phase 3 plan has 12 items. The port in `a65f331` brought in modules
