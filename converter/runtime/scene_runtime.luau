@@ -2789,6 +2789,177 @@ function SceneRuntime:start(domainFilter)
 	return crossDomainEdges
 end
 
+-- ---------------------------------------------------------------------
+-- Host-owned per-player embodiment authority (paradigm C). Methods over
+-- the ``self._player`` state table, driven from ``_tick`` OUTSIDE the
+-- component ``pairs()`` loop (the ``_tick`` hooks + ``_initPlayerAuthority``
+-- that build ``self._player`` and key it on the upstream
+-- ``has_character_controller`` signal land in a later slice). Every method
+-- here no-ops when ``self._player == nil`` (server side / no player).
+--
+-- Reuses the camera-input service's vetted pose MATH via the INJECTED pure
+-- helpers ``self._services.cameraAdvance`` / ``cameraComposeLook`` (never a
+-- top-of-file ``require`` — the host harness loads this module with no
+-- ``game`` global) and reads ``self._services.userInputService`` for raw
+-- mouse/key state. C owns the SINGLE per-frame E2E-channel read (D9): the
+-- ACK-once mouse-channel consume lives in ``_playerReadInput`` here, NEVER
+-- via the camera service's per-frame ``step`` / ``readDelta``.
+
+-- One-time, idempotent client boot: take authoritative camera control,
+-- lock the FPS mouse, disable Roblox's default PlayerModule controls, and
+-- hide the local default avatar (folds the camera service's one-time
+-- ``ensureInit`` body inline — per-player lifecycle resync on CharacterAdded
+-- is Phase 3).
+-- Reached only via the (later-slice) pre-tick bracket, which runs only when
+-- ``self._player`` is non-nil, so the ``isClient`` gate is enforced upstream.
+function SceneRuntime:_playerBoot()
+	local p = self._player
+	if not p or p._booted then return end
+	p._booted = true
+
+	-- E1b: ``workspace.CurrentCamera`` may be nil before the client camera
+	-- materializes -- guard the write, never nil-deref.
+	local cam = workspace.CurrentCamera
+	if cam then cam.CameraType = Enum.CameraType.Scriptable end
+
+	local uis = self._services.userInputService
+	if uis then
+		uis.MouseBehavior = Enum.MouseBehavior.LockCenter
+		uis.MouseIconEnabled = false
+	end
+
+	-- Disable Roblox's default PlayerModule controls (it re-asserts
+	-- MouseBehavior each frame otherwise) and hide the local default avatar,
+	-- which is not the scene player rig.
+	local players = self._services.players
+	local lp = players and players.LocalPlayer
+	local function applyControls()
+		local ps = lp and lp:FindFirstChild("PlayerScripts")
+		local pm = ps and ps:FindFirstChild("PlayerModule")
+		if pm then
+			local ok, mod = pcall(require, pm)
+			if ok and mod then
+				local ok2, controls = pcall(function() return mod:GetControls() end)
+				if ok2 and controls and controls.Disable then
+					pcall(function() controls:Disable() end)
+				end
+			end
+		end
+		if uis then
+			uis.MouseBehavior = Enum.MouseBehavior.LockCenter
+			uis.MouseIconEnabled = false
+		end
+	end
+	local function hideChar(char)
+		if not char then return end
+		local function hide(part)
+			if part:IsA("BasePart") or part:IsA("Decal") then
+				part.LocalTransparencyModifier = 1
+			end
+		end
+		char.DescendantAdded:Connect(hide)
+		for _, part in char:GetDescendants() do hide(part) end
+	end
+	if lp then
+		applyControls()
+		hideChar(lp.Character)
+		lp.CharacterAdded:Connect(function(char)
+			self._services.task.wait()
+			applyControls()
+			hideChar(char)
+		end)
+	end
+end
+
+-- The SINGLE per-frame E2E-channel read (D9). Reads the raw mouse delta off
+-- the injected ``userInputService`` AND the consume-once E2E channel on
+-- ``workspace`` (mirroring the camera service's ``readDelta`` semantics but
+-- OWNED here so C is the single consumer), then advances accumulated
+-- yaw/pitch via the INJECTED pure ``cameraAdvance`` helper. NEVER calls the
+-- camera service's per-frame ``step`` / ``readDelta``. Returns the raw
+-- (dx, dy) for test assertions.
+function SceneRuntime:_playerReadInput()
+	local p = self._player
+	if not p then return 0, 0 end
+
+	local dx, dy = 0, 0
+	local uis = self._services.userInputService
+	if uis then
+		local d = uis:GetMouseDelta()
+		dx, dy = d.X, d.Y
+	end
+
+	-- Production-safe E2E channel (docs/E2E_INPUT_CHANNEL.md): additive,
+	-- no-op when unset, acked exactly once so a same-frame second reader
+	-- (the lowered A singleton) sees seq == ack and adds 0.
+	local seq = workspace:GetAttribute("E2EMouseSeq") or 0
+	if seq > (workspace:GetAttribute("E2EMouseAckSeq") or 0) then
+		workspace:SetAttribute("E2EMouseAckSeq", seq)
+		dx = dx + (workspace:GetAttribute("E2EMouseDeltaX") or 0)
+		dy = dy + (workspace:GetAttribute("E2EMouseDeltaY") or 0)
+	end
+
+	p._yaw, p._pitch = self._services.cameraAdvance(
+		p._yaw, p._pitch, dx, dy,
+		p._sensitivity, p._minPitch, p._maxPitch
+	)
+	return dx, dy
+end
+
+-- Idempotent ``CurrentCamera`` write (called BOTH pre-Update and
+-- post-LateUpdate). Eye = character HRP position + eyeHeight when it exists;
+-- else the current camera position (degenerate, no character yet -- E1).
+-- Re-asserts ``CameraType = Scriptable`` if drifted, then composes the look
+-- via the INJECTED pure ``cameraComposeLook``. Pure function of the current
+-- yaw/pitch (advanced once in ``_playerReadInput``), so two calls with
+-- unchanged state yield the same pose (E9).
+function SceneRuntime:_playerWriteCamera()
+	local p = self._player
+	if not p then return end
+
+	-- E1b: guard a nil CurrentCamera (pre-materialize / no-camera context).
+	local cam = workspace.CurrentCamera
+
+	-- Eye source: follow the character's HRP when it exists; otherwise fall
+	-- back to the current camera position (degenerate, E1/E10) so a missing
+	-- character never nil-derefs.
+	local eyePos
+	local hrp = self:_playerCharacterHRP()
+	if hrp then
+		eyePos = hrp.Position + Vector3.new(0, p._eyeHeight, 0)
+	elseif cam then
+		eyePos = cam.CFrame.Position
+	else
+		eyePos = Vector3.zero
+	end
+
+	if cam then
+		if cam.CameraType ~= Enum.CameraType.Scriptable then
+			cam.CameraType = Enum.CameraType.Scriptable
+		end
+		cam.CFrame = self._services.cameraComposeLook(eyePos, p._yaw, p._pitch)
+	end
+end
+
+-- Resolve the local player character's HumanoidRootPart for the camera eye.
+-- Re-resolved each call (no stale cache) so a respawn re-follows the new
+-- HRP; nil until the character exists (E1 -- no crash).
+function SceneRuntime:_playerCharacterHRP()
+	local players = self._services.players
+	local lp = players and players.LocalPlayer
+	local char = lp and lp.Character
+	return char and char:FindFirstChild("HumanoidRootPart") or nil
+end
+
+-- Read-only look for game logic (Phase 3 wires Shoot's raycast to this via
+-- ``host.player``). STUB in Phase 2: mirrors ``CurrentCamera.CFrame``
+-- whether or not ``self._player`` is bound (a no-player place still answers
+-- a sane camera pose). E1b nil-guard preserved.
+function SceneRuntime:getLookCFrame()
+	local cam = workspace.CurrentCamera
+	return cam and cam.CFrame or CFrame.new()
+end
+
 function SceneRuntime:_tick(dt)
 	-- Update + LateUpdate every frame; FixedUpdate via fixed-step.
 	for comp, m in pairs(self._meta) do
