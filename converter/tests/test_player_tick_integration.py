@@ -180,9 +180,16 @@ class TestTickCameraBracketOrdering:
 
     def test_pre_write_precedes_update_and_post_write_is_last(self) -> None:
         # Drive the REAL _tick once with a bound authority + a synthetic
-        # component whose Update RECORDS the camera yaw it observes mid-pass.
-        # C's pre-write seeds a known yaw BEFORE Update, so a non-vacuous read
-        # sees C's pose (not the stale 0); the final camera is C's post-write.
+        # component that STOMPS a competing camera value in BOTH Update and
+        # LateUpdate. Two halves of AC2, each made non-vacuous:
+        #   * pre-write-precedes-Update: C's pre-write seeds yaw=1.25 BEFORE
+        #     Update, so the component's mid-Update READ (recorded before it
+        #     stomps) sees C's pose, not the stale 0.
+        #   * post-write-is-LAST: the component stomps a SENTINEL yaw (7.0) in
+        #     Update AND LateUpdate; the final camera must be C's post-write
+        #     (1.25), proving _playerPostTick re-wrote AFTER the LateUpdate
+        #     pass. If _playerPostTick were removed or moved before LateUpdate,
+        #     the LateUpdate stomp (7.0) would survive and FINAL would be 7.0.
         preamble = camera_input_preamble(mouse_deltas=[(0.0, 0.0)])
         body = """
             local plan = {modules = {}}
@@ -203,12 +210,24 @@ class TestTickCameraBracketOrdering:
                 _eyeHeight = 1.5,
             }
 
-            -- Synthetic component: its Update records the camera yaw it sees.
+            -- Synthetic component: Update records the camera yaw it observes
+            -- (mid-pass, BEFORE stomping), then BOTH Update and LateUpdate
+            -- STOMP a competing sentinel CFrame (yaw 7.0). The post-LateUpdate
+            -- bracket must win, overwriting the LateUpdate stomp.
+            local function stomp()
+                local c = CFrame.new(Vector3.new(0, 0, 0))
+                c._yaw = 7.0
+                workspace.CurrentCamera.CFrame = c
+            end
             local observed = {}
             local Comp = {}
             Comp.__index = Comp
             function Comp:Update(_dt)
                 observed.preYaw = workspace.CurrentCamera.CFrame._yaw
+                stomp()
+            end
+            function Comp:LateUpdate(_dt)
+                stomp()
             end
             local comp = setmetatable({}, Comp)
             engine._meta[comp] = {
@@ -223,10 +242,12 @@ class TestTickCameraBracketOrdering:
         """
         rc, out, err = run_camera_scenario(preamble, body)
         assert rc == 0, f"scenario failed (rc={rc}): {err}\n{out}"
-        # Non-vacuous: the mid-Update component saw C's pre-write yaw (1.25),
-        # not the stale initial 0.
+        # Pre-write-precedes-Update (non-vacuous): the mid-Update component saw
+        # C's pre-write yaw (1.25), not the stale initial 0.
         assert "OBSERVED_PRE=1.25" in out, out
-        # The final camera is C's post-write (same yaw, idempotent).
+        # Post-write-is-LAST (non-vacuous): C's post-write (1.25) overwrote the
+        # component's LateUpdate stomp (7.0). FAILS (FINAL=7.0) if
+        # _playerPostTick is removed or scheduled before the LateUpdate pass.
         assert "FINAL=1.25" in out, out
 
     def test_write_camera_twice_is_idempotent(self) -> None:

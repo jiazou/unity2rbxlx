@@ -48,7 +48,9 @@ class TestClientEntrypoint:
 
     def test_isClient_true(self) -> None:
         src = _client_source()
-        assert "isClient = true" in src, (
+        # Match the TABLE ASSIGNMENT (trailing comma), not a bare substring a
+        # doc comment also satisfies — deleting the real key must fail this.
+        assert "isClient = true," in src, (
             "client services table must stamp isClient = true (the explicit "
             "client/server discriminator the authority gates on)"
         )
@@ -74,7 +76,10 @@ class TestServerEntrypoint:
 
     def test_isClient_false(self) -> None:
         src = _server_source()
-        assert "isClient = false" in src, (
+        # Match the TABLE ASSIGNMENT (trailing comma), not a bare substring the
+        # surrounding doc comment ALSO contains — deleting the real key (which
+        # would build authority on the server) must fail this.
+        assert "isClient = false," in src, (
             "server services table must stamp isClient = false so "
             "_initPlayerAuthority leaves self._player nil (no authority)"
         )
@@ -93,6 +98,8 @@ class TestServerEntrypoint:
         assert "cameraComposeLook" not in src, src
 
     def test_isClient_true_not_present(self) -> None:
-        # Guard against a copy/paste that stamps both flags on the server.
+        # Guard against a copy/paste that stamps the client flag on the server.
+        # Forbid the ASSIGNMENT form (trailing comma) so a future doc comment
+        # mentioning ``isClient = true`` doesn't false-trip this guard.
         src = _server_source()
-        assert "isClient = true" not in src, src
+        assert "isClient = true," not in src, src
