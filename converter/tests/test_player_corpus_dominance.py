@@ -163,11 +163,27 @@ def _dominance_extra_setup(*, keys_down: list[str]) -> str:
         end
 
         -- ---- CFrame VectorToWorldSpace (getYawBasis():VectorToWorldSpace) --
+        -- A REAL yaw rotation (NOT identity): rotate the local WASD vector about
+        -- Y by the basis CFrame's accumulated ``_yaw``. This makes A's move
+        -- (basis = the A singleton's getYawBasis(), yaw 0 -- it lost the E2E ack)
+        -- NUMERICALLY DISTINCT from C's move (basis = CFrame.Angles(0, p._yaw, 0)
+        -- with C's E2E-advanced non-zero yaw). The rotated vector also carries
+        -- ``_srcYaw`` = the basis yaw that produced it, so the scenario can read
+        -- WHICH basis (A's 0 vs C's cYaw) wrote each ordered :Move entry.
         do
             local _cfmt = getmetatable(CFrame.new(Vector3.new(0, 0, 0)))
             -- __index is the metatable itself (CFramemt), so a method added
             -- here is reachable on every CFrame instance.
-            _cfmt.VectorToWorldSpace = function(_self, v) return v end
+            _cfmt.VectorToWorldSpace = function(_self, v)
+                local yaw = _self._yaw or 0
+                local c, s = math.cos(yaw), math.sin(yaw)
+                -- Roblox VectorToWorldSpace for CFrame.Angles(0, yaw, 0):
+                --   x' =  x*cos + z*sin ;  z' = -x*sin + z*cos
+                local out = Vector3.new(
+                    v.X * c + v.Z * s, v.Y, -v.X * s + v.Z * c)
+                out._srcYaw = yaw
+                return out
+            end
         end
 
         -- ---- Enum: extend with KeyCode / HumanoidStateType / Material -----
@@ -222,7 +238,12 @@ def _dominance_extra_setup(*, keys_down: list[str]) -> str:
         humanoid._stateLog = {}
         local _humBacking = humanoid
         function humanoid:Move(dir, rel)
-            table.insert(_humBacking._moveLog, dir)
+            -- Record the FULL move vector (its components + the basis yaw that
+            -- rotated it) so the scenario can prove WHICH writer (A's yaw-0 basis
+            -- vs C's yaw-cYaw basis) is the LAST :Move -- not merely count moves.
+            table.insert(_humBacking._moveLog, {
+                x = dir.X, y = dir.Y, z = dir.Z, srcYaw = dir._srcYaw,
+            })
         end
         function humanoid:ChangeState(state)
             table.insert(_humBacking._stateLog, state)
@@ -419,6 +440,20 @@ def _dominance_body(*, lowered_source: str, frames: int) -> str:
         print("SAWNONCYAW=" .. tostring(sawNonCYaw))
         print("LASTCAMYAW=" .. tostring(lastCamYaw))
         print("MOVES=" .. tostring(#moveLog))
+        -- The FINAL ordered :Move entry MUST be C's (its basis yaw == C's _yaw,
+        -- non-zero), NOT A's (basis yaw 0). Print the last entry's basis yaw +
+        -- components and the first entry's basis yaw (A, mid-pass) so the test
+        -- proves C is the LAST move writer by VALUE, not by count.
+        local lastMove = moveLog[#moveLog]
+        local firstMove = moveLog[1]
+        if lastMove then
+            print("LASTMOVESRCYAW=" .. tostring(lastMove.srcYaw))
+            print("LASTMOVEX=" .. tostring(lastMove.x))
+            print("LASTMOVEZ=" .. tostring(lastMove.z))
+        end
+        if firstMove then
+            print("FIRSTMOVESRCYAW=" .. tostring(firstMove.srcYaw))
+        end
         print("JUMPS=" .. tostring(#jumpLog))
         print("FIRSTJUMP=" .. tostring(jumpLog[1]))
         print("LASTJUMP=" .. tostring(jumpLog[#jumpLog]))
@@ -493,19 +528,51 @@ class TestCorpusDominanceByExecution:
             f"post-bracket); A active + C present\n{out}"
         )
 
+        cyaw = _grab(out, "CYAW=")
+        # C's yaw is non-zero (advanced by the E2E delta C acked) so every
+        # last-writer-is-C assertion below is NON-VACUOUS (not 0==0 with A
+        # coincidentally 0). Shared by the camera + move dominance proofs.
+        assert float(cyaw) != 0.0, (
+            f"{name}: C's yaw must advance via the E2E channel C acks first; "
+            f"got {cyaw} (D9 ACK race not exercised)\n{out}"
+        )
+
+        # AC5 (MOVE dominance, last-writer BY VALUE): the lowered A :Move runs
+        # mid-pass with the A SINGLETON's yaw basis (yaw 0 -- A lost the E2E ack),
+        # so A's move vector carries srcYaw=0. C's _playerDriveLocomotion runs in
+        # the post bracket with CFrame.Angles(0, cYaw, 0), so its move vector
+        # carries srcYaw=cYaw (non-zero). With a NON-identity VectorToWorldSpace
+        # the two vectors are NUMERICALLY DISTINCT, so asserting the FINAL :Move
+        # entry's basis yaw == cYaw PROVES C is the LAST move writer (would FAIL
+        # if A's move ran last). A's mid-pass move is the FIRST entry (srcYaw=0).
+        first_move_yaw = _grab(out, "FIRSTMOVESRCYAW=")
+        assert float(first_move_yaw) == 0.0, (
+            f"{name}: A's mid-pass :Move must use the A-singleton yaw basis "
+            f"(0, lost the ack) — it is the FIRST move entry\n{out}"
+        )
+        last_move_yaw = _grab(out, "LASTMOVESRCYAW=")
+        assert float(last_move_yaw) == float(cyaw), (
+            f"{name}: final Humanoid:Move must be C's post-bracket move "
+            f"(basis yaw={cyaw}), NOT A's mid-pass move (basis yaw=0); got "
+            f"last-move basis yaw={last_move_yaw}\n{out}"
+        )
+        # And the final move vector is NUMERICALLY different from A's (proves the
+        # right value reached the Humanoid, not just the right writer order). For
+        # WASD W+D the local vector is (1,0,-1); A (yaw 0) -> X=1, C (yaw=cYaw) ->
+        # X = cos(cYaw) + (-1)*sin(cYaw) != 1 for any cYaw not a multiple of 2pi.
+        last_move_x = float(_grab(out, "LASTMOVEX="))
+        assert last_move_x != 1.0, (
+            f"{name}: C's move vector must differ NUMERICALLY from A's "
+            f"(A X=1 at yaw 0); got last-move X={last_move_x} — VectorToWorldSpace "
+            f"must be a real yaw rotation, not identity\n{out}"
+        )
+
         # AC4 (camera dominance): the FINAL camera CFrame is C's (its E2E-
         # advanced yaw), not A's mid-pass write.
-        cyaw = _grab(out, "CYAW=")
         last = _grab(out, "LASTCAMYAW=")
         assert float(last) == float(cyaw), (
             f"{name}: final CurrentCamera.CFrame must be C's post-write "
             f"(yaw={cyaw}); got last-writer yaw={last}\n{out}"
-        )
-        # C's yaw is non-zero (advanced by the E2E delta C acked) so the
-        # last==C assertion is NON-VACUOUS (not 0==0 with A coincidentally 0).
-        assert float(cyaw) != 0.0, (
-            f"{name}: C's yaw must advance via the E2E channel C acks first; "
-            f"got {cyaw} (D9 ACK race not exercised)\n{out}"
         )
 
     @pytest.mark.parametrize("name", _FIXTURE_NAMES)
