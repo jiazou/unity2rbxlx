@@ -69,7 +69,9 @@ pytestmark = pytest.mark.skipif(
 # left false to drive the no-character tolerance path (AC10 / E1).
 # ---------------------------------------------------------------------------
 
-def _build_authority_runtime(*, char_hrp: bool = False) -> str:
+def _build_authority_runtime(
+    *, char_hrp: bool = False, boot_provision: bool = False
+) -> str:
     char_setup = ""
     if char_hrp:
         char_setup = """
@@ -84,6 +86,76 @@ def _build_authority_runtime(*, char_hrp: bool = False) -> str:
             -- LocalPlayer is the camera-harness mock; attach a Character.
             local players = game:GetService("Players")
             players.LocalPlayer.Character = char
+        end
+"""
+    if boot_provision:
+        # Provision the boot-path mocks AC8 exercises:
+        #   (1) the default-controls-off RESOLUTION chain LocalPlayer ->
+        #       PlayerScripts -> PlayerModule, instrumented so ``_bootRecord``
+        #       records the FindFirstChild traversal _playerBoot performs;
+        #   (2) a local avatar Character with BasePart/Decal descendants that
+        #       record their LocalTransparencyModifier writes.
+        #
+        # NOTE on the controls ``Disable()``: ``_playerBoot`` reaches the
+        # controls via ``pcall(require, pm)`` (mirroring scene_camera_input.luau).
+        # Standalone luau has NO ``require`` ("not supported in this context")
+        # AND gives each loadstring'd chunk its own readonly ``_G``, so the
+        # outer chunk CANNOT inject a working ``require`` into the runtime chunk
+        # — ``require(pm)`` always fails here, so ``controls:Disable()`` can
+        # never EXECUTE under standalone luau. We therefore assert the boot
+        # TRAVERSES the full resolution chain to the PlayerModule (the furthest
+        # the harness can prove dynamically); a static source-shape check
+        # (test_player_boot_source_disables_controls) guards that the
+        # GetControls()/controls:Disable() block itself is not dropped.
+        # ``_bootRecord`` is a chunk-level table the assertions read back.
+        char_setup += """
+        do
+            _bootRecord = {resolved = {}, hiddenParts = {}}
+
+            local playerModule = {Name = "PlayerModule"}
+            local playerScripts = {
+                Name = "PlayerScripts",
+                FindFirstChild = function(_, name)
+                    _bootRecord.resolved[#_bootRecord.resolved + 1] = "ps:" .. name
+                    if name == "PlayerModule" then return playerModule end
+                    return nil
+                end,
+            }
+
+            -- Avatar descendants: BasePart + Decal record their hide writes;
+            -- a non-BasePart/Decal stays untouched (proves the IsA filter).
+            local function mkPart(class, key)
+                local part = {Name = key}
+                function part:IsA(c) return c == class end
+                setmetatable(part, {
+                    __newindex = function(t, k, v)
+                        if k == "LocalTransparencyModifier" then
+                            _bootRecord.hiddenParts[key] = v
+                        end
+                        rawset(t, k, v)
+                    end,
+                })
+                return part
+            end
+            local nonVisual = {Name = "script"}
+            function nonVisual:IsA(_) return false end
+            local descendants = {
+                mkPart("BasePart", "torso"),
+                mkPart("Decal", "face"),
+                nonVisual,
+            }
+            local char = {
+                GetDescendants = function() return descendants end,
+                DescendantAdded = {Connect = function() return {Disconnect = function() end} end},
+            }
+
+            local lp = game:GetService("Players").LocalPlayer
+            lp.Character = char
+            lp.FindFirstChild = function(_, name)
+                _bootRecord.resolved[#_bootRecord.resolved + 1] = "lp:" .. name
+                if name == "PlayerScripts" then return playerScripts end
+                return nil
+            end
         end
 """
     return f"""
@@ -118,9 +190,17 @@ def _build_authority_runtime(*, char_hrp: bool = False) -> str:
 
 def test_player_boot_takes_camera_and_mouse_control() -> None:
     """``_playerBoot`` sets ``CameraType=Scriptable``, ``MouseBehavior=
-    LockCenter``, ``MouseIconEnabled=false`` and marks ``_booted`` (AC8)."""
+    LockCenter``, ``MouseIconEnabled=false``, TRAVERSES the default-controls-off
+    resolution chain (LocalPlayer -> PlayerScripts -> PlayerModule), HIDES the
+    local avatar (``LocalTransparencyModifier=1`` on every BasePart/Decal
+    descendant, leaving non-visual descendants untouched) and marks ``_booted``
+    (AC8). The PlayerScripts.PlayerModule + avatar descendants are provisioned in
+    the mock so a regression that drops the controls-resolution OR the avatar-hide
+    path fails here. (``controls:Disable()`` itself cannot EXECUTE under
+    standalone luau — see the helper note + the static source-shape guard in
+    ``test_player_boot_source_disables_controls``.)"""
     preamble = camera_input_preamble(mouse_deltas=[])
-    body = _build_authority_runtime() + """
+    body = _build_authority_runtime(boot_provision=True) + """
         engine:_playerBoot()
         local cam = workspace.CurrentCamera
         local uis = game:GetService("UserInputService")
@@ -128,6 +208,10 @@ def test_player_boot_takes_camera_and_mouse_control() -> None:
         print("MOUSEBEHAVIOR=" .. tostring(uis.MouseBehavior))
         print("ICON=" .. tostring(uis.MouseIconEnabled))
         print("BOOTED=" .. tostring(p._booted))
+        print("RESOLVED=" .. table.concat(_bootRecord.resolved, ","))
+        print("HIDE_TORSO=" .. tostring(_bootRecord.hiddenParts.torso))
+        print("HIDE_FACE=" .. tostring(_bootRecord.hiddenParts.face))
+        print("HIDE_SCRIPT=" .. tostring(_bootRecord.hiddenParts.script))
     """
     rc, out, err = run_camera_scenario(preamble, body)
     assert rc == 0, f"scenario failed (rc={rc}): {err}\n{out}"
@@ -135,6 +219,30 @@ def test_player_boot_takes_camera_and_mouse_control() -> None:
     assert "MOUSEBEHAVIOR=LockCenter" in out, out
     assert "ICON=false" in out, out
     assert "BOOTED=true" in out, out
+    # AC8 controls-off: boot RESOLVES the controls chain LocalPlayer ->
+    # PlayerScripts -> PlayerModule (the furthest the harness can prove
+    # dynamically; require() can't run under standalone luau). A regression that
+    # deletes/skips the controls block stops emitting these resolver calls.
+    assert "RESOLVED=lp:PlayerScripts,ps:PlayerModule" in out, out
+    # AC8 avatar-hide: every BasePart/Decal descendant got
+    # LocalTransparencyModifier=1; the non-visual descendant is left untouched.
+    assert "HIDE_TORSO=1" in out, out
+    assert "HIDE_FACE=1" in out, out
+    assert "HIDE_SCRIPT=nil" in out, out
+
+
+def test_player_boot_source_disables_controls() -> None:
+    """AC8 controls-off (static guard). ``controls:Disable()`` can never EXECUTE
+    under standalone luau (``require`` is unsupported there), so the dynamic boot
+    test can only prove the resolution chain is reached. This static check guards
+    that the ``GetControls()`` / ``controls:Disable()`` block in ``_playerBoot``
+    is not silently dropped — pinning the half the interpreter can't run."""
+    src = HOST_RUNTIME_PATH.read_text(encoding="utf-8")
+    boot = src[src.index("function SceneRuntime:_playerBoot()") :]
+    boot = boot[: boot.index("\nfunction SceneRuntime:")]
+    assert ":GetControls()" in boot, "boot must resolve default PlayerModule controls"
+    assert "controls:Disable()" in boot, "boot must Disable() the default controls"
+    assert 'FindFirstChild("PlayerModule")' in boot, boot
 
 
 def test_player_boot_is_idempotent() -> None:
@@ -292,6 +400,25 @@ def test_write_camera_twice_idempotent() -> None:
     m2 = re.search(r"W2=([\-\d.]+,[\-\d.]+)", out)
     assert m1 and m2, out
     assert m1.group(1) == m2.group(1), out
+
+
+def test_write_camera_nil_camera_does_not_crash() -> None:
+    """E1b — ``_playerWriteCamera`` with a nil ``workspace.CurrentCamera`` (the
+    pre-materialize / no-camera context) must not nil-deref: the camera write is
+    guarded, so the call no-ops cleanly with no character and no camera."""
+    preamble = camera_input_preamble(mouse_deltas=[])
+    body = _build_authority_runtime() + """
+        p._yaw = 0.4
+        p._pitch = 0.1
+        workspace.CurrentCamera = nil
+        engine:_playerWriteCamera()
+        print("CAM=" .. tostring(workspace.CurrentCamera))
+        print("NILWRITEOK=true")
+    """
+    rc, out, err = run_camera_scenario(preamble, body)
+    assert rc == 0, f"scenario failed (rc={rc}): {err}\n{out}"
+    assert "CAM=nil" in out, out
+    assert "NILWRITEOK=true" in out, out
 
 
 def test_get_look_cframe_returns_current_camera_pose() -> None:
