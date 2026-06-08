@@ -403,6 +403,14 @@ def transpile_with_contract(
         len(component_class_paths), len(runtime_bearing_paths),
     )
 
+    # Paradigm B (NON-load-bearing): the identified player controller's path,
+    # keyed on the deterministic upstream ``has_character_controller`` signal
+    # (NOT a transpiled-output fingerprint, §3). Threaded into transpilation so
+    # the player script's prompt gets ``_PLAYER_CONTROLLER_DIRECTIVE``. Abstains
+    # (empty) on 0/>1 CC-modules or any stem collision, mirroring
+    # ``find_player_controllers``.
+    player_controller_paths = _player_controller_paths(modules, script_infos)
+
     transpilation = transpile_scripts(
         unity_project_path=unity_project_path,
         script_infos=script_infos,
@@ -413,6 +421,7 @@ def transpile_with_contract(
         runtime_mode="generic",
         runtime_bearing_paths=runtime_bearing_paths,
         component_class_paths=component_class_paths,
+        player_controller_paths=player_controller_paths,
     )
 
     # Build the stem-keyed require graph from the planner's modules table.
@@ -736,6 +745,48 @@ def _component_class_paths(
         by_stem,
         lambda m: bool(m.get("is_component_class") or m.get("runtime_bearing")),
     )
+
+
+def _player_controller_paths(
+    modules: dict[str, _SceneRuntimeModule],
+    script_infos: list[ScriptInfo],
+) -> frozenset[Path]:
+    """Return the UNIQUE player-controller ``info.path`` (or ``frozenset()``),
+    keyed on the deterministic UPSTREAM Unity signal ``has_character_controller``
+    (paradigm B directive targeting, §3). Mirrors ``find_player_controllers``'
+    fail-closed abstention (``movement_facet_lowering.py:144-160``) so B targets
+    EXACTLY the script paradigm C binds — no divergence.
+
+    ``_join_module_paths`` does the stem->path JOIN but does NOT provide the
+    unique-exactly-one abstention on its own (it only flags per-stem collisions
+    and would add EVERY selected module's path). So the guard is added EXPLICITLY:
+    1. count distinct CC-modules via the same predicate as the orchestrator's
+       ``cc_module_count``; abstain (``frozenset()``) on count != 1 (0 -> non-FPS,
+       >1 -> ambiguous);
+    2. unpack the 2-tuple and abstain on any stem collision OR ``len(paths) != 1``
+       (a join that did not resolve to exactly one path is an abstain, not a
+       partial set);
+    3. else return the single player path.
+
+    Keyed on ``modules`` alone (no transpiled output): NO AI-output fingerprint.
+    """
+    cc_module_count = sum(
+        1 for m in modules.values()
+        if isinstance(m, dict) and m.get("has_character_controller")
+    )
+    if cc_module_count != 1:
+        return frozenset()
+    by_stem: dict[str, list[Path]] = {}
+    for info in script_infos:
+        by_stem.setdefault(info.path.stem, []).append(info.path)
+    paths, collisions = _join_module_paths(
+        modules,
+        by_stem,
+        lambda m: bool(m.get("has_character_controller")),
+    )
+    if collisions or len(paths) != 1:
+        return frozenset()
+    return paths
 
 
 def _join_module_paths(

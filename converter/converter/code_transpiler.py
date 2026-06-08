@@ -81,6 +81,20 @@ class TranspilationResult:
 RuntimeMode = Literal["legacy", "generic"]
 
 
+# Per-script prompt directive for the identified player controller (paradigm B,
+# NON-load-bearing — a conflict-reducer + cleaner-output nicety; paradigm C holds
+# the binding even if the AI ignores this entirely). Appended to ``project_context``
+# (a ``_ai_cache_key`` field), NEVER to the byte-frozen ``_AI_SYSTEM_PROMPT``.
+_PLAYER_CONTROLLER_DIRECTIVE = (
+    "## Player controller directive\n"
+    "This script is the player controller. The host owns camera, movement, aim, "
+    "and respawn via `self.host.player`. Do NOT write `workspace.CurrentCamera`, "
+    "do NOT call `Humanoid:Move`. For aim use `self.host.player:getLookCFrame()`; "
+    "for recoil `applyRecoil`; to teleport use `self.host.player:teleport(cf)`. "
+    "Keep your game logic (shoot decision, ammo, pickups, pause)."
+)
+
+
 def transpile_scripts(
     unity_project_path: str | Path,
     script_infos: list[Any],
@@ -92,6 +106,7 @@ def transpile_scripts(
     runtime_mode: RuntimeMode = "legacy",
     runtime_bearing_paths: frozenset[Path] | None = None,
     component_class_paths: frozenset[Path] | None = None,
+    player_controller_paths: frozenset[Path] | None = None,
 ) -> TranspilationResult:
     """Transpile a list of C# scripts to Luau.
 
@@ -125,11 +140,21 @@ def transpile_scripts(
             because a component runs host-bound whether authored or
             ``Instantiate()``-spawned. Defaults to ``runtime_bearing_paths``
             when not supplied (legacy callers / direct unit tests).
+        player_controller_paths: Under ``runtime_mode="generic"`` the set of
+            ``info.path`` values for the identified player controller (the
+            unique ``has_character_controller`` module, keyed on the
+            deterministic upstream Unity signal — see
+            ``_player_controller_paths`` in ``contract_pipeline.py``). Each such
+            script gets ``_PLAYER_CONTROLLER_DIRECTIVE`` appended to its prompt
+            ``project_context`` (paradigm B, NON-load-bearing). Defaults to an
+            empty set (legacy callers / direct unit tests unaffected — the
+            byte-identical no-directive context is preserved).
 
     Returns:
         TranspilationResult with all transpiled scripts and summary counts.
     """
     runtime_bearing_paths = runtime_bearing_paths or frozenset()
+    player_controller_paths = player_controller_paths or frozenset()
     # The generic mode/target gate keys off component-ness, not placement.
     # Fall back to runtime_bearing_paths so callers that predate the split
     # (and direct unit tests) keep their existing behaviour.
@@ -275,7 +300,17 @@ def transpile_scripts(
             field_ctx = _build_serialized_field_context(
                 info.path, unity_project_path, serialized_field_refs,
             )
-            context_parts = [project_context, scoped, field_ctx]
+            # Paradigm B (NON-load-bearing): append the player-controller
+            # directive to the identified player script's prompt context ONLY,
+            # gated on generic-mode AND the deterministic upstream player
+            # identity. It lands in ``project_context`` (a ``_ai_cache_key``
+            # field), never the byte-frozen ``_AI_SYSTEM_PROMPT``.
+            is_player = (
+                runtime_mode == "generic"
+                and info.path in player_controller_paths
+            )
+            player_directive = _PLAYER_CONTROLLER_DIRECTIVE if is_player else ""
+            context_parts = [project_context, scoped, field_ctx, player_directive]
             context = "\n\n".join(p for p in context_parts if p)
             try:
                 if backend == "claude_cli":
