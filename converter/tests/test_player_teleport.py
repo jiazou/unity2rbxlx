@@ -196,6 +196,57 @@ def test_teleport_round_trip_is_non_vacuous_mutation() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Phase-integration (P1) — after a teleport, the LOCAL authority yaw is reseeded
+# from the requested pose so the CAMERA adopts the teleported facing. Without the
+# reseed in _playerTeleport, p._yaw keeps the OLD value and _playerWriteCamera
+# composes the stale yaw even though the server moved the HRP to the new facing.
+# ---------------------------------------------------------------------------
+
+def test_teleport_reseeds_local_yaw_camera_adopts_teleported_facing() -> None:
+    """Cross-slice composition: teleport to yaw 1.5 with the LOCAL authority
+    starting at the OLD yaw 0.4. After the teleport, feed the server-applied HRP
+    back as LocalPlayer.Character and exercise _playerWriteCamera() on the SAME
+    _player state — the composed camera yaw must be the TELEPORTED 1.5, not the
+    stale 0.4. (Mutation-proof: removing the reseed leaves it at 0.4 → RED.)"""
+    preamble = camera_input_preamble(mouse_deltas=[])
+    body = (
+        _build_authority_runtime()
+        + _teleport_setup()
+        + """
+        -- The local authority starts facing the OLD direction (the finding's 0.4).
+        engine._player._yaw = 0.4
+        engine._player._pitch = -0.2
+
+        local host = engine:_makeHostSurface({})
+        local target = CFrame.new(Vector3.new(42, 7, -3))
+        target._yaw = 1.5
+
+        host.player:teleport(target)
+
+        -- The server applied the requested pose to the HRP; wire that SAME HRP
+        -- back as the local character so _playerWriteCamera's eye follows it.
+        _tp.appliedHrp.Position = Vector3.new(42, 7, -3)
+        game:GetService("Players").LocalPlayer.Character = _tp.actorChar
+
+        -- Exercise the camera on the SAME _player state the teleport reseeded.
+        engine:_playerWriteCamera()
+        local pitch, yaw = workspace.CurrentCamera.CFrame:ToEulerAnglesYXZ()
+        print(string.format("CAMYAW=%.6f", yaw))
+        print(string.format("STATEYAW=%.6f", engine._player._yaw))
+        print(string.format("STATEPITCH=%.6f", engine._player._pitch))
+        """
+    )
+    rc, out, err = run_camera_scenario(preamble, body)
+    assert rc == 0, f"scenario failed (rc={rc}): {err}\n{out}"
+    # The camera adopted the TELEPORTED facing, not the stale 0.4.
+    assert "CAMYAW=1.500000" in out, out
+    # The local authority state itself was reseeded from the requested pose.
+    assert "STATEYAW=1.500000" in out, out
+    # Pitch reset to the resync convention (zero), mirroring _playerResyncToCharacter.
+    assert "STATEPITCH=0.000000" in out, out
+
+
+# ---------------------------------------------------------------------------
 # AC5a guards — the client request validates its arg + nil-safe remote.
 # ---------------------------------------------------------------------------
 
