@@ -518,6 +518,8 @@ def test_character_added_late_hrp_reseeds_yaw_when_hrp_arrives() -> None:
         _lateChar.DescendantAdded:Fire(_lateHrp)
         print(string.format("YAW_AFTER=%.6f", p._yaw))
         print("DISCONNECTS=" .. tostring(_lateRecord.disconnects or 0))
+        -- On a successful fire the slot is CLEARED (it held THIS retry's conn).
+        print("SLOT_AFTER_FIRE=" .. tostring(engine._player._lateHRPConn ~= nil))
 
         -- The retry is ONE-SHOT: a second DescendantAdded (a NON-HRP descendant)
         -- must NOT re-reseed (the connection is gone). Set a sentinel yaw and
@@ -539,6 +541,9 @@ def test_character_added_late_hrp_reseeds_yaw_when_hrp_arrives() -> None:
     assert f"YAW_AFTER={RESPAWN_YAW:.6f}" in out, out
     # The one-shot retry disconnected exactly once.
     assert "DISCONNECTS=1" in out, out
+    # The slot is cleared on a successful fire (RED against ac66e09, where the
+    # dead ``== conn`` compare — conn already nilled — left the slot set).
+    assert "SLOT_AFTER_FIRE=false" in out, out
     # And does NOT fire again after disconnect (sentinel 0.5 survives).
     assert "YAW_AFTER_DISCONNECT=0.500000" in out, out
 
@@ -699,3 +704,62 @@ def test_stale_previous_character_late_hrp_does_not_stomp_superseding_yaw() -> N
     # stomp char B's yaw — it stays SUPERSEDE_YAW, NOT RESPAWN_YAW.
     assert f"YAW_FINAL={SUPERSEDE_YAW:.6f}" in out, out
     assert f"YAW_FINAL={RESPAWN_YAW:.6f}" not in out, out
+
+
+def test_stale_retry_fire_does_not_clobber_newer_retrys_slot() -> None:
+    """The slot-clear-on-fire (guarded by ``_lateHRPConn == thisConn``) must NOT
+    over-clear: when char A's stale retry fires AFTER char B re-armed a fresh
+    retry (so ``_lateHRPConn`` now holds char B's connection), char A's fire must
+    leave char B's live slot INTACT. Guards the ``== thisConn`` half of the fix —
+    an unconditional clear-on-fire would null char B's pending retry."""
+    preamble = camera_input_preamble(mouse_deltas=[])
+    body = (
+        _build_authority_runtime()
+        + _lifecycle_setup()
+        + _late_hrp_setup()
+        + f"""
+        -- char B: a SECOND character that ALSO spawns WITHOUT an HRP, so it ARMS
+        -- its OWN late-HRP retry (overwriting _lateHRPConn with char B's conn).
+        local charBHandlers = {{}}
+        local charB
+        charB = {{
+            FindFirstChild = function(_, _name) return nil end,
+            GetDescendants = function() return {{}} end,
+            DescendantAdded = {{
+                Connect = function(_, fn)
+                    charBHandlers[#charBHandlers + 1] = fn
+                    return {{Disconnect = function() end}}
+                end,
+            }},
+        }}
+
+        p._yaw = -9.0
+        engine:_playerBoot()
+        local lp = game:GetService("Players").LocalPlayer
+
+        -- char A spawns WITHOUT an HRP → arms a retry for char A.
+        lp.Character = _lateChar
+        lp.CharacterAdded:Fire(_lateChar)
+        local connA = engine._player._lateHRPConn
+
+        -- char B spawns WITHOUT an HRP → re-arms; cancels char A's retry and
+        -- installs char B's connection in the slot.
+        lp.Character = charB
+        lp.CharacterAdded:Fire(charB)
+        local connB = engine._player._lateHRPConn
+        print("SLOT_IS_B=" .. tostring(connB ~= nil and connB ~= connA))
+
+        -- char A's stale retry fires late (char A is no longer the current char).
+        -- Its slot-clear must compare against char A's OWN conn and find the slot
+        -- holds char B's — so it does NOT clear char B's live slot.
+        _lateChar.DescendantAdded:Fire(_lateHrp)
+        print("SLOT_STILL_B=" .. tostring(engine._player._lateHRPConn == connB))
+    """
+    )
+    rc, out, err = run_camera_scenario(preamble, body)
+    assert rc == 0, f"scenario failed (rc={rc}): {err}\n{out}"
+    # char B's re-arm installed a DISTINCT connection in the slot.
+    assert "SLOT_IS_B=true" in out, out
+    # char A's stale fire did NOT clobber char B's live slot (the == thisConn
+    # guard held; an unconditional clear would have nulled it).
+    assert "SLOT_STILL_B=true" in out, out

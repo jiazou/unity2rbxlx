@@ -3069,10 +3069,15 @@ function SceneRuntime:_playerArmLateHRPResync(char)
 	local conn
 	conn = char.DescendantAdded:Connect(function(desc)
 		if not (desc and desc.Name == "HumanoidRootPart") then return end
+		local thisConn = conn
 		if conn then conn:Disconnect(); conn = nil end
 		local pl = self._player
 		if not pl then return end
-		if pl._lateHRPConn == conn then pl._lateHRPConn = nil end
+		-- Clear the slot on fire ONLY when it still holds THIS retry's connection,
+		-- so a newer char's re-armed retry (which overwrote ``_lateHRPConn``) is
+		-- never clobbered. Compare against the captured ref, not the just-nilled
+		-- upvalue.
+		if pl._lateHRPConn == thisConn then pl._lateHRPConn = nil end
 		-- Tie the retry to the char it was armed for (guard 1): only reseed when
 		-- this char is STILL the current LocalPlayer.Character. If a newer char
 		-- superseded it (fast respawn), its late HRP must NOT overwrite the newer
