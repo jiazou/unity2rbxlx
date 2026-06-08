@@ -697,10 +697,16 @@ class TestPipelineInvocation:
             "player_move_unbound", "player_look_unbound",
         })
 
-    def test_pipeline_surfaces_player_look_unbound(self) -> None:
-        """Player identified, movement bound, but the look method is ambiguous
-        (two broad look methods) -> the pipeline surfaces player_look_unbound
-        instead of silently shipping an unbound camera."""
+    def test_pipeline_does_not_surface_player_look_unbound_when_c_authoritative(
+        self,
+    ) -> None:
+        """Player identified upstream (has_character_controller), so paradigm C
+        binds look deterministically in the runtime. A's look-locator may abstain
+        (here: TWO broad look methods, no strict winner -> no ``self._cam:step(``
+        splice), but that abstention is NO LONGER an unbound-player fail-closed:
+        the slice-2.6 amendment removed the ``player_look_unbound`` append. The
+        PRE-fix code DID surface it (A-locator fingerprint); the POST-fix code
+        does NOT (C is authoritative)."""
         lean = _REAL_ROTATE.replace("Player:Rotate", "Player:Lean")
         src = (
             "local Player = {}\nPlayer.__index = Player\n\n"
@@ -708,8 +714,12 @@ class TestPipelineInvocation:
             + "\n" + _HELPERS + "\nreturn Player\n"
         )
         result = self._run(src)
+        # Confirm A's look-locator DID abstain on this shape (the precondition
+        # that pre-fix made this fail-closed): no step splice landed.
+        assert "self._cam:step(" not in result.transpilation.scripts[0].luau_source
         kinds = {fc.kind for fc in result.fail_closed}
-        assert "player_look_unbound" in kinds
+        # New contract: C owns look, so A's abstention does not fail the build.
+        assert "player_look_unbound" not in kinds
         assert "player_move_unbound" not in kinds  # movement still bound
 
     def test_pipeline_surfaces_player_signal_absent(self) -> None:
@@ -786,3 +796,36 @@ class TestPipelineInvocation:
         assert "player_ambiguous" in kinds
         for sc in result.transpilation.scripts:
             assert "hum:Move" not in sc.luau_source
+
+    def test_pipeline_surfaces_player_unresolved(self) -> None:
+        """cc_module_count == 1 but the CC-flagged module's stem matches NO
+        transpiled script (stem mismatch) -> the pipeline surfaces
+        player_unresolved. This is a SIGNAL-based fail-closed (keyed on C's
+        identity contract, not an A-locator fingerprint), so slice 2.6 KEEPS it
+        -- the amendment removed only the A-output guards. Pins AC2.6.3 at the
+        PIPELINE level (only a find_player_controllers unit check existed)."""
+        from converter import contract_pipeline
+
+        # The script's source-path stem (the identity key) is NOT "Player".
+        other_path = Path("/proj/Assets/SomethingElse.cs")
+        infos = [_PInfo(other_path, "SomethingElse")]
+        scene_runtime = {
+            "modules": {"guid-player": _row("Player", has_cc=True)},
+            "scenes": {}, "prefabs": {}, "domain_overrides": {},
+        }
+        ps = TranspiledScript(
+            source_path=str(other_path), output_filename="SomethingElse.luau",
+            csharp_source="", luau_source=_player_src(), strategy="ai",
+            confidence=1.0, script_type="ModuleScript",
+        )
+        stub = TranspilationResult()
+        stub.total_transpiled = 1
+        stub.scripts.append(ps)
+        with patch(
+            "converter.contract_pipeline.transpile_scripts", return_value=stub,
+        ):
+            result = contract_pipeline.transpile_with_contract(
+                "/proj", infos, scene_runtime=scene_runtime, use_ai=False,
+            )
+        kinds = {fc.kind for fc in result.fail_closed}
+        assert "player_unresolved" in kinds

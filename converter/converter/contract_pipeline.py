@@ -510,29 +510,19 @@ def transpile_with_contract(
     if moved:
         log.info("[contract] movement-facet lowering retargeted %d player "
                  "controller(s) to the character Humanoid", moved)
-    # A player was identified upstream but a binding locator missed its rewrite
-    # site -- surface it loudly (the controller would run un-bound, the failure
-    # mode this fix exists to eliminate) instead of shipping a silent regression.
-    if players:
-        player = players[0]
-        if moved == 0:
-            player_fail_closed.append(FailClosed(
-                kind="player_move_unbound",
-                detail=(
-                    f"{Path(player.source_path).name}: player identified "
-                    f"upstream but no WASD movement method was located to "
-                    f"retarget onto the character Humanoid."
-                ),
-            ))
-        if "self._cam:step(" not in (player.luau_source or ""):
-            player_fail_closed.append(FailClosed(
-                kind="player_look_unbound",
-                detail=(
-                    f"{Path(player.source_path).name}: player identified "
-                    f"upstream but no look method was located to route onto "
-                    f"SceneCameraInput (camera will not follow the character)."
-                ),
-            ))
+    # NOTE: paradigm C (the deterministic host authority in scene_runtime.luau,
+    # keyed on the upstream ``has_character_controller`` signal) now binds BOTH
+    # look and move for every CC-identified player, OUTSIDE the transpiled
+    # script. So an A-locator abstention (camera-facet not splicing
+    # ``self._cam:step(``, or movement-facet ``moved == 0``) no longer means an
+    # unbound player -- it is just paradigm A declining to lower a shape it
+    # doesn't recognize, which C covers. The former ``player_move_unbound`` /
+    # ``player_look_unbound`` fail-closeds were keyed on those A-locator
+    # fingerprints (AI-output shape), so they fail-closed valid-but-unfamiliar
+    # cold shapes that C binds fine; they are removed here (the §3 fault-line).
+    # A's lowering passes still run above (kept until A's Phase-5 deletion);
+    # the signal-based fail-closeds (player_signal_absent / player_ambiguous /
+    # player_unresolved) remain -- they key on C's own identity, not A output.
 
     # Child-index lowering (allowlisted deterministic lowering pass): the
     # transpiler flattens Unity ``transform.GetChild(n)`` to
