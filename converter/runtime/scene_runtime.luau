@@ -773,6 +773,15 @@ function SceneRuntime:_makeHostSurface(owner)
 				-- engine's public method (no ``self``-dependent state here).
 				return engine:getLookCFrame()
 			end,
+			teleport = function(arg1, arg2)
+				-- Colon form ``host.player:teleport(cf)`` -> arg1 = the player
+				-- table, arg2 = cf. Dotted ``host.player.teleport(cf)`` -> arg1 =
+				-- cf. Select the CFrame from whichever slot carries it. NON-load-
+				-- bearing client REQUEST (D7) -> server applies via the RemoteEvent.
+				local cf = arg1
+				if arg2 ~= nil then cf = arg2 end
+				return engine:_playerTeleport(cf)
+			end,
 		},
 	}
 	return host
@@ -3009,6 +3018,41 @@ function SceneRuntime:_playerResyncToCharacter(char)
 	-- cache, 2968), so _playerWriteCamera now follows the NEW HRP automatically;
 	-- re-assert the camera immediately so the resync is visible THIS frame.
 	self:_playerWriteCamera()
+end
+
+-- Client teleport REQUEST (D7/D-P3-teleport, NON-load-bearing). Fires the
+-- server-apply ``PlayerTeleport`` RemoteEvent with the requested CFrame; the
+-- SERVER moves the character (the server owns the character CFrame -- mirrors the
+-- server-owned spawn teleport in the autogen GameServer). No-op (silent) when the
+-- player authority is not bound, the arg is not a CFrame, or the remote was never
+-- injected -- the AI MAY never call this and the goal still holds because respawn
+-- is server-owned (E7/AC5b). NO correctness path depends on this being called.
+function SceneRuntime:_playerTeleport(cf)
+	if not self._player then return end
+	-- CFrame type-guard via the injected predicate (the autogen client services
+	-- bind ``isCFrame`` to ``typeof(v) == "CFrame"``); injected (not a bare
+	-- ``typeof``) so the standalone-luau harness -- whose loadstring'd chunk
+	-- cannot override the ``typeof`` builtin -- can drive the real fire path.
+	local isCFrame = self._services.isCFrame
+	if isCFrame and not isCFrame(cf) then return end
+	local remote = self._services.playerTeleportRemote   -- injected client-side; nil-safe
+	if not (remote and remote.FireServer) then return end
+	remote:FireServer(cf)
+	-- Reseed the LOCAL authority facing from the REQUESTED pose (D-P3-teleport
+	-- /phase-integration P1) -- ONLY now that the request was actually SENT, so
+	-- when the remote is absent / lacks ``FireServer`` this stays a TRUE no-op
+	-- (no fire AND no local-state mutation, per the documented contract). The
+	-- server moves the HRP and U1 (slice 3.1) shadows the rig from it, but the
+	-- camera/locomotion authority (``p._yaw``, ``p._pitch``) is CLIENT-owned and
+	-- would otherwise keep the OLD facing — so camera/locomotion would not adopt
+	-- the teleported yaw. Mirror ``_playerResyncToCharacter``: yaw from the
+	-- INJECTED ``cameraYawOf`` (no re-derived yaw math), zero pitch. Sourced from
+	-- ``cf`` (the requested pose) rather than the HRP, since the server move is
+	-- asynchronous; a 1-frame eye-follow lag while the server moves the HRP is
+	-- acceptable (teleport is non-load-bearing per D7) — the yaw is what must
+	-- agree.
+	self._player._yaw = self._services.cameraYawOf(cf)
+	self._player._pitch = 0
 end
 
 -- Drive the character's locomotion once per frame, AFTER the LateUpdate pass
