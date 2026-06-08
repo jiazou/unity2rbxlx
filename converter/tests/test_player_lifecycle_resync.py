@@ -421,3 +421,183 @@ def test_resync_character_without_hrp_zeros_pitch_only() -> None:
     m = re.search(r"YAW=([\-\d.]+)", out)
     assert m and float(m.group(1)) == pytest.approx(2.5, abs=1e-4), out
     assert "PITCH=0.000000" in out, out
+
+
+# ---------------------------------------------------------------------------
+# D-P3-late-hrp — late-HRP fallback: when a character's HumanoidRootPart has not
+# replicated at the immediate resync, the yaw reseed is skipped and (since
+# ``_playerBoot`` is run-once) would stay STALE for that whole life. The immediate
+# resync now returns false on a missing HRP, and ``_playerBoot`` arms a one-shot
+# ``char.DescendantAdded`` retry that reseeds the yaw the moment the HRP appears.
+# ---------------------------------------------------------------------------
+
+# A character whose HRP is ABSENT at resync time and arrives LATER via a fireable
+# ``DescendantAdded``. ``Fire(desc)`` invokes every connected handler;
+# ``FindFirstChild("HumanoidRootPart")`` returns nil until the HRP is published
+# (matching the real replication-lag shape the bug fires on).
+def _late_hrp_setup() -> str:
+    return f"""
+        _lateRecord = {{}}
+        -- The HRP that will arrive LATE; faces RESPAWN_YAW. Name drives the
+        -- retry's HumanoidRootPart match.
+        local lateHrp = {{
+            Name = "HumanoidRootPart",
+            CFrame = CFrame.new(Vector3.new(20, 0, 30))
+                * CFrame.Angles(0, {RESPAWN_YAW}, 0),
+            Position = Vector3.new(20, 0, 30),
+            -- A real descendant is an Instance: hideChar (also connected to this
+            -- DescendantAdded by _playerBoot) calls :IsA on every descendant.
+            IsA = function(_, c) return c == "BasePart" end,
+        }}
+        _lateHrp = lateHrp
+
+        -- The character: NO HRP at first (FindFirstChild returns nil), with a
+        -- fireable DescendantAdded the retry connects to.
+        local lateChar
+        do
+            local handlers = {{}}
+            local hrpPublished = false
+            lateChar = {{
+                FindFirstChild = function(_, name)
+                    if name == "HumanoidRootPart" and hrpPublished then
+                        return lateHrp
+                    end
+                    return nil
+                end,
+                GetDescendants = function() return {{}} end,
+                DescendantAdded = {{
+                    Connect = function(_, fn)
+                        handlers[#handlers + 1] = fn
+                        return {{Disconnect = function()
+                            _lateRecord.disconnects = (_lateRecord.disconnects or 0) + 1
+                        end}}
+                    end,
+                    -- Publish the HRP, then fire the signal (real ordering: the
+                    -- descendant exists before DescendantAdded reports it).
+                    Fire = function(_, desc)
+                        if desc == lateHrp then hrpPublished = true end
+                        for _, fn in ipairs(handlers) do fn(desc) end
+                    end,
+                }},
+            }}
+        end
+        _lateChar = lateChar
+    """
+
+
+def test_character_added_late_hrp_reseeds_yaw_when_hrp_arrives() -> None:
+    """(a) CharacterAdded with the HRP ABSENT, then arriving late: the yaw stays
+    unchanged at the immediate resync (HRP nil) but reseeds to RESPAWN_YAW the
+    moment the late HRP fires DescendantAdded. RED without the one-shot retry."""
+    preamble = camera_input_preamble(mouse_deltas=[])
+    body = (
+        _build_authority_runtime()
+        + _lifecycle_setup()
+        + _late_hrp_setup()
+        + f"""
+        p._yaw = -9.0
+        p._pitch = 0.77
+
+        engine:_playerBoot()    -- installs the CharacterAdded connection.
+
+        local lp = game:GetService("Players").LocalPlayer
+        lp.Character = _lateChar
+        lp.CharacterAdded:Fire(_lateChar)
+
+        -- HRP absent at the immediate resync: yaw NOT reseeded yet (still -9.0),
+        -- pitch zeroed.
+        print(string.format("YAW_IMMEDIATE=%.6f", p._yaw))
+        print(string.format("PITCH_IMMEDIATE=%.6f", p._pitch))
+
+        -- The HRP replicates: fire DescendantAdded. The one-shot retry reseeds.
+        _lateChar.DescendantAdded:Fire(_lateHrp)
+        print(string.format("YAW_AFTER=%.6f", p._yaw))
+        print("DISCONNECTS=" .. tostring(_lateRecord.disconnects or 0))
+
+        -- The retry is ONE-SHOT: a second DescendantAdded (a NON-HRP descendant)
+        -- must NOT re-reseed (the connection is gone). Set a sentinel yaw and
+        -- confirm it survives.
+        p._yaw = 0.5
+        _lateChar.DescendantAdded:Fire({{
+            Name = "SomethingElse",
+            IsA = function(_, _c) return false end,
+        }})
+        print(string.format("YAW_AFTER_DISCONNECT=%.6f", p._yaw))
+    """
+    )
+    rc, out, err = run_camera_scenario(preamble, body)
+    assert rc == 0, f"scenario failed (rc={rc}): {err}\n{out}"
+    # Immediate resync: HRP nil → yaw untouched, pitch zeroed (E9 shape).
+    assert "YAW_IMMEDIATE=-9.000000" in out, out
+    assert "PITCH_IMMEDIATE=0.000000" in out, out
+    # Late HRP arrival reseeds the yaw (RED without the retry: stays -9.0).
+    assert f"YAW_AFTER={RESPAWN_YAW:.6f}" in out, out
+    # The one-shot retry disconnected exactly once.
+    assert "DISCONNECTS=1" in out, out
+    # And does NOT fire again after disconnect (sentinel 0.5 survives).
+    assert "YAW_AFTER_DISCONNECT=0.500000" in out, out
+
+
+def test_boot_with_existing_character_late_hrp_reseeds_yaw() -> None:
+    """(b) boot-with-existing-character whose HRP has not replicated at boot: the
+    boot reseed leaves yaw at the init value (HRP nil) but the one-shot retry
+    corrects it when the HRP arrives. RED without the boot-path retry arming."""
+    preamble = camera_input_preamble(mouse_deltas=[])
+    body = (
+        _build_authority_runtime()
+        + _lifecycle_setup()
+        + _late_hrp_setup()
+        + f"""
+        -- _yaw starts at the init 0; the character is ALREADY present at boot but
+        -- its HRP has not replicated.
+        p._yaw = -4.0
+        local lp = game:GetService("Players").LocalPlayer
+        lp.Character = _lateChar
+
+        engine:_playerBoot()
+
+        -- Boot reseed: HRP nil → yaw untouched (still -4.0), pitch zeroed.
+        print(string.format("YAW_BOOT=%.6f", p._yaw))
+        print(string.format("PITCH_BOOT=%.6f", p._pitch))
+
+        -- HRP replicates: the boot-armed one-shot retry reseeds.
+        _lateChar.DescendantAdded:Fire(_lateHrp)
+        print(string.format("YAW_AFTER=%.6f", p._yaw))
+        print("DISCONNECTS=" .. tostring(_lateRecord.disconnects or 0))
+    """
+    )
+    rc, out, err = run_camera_scenario(preamble, body)
+    assert rc == 0, f"scenario failed (rc={rc}): {err}\n{out}"
+    # Boot reseed: HRP nil → yaw untouched, pitch zeroed.
+    assert "YAW_BOOT=-4.000000" in out, out
+    assert "PITCH_BOOT=0.000000" in out, out
+    # Late HRP arrival reseeds the yaw (RED without the boot-path retry arming).
+    assert f"YAW_AFTER={RESPAWN_YAW:.6f}" in out, out
+    assert "DISCONNECTS=1" in out, out
+
+
+def test_late_hrp_retry_noops_when_player_cleared() -> None:
+    """The one-shot retry no-ops if ``self._player`` was cleared before the HRP
+    arrives (the player left mid-replication): no crash, no reseed attempt."""
+    preamble = camera_input_preamble(mouse_deltas=[])
+    body = (
+        _build_authority_runtime()
+        + _lifecycle_setup()
+        + _late_hrp_setup()
+        + """
+        engine:_playerBoot()
+        local lp = game:GetService("Players").LocalPlayer
+        lp.Character = _lateChar
+        lp.CharacterAdded:Fire(_lateChar)
+
+        -- Authority gone before the HRP replicates.
+        engine._player = nil
+        local ok = pcall(function()
+            _lateChar.DescendantAdded:Fire(_lateHrp)
+        end)
+        print("OK=" .. tostring(ok))
+    """
+    )
+    rc, out, err = run_camera_scenario(preamble, body)
+    assert rc == 0, f"scenario failed (rc={rc}): {err}\n{out}"
+    assert "OK=true" in out, out

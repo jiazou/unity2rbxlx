@@ -338,6 +338,42 @@ def test_teleport_noop_when_remote_lacks_fireserver() -> None:
     assert "STATEPITCH=-0.200000" in out, out
 
 
+def test_teleport_reseed_survives_synchronous_authority_clear() -> None:
+    """Harness-model regression guard: if the injected remote's ``FireServer``
+    SYNCHRONOUSLY clears ``self._player`` mid-fire, the post-fire reseed must NOT
+    index-nil. The reseed targets the ``p`` captured BEFORE the fire, not a re-read
+    ``self._player`` (unreachable with a real async Roblox RemoteEvent, but a real
+    standalone-luau-harness regression — pre-fix this raised ``index nil with
+    '_yaw'`` at the reseed line)."""
+    preamble = camera_input_preamble(mouse_deltas=[])
+    body = (
+        _build_authority_runtime()
+        + _teleport_setup()
+        + """
+        -- A FireServer that synchronously clears the authority mid-fire.
+        local captured = engine._player
+        _tp.remote.FireServer = function(_self, cf)
+            table.insert(_tp.fires, cf)
+            engine._player = nil
+        end
+        local host = engine:_makeHostSurface({})
+        local target = CFrame.new(Vector3.new(1, 2, 3)); target._yaw = 0.9
+        local ok = pcall(function() host.player:teleport(target) end)
+        print("OK=" .. tostring(ok))
+        print("FIRES=" .. tostring(#_tp.fires))
+        -- The reseed landed on the CAPTURED authority table, not a nil re-read.
+        print(string.format("YAW=%.6f", captured._yaw))
+        print(string.format("PITCH=%.6f", captured._pitch))
+        """
+    )
+    rc, out, err = run_camera_scenario(preamble, body)
+    assert rc == 0, f"scenario failed (rc={rc}): {err}\n{out}"
+    assert "OK=true" in out, out
+    assert "FIRES=1" in out, out
+    assert "YAW=0.900000" in out, out
+    assert "PITCH=0.000000" in out, out
+
+
 def test_teleport_noops_on_server_no_player() -> None:
     """E6 — on the server ``self._player`` is nil, so ``_playerTeleport`` no-ops
     (the server never REQUESTS a teleport; it only applies). No fire, no crash."""

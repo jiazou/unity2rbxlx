@@ -2896,7 +2896,12 @@ function SceneRuntime:_playerBoot()
 		lp.CharacterAdded:Connect(function(char)
 			-- IMMEDIATE yaw+camera resync FIRST, BEFORE the yield (D7/P1-b) --
 			-- so respawn yaw is correct the SAME frame (no stale-yaw frame).
-			self:_playerResyncToCharacter(char)
+			-- If the HRP has not replicated yet the immediate yaw reseed is
+			-- skipped; arm a one-shot late-HRP retry (D-P3-late-hrp) so the yaw
+			-- corrects the moment the HRP arrives (else it stays stale this life).
+			if not self:_playerResyncToCharacter(char) then
+				self:_playerArmLateHRPResync(char)
+			end
 			-- DELAYED: controls-off + body-hide LEGITIMATELY need the yield --
 			-- applyControls needs PlayerScripts->PlayerModule (populated a frame
 			-- after CharacterAdded) and hideChar walks char:GetDescendants()
@@ -2909,8 +2914,13 @@ function SceneRuntime:_playerBoot()
 		-- boot (Studio test mode / fast spawn), CharacterAdded never fires for
 		-- it, so seed facing once via the SAME shared resync -- facing correct
 		-- from frame 0 (else _yaw stays at the init 0 until later input/respawn).
+		-- Same late-HRP fallback as the CharacterAdded path: if the existing
+		-- character's HRP has not replicated at boot, arm the one-shot retry so
+		-- the boot facing corrects when it arrives (D-P3-late-hrp).
 		if lp.Character then
-			self:_playerResyncToCharacter(lp.Character)
+			if not self:_playerResyncToCharacter(lp.Character) then
+				self:_playerArmLateHRPResync(lp.Character)
+			end
 		end
 	end
 end
@@ -3004,20 +3014,50 @@ end
 -- there is no stale-yaw frame (D-P3-resync-ordering/P1-b). NO dependency on the
 -- AI's ``PivotTo``, NO dependency on paradigm B. Guards a character with no HRP
 -- yet (E9): leaves yaw unchanged, still zeroes pitch + re-asserts the camera.
+-- RETURNS true when the HRP was present and the yaw was reseeded from it; false
+-- when the HRP has not replicated yet (so the caller can arm a one-shot late-HRP
+-- retry — D-P3-late-hrp). The pitch-zero + camera re-assert run unconditionally.
 function SceneRuntime:_playerResyncToCharacter(char)
 	local p = self._player
-	if not p then return end
+	if not p then return false end
 	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	local hadHrp = false
 	if hrp and hrp.CFrame then
 		-- Yaw reseed from the new character's facing via the INJECTED pure helper
 		-- (D-P3-resync-helper); no re-derived yaw math in scene_runtime.luau.
 		p._yaw = self._services.cameraYawOf(hrp.CFrame)
+		hadHrp = true
 	end
 	p._pitch = 0
 	-- _playerCharacterHRP re-resolves LocalPlayer.Character each call (no stale
 	-- cache, 2968), so _playerWriteCamera now follows the NEW HRP automatically;
 	-- re-assert the camera immediately so the resync is visible THIS frame.
 	self:_playerWriteCamera()
+	return hadHrp
+end
+
+-- Late-HRP fallback (D-P3-late-hrp): when the immediate resync ran on a character
+-- whose HumanoidRootPart had not replicated yet, the yaw reseed was SKIPPED and
+-- would otherwise stay STALE for that whole life (``_playerBoot`` is run-once, so
+-- there is no later reseed). Arm a ONE-SHOT, event-driven ``char.DescendantAdded``
+-- retry: the moment the HumanoidRootPart appears, reseed the yaw from its facing +
+-- re-assert the camera, then DISCONNECT. Event-driven (no yield, no top-require) to
+-- match the host model. No-op if the player authority is gone by the time it fires.
+function SceneRuntime:_playerArmLateHRPResync(char)
+	if not char or not char.DescendantAdded then return end
+	local conn
+	conn = char.DescendantAdded:Connect(function(desc)
+		if not (desc and desc.Name == "HumanoidRootPart") then return end
+		if conn then conn:Disconnect(); conn = nil end
+		local p = self._player
+		if not p then return end
+		if desc.CFrame then
+			p._yaw = self._services.cameraYawOf(desc.CFrame)
+		end
+		-- Re-assert the camera so the corrected facing is visible the frame the
+		-- HRP arrives (mirrors the immediate resync's camera re-assert).
+		self:_playerWriteCamera()
+	end)
 end
 
 -- Client teleport REQUEST (D7/D-P3-teleport, NON-load-bearing). Fires the
@@ -3028,7 +3068,8 @@ end
 -- injected -- the AI MAY never call this and the goal still holds because respawn
 -- is server-owned (E7/AC5b). NO correctness path depends on this being called.
 function SceneRuntime:_playerTeleport(cf)
-	if not self._player then return end
+	local p = self._player
+	if not p then return end
 	-- CFrame type-guard via the injected predicate (the autogen client services
 	-- bind ``isCFrame`` to ``typeof(v) == "CFrame"``); injected (not a bare
 	-- ``typeof``) so the standalone-luau harness -- whose loadstring'd chunk
@@ -3050,9 +3091,12 @@ function SceneRuntime:_playerTeleport(cf)
 	-- ``cf`` (the requested pose) rather than the HRP, since the server move is
 	-- asynchronous; a 1-frame eye-follow lag while the server moves the HRP is
 	-- acceptable (teleport is non-load-bearing per D7) — the yaw is what must
-	-- agree.
-	self._player._yaw = self._services.cameraYawOf(cf)
-	self._player._pitch = 0
+	-- agree. Reseed the CAPTURED ``p`` (taken before the fire), not a re-read
+	-- ``self._player``: a synchronous fire handler could have cleared the
+	-- authority mid-fire, which would index-nil a re-read (real harness-model
+	-- regression; unreachable with a real async Roblox RemoteEvent).
+	p._yaw = self._services.cameraYawOf(cf)
+	p._pitch = 0
 end
 
 -- Drive the character's locomotion once per frame, AFTER the LateUpdate pass
