@@ -3046,9 +3046,62 @@ end
 -- READ during the Update pass sees C's pose.
 function SceneRuntime:_playerPreTick(_dt)
 	if not self._player then return end
+	self:_playerShadowSyncRig()
 	self:_playerBoot()
 	self:_playerReadInput()
 	self:_playerWriteCamera()
+end
+
+-- U1 rig shadow-sync (player-embodiment-authority-design.md §Rig<->character
+-- unification; D-P3-U1-shadow). Each frame, BEFORE the component Update pass,
+-- drive every authored player-rig Instance to the character HRP CFrame, so the
+-- AI's ``gameObject:GetPivot()`` reads see the ONE body (the character). The
+-- component still LIVES on the authored rig Instance, so GetComponent /
+-- _SceneRuntimeId / registry closures over the rig are PRESERVED (U1, NOT U2 --
+-- we never rebind ``self.gameObject``). The AI's ``PivotTo`` writes are
+-- overwritten next frame (vestigial; nothing authoritative reads rig yaw -- the
+-- camera owns yaw via ``p._yaw``, AC1d). The rig is a POSITIONAL SHADOW of the
+-- one body, NOT a second state store. No-op when no character yet (E1) or no rig
+-- built (E2) -- never nil-derefs.
+function SceneRuntime:_playerShadowSyncRig()
+	if not self._player then return end
+	local hrp = self:_playerCharacterHRP()
+	if not hrp then return end                 -- no character yet -> nothing to shadow
+	local cf = hrp.CFrame
+	if cf == nil then return end
+	for _, rig in ipairs(self:_playerRigInstances()) do
+		if rig.PivotTo ~= nil then
+			rig:PivotTo(cf)
+		elseif rig.CFrame ~= nil then          -- BasePart rig (CharacterController->BasePart map)
+			rig.CFrame = cf
+		end
+	end
+end
+
+-- Resolve the authored rig Instance(s) for the player module. Keyed ON the
+-- deterministic upstream ``scriptId`` (the SAME MODULE row whose
+-- ``has_character_controller`` is the §3 anchor -- NOT an AI-output fingerprint,
+-- D-P3-rig-key). Scans ``self._meta`` for components whose
+-- ``meta.scriptId == p._playerScriptId`` and returns their
+-- ``meta.gameObjectInstance`` (the authored rig). Returns a LIST because one
+-- player MODULE may be placed on >1 GameObject (P2-F: module count 1, instance
+-- count N) -- U1 shadow-syncs ALL of them to the one character HRP. Empty when
+-- the component isn't built yet (E2 -- no crash). De-dupes (multiple components
+-- on one GO share a ``gameObjectInstance``).
+function SceneRuntime:_playerRigInstances()
+	local p = self._player
+	if not p or not p._playerScriptId then return {} end
+	local out, seen = {}, {}
+	for _, m in pairs(self._meta) do
+		if m.scriptId == p._playerScriptId then
+			local inst = m.gameObjectInstance
+			if inst ~= nil and not seen[inst] then
+				seen[inst] = true
+				table.insert(out, inst)
+			end
+		end
+	end
+	return out
 end
 
 -- Post-LateUpdate bracket (runs OUTSIDE the component ``pairs()`` loop, AFTER
@@ -3085,9 +3138,16 @@ function SceneRuntime:_initPlayerAuthority()
 	if not self._services.isClient then return end
 
 	local ccCount = 0
-	for _, row in pairs(self._plan.modules or {}) do
+	-- Capture the player MODULE's scriptId (the deterministic upstream identity --
+	-- the SAME row whose ``has_character_controller`` is the §3 anchor, NOT an
+	-- AI-output fingerprint). U1's rig resolution (_playerRigInstances) keys on
+	-- it. The ``>1`` branch below returns before the build, so exactly one
+	-- scriptId reaches the state table.
+	local playerScriptId = nil
+	for sid, row in pairs(self._plan.modules or {}) do
 		if type(row) == "table" and row.has_character_controller then
 			ccCount = ccCount + 1
+			playerScriptId = sid
 		end
 	end
 
@@ -3110,6 +3170,7 @@ function SceneRuntime:_initPlayerAuthority()
 		_minPitch = math.rad(-80),
 		_maxPitch = math.rad(80),
 		_eyeHeight = 1.5,
+		_playerScriptId = playerScriptId,   -- deterministic rig-resolution key (U1, §3)
 	}
 end
 
