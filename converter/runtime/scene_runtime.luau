@@ -3036,24 +3036,23 @@ function SceneRuntime:_playerTeleport(cf)
 	local isCFrame = self._services.isCFrame
 	if isCFrame and not isCFrame(cf) then return end
 	local remote = self._services.playerTeleportRemote   -- injected client-side; nil-safe
-	if remote and remote.FireServer then
-		remote:FireServer(cf)
-	end
+	if not (remote and remote.FireServer) then return end
+	remote:FireServer(cf)
 	-- Reseed the LOCAL authority facing from the REQUESTED pose (D-P3-teleport
-	-- /phase-integration P1). The server moves the HRP and U1 (slice 3.1)
-	-- shadows the rig from it, but the camera/locomotion authority (``p._yaw``,
-	-- ``p._pitch``) is CLIENT-owned and would otherwise keep the OLD facing —
-	-- so camera/locomotion would not adopt the teleported yaw. Mirror
-	-- ``_playerResyncToCharacter``: yaw from the INJECTED ``cameraYawOf`` (no
-	-- re-derived yaw math), zero pitch. Sourced from ``cf`` (the requested
-	-- pose) rather than the HRP, since the server move is asynchronous; a
-	-- 1-frame eye-follow lag while the server moves the HRP is acceptable
-	-- (teleport is non-load-bearing per D7) — the yaw is what must agree.
-	local p = self._player
-	if p then
-		p._yaw = self._services.cameraYawOf(cf)
-		p._pitch = 0
-	end
+	-- /phase-integration P1) -- ONLY now that the request was actually SENT, so
+	-- when the remote is absent / lacks ``FireServer`` this stays a TRUE no-op
+	-- (no fire AND no local-state mutation, per the documented contract). The
+	-- server moves the HRP and U1 (slice 3.1) shadows the rig from it, but the
+	-- camera/locomotion authority (``p._yaw``, ``p._pitch``) is CLIENT-owned and
+	-- would otherwise keep the OLD facing — so camera/locomotion would not adopt
+	-- the teleported yaw. Mirror ``_playerResyncToCharacter``: yaw from the
+	-- INJECTED ``cameraYawOf`` (no re-derived yaw math), zero pitch. Sourced from
+	-- ``cf`` (the requested pose) rather than the HRP, since the server move is
+	-- asynchronous; a 1-frame eye-follow lag while the server moves the HRP is
+	-- acceptable (teleport is non-load-bearing per D7) — the yaw is what must
+	-- agree.
+	self._player._yaw = self._services.cameraYawOf(cf)
+	self._player._pitch = 0
 end
 
 -- Drive the character's locomotion once per frame, AFTER the LateUpdate pass

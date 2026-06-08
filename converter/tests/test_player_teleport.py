@@ -275,24 +275,67 @@ def test_teleport_rejects_non_cframe_arg() -> None:
 
 def test_teleport_noop_when_remote_absent() -> None:
     """The remote was never injected (e.g. a place with no GameServer wiring):
-    ``_playerTeleport`` no-ops cleanly — non-load-bearing, never crashes."""
+    ``_playerTeleport`` is a TRUE no-op — non-load-bearing, never crashes, and
+    (phase-integration P1 regression guard) leaves the CLIENT-owned authority
+    facing UNCHANGED. The reseed must run only after the request was SENT, so an
+    absent remote rotates neither the fire nor the local camera/locomotion yaw."""
     preamble = camera_input_preamble(mouse_deltas=[])
     body = (
         _build_authority_runtime()
         + _teleport_setup()
         + """
         engine._services.playerTeleportRemote = nil
+        -- Pre-seed the OLD local facing; a no-op teleport must not touch it.
+        engine._player._yaw = 0.4
+        engine._player._pitch = -0.2
         local host = engine:_makeHostSurface({})
         local target = CFrame.new(Vector3.new(5, 5, 5)); target._yaw = 0.3
         local ok = pcall(function() host.player:teleport(target) end)
         print("OK=" .. tostring(ok))
         print("FIRES=" .. tostring(#_tp.fires))
+        print(string.format("STATEYAW=%.6f", engine._player._yaw))
+        print(string.format("STATEPITCH=%.6f", engine._player._pitch))
         """
     )
     rc, out, err = run_camera_scenario(preamble, body)
     assert rc == 0, f"scenario failed (rc={rc}): {err}\n{out}"
     assert "OK=true" in out, out
     assert "FIRES=0" in out, out
+    # Regression guard: the absent-remote path mutated NO local authority state.
+    assert "STATEYAW=0.400000" in out, out
+    assert "STATEPITCH=-0.200000" in out, out
+
+
+def test_teleport_noop_when_remote_lacks_fireserver() -> None:
+    """The remote table is present but lacks ``FireServer`` (a half-wired / stub
+    remote): ``_playerTeleport`` must STILL be a true no-op — no fire AND no local
+    yaw/pitch mutation (phase-integration P1: the reseed is gated on the real
+    fire, not merely on the remote being non-nil)."""
+    preamble = camera_input_preamble(mouse_deltas=[])
+    body = (
+        _build_authority_runtime()
+        + _teleport_setup()
+        + """
+        -- A remote table with NO FireServer — the fire guard must reject it.
+        engine._services.playerTeleportRemote = {}
+        engine._player._yaw = 0.4
+        engine._player._pitch = -0.2
+        local host = engine:_makeHostSurface({})
+        local target = CFrame.new(Vector3.new(5, 5, 5)); target._yaw = 0.3
+        local ok = pcall(function() host.player:teleport(target) end)
+        print("OK=" .. tostring(ok))
+        print("FIRES=" .. tostring(#_tp.fires))
+        print(string.format("STATEYAW=%.6f", engine._player._yaw))
+        print(string.format("STATEPITCH=%.6f", engine._player._pitch))
+        """
+    )
+    rc, out, err = run_camera_scenario(preamble, body)
+    assert rc == 0, f"scenario failed (rc={rc}): {err}\n{out}"
+    assert "OK=true" in out, out
+    assert "FIRES=0" in out, out
+    # Same regression guard for the present-but-unfireable remote.
+    assert "STATEYAW=0.400000" in out, out
+    assert "STATEPITCH=-0.200000" in out, out
 
 
 def test_teleport_noops_on_server_no_player() -> None:
