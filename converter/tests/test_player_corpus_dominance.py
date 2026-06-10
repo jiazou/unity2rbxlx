@@ -88,14 +88,6 @@ pytestmark = pytest.mark.skipif(
 # --------------------------------------------------------------------------- #
 
 
-class _Script:
-    """Minimal ``_HasLuauSource`` holder (kept for callers that wrap a fixture
-    source as a script-like object; reads/writes ``luau_source`` only)."""
-
-    def __init__(self, source: str) -> None:
-        self.luau_source = source
-
-
 def _native_fixture_source(name: str) -> str:
     """Return the NATIVE (un-lowered) fixture source — the production shape after
     paradigm A's deletion (C is its only camera/move/jump writer)."""
@@ -119,8 +111,6 @@ def _native_fixture_source(name: str) -> str:
 #     ``workspace._humProxy`` so a native fixture whose ``Move`` reads
 #     ``self.control`` (the CharacterController/Humanoid) records onto the SAME
 #     ordered logs C writes to;
-#   * ReplicatedStorage:WaitForChild("SceneCameraInput") returning the REAL
-#     loaded SceneCameraInput module;
 #   * Space-down UIS (IsKeyDown(Space) true, W/D true so WASD is non-trivial).
 # The extra setup runs AFTER the base mocks and BEFORE the camera module loads.
 # --------------------------------------------------------------------------- #
@@ -276,22 +266,6 @@ def _dominance_extra_setup(*, keys_down: list[str]) -> str:
             local lp = game:GetService("Players").LocalPlayer
             lp.Character = character
         end
-
-        -- ---- ReplicatedStorage -> the REAL SceneCameraInput module --------
-        do
-            local realGetService = game.GetService
-            local RS = {}
-            function RS:WaitForChild(n)
-                if n == "SceneCameraInput" then
-                    return {__sceneCameraInputModule = true}
-                end
-                return nil
-            end
-            game.GetService = function(self, name)
-                if name == "ReplicatedStorage" then return RS end
-                return realGetService(self, name)
-            end
-        end
     """)
     return template.replace("__KEYS_LITERAL__", keys_literal)
 
@@ -311,22 +285,25 @@ def _embed(source: str, tag: str) -> str:
     return f"[{delim}[\n{source}\n]{delim}]"
 
 
-def _dominance_body(*, native_source: str, frames: int) -> str:
+def _dominance_body(*, native_source: str, frames: int, post_tick: bool = True) -> str:
     """Build the scenario body that drives ``frames`` real ``_tick`` calls with
-    the NATIVE fixture component bracketed by the real authority."""
-    fixture_lit = _embed(native_source, "fixture")
-    template = textwrap.dedent("""\
-        -- Make require() on the SceneCameraInput placeholder return the REAL
-        -- loaded module (SceneCameraInput is the local the camera-service
-        -- loader exposed before this body runs).
-        local _origRequire = require
-        require = function(target)
-            if type(target) == "table" and target.__sceneCameraInputModule then
-                return SceneCameraInput
-            end
-            return _origRequire(target)
-        end
+    the NATIVE fixture component bracketed by the real authority.
 
+    ``post_tick`` controls whether the post-LateUpdate bracket
+    (``_playerPostTick`` — which runs C's ``_playerWriteCamera`` /
+    ``_playerDriveLocomotion``) runs. Set False for the mutation kill: with C's
+    post-write neutralized the NATIVE writes are last, so the dominance
+    assertions go RED — proving they are load-bearing (C's post-write, not
+    coincidence)."""
+    fixture_lit = _embed(native_source, "fixture")
+    # When post_tick is False, override _playerPostTick to a no-op AFTER the
+    # authority is built (mirrors test_fieldcam_dominance's mutation kill).
+    mutation = (
+        ""
+        if post_tick
+        else "function engine:_playerPostTick(_dt) end\n"
+    )
+    template = textwrap.dedent("""\
         -- STUDS_PER_METER: the cold3a59 native Move scales by it (line 46). It
         -- is a transpiler-emitted module constant in production; seed it here.
         if STUDS_PER_METER == nil then STUDS_PER_METER = 1 end
@@ -392,7 +369,7 @@ def _dominance_body(*, native_source: str, frames: int) -> str:
         local engine = SceneRuntime.new(services, plan)
         engine:_initPlayerAuthority()
         assert(engine._player ~= nil, "authority must bind on the CC module")
-
+        __MUTATION__
         -- Register the native component into the real component map so the real
         -- _tick pairs() loop drives it (Update + LateUpdate), bracketed by the
         -- REAL _playerPreTick / _playerPostTick.
@@ -417,10 +394,11 @@ def _dominance_body(*, native_source: str, frames: int) -> str:
         -- Read the recorded logs. The final CurrentCamera.CFrame write is the
         -- last entry whose key == "CFrame".
         local camWrites = workspace._camWrites
-        local lastCamYaw, anyCamWrite = nil, false
+        local lastCamYaw, firstCamYaw, anyCamWrite = nil, nil, false
         local cYaw = engine._player._yaw
         for _, w in ipairs(camWrites) do
             if w.key == "CFrame" then
+                if not anyCamWrite then firstCamYaw = w.value._yaw end
                 anyCamWrite = true
                 lastCamYaw = w.value._yaw
             end
@@ -433,6 +411,7 @@ def _dominance_body(*, native_source: str, frames: int) -> str:
 
         print("CYAW=" .. tostring(cYaw))
         print("ANYCAMWRITE=" .. tostring(anyCamWrite))
+        print("FIRSTCAMYAW=" .. tostring(firstCamYaw))
         print("LASTCAMYAW=" .. tostring(lastCamYaw))
         print("MOVES=" .. tostring(#moveLog))
         local lastMove = moveLog[#moveLog]
@@ -455,18 +434,23 @@ def _dominance_body(*, native_source: str, frames: int) -> str:
     """)
     return (template
             .replace("__FIXTURE_LIT__", fixture_lit)
-            .replace("__FRAMES__", str(frames)))
+            .replace("__FRAMES__", str(frames))
+            .replace("__MUTATION__", mutation))
 
 
-def _run_dominance(*, name: str, keys_down: list[str], frames: int):
+def _run_dominance(
+    *, name: str, keys_down: list[str], frames: int, post_tick: bool = True
+):
     """Run the real-authority dominance scenario over the NATIVE fixture as the
-    mid-pass competitor. Returns (rc, out, err)."""
+    mid-pass competitor. ``post_tick=False`` neutralizes C's post-write bracket
+    (the mutation kill). Returns (rc, out, err)."""
     native_source = _native_fixture_source(name)
     preamble = camera_input_preamble(
         mouse_deltas=[(0.0, 0.0)] * (frames + 2),
         extra_mock_setup=_dominance_extra_setup(keys_down=keys_down),
     )
-    body = _dominance_body(native_source=native_source, frames=frames)
+    body = _dominance_body(
+        native_source=native_source, frames=frames, post_tick=post_tick)
     rc, out, err = run_camera_scenario(preamble, body)
     return rc, out, err
 
@@ -502,12 +486,51 @@ class TestCorpusDominanceByExecution:
             f"got {cyaw} (D9 ACK race not exercised)\n{out}"
         )
 
+        # NON-VACUITY (a real, DISTINCT competitor landed FIRST): the native
+        # camera write runs mid-pass with a value DISTINCT from C's. Both
+        # fixtures' native Rotate writes ``cam.CFrame = ... * CFrame.Angles(
+        # -rad(pitch), 0, 0)`` — pitch-only, so its CFrame carries yaw 0 (the rig
+        # pivot, not the camera, gets the yaw). Asserting the FIRST camera write
+        # is yaw 0 (≠ C's non-zero) proves a genuine competing native write
+        # landed BEFORE C — without this the proof would pass even if the native
+        # write never ran (C's own post-write being the only entry).
+        first = _grab(out, "FIRSTCAMYAW=")
+        assert float(first) == 0.0 and float(first) != float(cyaw), (
+            f"{name}: the native mid-pass camera write must land FIRST with a "
+            f"value DISTINCT from C's (native pitch-only yaw=0, C yaw={cyaw}); "
+            f"got first-write yaw={first}\n{out}"
+        )
+
         # CAMERA dominance: the FINAL camera CFrame is C's (its E2E-advanced
         # yaw), not the native raw write (rig-pivot yaw 0).
         last = _grab(out, "LASTCAMYAW=")
         assert float(last) == float(cyaw), (
             f"{name}: final CurrentCamera.CFrame must be C's post-write "
             f"(yaw={cyaw}); got last-writer yaw={last}\n{out}"
+        )
+
+    @pytest.mark.parametrize("name", ("cold3a59", "dde248"))
+    def test_C_dominates_camera_is_load_bearing_mutation(self, name: str) -> None:
+        # MUTATION KILL (per-fixture, mirrors test_fieldcam_dominance): with C's
+        # post-LateUpdate bracket (_playerPostTick → _playerWriteCamera)
+        # neutralized, the native mid-pass camera write (yaw 0) is the LAST
+        # writer → the dominance assertion above would go RED. Proves that
+        # assertion is load-bearing — it fails if C does NOT dominate.
+        rc, out, err = _run_dominance(
+            name=name, keys_down=["W", "D"], frames=1, post_tick=False)
+        assert rc == 0, f"{name}: luau failed: {err}\n{out}"
+
+        # The native camera write still landed mid-pass (non-vacuous competitor).
+        assert "ANYCAMWRITE=true" in out, f"{name}: no camera write logged\n{out}"
+        cyaw = _grab(out, "CYAW=")
+        assert float(cyaw) != 0.0, (
+            f"{name}: C's yaw must still advance via the E2E channel\n{out}"
+        )
+        # With C's post-write gone, the native (yaw 0) is last — NOT C's yaw.
+        last = _grab(out, "LASTCAMYAW=")
+        assert float(last) != float(cyaw), (
+            f"{name}: mutation — with no _playerPostTick the native camera write "
+            f"must be last (last yaw {last} should NOT equal C's {cyaw})\n{out}"
         )
 
     def test_C_dominates_move_dde248(self) -> None:

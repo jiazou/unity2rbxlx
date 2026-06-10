@@ -94,16 +94,6 @@ def _fieldcam_body(*, native_source: str, post_tick: bool) -> str:
         else "function engine:_playerPostTick(_dt) end\n"
     )
     template = textwrap.dedent("""\
-        -- require() on the SceneCameraInput placeholder returns the REAL module
-        -- (the lazy-acquire the movement lowerer injected into Move uses it).
-        local _origRequire = require
-        require = function(target)
-            if type(target) == "table" and target.__sceneCameraInputModule then
-                return SceneCameraInput
-            end
-            return _origRequire(target)
-        end
-
         local PlayerChunk = assert(loadstring(
             "return (function() " .. __FIXTURE_LIT__ .. " end)()",
             "native_fieldcam"))

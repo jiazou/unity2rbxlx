@@ -146,6 +146,21 @@ def camera_input_preamble(
                 _pitch = (a._pitch or 0) + (b._pitch or 0),
             }}, CFramemt)
         end
+        -- ``cframe - vector3`` translates the position by -v, keeping rotation
+        -- (Roblox semantics). The dde248 native camera write does
+        -- ``(basePivot - basePivot.Position)`` to strip the pivot's translation
+        -- before re-anchoring; preserve _yaw/_pitch so that raw write lands as a
+        -- real competitor rather than erroring out (a missing __sub would make
+        -- the native camera write silently absent → a vacuous dominance proof).
+        function CFramemt.__sub(a, v)
+            local p = a.Position or Vector3new(0, 0, 0)
+            return setmetatable({{
+                Position = Vector3new(p.X - (v.X or 0), p.Y - (v.Y or 0),
+                                      p.Z - (v.Z or 0)),
+                _yaw = a._yaw or 0,
+                _pitch = a._pitch or 0,
+            }}, CFramemt)
+        end
         CFrame = {{
             new = function(pos)
                 return setmetatable(

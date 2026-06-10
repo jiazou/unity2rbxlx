@@ -528,6 +528,18 @@ def transpile_with_contract(
     # camera-facet lowering -- paradigm C owns the player camera; this pass is
     # drone/turret-only (P1-a). Filtering by ``player_controller_paths`` (not an
     # AI fingerprint) means a strict-match player look method is never spliced.
+    #
+    # FAIL-CLOSE GATE makes a stray player lowering moot: when the player signal
+    # is absent / ambiguous / unresolved, ``player_controller_paths`` is ∅ so
+    # this filter excludes nothing -- a strict-look player-shaped script COULD
+    # get ``self._cam:step`` spliced. But each of those cases appended a
+    # ``player_signal_absent`` / ``player_ambiguous`` / ``player_unresolved``
+    # row to ``player_fail_closed`` above, which the orchestrator turns into a
+    # project-level fail-closed reason: the conversion is REJECTED and nothing
+    # ships. So a lowering on the ∅ path can never reach a shipped build -- the
+    # fail-close is the decisive gate, not this exclusion. (A 2nd exclusion path
+    # is intentionally NOT added: it would risk the drone/turret path for no
+    # shipped-output benefit.)
     lowered = lower_camera_facet(
         [s for s in transpilation.scripts
          if Path(s.source_path) not in player_controller_paths]
