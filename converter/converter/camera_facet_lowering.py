@@ -28,7 +28,7 @@ Idempotent: after lowering, neither fingerprint matches, so re-runs no-op.
 from __future__ import annotations
 
 import re
-from typing import Collection, Protocol
+from typing import Protocol
 
 from converter.runtime_contract import (
     _extract_function_body,
@@ -72,61 +72,27 @@ _PITCH_IN_CAM_RE = re.compile(
     r"CFrame\.Angles\(\s*math\.rad\(\s*self\.(?P<pitch>\w+)",
 )
 
-# Broadened look-method signals (used ONLY on the upstream-identified player
-# script, never globally -- a non-player camera keeps the strict shape below).
-# The strict ``_CAM_PITCH_RE`` requires an EXACT ``CFrame.new(...) *
-# CFrame.Angles(...)`` rebuild, which the AI defeats with an intervening yaw
-# term (``CFrame.new(pos) * (basePivot - basePivot.Position) * CFrame.Angles
-# (pitch)``). Instead, key on two INVARIANTS of a mouse-look method that are
-# robust to CFrame-composition shape: it reads the mouse delta AND it owns the
-# camera. Requiring BOTH (not GetMouseDelta alone) excludes a "consume the
-# first-frame spike" helper that reads the delta but never writes the camera.
-_MOUSE_DELTA_RE = re.compile(r"GetMouseDelta\(")
-_CAM_OWNER_RE = re.compile(
-    r"CurrentCamera|CameraType\s*=\s*Enum\.CameraType\.Scriptable",
-)
-# The broad look method must also WRITE a camera orientation (``CFrame.Angles``)
-# -- this is what separates the real mouse-look from an aim-down-sights / zoom
-# method that reads ``GetMouseDelta`` and touches the camera only to change
-# ``FieldOfView`` (codex adversarial finding: without it, an ``Aim()``/
-# ``PrimeMouse()`` method declared before ``Rotate`` was mis-bound).
-_CAM_ANGLES_RE = re.compile(r"CFrame\.Angles\(")
 
-
-def _find_look_method(stripped: str, broadened: bool = False):
+def _find_look_method(stripped: str):
     """Return ``(body_start, body_len, param, pitch_field)`` for the look
     method, or ``None``. Scans on the comment/string-stripped source so
     fingerprints inside literals are never signals; offsets map 1:1 to the
     real source (the strip preserves length).
 
-    ``broadened`` (set ONLY for the upstream-identified player script) ALSO
-    accepts a method that reads ``GetMouseDelta()``, owns the camera, AND
-    writes a camera orientation (``CFrame.Angles``), so an AI-emitted CFrame
-    shape the strict pitch-rebuild regex misses is still located. Non-player
-    scripts pass ``broadened=False`` and keep the exact strict shape
-    (byte-identical behavior; no new false positives).
+    Matches ONLY the strict yaw-turn + pitch-rebuild drone/turret fingerprint;
+    the player camera is owned by paradigm C and excluded from this pass at the
+    call site (it never reaches here).
 
     Uniqueness is enforced (mirroring the WASD move locator): collect every
-    matching method, PREFER the canonical strict shape when present, and
-    fail-closed (``None``) when more than one method qualifies with no single
-    strict winner -- so a player script with a second mouse-look-ish method
-    (aim/lean) abstains rather than letting first-match-wins splice the wrong
-    body (codex: the wrong-method bind + the ``self._cam:step(`` false
-    reassurance)."""
-    matches: list[tuple[int, int, str | None, str | None]] = []
+    strict match and fail-closed (``None``) when more than one method
+    qualifies -- so a script with a second strict-look-ish method abstains
+    rather than letting first-match-wins splice the wrong body."""
     strict_matches: list[tuple[int, int, str | None, str | None]] = []
     for m in _METHOD_RE.finditer(stripped):
         body, body_start = _extract_function_body(stripped, m.end())
         if body is None:
             continue
-        strict = bool(_YAW_TURN_RE.search(body) and _CAM_PITCH_RE.search(body))
-        broad = bool(
-            broadened
-            and _MOUSE_DELTA_RE.search(body)
-            and _CAM_OWNER_RE.search(body)
-            and _CAM_ANGLES_RE.search(body)
-        )
-        if not (strict or broad):
+        if not (_YAW_TURN_RE.search(body) and _CAM_PITCH_RE.search(body)):
             continue
         # First identifier in the (already-passed) arg list, if any.
         close = stripped.find(")", m.end())
@@ -137,18 +103,10 @@ def _find_look_method(stripped: str, broadened: bool = False):
                 param = pm.group(1)
         pitch_m = _PITCH_CLAMP_RE.search(body) or _PITCH_IN_CAM_RE.search(body)
         pitch_field = pitch_m.group("pitch") if pitch_m else None
-        result = (body_start, len(body), param, pitch_field)
-        matches.append(result)
-        if strict:
-            strict_matches.append(result)
-    # Prefer the canonical strict look method; else the unique broad one; else
-    # fail-closed on ambiguity.
+        strict_matches.append((body_start, len(body), param, pitch_field))
+    # The unique strict look method, else fail-closed on ambiguity / no match.
     if len(strict_matches) == 1:
         return strict_matches[0]
-    if len(strict_matches) > 1:
-        return None
-    if len(matches) == 1:
-        return matches[0]
     return None
 
 
@@ -160,24 +118,12 @@ def _recoil_re(pitch_field: str) -> re.Pattern[str]:
     )
 
 
-def _step_body(param: str | None, follow_character: bool | None = None) -> str:
+def _step_body(param: str | None) -> str:
     arg = param or "0"
-    # Tri-state ``followCharacter`` so the singleton's eye state is deterministic
-    # and never leaks across camera controllers (the service is one camera per
-    # client):
-    #   True  -> the player controller: eye follows the Roblox character.
-    #   False -> a non-player camera (drone/turret) IN A CONVERSION THAT ALSO HAS
-    #            a player: emit the flag explicitly so a later configure clears
-    #            any prior player ``true`` instead of inheriting it (the phase-
-    #            review stickiness finding).
-    #   None  -> no player identified in this conversion: omit the key entirely
-    #            so the emit stays byte-identical to the pre-followCharacter pass.
-    if follow_character is None:
-        config = "{rig = self.gameObject}"
-    elif follow_character:
-        config = "{rig = self.gameObject, followCharacter = true}"
-    else:
-        config = "{rig = self.gameObject, followCharacter = false}"
+    # Drone/turret-only pass (the player is excluded at the call site, owned by
+    # paradigm C), so the ``followCharacter`` key is always omitted -- the emit
+    # is byte-identical to the historical non-player pass.
+    config = "{rig = self.gameObject}"
     return (
         "\n"
         '\tif not self._cam then\n'
@@ -189,46 +135,26 @@ def _step_body(param: str | None, follow_character: bool | None = None) -> str:
     )
 
 
-def lower_camera_facet(
-    scripts: list[_HasLuauSource],
-    follow_character_paths: "Collection[_HasLuauSource] | None" = None,
-) -> int:
-    """Lower the look facet of any flattened first-person controller in
-    ``scripts`` onto the SceneCameraInput service. Returns the number of
-    scripts modified.
+def lower_camera_facet(scripts: list[_HasLuauSource]) -> int:
+    """Lower the look facet of any flattened first-person DRONE/TURRET
+    controller in ``scripts`` onto the SceneCameraInput service. Returns the
+    number of scripts modified.
 
-    ``follow_character_paths`` is the (identity) collection of scripts
-    identified as the player controller (from
-    ``movement_facet_lowering.find_player_controllers``). For a script in that
-    set, the emitted ``configure`` carries ``followCharacter = true`` (eye
-    follows the Roblox character); for every other script the emit is
-    byte-identical to before."""
-    follow_ids = (
-        {id(s) for s in follow_character_paths} if follow_character_paths else set()
-    )
+    The player script is EXCLUDED upstream (at the call site, keyed on the
+    deterministic ``has_character_controller`` signal); paradigm C owns the
+    player camera. Every script reaching here is a non-player camera, so the
+    emit carries no ``followCharacter`` key (byte-identical to the historical
+    non-player pass)."""
     changed = 0
     for s in scripts:
         src = s.luau_source or ""
         stripped = _strip_strings_and_comments(src)
-        # The player controller gets the broadened locator (its look method may
-        # carry an AI CFrame shape the strict regex misses); every other script
-        # keeps the strict shape so non-player cameras are byte-identical.
-        found = _find_look_method(stripped, broadened=id(s) in follow_ids)
+        found = _find_look_method(stripped)
         if found is None:
             continue
         body_start, body_len, param, pitch_field = found
 
-        # Tri-state: the player -> True; a non-player camera when a player
-        # exists in this conversion -> False (explicit, so it can't inherit a
-        # stale singleton ``true``); no player at all -> None (byte-identical
-        # omit, so non-FPS conversions are unchanged).
-        if id(s) in follow_ids:
-            follow: bool | None = True
-        elif follow_ids:
-            follow = False
-        else:
-            follow = None
-        new_src = src[:body_start] + _step_body(param, follow) + src[body_start + body_len:]
+        new_src = src[:body_start] + _step_body(param) + src[body_start + body_len:]
 
         # Recoil writes (outside the now-replaced look body) -> applyRecoil.
         if pitch_field:

@@ -537,18 +537,11 @@ def transpile_with_contract(
                  "to SceneCameraInput", lowered)
 
     # NOTE: paradigm C (the deterministic host authority in scene_runtime.luau,
-    # keyed on the upstream ``has_character_controller`` signal) now binds BOTH
-    # look and move for every CC-identified player, OUTSIDE the transpiled
-    # script. So an A-locator abstention (camera-facet not splicing
-    # ``self._cam:step(``, or movement-facet ``moved == 0``) no longer means an
-    # unbound player -- it is just paradigm A declining to lower a shape it
-    # doesn't recognize, which C covers. The former ``player_move_unbound`` /
-    # ``player_look_unbound`` fail-closeds were keyed on those A-locator
-    # fingerprints (AI-output shape), so they fail-closed valid-but-unfamiliar
-    # cold shapes that C binds fine; they are removed here (the §3 fault-line).
-    # A's lowering passes still run above (kept until A's Phase-5 deletion);
-    # the signal-based fail-closeds (player_signal_absent / player_ambiguous /
-    # player_unresolved) remain -- they key on C's own identity, not A output.
+    # keyed on the upstream ``has_character_controller`` signal) owns the
+    # player's look + move; paradigm A is deleted, so there is no A-locator
+    # abstention concept any more. The signal-based fail-closeds
+    # (player_signal_absent / player_ambiguous / player_unresolved) key on C's
+    # own identity and remain above.
 
     # Child-index lowering (allowlisted deterministic lowering pass): the
     # transpiler flattens Unity ``transform.GetChild(n)`` to
