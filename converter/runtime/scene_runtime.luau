@@ -782,6 +782,18 @@ function SceneRuntime:_makeHostSurface(owner)
 				if arg2 ~= nil then cf = arg2 end
 				return engine:_playerTeleport(cf)
 			end,
+			applyRecoil = function(arg1, arg2)
+				-- The Phase-4 directive advertises ``host.player:applyRecoil``;
+				-- the AI's Shoot calls it, so the surface MUST implement it
+				-- (caller/callee contract — a missing method throws in Update,
+				-- caught at the Phase-5 cold-Studio verify). Colon form -> arg1 =
+				-- the player table, arg2 = delta; dotted -> arg1 = delta. The
+				-- number type-guard in ``_playerApplyRecoil`` makes the colon-
+				-- with-no-arg call a safe no-op.
+				local delta = arg1
+				if arg2 ~= nil then delta = arg2 end
+				return engine:_playerApplyRecoil(delta)
+			end,
 		},
 	}
 	return host
@@ -3132,6 +3144,18 @@ function SceneRuntime:_playerTeleport(cf)
 	-- regression; unreachable with a real async Roblox RemoteEvent).
 	p._yaw = self._services.cameraYawOf(cf)
 	p._pitch = 0
+end
+
+-- Recoil kick on C's camera pitch. Same semantic as SceneCameraInput:
+-- applyRecoil (scene_camera_input.luau): additive, clamped to the player's
+-- pitch range. A mid-Update kick survives to render because the post-tick
+-- camera write composes from ``p._pitch``, and ``cameraAdvance`` carries the
+-- state forward on later frames. No player / non-number delta -> no-op.
+function SceneRuntime:_playerApplyRecoil(deltaPitchRad)
+	local p = self._player
+	if not p then return end
+	if type(deltaPitchRad) ~= "number" then return end
+	p._pitch = math.clamp(p._pitch + deltaPitchRad, p._minPitch, p._maxPitch)
 end
 
 -- Drive the character's locomotion once per frame, AFTER the LateUpdate pass
