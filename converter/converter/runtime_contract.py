@@ -82,11 +82,22 @@ class VerificationResult:
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def verify_module(source: str) -> VerificationResult:
+def verify_module(
+    source: str, *, is_player_controller: bool = False,
+) -> VerificationResult:
     """Verify a Luau ModuleScript against the generic-runtime contract.
 
     Args:
         source: The full Luau source as a single string.
+        is_player_controller: When ``True``, additionally run the two
+            paradigm-B player rejects (rule ``p1`` -- a direct
+            ``workspace.CurrentCamera.CFrame``/``CameraType`` write; rule
+            ``p2`` -- a direct ``Humanoid:Move(`` call). These rules are
+            NON-load-bearing: the host owns camera + locomotion via
+            ``self.host.player`` (paradigm C), so a surviving player reject
+            warns + fails OPEN (the caller tags it ``contract-verifier-player``),
+            never fail-closed. Default ``False`` preserves every existing
+            (non-player) call site -- only the 8 contract rules run.
 
     Returns:
         ``VerificationResult`` with ``ok=True`` and no violations when the
@@ -104,6 +115,9 @@ def verify_module(source: str) -> VerificationResult:
     violations.extend(_check_unity_message_callbacks(statements, stripped, source))
     violations.extend(_check_gameobject_touch(stripped, source))
     violations.extend(_check_script_parent(stripped, source))
+    if is_player_controller:
+        violations.extend(_check_player_camera_write(stripped, source))
+        violations.extend(_check_player_humanoid_move(stripped, source))
 
     # Source order for reprompt readability. Tie-break on rule letter so
     # output is deterministic across runs.
@@ -1095,4 +1109,76 @@ def _check_script_parent(stripped: str, source: str) -> list[Violation]:
                 scopes.pop()
             # The following ``then`` pushes the new branch scope.
 
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Paradigm-B player rejects (rules ``p1`` / ``p2``) -- NON-load-bearing.
+#
+# Run ONLY when ``verify_module(..., is_player_controller=True)``, i.e. for
+# the script the deterministic upstream player identity
+# (``has_character_controller``) selects. The host owns camera + locomotion
+# via ``self.host.player`` (paradigm C, which dominates by last-writer
+# ordering regardless), so a player controller that ALSO writes the camera
+# or moves the Humanoid directly is a conflict the directive asks it to drop.
+# A surviving reject warns + fails OPEN (caller tags ``contract-verifier-
+# player``); C binds anyway. Both checks scan ``stripped`` (string/comment-
+# blanked) so a match inside a literal/comment is not a false positive, and
+# map line numbers via ``source`` -- identical to every other ``_check_*``.
+#
+# PivotTo is deliberately NOT rejected: it serves yaw / translate / respawn in
+# the same script and is not lexically separable (a conservative-lexical
+# verifier cannot tell a movement PivotTo from a respawn one).
+# ---------------------------------------------------------------------------
+
+# ``workspace.CurrentCamera.CFrame =`` (or ``.CameraType =``) -- a direct
+# write to the host-owned camera. Whitespace-tolerant around the dots and the
+# ``=``. The ``(?!=)`` negative lookahead excludes an equality test
+# (``... CFrame == x``): a single ``=`` not followed by another ``=`` is an
+# assignment; ``==`` is a comparison, not a write.
+_RE_P1_CAMERA_WRITE = re.compile(
+    r"workspace\s*\.\s*CurrentCamera\s*\.\s*(CFrame|CameraType)\s*=(?!=)",
+)
+
+
+def _check_player_camera_write(stripped: str, source: str) -> list[Violation]:
+    out: list[Violation] = []
+    for m in _RE_P1_CAMERA_WRITE.finditer(stripped):
+        member = m.group(1)
+        line = source.count("\n", 0, m.start()) + 1
+        out.append(Violation(
+            rule="p1",
+            line=line,
+            message=(
+                f"Direct ``workspace.CurrentCamera.{member}`` write -- the "
+                f"host owns the camera via ``self.host.player``; do not write "
+                f"CurrentCamera in the player controller. For aim use "
+                f"``self.host.player:getLookCFrame()``."
+            ),
+        ))
+    return out
+
+
+# ``Humanoid:Move(`` -- a direct locomotion call on the literal ``Humanoid``.
+# Whitespace-tolerant around the ``:`` and the ``(``. A ``hum:Move(`` local
+# alias is intentionally NOT matched (the directive's literal is
+# ``Humanoid:Move``; B is non-load-bearing and C dominates the move write).
+_RE_P2_HUMANOID_MOVE = re.compile(
+    r"\bHumanoid\s*:\s*Move\s*\(",
+)
+
+
+def _check_player_humanoid_move(stripped: str, source: str) -> list[Violation]:
+    out: list[Violation] = []
+    for m in _RE_P2_HUMANOID_MOVE.finditer(stripped):
+        line = source.count("\n", 0, m.start()) + 1
+        out.append(Violation(
+            rule="p2",
+            line=line,
+            message=(
+                "Direct ``Humanoid:Move(`` call -- the host owns locomotion "
+                "via ``self.host.player``; do not call ``Humanoid:Move`` in "
+                "the player controller."
+            ),
+        ))
     return out

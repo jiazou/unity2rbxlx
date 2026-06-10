@@ -197,8 +197,18 @@ class ContractPipelineResult:
 
 
 def _is_contract_warning(w: str) -> bool:
-    """A warning emitted by ``_verify_and_reprompt`` (pre OR post tag)."""
-    return w.startswith("contract-verifier")
+    """A contract-rule (a)-(h) warning from ``_verify_and_reprompt`` (pre OR
+    post tag).
+
+    EXCLUDES ``contract-verifier-player`` (paradigm B, rules ``p1``/``p2``):
+    player rejects are NON-load-bearing cosmetic notes outside the a-h
+    contract the compliance spike measures, so they must not perturb
+    ``first_attempt_pass_count`` (which drops any script carrying a contract
+    warning)."""
+    return (
+        w.startswith("contract-verifier")
+        and not w.startswith("contract-verifier-player")
+    )
 
 
 def _is_post_reprompt_warning(w: str) -> bool:

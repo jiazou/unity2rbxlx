@@ -102,7 +102,7 @@ def _capture_contexts(monkeypatch) -> dict[str, str]:
 
     def fake_ai(csharp_source, api_key, model, class_name="",
                 script_type="Script", project_context="",
-                runtime_mode="legacy"):
+                runtime_mode="legacy", is_player_controller=False):
         captured[class_name] = project_context
         return ("local M = {}\nreturn M\n", 0.9, [])
 

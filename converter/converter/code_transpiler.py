@@ -320,6 +320,7 @@ def transpile_scripts(
                         script_type=script_type,
                         project_context=context,
                         runtime_mode=effective_runtime_mode,
+                        is_player_controller=is_player,
                     )
                 elif backend == "anthropic_api" and api_key:
                     luau, confidence, warnings = _ai_transpile(
@@ -328,6 +329,7 @@ def transpile_scripts(
                         script_type=script_type,
                         project_context=context,
                         runtime_mode=effective_runtime_mode,
+                        is_player_controller=is_player,
                     )
                 else:
                     return stem, None
@@ -1535,8 +1537,36 @@ def _contract_reprompt_user_message(
     )
 
 
+_PLAYER_RULES: frozenset[str] = frozenset({"p1", "p2"})
+
+
+def _format_contract_survivor_warning(violation) -> str:
+    """Tag a SURVIVING verifier violation for the ``TranspiledScript``.
+
+    Player rejects (``p1``/``p2``, paradigm B) get the distinct
+    ``contract-verifier-player`` tag -- it starts with ``contract-verifier-``
+    so it NEVER matches ``_is_post_reprompt_warning`` (which keys on the
+    ``contract-verifier `` space / ``contract-verifier:`` colon forms) -->
+    never promotes to a fail-closed --> B stays NON-load-bearing. Contract
+    rules (a)-(h) keep the ``contract-verifier `` (space) tag and stay
+    fail-closed. Shared between the cold ``_verify_and_reprompt`` path and
+    the ``_refresh_contract_warnings`` cache-replay path so both fail open
+    on a surviving player reject identically.
+    """
+    if violation.rule in _PLAYER_RULES:
+        return (
+            f"contract-verifier-player (rule {violation.rule}, "
+            f"line {violation.line}): {violation.message}"
+        )
+    return (
+        f"contract-verifier (rule {violation.rule}, "
+        f"line {violation.line}): {violation.message}"
+    )
+
+
 def _refresh_contract_warnings(
     luau_source: str, cached_warnings: list[str],
+    is_player_controller: bool = False,
 ) -> list[str]:
     """Replace cached contract-verifier warnings with a fresh re-verify.
 
@@ -1555,18 +1585,30 @@ def _refresh_contract_warnings(
     reprompt-rescued modules; on cache replay that distinction is
     unrecoverable, so we treat the cached output as "first attempt
     clean" if the current verifier passes.
+
+    ``is_player_controller`` (paradigm B, NON-load-bearing): when ``True``
+    the verifier also runs the two player rejects (``p1``/``p2``). This is
+    the LOAD-BEARING fail-open-on-cache-hit path: a cached player reject
+    (``p1``/``p2``) MUST be re-emitted under the ``contract-verifier-player``
+    tag, NOT the default ``contract-verifier `` (space) tag -- the space tag
+    matches ``_is_post_reprompt_warning`` and would promote to a hard
+    fail-closed on replay, making B load-bearing. The ``-player`` tag never
+    matches that promotion, so a surviving player reject fails OPEN on the
+    cache-replay path exactly as on the cold path. Contract rules (a)-(h)
+    keep the space tag and stay fail-closed.
     """
     from converter.runtime_contract import verify_module
     non_contract = [
         w for w in cached_warnings
         if not w.startswith("contract-verifier")
     ]
-    result = verify_module(luau_source)
+    result = verify_module(
+        luau_source, is_player_controller=is_player_controller,
+    )
     if result.ok:
         return non_contract
     return non_contract + [
-        f"contract-verifier (rule {v.rule}, line {v.line}): {v.message}"
-        for v in result.violations
+        _format_contract_survivor_warning(v) for v in result.violations
     ]
 
 
@@ -1575,6 +1617,7 @@ def _verify_and_reprompt(
     csharp_source: str,
     runtime_mode: RuntimeMode,
     reprompt_call,
+    is_player_controller: bool = False,
 ) -> tuple[str, list[str]]:
     """Run the contract verifier; on violations call ``reprompt_call`` ONCE.
 
@@ -1590,13 +1633,18 @@ def _verify_and_reprompt(
     only by design (the bottom of the design doc's "What already exists"
     section explicitly preserves legacy's repair passes).
 
-    Warnings carry two distinct tags so the compliance spike can compute
+    Warnings carry distinct tags so the compliance spike can compute
     pre/post-reprompt pass rates from the returned list alone:
 
-      * ``contract-verifier-pre`` -- a violation the FIRST AI output had.
-        Emitted only when reprompt was actually called.
-      * ``contract-verifier`` -- a violation that survived the reprompt
-        (and therefore routes to project-level fail-closed).
+      * ``contract-verifier-pre`` -- a contract-rule (a)-(h) violation the
+        FIRST AI output had. Emitted only when reprompt was actually called.
+      * ``contract-verifier`` -- a contract-rule (a)-(h) violation that
+        survived the reprompt (routes to project-level fail-closed).
+      * ``contract-verifier-player`` -- a SURVIVING paradigm-B player reject
+        (``p1``/``p2``). NON-load-bearing: fails OPEN (the ``-player`` tag
+        never matches ``_is_post_reprompt_warning``). Player rules emit NO
+        ``-pre`` tag, so a FIXED ``p1``/``p2`` leaves NO surviving player
+        warning, and the counter taxonomy never false-counts it as rescued.
 
     A module with only ``-pre`` warnings means the reprompt fixed
     everything; a module with both means partial fix; a module with no
@@ -1607,16 +1655,22 @@ def _verify_and_reprompt(
 
     from converter.runtime_contract import verify_module
 
-    initial = verify_module(luau_source)
+    initial = verify_module(
+        luau_source, is_player_controller=is_player_controller,
+    )
     if initial.ok:
         return luau_source, []
 
     # Record the pre-reprompt violations as ``-pre`` warnings before the
     # reprompt has a chance to fix them. They survive even on a
-    # successful reprompt so the spike can measure delta.
+    # successful reprompt so the spike can measure delta. Player rules
+    # (``p1``/``p2``) are EXCLUDED -- they are non-load-bearing and emit a
+    # ``-player`` survivor tag ONLY if they survive the reprompt (a fixed
+    # player reject leaves no warning), keeping the spike counters clean.
     pre_warnings = [
         f"contract-verifier-pre (rule {v.rule}, line {v.line}): {v.message}"
         for v in initial.violations
+        if v.rule not in _PLAYER_RULES
     ]
 
     violations_text = _format_contract_violations(initial.violations)
@@ -1630,29 +1684,28 @@ def _verify_and_reprompt(
         # warning too -- backend failure is operationally equivalent to
         # "reprompt didn't fix anything".
         return luau_source, pre_warnings + [
-            f"contract-verifier (rule {v.rule}, line {v.line}): {v.message}"
-            for v in initial.violations
+            _format_contract_survivor_warning(v) for v in initial.violations
         ]
 
     new_luau = _strip_code_fences(new_text)
     if not new_luau:
         return luau_source, pre_warnings + [
-            f"contract-verifier (rule {v.rule}, line {v.line}): {v.message}"
-            for v in initial.violations
+            _format_contract_survivor_warning(v) for v in initial.violations
         ]
 
-    second = verify_module(new_luau)
+    second = verify_module(
+        new_luau, is_player_controller=is_player_controller,
+    )
     if second.ok:
         # Reprompt fixed everything. Pre-warnings are still surfaced so
         # the spike can count "reprompt-rescued" modules separately from
         # "first-attempt clean" modules.
         return new_luau, pre_warnings
     # Still failing after one reprompt -- per design doc this routes to
-    # project-wide legacy fallback. Carry the remaining violations as
-    # ``contract-verifier`` warnings; the orchestrator decides.
+    # project-wide legacy fallback for contract rules (a)-(h); a surviving
+    # player reject (``p1``/``p2``) carries the fail-OPEN ``-player`` tag.
     return new_luau, pre_warnings + [
-        f"contract-verifier (rule {v.rule}, line {v.line}): {v.message}"
-        for v in second.violations
+        _format_contract_survivor_warning(v) for v in second.violations
     ]
 
 
@@ -1664,6 +1717,7 @@ def _ai_transpile(
     script_type: str = "Script",
     project_context: str = "",
     runtime_mode: RuntimeMode = "legacy",
+    is_player_controller: bool = False,
 ) -> tuple[str, float, list[str]]:
     """Transpile C# source to Luau using the Claude API.
 
@@ -1712,6 +1766,7 @@ def _ai_transpile(
             if runtime_mode == "generic":
                 cached_warnings = _refresh_contract_warnings(
                     luau_cached, cached_warnings,
+                    is_player_controller=is_player_controller,
                 )
             return luau_cached, cached["confidence"], cached_warnings
         else:
@@ -1796,6 +1851,7 @@ def _ai_transpile(
 
     luau_source, contract_warnings = _verify_and_reprompt(
         luau_source, csharp_source, runtime_mode, _api_reprompt,
+        is_player_controller=is_player_controller,
     )
     warnings.extend(contract_warnings)
 
@@ -1870,6 +1926,7 @@ def _claude_cli_transpile(
     script_type: str = "Script",
     project_context: str = "",
     runtime_mode: RuntimeMode = "legacy",
+    is_player_controller: bool = False,
 ) -> tuple[str, float, list[str]]:
     """Transpile C# to Luau by invoking Claude Code CLI.
 
@@ -1907,6 +1964,7 @@ def _claude_cli_transpile(
             if runtime_mode == "generic":
                 cached_warnings = _refresh_contract_warnings(
                     luau_cached, cached_warnings,
+                    is_player_controller=is_player_controller,
                 )
             return luau_cached, cached["confidence"], cached_warnings
         else:
@@ -1981,6 +2039,7 @@ def _claude_cli_transpile(
 
     luau_source, contract_warnings = _verify_and_reprompt(
         luau_source, csharp_source, runtime_mode, _cli_reprompt,
+        is_player_controller=is_player_controller,
     )
     warnings.extend(contract_warnings)
 
