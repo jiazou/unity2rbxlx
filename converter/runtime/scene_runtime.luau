@@ -3146,16 +3146,22 @@ function SceneRuntime:_playerTeleport(cf)
 	p._pitch = 0
 end
 
--- Recoil kick on C's camera pitch. Same semantic as SceneCameraInput:
--- applyRecoil (scene_camera_input.luau): additive, clamped to the player's
--- pitch range. A mid-Update kick survives to render because the post-tick
--- camera write composes from ``p._pitch``, and ``cameraAdvance`` carries the
--- state forward on later frames. No player / non-number delta -> no-op.
-function SceneRuntime:_playerApplyRecoil(deltaPitchRad)
+-- Recoil kick on C's camera pitch. ``deltaPitchDeg`` is DEGREES — the unit the
+-- directive contract binds (``applyRecoil(degrees)``): Unity recoil constants
+-- are degrees and the AI's natural translation of ``camRotation.x -= 2`` is
+-- ``applyRecoil(2)``; a radians surface turns that into a 114° clamp-slam
+-- (observed at the Phase-5 cold-Studio verify). (``SceneCameraInput:
+-- applyRecoil`` keeps radians — its caller is OUR lowering pass, which already
+-- emits ``math.rad`` literals.) Additive, clamped to the player's pitch range;
+-- a mid-Update kick survives to render because the post-tick camera write
+-- composes from ``p._pitch``, and ``cameraAdvance`` carries the state forward.
+-- No player / non-number delta -> no-op.
+function SceneRuntime:_playerApplyRecoil(deltaPitchDeg)
 	local p = self._player
 	if not p then return end
-	if type(deltaPitchRad) ~= "number" then return end
-	p._pitch = math.clamp(p._pitch + deltaPitchRad, p._minPitch, p._maxPitch)
+	if type(deltaPitchDeg) ~= "number" then return end
+	p._pitch = math.clamp(
+		p._pitch + math.rad(deltaPitchDeg), p._minPitch, p._maxPitch)
 end
 
 -- Drive the character's locomotion once per frame, AFTER the LateUpdate pass

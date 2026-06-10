@@ -96,7 +96,9 @@ _PLAYER_CONTROLLER_DIRECTIVE = (
     "This script is the player controller. The host owns camera, movement, aim, "
     "and respawn via `self.host.player`. Do NOT write `workspace.CurrentCamera`, "
     "do NOT call `Humanoid:Move`. For aim use `self.host.player:getLookCFrame()`; "
-    "for recoil `applyRecoil`; to teleport use `self.host.player:teleport(cf)`. "
+    "for recoil `self.host.player:applyRecoil(degrees)` (pitch kick in DEGREES, "
+    "e.g. Unity `camRotation.x -= 2` -> `applyRecoil(2)`); to teleport use "
+    "`self.host.player:teleport(cf)`. "
     "Keep your game logic (shoot decision, ammo, pickups, pause)."
 )
 

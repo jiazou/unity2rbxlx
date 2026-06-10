@@ -12,6 +12,11 @@ Semantic parity with ``SceneCameraInput:applyRecoil`` (the drone/turret recoil
 path): additive on the pitch state, clamped to the player's pitch range. The
 kick must SURVIVE to the rendered camera: ``_playerWriteCamera`` composes from
 ``p._pitch``, so a mid-Update kick lands in the same frame's post-write.
+
+UNITS: the surface takes DEGREES (the directive contract) — Unity recoil
+constants are degrees and the AI's natural emission of ``camRotation.x -= 2``
+is ``applyRecoil(2)``; a radians surface clamp-slams the camera to the sky
+(SceneCameraInput:applyRecoil stays radians; its caller is OUR lowering pass).
 """
 
 from __future__ import annotations
@@ -55,15 +60,19 @@ def test_apply_recoil_colon_form_kicks_pitch_no_throw() -> None:
     body = _build_authority_runtime() + """
         local host = engine:_makeHostSurface({})
         local before = p._pitch
-        -- The cold AI shape's exact call form (ReplicatedStorage.Player:119).
-        local ok, err = pcall(function() host.player:applyRecoil(0.05) end)
+        -- The cold AI shape's exact call form: ``applyRecoil(2)`` —
+        -- Unity ``camRotation.x -= 2`` => a 2-DEGREE kick (the directive's
+        -- units contract). A radians surface would read 2 rad = 114.6deg and
+        -- clamp-slam the camera to the sky (the second Studio-caught bug).
+        local ok, err = pcall(function() host.player:applyRecoil(2) end)
         print("OK=" .. tostring(ok) .. " ERR=" .. tostring(err))
-        print(string.format("KICK=%.6f", p._pitch - before))
+        print(string.format("KICKDEG=%.4f", math.deg(p._pitch - before)))
     """
     rc, out, err = run_camera_scenario(preamble, body)
     assert rc == 0, f"scenario failed (rc={rc}): {err}\n{out}"
     assert "OK=true" in out, out
-    assert "KICK=0.050000" in out, out
+    # 2 DEGREES — small kick, nowhere near the 80-deg clamp.
+    assert "KICKDEG=2.0000" in out, out
 
 
 def test_apply_recoil_dotted_form() -> None:
@@ -71,21 +80,21 @@ def test_apply_recoil_dotted_form() -> None:
     body = _build_authority_runtime() + """
         local host = engine:_makeHostSurface({})
         local before = p._pitch
-        host.player.applyRecoil(-0.02)
-        print(string.format("KICK=%.6f", p._pitch - before))
+        host.player.applyRecoil(-2)
+        print(string.format("KICKDEG=%.4f", math.deg(p._pitch - before)))
     """
     rc, out, err = run_camera_scenario(preamble, body)
     assert rc == 0, f"scenario failed (rc={rc}): {err}\n{out}"
-    assert "KICK=-0.020000" in out, out
+    assert "KICKDEG=-2.0000" in out, out
 
 
 def test_apply_recoil_clamps_to_pitch_range() -> None:
     preamble = camera_input_preamble(mouse_deltas=[])
     body = _build_authority_runtime() + """
         local host = engine:_makeHostSurface({})
-        host.player:applyRecoil(99)   -- absurd kick -> clamp at _maxPitch
+        host.player:applyRecoil(999)  -- absurd kick (degrees) -> clamp at _maxPitch
         print(string.format("MAXED=%.6f", p._pitch))
-        host.player:applyRecoil(-99)  -- and the floor
+        host.player:applyRecoil(-999) -- and the floor
         print(string.format("MINNED=%.6f", p._pitch))
     """
     rc, out, err = run_camera_scenario(preamble, body)
@@ -139,14 +148,14 @@ def test_apply_recoil_survives_to_camera_write() -> None:
         local host = engine:_makeHostSurface({})
         engine:_playerWriteCamera()
         local pitch0 = workspace.CurrentCamera.CFrame._pitch
-        host.player:applyRecoil(0.3)
+        host.player:applyRecoil(10)  -- 10 degrees
         engine:_playerWriteCamera()
         local pitch1 = workspace.CurrentCamera.CFrame._pitch
-        print(string.format("DELTA=%.6f", pitch1 - pitch0))
+        print(string.format("DELTADEG=%.4f", math.deg(pitch1 - pitch0)))
     """
     rc, out, err = run_camera_scenario(preamble, body)
     assert rc == 0, f"scenario failed (rc={rc}): {err}\n{out}"
-    assert "DELTA=0.300000" in out, out
+    assert "DELTADEG=10.0000" in out, out
 
 
 def test_host_player_surface_has_apply_recoil_and_stays_narrow() -> None:
