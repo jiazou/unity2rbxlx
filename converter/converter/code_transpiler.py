@@ -87,6 +87,22 @@ class TranspilationResult:
 RuntimeMode = Literal["legacy", "generic"]
 
 
+# Per-script prompt directive for the identified player controller (paradigm B,
+# NON-load-bearing — a conflict-reducer + cleaner-output nicety; paradigm C holds
+# the binding even if the AI ignores this entirely). Appended to ``project_context``
+# (a ``_ai_cache_key`` field), NEVER to the byte-frozen ``_AI_SYSTEM_PROMPT``.
+_PLAYER_CONTROLLER_DIRECTIVE = (
+    "## Player controller directive\n"
+    "This script is the player controller. The host owns camera, movement, aim, "
+    "and respawn via `self.host.player`. Do NOT write `workspace.CurrentCamera`, "
+    "do NOT call `Humanoid:Move`. For aim use `self.host.player:getLookCFrame()`; "
+    "for recoil `self.host.player:applyRecoil(degrees)` (pitch kick in DEGREES, "
+    "e.g. Unity `camRotation.x -= 2` -> `applyRecoil(2)`); to teleport use "
+    "`self.host.player:teleport(cf)`. "
+    "Keep your game logic (shoot decision, ammo, pickups, pause)."
+)
+
+
 def transpile_scripts(
     unity_project_path: str | Path,
     script_infos: list[Any],
@@ -98,6 +114,7 @@ def transpile_scripts(
     runtime_mode: RuntimeMode = "legacy",
     runtime_bearing_paths: frozenset[Path] | None = None,
     component_class_paths: frozenset[Path] | None = None,
+    player_controller_paths: frozenset[Path] | None = None,
 ) -> TranspilationResult:
     """Transpile a list of C# scripts to Luau.
 
@@ -131,11 +148,21 @@ def transpile_scripts(
             because a component runs host-bound whether authored or
             ``Instantiate()``-spawned. Defaults to ``runtime_bearing_paths``
             when not supplied (legacy callers / direct unit tests).
+        player_controller_paths: Under ``runtime_mode="generic"`` the set of
+            ``info.path`` values for the identified player controller (the
+            unique ``has_character_controller`` module, keyed on the
+            deterministic upstream Unity signal — see
+            ``_player_controller_paths`` in ``contract_pipeline.py``). Each such
+            script gets ``_PLAYER_CONTROLLER_DIRECTIVE`` appended to its prompt
+            ``project_context`` (paradigm B, NON-load-bearing). Defaults to an
+            empty set (legacy callers / direct unit tests unaffected — the
+            byte-identical no-directive context is preserved).
 
     Returns:
         TranspilationResult with all transpiled scripts and summary counts.
     """
     runtime_bearing_paths = runtime_bearing_paths or frozenset()
+    player_controller_paths = player_controller_paths or frozenset()
     # The generic mode/target gate keys off component-ness, not placement.
     # Fall back to runtime_bearing_paths so callers that predate the split
     # (and direct unit tests) keep their existing behaviour.
@@ -337,7 +364,17 @@ def transpile_scripts(
             field_ctx = _build_serialized_field_context(
                 info.path, unity_project_path, serialized_field_refs,
             )
-            context_parts = [project_context, scoped, field_ctx]
+            # Paradigm B (NON-load-bearing): append the player-controller
+            # directive to the identified player script's prompt context ONLY,
+            # gated on generic-mode AND the deterministic upstream player
+            # identity. It lands in ``project_context`` (a ``_ai_cache_key``
+            # field), never the byte-frozen ``_AI_SYSTEM_PROMPT``.
+            is_player = (
+                runtime_mode == "generic"
+                and info.path in player_controller_paths
+            )
+            player_directive = _PLAYER_CONTROLLER_DIRECTIVE if is_player else ""
+            context_parts = [project_context, scoped, field_ctx, player_directive]
             context = "\n\n".join(p for p in context_parts if p)
             try:
                 if backend == "claude_cli":
@@ -347,6 +384,7 @@ def transpile_scripts(
                         script_type=script_type,
                         project_context=context,
                         runtime_mode=effective_runtime_mode,
+                        is_player_controller=is_player,
                     )
                 elif backend == "anthropic_api" and api_key:
                     luau, confidence, warnings = _ai_transpile(
@@ -355,6 +393,7 @@ def transpile_scripts(
                         script_type=script_type,
                         project_context=context,
                         runtime_mode=effective_runtime_mode,
+                        is_player_controller=is_player,
                     )
                 else:
                     return stem, None
@@ -1562,8 +1601,36 @@ def _contract_reprompt_user_message(
     )
 
 
+_PLAYER_RULES: frozenset[str] = frozenset({"p1", "p2"})
+
+
+def _format_contract_survivor_warning(violation) -> str:
+    """Tag a SURVIVING verifier violation for the ``TranspiledScript``.
+
+    Player rejects (``p1``/``p2``, paradigm B) get the distinct
+    ``contract-verifier-player`` tag -- it starts with ``contract-verifier-``
+    so it NEVER matches ``_is_post_reprompt_warning`` (which keys on the
+    ``contract-verifier `` space / ``contract-verifier:`` colon forms) -->
+    never promotes to a fail-closed --> B stays NON-load-bearing. Contract
+    rules (a)-(h) keep the ``contract-verifier `` (space) tag and stay
+    fail-closed. Shared between the cold ``_verify_and_reprompt`` path and
+    the ``_refresh_contract_warnings`` cache-replay path so both fail open
+    on a surviving player reject identically.
+    """
+    if violation.rule in _PLAYER_RULES:
+        return (
+            f"contract-verifier-player (rule {violation.rule}, "
+            f"line {violation.line}): {violation.message}"
+        )
+    return (
+        f"contract-verifier (rule {violation.rule}, "
+        f"line {violation.line}): {violation.message}"
+    )
+
+
 def _refresh_contract_warnings(
     luau_source: str, cached_warnings: list[str],
+    is_player_controller: bool = False,
 ) -> list[str]:
     """Replace cached contract-verifier warnings with a fresh re-verify.
 
@@ -1582,18 +1649,30 @@ def _refresh_contract_warnings(
     reprompt-rescued modules; on cache replay that distinction is
     unrecoverable, so we treat the cached output as "first attempt
     clean" if the current verifier passes.
+
+    ``is_player_controller`` (paradigm B, NON-load-bearing): when ``True``
+    the verifier also runs the two player rejects (``p1``/``p2``). This is
+    the LOAD-BEARING fail-open-on-cache-hit path: a cached player reject
+    (``p1``/``p2``) MUST be re-emitted under the ``contract-verifier-player``
+    tag, NOT the default ``contract-verifier `` (space) tag -- the space tag
+    matches ``_is_post_reprompt_warning`` and would promote to a hard
+    fail-closed on replay, making B load-bearing. The ``-player`` tag never
+    matches that promotion, so a surviving player reject fails OPEN on the
+    cache-replay path exactly as on the cold path. Contract rules (a)-(h)
+    keep the space tag and stay fail-closed.
     """
     from converter.runtime_contract import verify_module
     non_contract = [
         w for w in cached_warnings
         if not w.startswith("contract-verifier")
     ]
-    result = verify_module(luau_source)
+    result = verify_module(
+        luau_source, is_player_controller=is_player_controller,
+    )
     if result.ok:
         return non_contract
     return non_contract + [
-        f"contract-verifier (rule {v.rule}, line {v.line}): {v.message}"
-        for v in result.violations
+        _format_contract_survivor_warning(v) for v in result.violations
     ]
 
 
@@ -1602,6 +1681,7 @@ def _verify_and_reprompt(
     csharp_source: str,
     runtime_mode: RuntimeMode,
     reprompt_call,
+    is_player_controller: bool = False,
 ) -> tuple[str, list[str]]:
     """Run the contract verifier; on violations call ``reprompt_call`` ONCE.
 
@@ -1617,13 +1697,18 @@ def _verify_and_reprompt(
     only by design (the bottom of the design doc's "What already exists"
     section explicitly preserves legacy's repair passes).
 
-    Warnings carry two distinct tags so the compliance spike can compute
+    Warnings carry distinct tags so the compliance spike can compute
     pre/post-reprompt pass rates from the returned list alone:
 
-      * ``contract-verifier-pre`` -- a violation the FIRST AI output had.
-        Emitted only when reprompt was actually called.
-      * ``contract-verifier`` -- a violation that survived the reprompt
-        (and therefore routes to project-level fail-closed).
+      * ``contract-verifier-pre`` -- a contract-rule (a)-(h) violation the
+        FIRST AI output had. Emitted only when reprompt was actually called.
+      * ``contract-verifier`` -- a contract-rule (a)-(h) violation that
+        survived the reprompt (routes to project-level fail-closed).
+      * ``contract-verifier-player`` -- a SURVIVING paradigm-B player reject
+        (``p1``/``p2``). NON-load-bearing: fails OPEN (the ``-player`` tag
+        never matches ``_is_post_reprompt_warning``). Player rules emit NO
+        ``-pre`` tag, so a FIXED ``p1``/``p2`` leaves NO surviving player
+        warning, and the counter taxonomy never false-counts it as rescued.
 
     A module with only ``-pre`` warnings means the reprompt fixed
     everything; a module with both means partial fix; a module with no
@@ -1634,16 +1719,22 @@ def _verify_and_reprompt(
 
     from converter.runtime_contract import verify_module
 
-    initial = verify_module(luau_source)
+    initial = verify_module(
+        luau_source, is_player_controller=is_player_controller,
+    )
     if initial.ok:
         return luau_source, []
 
     # Record the pre-reprompt violations as ``-pre`` warnings before the
     # reprompt has a chance to fix them. They survive even on a
-    # successful reprompt so the spike can measure delta.
+    # successful reprompt so the spike can measure delta. Player rules
+    # (``p1``/``p2``) are EXCLUDED -- they are non-load-bearing and emit a
+    # ``-player`` survivor tag ONLY if they survive the reprompt (a fixed
+    # player reject leaves no warning), keeping the spike counters clean.
     pre_warnings = [
         f"contract-verifier-pre (rule {v.rule}, line {v.line}): {v.message}"
         for v in initial.violations
+        if v.rule not in _PLAYER_RULES
     ]
 
     violations_text = _format_contract_violations(initial.violations)
@@ -1657,29 +1748,28 @@ def _verify_and_reprompt(
         # warning too -- backend failure is operationally equivalent to
         # "reprompt didn't fix anything".
         return luau_source, pre_warnings + [
-            f"contract-verifier (rule {v.rule}, line {v.line}): {v.message}"
-            for v in initial.violations
+            _format_contract_survivor_warning(v) for v in initial.violations
         ]
 
     new_luau = _strip_code_fences(new_text)
     if not new_luau:
         return luau_source, pre_warnings + [
-            f"contract-verifier (rule {v.rule}, line {v.line}): {v.message}"
-            for v in initial.violations
+            _format_contract_survivor_warning(v) for v in initial.violations
         ]
 
-    second = verify_module(new_luau)
+    second = verify_module(
+        new_luau, is_player_controller=is_player_controller,
+    )
     if second.ok:
         # Reprompt fixed everything. Pre-warnings are still surfaced so
         # the spike can count "reprompt-rescued" modules separately from
         # "first-attempt clean" modules.
         return new_luau, pre_warnings
     # Still failing after one reprompt -- per design doc this routes to
-    # project-wide legacy fallback. Carry the remaining violations as
-    # ``contract-verifier`` warnings; the orchestrator decides.
+    # project-wide legacy fallback for contract rules (a)-(h); a surviving
+    # player reject (``p1``/``p2``) carries the fail-OPEN ``-player`` tag.
     return new_luau, pre_warnings + [
-        f"contract-verifier (rule {v.rule}, line {v.line}): {v.message}"
-        for v in second.violations
+        _format_contract_survivor_warning(v) for v in second.violations
     ]
 
 
@@ -1691,6 +1781,7 @@ def _ai_transpile(
     script_type: str = "Script",
     project_context: str = "",
     runtime_mode: RuntimeMode = "legacy",
+    is_player_controller: bool = False,
 ) -> tuple[str, float, list[str]]:
     """Transpile C# source to Luau using the Claude API.
 
@@ -1739,6 +1830,7 @@ def _ai_transpile(
             if runtime_mode == "generic":
                 cached_warnings = _refresh_contract_warnings(
                     luau_cached, cached_warnings,
+                    is_player_controller=is_player_controller,
                 )
             return luau_cached, cached["confidence"], cached_warnings
         else:
@@ -1823,6 +1915,7 @@ def _ai_transpile(
 
     luau_source, contract_warnings = _verify_and_reprompt(
         luau_source, csharp_source, runtime_mode, _api_reprompt,
+        is_player_controller=is_player_controller,
     )
     warnings.extend(contract_warnings)
 
@@ -1897,6 +1990,7 @@ def _claude_cli_transpile(
     script_type: str = "Script",
     project_context: str = "",
     runtime_mode: RuntimeMode = "legacy",
+    is_player_controller: bool = False,
 ) -> tuple[str, float, list[str]]:
     """Transpile C# to Luau by invoking Claude Code CLI.
 
@@ -1934,6 +2028,7 @@ def _claude_cli_transpile(
             if runtime_mode == "generic":
                 cached_warnings = _refresh_contract_warnings(
                     luau_cached, cached_warnings,
+                    is_player_controller=is_player_controller,
                 )
             return luau_cached, cached["confidence"], cached_warnings
         else:
@@ -2008,6 +2103,7 @@ def _claude_cli_transpile(
 
     luau_source, contract_warnings = _verify_and_reprompt(
         luau_source, csharp_source, runtime_mode, _cli_reprompt,
+        is_player_controller=is_player_controller,
     )
     warnings.extend(contract_warnings)
 

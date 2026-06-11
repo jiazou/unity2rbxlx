@@ -759,6 +759,42 @@ function SceneRuntime:_makeHostSurface(owner)
 			end
 			return engine:isPlayerTouch(arg1)
 		end,
+		-- Public per-player read surface (P1-4/P2-G). A NARROW table closing
+		-- over ``engine`` — exposes ONLY the public ``getLookCFrame`` read so
+		-- Phase 3's Shoot raycast can reach ``self.host.player:getLookCFrame()``
+		-- without an interface change. It is NOT the raw SceneRuntime: internal
+		-- scheduling state (``engine._player`` / ``_services`` / the per-frame
+		-- brackets / ``start``) is NOT reachable through it, matching the
+		-- authoritative "dedicated embodiment object" boundary.
+		player = {
+			getLookCFrame = function(arg1)
+				-- Colon form ``host.player:getLookCFrame()`` -> arg1 = the
+				-- player table; dotted -> arg1 = nil. Either way dispatch the
+				-- engine's public method (no ``self``-dependent state here).
+				return engine:getLookCFrame()
+			end,
+			teleport = function(arg1, arg2)
+				-- Colon form ``host.player:teleport(cf)`` -> arg1 = the player
+				-- table, arg2 = cf. Dotted ``host.player.teleport(cf)`` -> arg1 =
+				-- cf. Select the CFrame from whichever slot carries it. NON-load-
+				-- bearing client REQUEST (D7) -> server applies via the RemoteEvent.
+				local cf = arg1
+				if arg2 ~= nil then cf = arg2 end
+				return engine:_playerTeleport(cf)
+			end,
+			applyRecoil = function(arg1, arg2)
+				-- The Phase-4 directive advertises ``host.player:applyRecoil``;
+				-- the AI's Shoot calls it, so the surface MUST implement it
+				-- (caller/callee contract — a missing method throws in Update,
+				-- caught at the Phase-5 cold-Studio verify). Colon form -> arg1 =
+				-- the player table, arg2 = delta; dotted -> arg1 = delta. The
+				-- number type-guard in ``_playerApplyRecoil`` makes the colon-
+				-- with-no-arg call a safe no-op.
+				local delta = arg1
+				if arg2 ~= nil then delta = arg2 end
+				return engine:_playerApplyRecoil(delta)
+			end,
+		},
 	}
 	return host
 end
@@ -2786,10 +2822,555 @@ function SceneRuntime:start(domainFilter)
 	-- their PlayerGui clone resolves event-driven.
 	self:_resolveDeferredUiInstances()
 
+	-- Build the host-owned per-player embodiment authority (paradigm C).
+	-- Client-only + keyed on the upstream has_character_controller MODULE
+	-- signal; leaves ``self._player = nil`` (the _tick brackets no-op) on the
+	-- server or when identity is absent/ambiguous (fail-closed).
+	self:_initPlayerAuthority()
+
 	return crossDomainEdges
 end
 
+-- ---------------------------------------------------------------------
+-- Host-owned per-player embodiment authority (paradigm C). Methods over
+-- the ``self._player`` state table, driven from ``_tick`` OUTSIDE the
+-- component ``pairs()`` loop (the ``_tick`` hooks + ``_initPlayerAuthority``
+-- that build ``self._player`` and key it on the upstream
+-- ``has_character_controller`` signal land in a later slice). Every method
+-- here no-ops when ``self._player == nil`` (server side / no player).
+--
+-- Reuses the camera-input service's vetted pose MATH via the INJECTED pure
+-- helpers ``self._services.cameraAdvance`` / ``cameraComposeLook`` (never a
+-- top-of-file ``require`` — the host harness loads this module with no
+-- ``game`` global) and reads ``self._services.userInputService`` for raw
+-- mouse/key state. C owns the SINGLE per-frame E2E-channel read (D9): the
+-- ACK-once mouse-channel consume lives in ``_playerReadInput`` here, NEVER
+-- via the camera service's per-frame ``step`` / ``readDelta``.
+
+-- One-time, idempotent client boot: take authoritative camera control,
+-- lock the FPS mouse, disable Roblox's default PlayerModule controls, and
+-- hide the local default avatar (folds the camera service's one-time
+-- ``ensureInit`` body inline — per-player lifecycle resync on CharacterAdded
+-- is Phase 3).
+-- Reached only via the (later-slice) pre-tick bracket, which runs only when
+-- ``self._player`` is non-nil, so the ``isClient`` gate is enforced upstream.
+function SceneRuntime:_playerBoot()
+	local p = self._player
+	if not p or p._booted then return end
+	p._booted = true
+
+	-- E1b: ``workspace.CurrentCamera`` may be nil before the client camera
+	-- materializes -- guard the write, never nil-deref.
+	local cam = workspace.CurrentCamera
+	if cam then cam.CameraType = Enum.CameraType.Scriptable end
+
+	local uis = self._services.userInputService
+	if uis then
+		uis.MouseBehavior = Enum.MouseBehavior.LockCenter
+		uis.MouseIconEnabled = false
+	end
+
+	-- Disable Roblox's default PlayerModule controls (it re-asserts
+	-- MouseBehavior each frame otherwise) and hide the local default avatar,
+	-- which is not the scene player rig.
+	local players = self._services.players
+	local lp = players and players.LocalPlayer
+	local function applyControls()
+		local ps = lp and lp:FindFirstChild("PlayerScripts")
+		local pm = ps and ps:FindFirstChild("PlayerModule")
+		if pm then
+			local ok, mod = pcall(require, pm)
+			if ok and mod then
+				local ok2, controls = pcall(function() return mod:GetControls() end)
+				if ok2 and controls and controls.Disable then
+					pcall(function() controls:Disable() end)
+				end
+			end
+		end
+		if uis then
+			uis.MouseBehavior = Enum.MouseBehavior.LockCenter
+			uis.MouseIconEnabled = false
+		end
+	end
+	local function hideChar(char)
+		if not char then return end
+		local function hide(part)
+			if part:IsA("BasePart") or part:IsA("Decal") then
+				part.LocalTransparencyModifier = 1
+			end
+		end
+		char.DescendantAdded:Connect(hide)
+		for _, part in char:GetDescendants() do hide(part) end
+	end
+	if lp then
+		applyControls()
+		hideChar(lp.Character)
+		lp.CharacterAdded:Connect(function(char)
+			-- Fast-respawn race (harden P1): a NEW character supersedes any prior
+			-- char's pending late-HRP retry — cancel it before (re)acquiring, so an
+			-- earlier char's late HRP can never stomp this char's yaw. When this
+			-- char itself lacks an HRP, _playerArmLateHRPResync re-arms a fresh one.
+			local pp = self._player
+			if pp and pp._lateHRPConn then
+				pp._lateHRPConn:Disconnect(); pp._lateHRPConn = nil
+			end
+			-- IMMEDIATE yaw+camera resync FIRST, BEFORE the yield (D7/P1-b) --
+			-- so respawn yaw is correct the SAME frame (no stale-yaw frame).
+			-- If the HRP has not replicated yet the immediate yaw reseed is
+			-- skipped; arm a one-shot late-HRP retry (D-P3-late-hrp) so the yaw
+			-- corrects the moment the HRP arrives (else it stays stale this life).
+			if not self:_playerResyncToCharacter(char) then
+				self:_playerArmLateHRPResync(char)
+			end
+			-- DELAYED: controls-off + body-hide LEGITIMATELY need the yield --
+			-- applyControls needs PlayerScripts->PlayerModule (populated a frame
+			-- after CharacterAdded) and hideChar walks char:GetDescendants()
+			-- (fill in over the same window).
+			self._services.task.wait()
+			applyControls()
+			hideChar(char)
+		end)
+		-- Boot-with-existing-character (P2-a): if lp.Character already EXISTS at
+		-- boot (Studio test mode / fast spawn), CharacterAdded never fires for
+		-- it, so seed facing once via the SAME shared resync -- facing correct
+		-- from frame 0 (else _yaw stays at the init 0 until later input/respawn).
+		-- Same late-HRP fallback as the CharacterAdded path: if the existing
+		-- character's HRP has not replicated at boot, arm the one-shot retry so
+		-- the boot facing corrects when it arrives (D-P3-late-hrp).
+		if lp.Character then
+			if not self:_playerResyncToCharacter(lp.Character) then
+				self:_playerArmLateHRPResync(lp.Character)
+			end
+		end
+	end
+end
+
+-- The SINGLE per-frame E2E-channel read (D9). Reads the raw mouse delta off
+-- the injected ``userInputService`` AND the consume-once E2E channel on
+-- ``workspace`` (mirroring the camera service's ``readDelta`` semantics but
+-- OWNED here so C is the single consumer), then advances accumulated
+-- yaw/pitch via the INJECTED pure ``cameraAdvance`` helper. NEVER calls the
+-- camera service's per-frame ``step`` / ``readDelta``. Returns the raw
+-- (dx, dy) for test assertions.
+function SceneRuntime:_playerReadInput()
+	local p = self._player
+	if not p then return 0, 0 end
+
+	local dx, dy = 0, 0
+	local uis = self._services.userInputService
+	if uis then
+		local d = uis:GetMouseDelta()
+		dx, dy = d.X, d.Y
+	end
+
+	-- Production-safe E2E channel (docs/E2E_INPUT_CHANNEL.md): additive,
+	-- no-op when unset, acked exactly once so a same-frame second reader
+	-- (the lowered A singleton) sees seq == ack and adds 0.
+	local seq = workspace:GetAttribute("E2EMouseSeq") or 0
+	if seq > (workspace:GetAttribute("E2EMouseAckSeq") or 0) then
+		workspace:SetAttribute("E2EMouseAckSeq", seq)
+		dx = dx + (workspace:GetAttribute("E2EMouseDeltaX") or 0)
+		dy = dy + (workspace:GetAttribute("E2EMouseDeltaY") or 0)
+	end
+
+	p._yaw, p._pitch = self._services.cameraAdvance(
+		p._yaw, p._pitch, dx, dy,
+		p._sensitivity, p._minPitch, p._maxPitch
+	)
+	return dx, dy
+end
+
+-- Idempotent ``CurrentCamera`` write (called BOTH pre-Update and
+-- post-LateUpdate). Eye = character HRP position + eyeHeight when it exists;
+-- else the current camera position (degenerate, no character yet -- E1).
+-- Re-asserts ``CameraType = Scriptable`` if drifted, then composes the look
+-- via the INJECTED pure ``cameraComposeLook``. Pure function of the current
+-- yaw/pitch (advanced once in ``_playerReadInput``), so two calls with
+-- unchanged state yield the same pose (E9).
+function SceneRuntime:_playerWriteCamera()
+	local p = self._player
+	if not p then return end
+
+	-- E1b: guard a nil CurrentCamera (pre-materialize / no-camera context).
+	local cam = workspace.CurrentCamera
+
+	-- Eye source: follow the character's HRP when it exists; otherwise fall
+	-- back to the current camera position (degenerate, E1/E10) so a missing
+	-- character never nil-derefs.
+	local eyePos
+	local hrp = self:_playerCharacterHRP()
+	if hrp then
+		eyePos = hrp.Position + Vector3.new(0, p._eyeHeight, 0)
+	elseif cam then
+		eyePos = cam.CFrame.Position
+	else
+		eyePos = Vector3.zero
+	end
+
+	if cam then
+		if cam.CameraType ~= Enum.CameraType.Scriptable then
+			cam.CameraType = Enum.CameraType.Scriptable
+		end
+		cam.CFrame = self._services.cameraComposeLook(eyePos, p._yaw, p._pitch)
+	end
+end
+
+-- Resolve the local player character's HumanoidRootPart for the camera eye.
+-- Re-resolved each call (no stale cache) so a respawn re-follows the new
+-- HRP; nil until the character exists (E1 -- no crash).
+function SceneRuntime:_playerCharacterHRP()
+	local players = self._services.players
+	local lp = players and players.LocalPlayer
+	local char = lp and lp.Character
+	return char and char:FindFirstChild("HumanoidRootPart") or nil
+end
+
+-- IMMEDIATE per-player lifecycle resync (D7), shared by the CharacterAdded
+-- handler AND the boot-with-existing-character path (§3.2/P2-a). Respawn itself
+-- is SERVER-OWNED (autogen GameServer CharacterAdded spawn + engine
+-- SpawnLocation); this is the CLIENT re-acquire: reseed yaw from the NEW
+-- character's facing, zero pitch (mirrors scene_camera_input.onRespawn), and
+-- re-assert the camera so it follows the NEW HRP THIS frame -- NO yield, so
+-- there is no stale-yaw frame (D-P3-resync-ordering/P1-b). NO dependency on the
+-- AI's ``PivotTo``, NO dependency on paradigm B. Guards a character with no HRP
+-- yet (E9): leaves yaw unchanged, still zeroes pitch + re-asserts the camera.
+-- RETURNS true when the HRP was present and the yaw was reseeded from it; false
+-- when the HRP has not replicated yet (so the caller can arm a one-shot late-HRP
+-- retry — D-P3-late-hrp). The pitch-zero + camera re-assert run unconditionally.
+function SceneRuntime:_playerResyncToCharacter(char)
+	local p = self._player
+	if not p then return false end
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	local hadHrp = false
+	if hrp and hrp.CFrame then
+		-- Yaw reseed from the new character's facing via the INJECTED pure helper
+		-- (D-P3-resync-helper); no re-derived yaw math in scene_runtime.luau.
+		p._yaw = self._services.cameraYawOf(hrp.CFrame)
+		hadHrp = true
+	end
+	p._pitch = 0
+	-- _playerCharacterHRP re-resolves LocalPlayer.Character each call (no stale
+	-- cache, 2968), so _playerWriteCamera now follows the NEW HRP automatically;
+	-- re-assert the camera immediately so the resync is visible THIS frame.
+	self:_playerWriteCamera()
+	return hadHrp
+end
+
+-- Late-HRP fallback (D-P3-late-hrp): when the immediate resync ran on a character
+-- whose HumanoidRootPart had not replicated yet, the yaw reseed was SKIPPED and
+-- would otherwise stay STALE for that whole life (``_playerBoot`` is run-once, so
+-- there is no later reseed). Arm a ONE-SHOT, event-driven ``char.DescendantAdded``
+-- retry: the moment the HumanoidRootPart appears, reseed the yaw from its facing +
+-- re-assert the camera, then DISCONNECT. Event-driven (no yield, no top-require) to
+-- match the host model. No-op if the player authority is gone by the time it fires.
+--
+-- Fast-respawn lifecycle race (harden P1): a retry armed for char A must NOT stomp
+-- a SUPERSEDING char B's yaw. Two guards: (1) tie the retry to the char it was armed
+-- for — on HRP arrival only reseed when ``char`` is STILL ``LocalPlayer.Character``
+-- (else a newer char has superseded it; just disconnect). (2) Cancel the prior
+-- pending retry on re-arm: track the active retry connection on ``self._player``
+-- (like ``_heartbeatConn``) and disconnect any prior pending retry before arming the
+-- next, so only the newest char's retry can fire.
+function SceneRuntime:_playerArmLateHRPResync(char)
+	if not char or not char.DescendantAdded then return end
+	local p = self._player
+	if not p then return end
+	-- Cancel any prior pending late-HRP retry (an earlier char's): only the
+	-- newest char's retry should be live (guard 2).
+	if p._lateHRPConn then p._lateHRPConn:Disconnect(); p._lateHRPConn = nil end
+	local conn
+	conn = char.DescendantAdded:Connect(function(desc)
+		if not (desc and desc.Name == "HumanoidRootPart") then return end
+		local thisConn = conn
+		if conn then conn:Disconnect(); conn = nil end
+		local pl = self._player
+		if not pl then return end
+		-- Clear the slot on fire ONLY when it still holds THIS retry's connection,
+		-- so a newer char's re-armed retry (which overwrote ``_lateHRPConn``) is
+		-- never clobbered. Compare against the captured ref, not the just-nilled
+		-- upvalue.
+		if pl._lateHRPConn == thisConn then pl._lateHRPConn = nil end
+		-- Tie the retry to the char it was armed for (guard 1): only reseed when
+		-- this char is STILL the current LocalPlayer.Character. If a newer char
+		-- superseded it (fast respawn), its late HRP must NOT overwrite the newer
+		-- char's yaw — just disconnect (done above).
+		local players = self._services.players
+		local lp = players and players.LocalPlayer
+		if not lp or lp.Character ~= char then return end
+		if desc.CFrame then
+			pl._yaw = self._services.cameraYawOf(desc.CFrame)
+		end
+		-- Re-assert the camera so the corrected facing is visible the frame the
+		-- HRP arrives (mirrors the immediate resync's camera re-assert).
+		self:_playerWriteCamera()
+	end)
+	p._lateHRPConn = conn
+end
+
+-- Client teleport REQUEST (D7/D-P3-teleport, NON-load-bearing). Fires the
+-- server-apply ``PlayerTeleport`` RemoteEvent with the requested CFrame; the
+-- SERVER moves the character (the server owns the character CFrame -- mirrors the
+-- server-owned spawn teleport in the autogen GameServer). No-op (silent) when the
+-- player authority is not bound, the arg is not a CFrame, or the remote was never
+-- injected -- the AI MAY never call this and the goal still holds because respawn
+-- is server-owned (E7/AC5b). NO correctness path depends on this being called.
+function SceneRuntime:_playerTeleport(cf)
+	local p = self._player
+	if not p then return end
+	-- CFrame type-guard via the injected predicate (the autogen client services
+	-- bind ``isCFrame`` to ``typeof(v) == "CFrame"``); injected (not a bare
+	-- ``typeof``) so the standalone-luau harness -- whose loadstring'd chunk
+	-- cannot override the ``typeof`` builtin -- can drive the real fire path.
+	local isCFrame = self._services.isCFrame
+	if isCFrame and not isCFrame(cf) then return end
+	local remote = self._services.playerTeleportRemote   -- injected client-side; nil-safe
+	if not (remote and remote.FireServer) then return end
+	remote:FireServer(cf)
+	-- Reseed the LOCAL authority facing from the REQUESTED pose (D-P3-teleport
+	-- /phase-integration P1) -- ONLY now that the request was actually SENT, so
+	-- when the remote is absent / lacks ``FireServer`` this stays a TRUE no-op
+	-- (no fire AND no local-state mutation, per the documented contract). The
+	-- server moves the HRP and U1 (slice 3.1) shadows the rig from it, but the
+	-- camera/locomotion authority (``p._yaw``, ``p._pitch``) is CLIENT-owned and
+	-- would otherwise keep the OLD facing — so camera/locomotion would not adopt
+	-- the teleported yaw. Mirror ``_playerResyncToCharacter``: yaw from the
+	-- INJECTED ``cameraYawOf`` (no re-derived yaw math), zero pitch. Sourced from
+	-- ``cf`` (the requested pose) rather than the HRP, since the server move is
+	-- asynchronous; a 1-frame eye-follow lag while the server moves the HRP is
+	-- acceptable (teleport is non-load-bearing per D7) — the yaw is what must
+	-- agree. Reseed the CAPTURED ``p`` (taken before the fire), not a re-read
+	-- ``self._player``: a synchronous fire handler could have cleared the
+	-- authority mid-fire, which would index-nil a re-read (real harness-model
+	-- regression; unreachable with a real async Roblox RemoteEvent).
+	p._yaw = self._services.cameraYawOf(cf)
+	p._pitch = 0
+end
+
+-- Recoil kick on C's camera pitch. ``deltaPitchDeg`` is DEGREES — the unit the
+-- directive contract binds (``applyRecoil(degrees)``): Unity recoil constants
+-- are degrees and the AI's natural translation of ``camRotation.x -= 2`` is
+-- ``applyRecoil(2)``; a radians surface turns that into a 114° clamp-slam
+-- (observed at the Phase-5 cold-Studio verify). (``SceneCameraInput:
+-- applyRecoil`` keeps radians — its caller is OUR lowering pass, which already
+-- emits ``math.rad`` literals.) Additive, clamped to the player's pitch range;
+-- a mid-Update kick survives to render because the post-tick camera write
+-- composes from ``p._pitch``, and ``cameraAdvance`` carries the state forward.
+-- No player / non-number delta -> no-op.
+function SceneRuntime:_playerApplyRecoil(deltaPitchDeg)
+	local p = self._player
+	if not p then return end
+	if type(deltaPitchDeg) ~= "number" then return end
+	p._pitch = math.clamp(
+		p._pitch + math.rad(deltaPitchDeg), p._minPitch, p._maxPitch)
+end
+
+-- Drive the character's locomotion once per frame, AFTER the LateUpdate pass
+-- (the post bracket). WASD is camera-yaw-relative (same basis the lowered A
+-- body uses: ``CFrame.Angles(0, yaw, 0):VectorToWorldSpace(Vector3.new(h, 0,
+-- -v))`` with D/A -> +/-1 on h and W/S -> +/-1 on v) -> ``Humanoid:Move``.
+--
+-- JUMP (D-jump / E7 / P1-3 -- every-frame last-writer): the jump intent is
+-- WRITTEN EVERY frame as ``humanoid.Jump = risingEdge`` -- true ONLY on the
+-- frame Space transitions down, EXPLICITLY false otherwise. Because this runs
+-- in the post-LateUpdate bracket it OVERWRITES paradigm A's level-triggered
+-- ``hum.Jump = true`` (set mid-pass every grounded frame Space is held), so C
+-- is the LAST jump writer every frame: on a held Space frame 1 ends true (the
+-- press edge), frames 2+ end false -- one jump per press while still dominating
+-- A. ``:ChangeState(Jumping)`` fires ONLY on the rising edge. ``p._jumpHeld`` is
+-- the edge memory (NOT a write-suppressor: the Jump write happens every frame).
+--
+-- No character Humanoid yet -> no-op (E1). No-op when ``self._player == nil``.
+function SceneRuntime:_playerDriveLocomotion()
+	local p = self._player
+	if not p then return end
+
+	local players = self._services.players
+	local lp = players and players.LocalPlayer
+	local char = lp and lp.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if not hum then return end
+
+	local uis = self._services.userInputService
+
+	-- WASD -> camera-yaw-relative move direction (mirrors the lowered A body's
+	-- yaw basis so C's move-intent matches the player's facing).
+	local h, v = 0, 0
+	if uis then
+		if uis:IsKeyDown(Enum.KeyCode.D) then h = h + 1 end
+		if uis:IsKeyDown(Enum.KeyCode.A) then h = h - 1 end
+		if uis:IsKeyDown(Enum.KeyCode.W) then v = v + 1 end
+		if uis:IsKeyDown(Enum.KeyCode.S) then v = v - 1 end
+	end
+	local dir = CFrame.Angles(0, p._yaw, 0):VectorToWorldSpace(
+		Vector3.new(h, 0, -v))
+	if dir.Magnitude > 0 then
+		hum:Move(dir.Unit, false)
+	else
+		hum:Move(Vector3.zero, false)
+	end
+
+	-- JUMP -- every-frame last-writer (E7/P1-3). Compute the rising edge, then
+	-- WRITE ``Jump`` every frame (true only on the edge) so C dominates A's
+	-- mid-pass ``hum.Jump = true``; ``ChangeState(Jumping)`` only on the edge.
+	local spaceDown = uis ~= nil and uis:IsKeyDown(Enum.KeyCode.Space) or false
+	local risingEdge = spaceDown and not p._jumpHeld
+	hum.Jump = risingEdge
+	if risingEdge then
+		hum:ChangeState(Enum.HumanoidStateType.Jumping)
+	end
+	p._jumpHeld = spaceDown
+end
+
+-- Read-only look for game logic (Phase 3 wires Shoot's raycast to this via
+-- ``host.player``). STUB in Phase 2: mirrors ``CurrentCamera.CFrame``
+-- whether or not ``self._player`` is bound (a no-player place still answers
+-- a sane camera pose). E1b nil-guard preserved.
+function SceneRuntime:getLookCFrame()
+	local cam = workspace.CurrentCamera
+	return cam and cam.CFrame or CFrame.new()
+end
+
+-- Pre-Update bracket (runs OUTSIDE the component ``pairs()`` loop, BEFORE
+-- the Update pass). No-op when ``self._player == nil`` (server / no player).
+-- Boots once (idempotent), reads the SINGLE per-frame E2E input snapshot
+-- (D9 — before the lowered A controller's mid-pass ``_cam:step``->``_readDelta``
+-- can consume the channel), then writes the camera so a same-frame raw camera
+-- READ during the Update pass sees C's pose.
+function SceneRuntime:_playerPreTick(_dt)
+	if not self._player then return end
+	self:_playerShadowSyncRig()
+	self:_playerBoot()
+	self:_playerReadInput()
+	self:_playerWriteCamera()
+end
+
+-- U1 rig shadow-sync (player-embodiment-authority-design.md §Rig<->character
+-- unification; D-P3-U1-shadow). Each frame, BEFORE the component Update pass,
+-- drive every authored player-rig Instance to the character HRP CFrame, so the
+-- AI's ``gameObject:GetPivot()`` reads see the ONE body (the character). The
+-- component still LIVES on the authored rig Instance, so GetComponent /
+-- _SceneRuntimeId / registry closures over the rig are PRESERVED (U1, NOT U2 --
+-- we never rebind ``self.gameObject``). The AI's ``PivotTo`` writes are
+-- overwritten next frame (vestigial; nothing authoritative reads rig yaw -- the
+-- camera owns yaw via ``p._yaw``, AC1d). The rig is a POSITIONAL SHADOW of the
+-- one body, NOT a second state store. No-op when no character yet (E1) or no rig
+-- built (E2) -- never nil-derefs.
+function SceneRuntime:_playerShadowSyncRig()
+	if not self._player then return end
+	local hrp = self:_playerCharacterHRP()
+	if not hrp then return end                 -- no character yet -> nothing to shadow
+	local cf = hrp.CFrame
+	if cf == nil then return end
+	for _, rig in ipairs(self:_playerRigInstances()) do
+		if rig.PivotTo ~= nil then
+			rig:PivotTo(cf)
+		elseif rig.CFrame ~= nil then          -- BasePart rig (CharacterController->BasePart map)
+			rig.CFrame = cf
+		end
+	end
+end
+
+-- Resolve the authored rig Instance(s) for the player module. Keyed ON the
+-- deterministic upstream ``scriptId`` (the SAME MODULE row whose
+-- ``has_character_controller`` is the §3 anchor -- NOT an AI-output fingerprint,
+-- D-P3-rig-key). Scans ``self._meta`` for components whose
+-- ``meta.scriptId == p._playerScriptId`` and returns their
+-- ``meta.gameObjectInstance`` (the authored rig). Returns a LIST because one
+-- player MODULE may be placed on >1 GameObject (P2-F: module count 1, instance
+-- count N) -- U1 shadow-syncs ALL of them to the one character HRP. Empty when
+-- the component isn't built yet (E2 -- no crash). De-dupes (multiple components
+-- on one GO share a ``gameObjectInstance``).
+function SceneRuntime:_playerRigInstances()
+	local p = self._player
+	if not p or not p._playerScriptId then return {} end
+	local out, seen = {}, {}
+	for _, m in pairs(self._meta) do
+		if m.scriptId == p._playerScriptId then
+			local inst = m.gameObjectInstance
+			if inst ~= nil and not seen[inst] then
+				seen[inst] = true
+				table.insert(out, inst)
+			end
+		end
+	end
+	return out
+end
+
+-- Post-LateUpdate bracket (runs OUTSIDE the component ``pairs()`` loop, AFTER
+-- the LateUpdate pass). No-op when ``self._player == nil``. Re-asserts the
+-- camera (last-writer over any component camera write this frame — D8) folding
+-- this frame's locomotion-driven eye position, then drives WASD->Move + the
+-- every-frame last-writer jump.
+function SceneRuntime:_playerPostTick(_dt)
+	if not self._player then return end
+	self:_playerWriteCamera()
+	self:_playerDriveLocomotion()
+end
+
+-- Per-player lifecycle init (P1-2/P1-5/P2-F). Called ONCE at the end of
+-- ``start()``. Builds ``self._player`` ONLY on the client side AND only when
+-- the upstream ``has_character_controller`` signal identifies EXACTLY ONE
+-- CC-bearing MODULE row over ``self._plan.modules`` (fail-closed otherwise):
+--   * ``self._services.isClient`` not truthy  -> leave ``self._player = nil``
+--     (the server never builds/drives the authority — the brackets no-op). The
+--     gate is the explicit ``isClient`` boolean the entrypoint stamps, NOT a
+--     ``RunService`` presence sniff (the server services table has no
+--     ``runService``, so a presence sniff would mis-treat it as a client).
+--   * 0 CC module rows -> no player (fail-closed silent; the build-time
+--     ``player_signal_absent`` fail-close already catches this at convert time).
+--   * >1 CC module rows -> warn + no player (ambiguous; mirrors the build-time
+--     ``player_ambiguous`` fail-close — one camera per client).
+--   * exactly 1 -> build the ``self._player`` state table (§1 shape).
+-- Identity counts distinct CC MODULE rows (NOT per-instance ``_meta`` — one
+-- CC module placed on N GameObjects is ONE row, not N), keyed ONLY on the
+-- deterministic upstream ``row.has_character_controller`` signal — NEVER an
+-- AI-output fingerprint (§3 guardrail).
+function SceneRuntime:_initPlayerAuthority()
+	self._player = nil
+	if not self._services.isClient then return end
+
+	local ccCount = 0
+	-- Capture the player MODULE's scriptId (the deterministic upstream identity --
+	-- the SAME row whose ``has_character_controller`` is the §3 anchor, NOT an
+	-- AI-output fingerprint). U1's rig resolution (_playerRigInstances) keys on
+	-- it. The ``>1`` branch below returns before the build, so exactly one
+	-- scriptId reaches the state table.
+	local playerScriptId = nil
+	for sid, row in pairs(self._plan.modules or {}) do
+		if type(row) == "table" and row.has_character_controller then
+			ccCount = ccCount + 1
+			playerScriptId = sid
+		end
+	end
+
+	if ccCount == 0 then
+		return
+	elseif ccCount > 1 then
+		self._warn(string.format(
+			"[scene-runtime] player-embodiment authority unbound: %d modules "
+			.. "carry has_character_controller (ambiguous; expected exactly "
+			.. "one). No player camera/locomotion authority bound.", ccCount))
+		return
+	end
+
+	self._player = {
+		_yaw = 0,
+		_pitch = 0,
+		_booted = false,
+		_jumpHeld = false,
+		_sensitivity = 0.0045,
+		_minPitch = math.rad(-80),
+		_maxPitch = math.rad(80),
+		_eyeHeight = 1.5,
+		_playerScriptId = playerScriptId,   -- deterministic rig-resolution key (U1, §3)
+	}
+end
+
 function SceneRuntime:_tick(dt)
+	-- Host-owned player embodiment pre-Update bracket (no-op on server /
+	-- no player) — runs BEFORE the component pass so C's input snapshot +
+	-- camera write precede any component camera read this frame.
+	self:_playerPreTick(dt)
 	-- Update + LateUpdate every frame; FixedUpdate via fixed-step.
 	for comp, m in pairs(self._meta) do
 		if m.activeInHierarchy and m.enabled then
@@ -2810,6 +3391,9 @@ function SceneRuntime:_tick(dt)
 			self:_callMethod(comp, "LateUpdate", dt)
 		end
 	end
+	-- Host-owned player embodiment post-LateUpdate bracket — runs AFTER the
+	-- component pass so C is the LAST writer of camera + move + jump intent.
+	self:_playerPostTick(dt)
 end
 
 -- ---------------------------------------------------------------------

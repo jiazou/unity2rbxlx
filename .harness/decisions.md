@@ -363,3 +363,18 @@ design refinements D7 (server-owned respawn; teleport non-load-bearing), D8 (pro
 ACTIVE, no suppression), D9 (C owns the single E2E read via pure advance()) — which must be propagated
 into converter/docs/design/player-embodiment-authority-design.md at the start of that run
 (update-design-doc-before-implementation). Carryforwards in followups.md.
+
+---
+
+## Step-1b — self.host.player product authority (phases 2-5) — /drive run generic-converter-step1b-20260607T103041 (2026-06-07 → 2026-06-10)
+
+The §7 generic-converter Step-1 player-embodiment effort: paradigm C (`self.host.player`) becomes the load-bearing player binding, anchored on the deterministic upstream `_HasCharacterController` signal (§3 fault-line: never a fingerprint of non-deterministic AI output), and paradigm A (the match/rewrite locators) is deleted.
+
+- **D7** respawn is SERVER-owned (autogen GameServer CharacterAdded + SpawnLocation); C only does per-player lifecycle resync; `teleport(cf)` is a NON-load-bearing client-request/server-apply helper.
+- **D8 strangler-fig** — C lands WITH paradigm A still ACTIVE (proven to DOMINATE by last-writer on both A-hit `dde248` + A-miss `cold3a59` shapes); A deleted LAST (Phase 5). Suppressing A early would expose the raw AI writes A neutralizes.
+- **D9** C owns the SINGLE per-frame E2E channel read via the pure `advance()` helper (consume-once ACK).
+- **slice 2.6** — neutralized the #182 A-locator fail-closeds (`player_move/look_unbound`) that aborted on a field-aliased camera; C binds on `has_character_controller` regardless.
+- **D13** — the GerstnerDisplace cold-conversion fail-close was a PRE-EXISTING out-of-scope dead-module bug (empty subclass of a stubbed dead base); fixed as a SEPARATE prereq PR (ntornow#186, merged) rather than folded into Step-1b.
+- **Phase 5** deleted `movement_facet_lowering.py` + the camera_facet PLAYER path (drone/turret strict path kept byte-identical) + the #182 locator residue; re-sourced the kept `player_unresolved` fail-close on the post-transpile `player_controller_paths ∩ emitted` intersection (D-P5-1); adapted the C-dominance corpus tests to drive the NATIVE un-lowered fixture per-fixture (cold3a59=camera, dde248=camera+move+jump) (D-P5-5); excluded the player from camera_facet lowering at the call site (D-P5-2 revised); FLIPPED `REQUIRE_PLAYER_BIND` 0→1 as the LAST act (slice 5.4) after a fresh cold-Studio conversion proved camera+WASD+jump+shoot+respawn all C-owned with A deleted.
+- **Cold-Studio verify caught 2 real player bugs** the build-time suite couldn't: `host.player:applyRecoil` advertised by the directive but never implemented (missing-method throw); then radians-vs-degrees (the AI's `applyRecoil(2)` slammed the camera to the 80° clamp). Both fixed (applyRecoil takes DEGREES; SceneCameraInput stays radians as its caller is the deterministic lowering pass).
+- Full effort dual-reviewed throughout (design 2 rounds caught 4 codex P1s; phase review caught a vacuous-camera-proof P1; the adversarial codex voice was load-bearing repeatedly). Full fast suite green at the flipped value (2868).
