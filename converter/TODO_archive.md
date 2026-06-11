@@ -1133,3 +1133,44 @@ PauseMenu`, a real signal where the AI renamed the method to
 the same name. Human-actionable, not noise.
 
 Signal-to-noise went from 0/37 → 1/1.
+
+## Moved from TODO.md (2026-06-11 cleanup)
+
+Completed items relocated here verbatim-in-substance during the 2026-06-11
+TODO condensation (full original text in git history of `TODO.md`).
+
+- [x] **P1 — Shared-flag name sanitization is unowned.** FIXED 2026-06-02
+  (`fix/shared-flag-name-sanitization`, PR #165): canonical ASCII sanitizer applied at the
+  runtime `"has" .. name` concat (emitted Luau `gsub("[^%w_]+","_")` from one constant in
+  `core/flag_names.py`) at every writer + the Machine dynamic reader; `itemName`/`ItemType`
+  kept RAW (gameplay payloads); scan made ASCII-explicit. See
+  `docs/design/shared-flag-name-sanitization-brief.md`.
+
+- [x] **P2 — Topology prepass reads pre-coherence `script_type`.** CLOSED 2026-06-02
+  (`fix/topology-script-type-authority-guard`): premise was IMPRECISE — in legacy mode the
+  prepass runs after `_subphase_cohere_scripts`; `infer_module_domains` derives from
+  source/evidence, not `script_type`; the only pre-coherence read
+  (`compute_shared_flag_channels`) already fails open. Residual LATENT generic-mode gap (stale
+  `LocalScript` with server-domain source could misroute to StarterPlayerScripts): shipped a
+  defensive WARNING on the LocalScript/server-domain conflict + a regression test pinning
+  legacy cohere-before-classify ordering; full type↔domain reconciliation in generic mode
+  deferred as unjustified for an unprovable edge.
+
+- [x] **P1 — Upstream classifier misroutes Roblox-dead Unity-rendering modules to
+  server-only.** FIXED 2026-06-01 (`fix/roblox-dead-module-routing`). Corrected root cause:
+  caller-domain storage routing pulled a self-requiring cluster of Roblox-dead rendering
+  modules into `ServerStorage`; the prior `_is_visual_only_script` heuristic was a hardcoded
+  class-name list that never reached routing. Fix: generic behavior-based
+  `roblox_dead_modules` detector (no class names); dead modules routed to
+  `ReplicatedStorage` (topology + legacy paths); closure-safe prune pass for fully-dead
+  require-closures. See `docs/design/roblox-dead-module-routing-brief.md` +
+  `docs/design/scene-runtime-architecture-ir.md` § "Roblox-dead module handling".
+
+- [x] **P1 — Transpiler false-positive `require()` injection poisons storage
+  classification.** FIXED 2026-06-01 (`fix/dead-require-from-runtime-lookup-generics`).
+  Root cause: the reference extractor's generic-type-arg regex captured
+  `FindObjectOfType<GameManager>()` runtime-lookup type args as `referenced_types`,
+  poisoning both the legacy require-injector and the generic-mode topology `caller_graph`.
+  Fix at the source: exclude type args of global scene-lookup generics
+  (`_GLOBAL_LOOKUP_GENERIC_METHODS` in `script_analyzer.py`); component-lookup generics
+  (`GetComponent<T>` etc.) deliberately NOT excluded — they are real peer edges.
