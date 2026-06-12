@@ -795,8 +795,12 @@ _RIG_FUNCTION_METHOD_RE = re.compile(
 # Anchored on the deterministic ``field`` (the IR projection), code-position
 # guarded — NOT an arbitrary AI-output grep. Span-limited to the start of the RHS
 # (the assignment text up to the access) so it does not run across statements.
+# ``\s*`` at each postfix junction so a write split across a newline at a postfix
+# head (``GetChildren()\n[1]`` index, ``GetChild\n(1)`` call) still matches once the
+# continuation-aware span has reached the access — mirrors the postfix-continuation
+# class admitted in ``_rig_line_continues``.
 _RIG_ORDINAL_WRITE_TAIL_RE = re.compile(
-    r":GetChildren\(\)\s*\[\s*\d+\s*\]|[:.]GetChild\(\s*\d+\s*\)"
+    r":GetChildren\s*\(\s*\)\s*\[\s*\d+\s*\]|[:.]GetChild\s*\(\s*\d+\s*\)"
 )
 
 
@@ -855,11 +859,28 @@ def _rig_has_surviving_field_read(source: str, field: str) -> bool:
     return False
 
 
+# Continuation HEADS — a next-line first token that continues the RHS. Beyond the
+# operator-led heads (``and``/``or``/``..``/arithmetic/comparison) this admits the
+# FULL Luau POSTFIX-continuation class so a write split before a trailing access is
+# spanned: ``[`` (index — ``expr\n[1]``), ``(`` (call — ``expr\n(args)``), ``.``
+# (member — ``expr\n.field``), ``:`` (method — ``expr\n:m()``). Closing the postfix
+# class as a whole (not just ``[``) avoids whack-a-moling ``(``/``.`` next round.
 _RIG_CONTINUATION_HEAD_RE = re.compile(
-    r"^(and|or|not|\.\.|[.:+\-*/%<>=~^#]|\bthen\b)"
+    r"^(and|or|not|\.\.|[.:+\-*/%<>=~^#({\[]|\bthen\b)"
 )
 _RIG_CONTINUATION_TAIL_RE = re.compile(
     r"(\b(and|or|not)|\.\.|[.:+\-*/%<>=~^,({\[]|=)\s*$"
+)
+
+# A next-line first token that begins a NEW statement (so a ``(``/``[`` postfix head
+# must NOT swallow it). Admitting ``(``/``[`` as continuation heads risks reaching
+# across a following parenthesized-expression statement or the ``a = b\n(f)()``
+# ambiguity; this boundary check stops the span there. Bias: when ambiguous we keep
+# scanning (fail-closed — over-detecting a survivor yields ``discharged=False`` ->
+# a violation row, the SAFE direction for this verifier; a MISSED survivor is unsafe).
+_RIG_STATEMENT_BOUNDARY_RE = re.compile(
+    r"^(local\b|function\b|return\b|end\b|if\b|for\b|while\b|repeat\b|until\b"
+    r"|do\b|else\b|elseif\b|break\b|self\.\w+\s*=(?!=)|\w+\s*=(?!=))"
 )
 
 
@@ -869,7 +890,10 @@ def _rig_line_continues(source: str, start: int, nl_pos: int) -> bool:
     binary/continuation operator, OR the next non-blank line begins with one.
     Mirrors the lowering's ``_line_continues`` so the verifier's RHS span is
     continuation-aware (codex BLOCKING: a multiline surviving ordinal write must be
-    spanned, not truncated at the first newline)."""
+    spanned, not truncated at the first newline), AND closes the postfix-head class
+    (``[``/``(``/``.``/``:``) so a write split before a trailing index/call/member is
+    spanned — guarded by a statement-boundary check so a ``(``/``[`` head does not
+    swallow a following statement."""
     before = source[start:nl_pos]
     if _RIG_CONTINUATION_TAIL_RE.search(before):
         return True
@@ -879,7 +903,13 @@ def _rig_line_continues(source: str, start: int, nl_pos: int) -> bool:
         j += 1
     if j >= n:
         return False
-    return _RIG_CONTINUATION_HEAD_RE.match(source[j:j + 4]) is not None
+    nxt = source[j:j + 16]
+    # A next line that clearly opens a new statement is NOT a continuation — this
+    # bounds the span so an admitted ``(``/``[`` head cannot reach across a following
+    # statement (over-reach guard).
+    if _RIG_STATEMENT_BOUNDARY_RE.match(nxt):
+        return False
+    return _RIG_CONTINUATION_HEAD_RE.match(nxt) is not None
 
 
 def _rig_statement_rhs_end(source: str, start: int) -> int:

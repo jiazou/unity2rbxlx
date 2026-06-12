@@ -476,3 +476,85 @@ def test_review_f3_resolver_only_in_long_bracket_does_not_discharge() -> None:
         {"field": "weaponSlot", "child": "WeaponSlot", "present": True},
     )
     assert len(_rig_rows([script])) == 1
+
+
+# ---------------------------------------------------------------------------
+# Dual-voice REVIEW finding (round 2) — POSTFIX-continuation class. The round-1
+# continuation scan admitted operator-led + ``:``-led heads but NOT the ``[``
+# index head, so a surviving write split BEFORE the index leaked past the RHS
+# span. The fix closes the whole postfix class (``[``/``(``/``.``/``:``). Each
+# split case is RED against 1ca1cbb (the round-1 verifier).
+# ---------------------------------------------------------------------------
+def test_review_r2_split_before_index_surviving_write_is_detected() -> None:
+    """ROUND-2 BLOCKING — a surviving camera-child write split BEFORE the ``[``
+    index (``self.weaponSlot = self.cam:GetChildren()\\n    [1]``) re-clobbers the
+    field at runtime, so the continuation-aware RHS span must reach the ``[1]`` ->
+    the write is DETECTED -> NOT discharged -> the check fires."""
+    green = _lower()
+    split_source = green.luau_source.replace(
+        "return rifle\nend",
+        "self.weaponSlot = self.cam:GetChildren()\n        [1]\n    return rifle\nend",
+    )
+    assert "self.cam:GetChildren()\n        [1]" in split_source
+    # Scan-level: the split-before-index write IS detected (round-1 missed it).
+    assert _rig_has_surviving_ordinal_write(split_source, "weaponSlot") is True
+    assert _rig_binding_discharged(split_source, "weaponSlot", "WeaponSlot") is False
+    script = _rbx(
+        "Player",
+        split_source,
+        {"field": "weaponSlot", "child": "WeaponSlot", "present": True},
+    )
+    assert len(_rig_rows([script])) == 1
+
+
+def test_review_r2_split_before_getchild_call_is_detected() -> None:
+    """ROUND-2 — the call-continuation head (``(``): a write split BEFORE the
+    ``GetChild(`` call args (``self.weaponSlot = self.cam:GetChild\\n    (1)``)
+    must be spanned -> detected -> not discharged."""
+    green = _lower()
+    split_source = green.luau_source.replace(
+        "return rifle\nend",
+        "self.weaponSlot = self.cam:GetChild\n        (1)\n    return rifle\nend",
+    )
+    assert _rig_has_surviving_ordinal_write(split_source, "weaponSlot") is True
+    assert _rig_binding_discharged(split_source, "weaponSlot", "WeaponSlot") is False
+    script = _rbx(
+        "Player",
+        split_source,
+        {"field": "weaponSlot", "child": "WeaponSlot", "present": True},
+    )
+    assert len(_rig_rows([script])) == 1
+
+
+def test_review_r2_split_before_member_getchildren_is_detected() -> None:
+    """ROUND-2 — the member-continuation head (``.``): a write split BEFORE the
+    member access (``self.weaponSlot = self.cam\\n    :GetChildren()[1]`` is the
+    ``:`` head already handled; the ``.`` head is exercised by splitting before a
+    ``.GetChild`` member form). Spanned -> detected -> not discharged."""
+    green = _lower()
+    split_source = green.luau_source.replace(
+        "return rifle\nend",
+        "self.weaponSlot = self.cam\n        .GetChild(1)\n    return rifle\nend",
+    )
+    assert _rig_has_surviving_ordinal_write(split_source, "weaponSlot") is True
+    assert _rig_binding_discharged(split_source, "weaponSlot", "WeaponSlot") is False
+
+
+def test_review_r2_over_reach_guard_does_not_swallow_following_statement() -> None:
+    """ROUND-2 over-reach guard — admitting ``(``/``[`` as continuation heads must
+    NOT reach across a FOLLOWING statement. A clean (already-neutralized) write
+    followed by an unrelated statement that begins a new ``self.<field> =`` /
+    ``local`` must STILL discharge: the boundary check stops the span at the new
+    statement so its (hypothetical) ordinal text does not leak into the RHS span."""
+    # The real discharged shape: write is ``self.weaponSlot = nil``. Inject a
+    # following statement that begins with ``local`` AND happens to carry an
+    # ordinal access — the span must stop at ``local``, not swallow it.
+    green = _lower()
+    over_reach_source = green.luau_source.replace(
+        "self.weaponSlot = nil",
+        "self.weaponSlot = nil\n    local other = somethingElse:GetChildren()[1]",
+    )
+    # The neutralized write does NOT pick up the following ``local`` ordinal -> the
+    # binding STILL discharges (the over-reach guard held).
+    assert _rig_has_surviving_ordinal_write(over_reach_source, "weaponSlot") is False
+    assert _rig_binding_discharged(over_reach_source, "weaponSlot", "WeaponSlot") is True
