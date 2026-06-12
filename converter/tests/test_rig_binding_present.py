@@ -558,3 +558,114 @@ def test_review_r2_over_reach_guard_does_not_swallow_following_statement() -> No
     # binding STILL discharges (the over-reach guard held).
     assert _rig_has_surviving_ordinal_write(over_reach_source, "weaponSlot") is False
     assert _rig_binding_discharged(over_reach_source, "weaponSlot", "WeaponSlot") is True
+
+
+# ---------------------------------------------------------------------------
+# Dual-voice REVIEW finding (round 3) — the surviving-ordinal-write scan's manual
+# inline whitespace/comment/continuation handling had a long formatting tail.
+# Round 3's STRUCTURAL fix runs the detection over a CODE PROJECTION of the source
+# (comment/string interiors blanked, position-preserving) with the spanned RHS
+# whitespace-collapsed before the canonical tail match — so the whole formatting
+# class collapses to ``self.<field> = <recv>:GetChildren()[n]`` at once. Each case
+# below is RED against f4f1e63 (the round-2 verifier) and the corpus happy-path
+# still discharges (the legit resolver body must NOT look like a surviving write).
+# ---------------------------------------------------------------------------
+def test_review_r3_whitespace_at_colon_method_junction_is_detected() -> None:
+    """ROUND-3 — whitespace at the receiver -> ``:`` -> method junction
+    (``self.cam : GetChildren ( ) [ 1 ]``) must still be detected as a surviving
+    ordinal write. The round-2 tail regex had no ``\\s*`` between ``:`` and the
+    method name; the projection's whitespace-collapse closes the whole class."""
+    green = _lower()
+    spaced = green.luau_source.replace(
+        "return rifle\nend",
+        "self.weaponSlot = self.cam : GetChildren ( ) [ 1 ]\n    return rifle\nend",
+    )
+    assert _rig_has_surviving_ordinal_write(spaced, "weaponSlot") is True
+    assert _rig_binding_discharged(spaced, "weaponSlot", "WeaponSlot") is False
+    script = _rbx(
+        "Player", spaced, {"field": "weaponSlot", "child": "WeaponSlot", "present": True}
+    )
+    assert len(_rig_rows([script])) == 1
+
+
+def test_review_r3_whitespace_before_method_getchild_is_detected() -> None:
+    """ROUND-3 — the ``:`` -> ``GetChild`` junction whitespace variant
+    (``self.cam: GetChild(1)``) is also detected."""
+    green = _lower()
+    spaced = green.luau_source.replace(
+        "return rifle\nend",
+        "self.weaponSlot = self.cam: GetChild(1)\n    return rifle\nend",
+    )
+    assert _rig_has_surviving_ordinal_write(spaced, "weaponSlot") is True
+    assert _rig_binding_discharged(spaced, "weaponSlot", "WeaponSlot") is False
+
+
+def test_review_r3_comment_after_call_before_index_is_detected() -> None:
+    """ROUND-3 — an intra-statement ``--`` comment between the call and its postfix
+    index (``self.cam:GetChildren() -- gap\\n  [1]``) must NOT truncate the RHS span:
+    the projection blanks the comment, so the span reaches ``[1]`` and the write is
+    detected. Round-2 broke the span at ``--`` and missed it (fail-open)."""
+    green = _lower()
+    commented = green.luau_source.replace(
+        "return rifle\nend",
+        "self.weaponSlot = self.cam:GetChildren() -- gap\n        [1]\n    return rifle\nend",
+    )
+    assert "-- gap" in commented
+    assert _rig_has_surviving_ordinal_write(commented, "weaponSlot") is True
+    assert _rig_binding_discharged(commented, "weaponSlot", "WeaponSlot") is False
+    script = _rbx(
+        "Player", commented,
+        {"field": "weaponSlot", "child": "WeaponSlot", "present": True},
+    )
+    assert len(_rig_rows([script])) == 1
+
+
+def test_review_r3_comment_before_method_is_detected() -> None:
+    """ROUND-3 — a ``--`` comment between the receiver and its method
+    (``self.cam -- gap\\n  :GetChildren()[1]``) must not truncate the span either."""
+    green = _lower()
+    commented = green.luau_source.replace(
+        "return rifle\nend",
+        "self.weaponSlot = self.cam -- gap\n        :GetChildren()[1]\n    return rifle\nend",
+    )
+    assert _rig_has_surviving_ordinal_write(commented, "weaponSlot") is True
+    assert _rig_binding_discharged(commented, "weaponSlot", "WeaponSlot") is False
+
+
+def test_review_r3_crlf_line_ending_split_is_detected() -> None:
+    """ROUND-3 — a ``\\r\\n`` (Windows) line ending at a postfix split
+    (``self.cam:GetChildren()\\r\\n  [1]``) must be spanned and detected; the
+    projection/collapse treats ``\\r`` as inter-token whitespace."""
+    green = _lower()
+    crlf = green.luau_source.replace(
+        "return rifle\nend",
+        "self.weaponSlot = self.cam:GetChildren()\r\n        [1]\r\n    return rifle\nend",
+    )
+    assert "\r\n" in crlf
+    assert _rig_has_surviving_ordinal_write(crlf, "weaponSlot") is True
+    assert _rig_binding_discharged(crlf, "weaponSlot", "WeaponSlot") is False
+
+
+def test_review_r3_ordinal_inside_string_does_not_false_detect() -> None:
+    """ROUND-3 — the projection blanks STRING interiors, so an ordinal-shaped token
+    inside a string literal assigned to the field
+    (``self.weaponSlot = "self.cam:GetChildren()[1]"``) is NOT a surviving ordinal
+    write (it is a harmless string) -> must NOT be detected."""
+    green = _lower()
+    stringy = green.luau_source.replace(
+        "self.weaponSlot = nil",
+        'self.weaponSlot = "self.cam:GetChildren()[1]"',
+    )
+    assert _rig_has_surviving_ordinal_write(stringy, "weaponSlot") is False
+
+
+def test_review_r3_corpus_happy_path_still_discharges() -> None:
+    """ROUND-3 REGRESSION GUARD — the structural projection must NOT make the legit
+    resolver body (its internal ``:GetChildren()`` / ``FindFirstChild`` /
+    ``:GetAttribute("_MainCameraRig")``) or the neutralized ``self.weaponSlot = nil``
+    write look like a surviving ordinal write. The corpus happy-path discharges."""
+    green = _lower()
+    assert "self.weaponSlot = nil" in green.luau_source
+    assert "function Player:_resolveWeaponSlot()" in green.luau_source
+    assert _rig_has_surviving_ordinal_write(green.luau_source, "weaponSlot") is False
+    assert _rig_binding_discharged(green.luau_source, "weaponSlot", "WeaponSlot") is True

@@ -795,12 +795,18 @@ _RIG_FUNCTION_METHOD_RE = re.compile(
 # Anchored on the deterministic ``field`` (the IR projection), code-position
 # guarded — NOT an arbitrary AI-output grep. Span-limited to the start of the RHS
 # (the assignment text up to the access) so it does not run across statements.
-# ``\s*`` at each postfix junction so a write split across a newline at a postfix
-# head (``GetChildren()\n[1]`` index, ``GetChild\n(1)`` call) still matches once the
-# continuation-aware span has reached the access — mirrors the postfix-continuation
-# class admitted in ``_rig_line_continues``.
+#
+# Run over the CODE PROJECTION of the source (``_rig_code_projection``): comment
+# and string interiors are already blanked there, and the RHS is whitespace-
+# collapsed before the match (``_rig_collapse_code_ws``), so the whole formatting
+# tail collapses to one canonical form — ``self.<field> = <recv>:GetChildren()[n]``
+# — regardless of inter-token whitespace, ``--`` comments between tokens, or line
+# splits. This is the STRUCTURAL close of the surviving-write formatting class
+# (round 3): normalization over an ever-growing set of per-junction ``\s*``
+# tolerances. The pattern stays minimal (no per-junction ``\s*``) because the
+# projection has already removed the whitespace the regex used to chase.
 _RIG_ORDINAL_WRITE_TAIL_RE = re.compile(
-    r":GetChildren\s*\(\s*\)\s*\[\s*\d+\s*\]|[:.]GetChild\s*\(\s*\d+\s*\)"
+    r":GetChildren\(\)\[\d+\]|[:.]GetChild\(\d+\)"
 )
 
 
@@ -957,26 +963,133 @@ def _rig_statement_rhs_end(source: str, start: int) -> int:
     return i
 
 
+def _rig_code_projection(source: str) -> str:
+    """A position-PRESERVING projection of ``source`` that keeps ONLY code and blanks
+    every comment / string / long-bracket span — INCLUDING the ``--`` / quote / long-
+    bracket delimiters themselves — to spaces (newlines kept as newlines so statement
+    structure, continuation, and the over-reach boundary check are unchanged). Same
+    length as ``source`` so the char-index machinery (RHS span, continuation scan)
+    maps 1:1.
+
+    This is the STRUCTURAL normalization the round-3 fix is built on: once a comment
+    span (delimiter and all) is whitespace, a ``--`` between tokens can never
+    truncate an RHS span and a token inside a string can never match. Walks the
+    source with the SAME state machine as ``_luau_pos_is_code`` (line/block comments,
+    long strings, short strings) so the projection agrees exactly with every other
+    rig scan's notion of code; a non-code char is blanked, a non-code newline kept."""
+    chars = list(source)
+    n = len(source)
+
+    def _blank(lo: int, hi: int) -> None:
+        for k in range(lo, min(hi, n)):
+            if chars[k] != "\n":
+                chars[k] = " "
+
+    i = 0
+    while i < n:
+        ch = source[i]
+        # Comment — line or block (``--`` then optional long bracket).
+        if ch == "-" and i + 1 < n and source[i + 1] == "-":
+            level = _long_bracket_open_level(source, i + 2)
+            if level is not None:
+                close = source.find("]" + "=" * level + "]", i + 2)
+                end = n if close == -1 else close + level + 2
+                _blank(i, end)
+                i = end
+                continue
+            nl = source.find("\n", i)
+            end = n if nl == -1 else nl  # keep the terminating newline
+            _blank(i, end)
+            i = end
+            continue
+        # Long string ``[[ ]]`` / ``[=[ ]=]`` (not a comment).
+        level = _long_bracket_open_level(source, i)
+        if level is not None:
+            close = source.find("]" + "=" * level + "]", i + level + 2)
+            end = n if close == -1 else close + level + 2
+            _blank(i, end)
+            i = end
+            continue
+        # Short string ``"..."`` / ``'...'`` (``\\`` escapes).
+        if ch in ("'", '"'):
+            j = i + 1
+            while j < n:
+                if source[j] == "\\":
+                    j += 2
+                    continue
+                if source[j] == ch or source[j] == "\n":
+                    break
+                j += 1
+            end = j + 1 if j < n and source[j] == ch else j
+            _blank(i, end)
+            i = end
+            continue
+        i += 1
+    return "".join(chars)
+
+
+def _rig_collapse_code_ws(rhs: str) -> str:
+    """Collapse inter-token whitespace in an already-projected RHS so the canonical
+    tail pattern matches regardless of the original formatting: runs of whitespace
+    (spaces/newlines — the projection left no comments) become empty where they sit
+    between two punctuation/identifier-boundary characters, and a single space only
+    where two identifier characters would otherwise fuse. The tail regex matches
+    ``:GetChildren()[n]`` / ``:GetChild(n)`` which is pure punctuation+name with no
+    internal identifier-identifier boundary, so collapsing to empty between
+    non-identifier neighbours suffices to canonicalize ``self.cam :  GetChildren ( )
+    [ 1 ]`` -> ``self.cam:GetChildren()[1]``."""
+    out: list[str] = []
+    i = 0
+    n = len(rhs)
+    while i < n:
+        ch = rhs[i]
+        if ch in " \t\r\n":
+            j = i
+            while j < n and rhs[j] in " \t\r\n":
+                j += 1
+            prev = out[-1] if out else ""
+            nxt = rhs[j] if j < n else ""
+            # Keep a single space only when removing it would fuse two identifier
+            # characters into one token (``a b`` -> ``ab``); drop it otherwise.
+            if prev and nxt and _rig_is_ident_char(prev) and _rig_is_ident_char(nxt):
+                out.append(" ")
+            i = j
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _rig_is_ident_char(c: str) -> bool:
+    """True if ``c`` can be part of a Luau identifier (alphanumeric or ``_``)."""
+    return c.isalnum() or c == "_"
+
+
 def _rig_has_surviving_ordinal_write(source: str, field: str) -> bool:
     """True if a code-position ``self.<field> = <... GetChild(n) | GetChildren()[n] ...>``
     positional-ordinal WRITE survives — the camera-child shape the lowering should
     have neutralized to ``nil``. Anchored on the deterministic ``field``; the RHS
     is balanced to the END of the logical statement (multiline-aware), so a
     multi-line camera-child RHS (``self.<field> =\\n  self.cam:GetChildren()[1]``)
-    is fully spanned and a later unrelated statement's ordinal does not leak in."""
+    is fully spanned and a later unrelated statement's ordinal does not leak in.
+
+    The scan runs over the CODE PROJECTION of ``source`` (comment/string interiors
+    blanked, position-preserving) and the spanned RHS is whitespace-collapsed before
+    the tail match, so the whole whitespace/comment/line-split formatting class
+    collapses to the one canonical access form — closing it structurally rather than
+    per-junction (round-3 directive)."""
+    projected = _rig_code_projection(source)
     assign_re = re.compile(r"self\." + re.escape(field) + r"\s*=(?!=)")
-    for m in assign_re.finditer(source):
-        if not _rig_pos_is_real_code(source, m.start()):
-            continue
+    for m in assign_re.finditer(projected):
         # The ``=`` established we are mid-statement, so the value may begin on the
         # NEXT line (``self.<field> =\n  self.cam:GetChildren()[1]``). Advance past
         # leading whitespace/newlines to the first real RHS token before spanning,
         # so a value-on-next-line write is not truncated at the leading newline.
         rhs_start = m.end()
-        while rhs_start < len(source) and source[rhs_start] in " \t\r\n":
+        while rhs_start < len(projected) and projected[rhs_start] in " \t\r\n":
             rhs_start += 1
-        rhs_end = _rig_statement_rhs_end(source, rhs_start)
-        rhs = source[rhs_start:rhs_end]
+        rhs_end = _rig_statement_rhs_end(projected, rhs_start)
+        rhs = _rig_collapse_code_ws(projected[rhs_start:rhs_end])
         if _RIG_ORDINAL_WRITE_TAIL_RE.search(rhs):
             return True
     return False
