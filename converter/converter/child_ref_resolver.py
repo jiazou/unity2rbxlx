@@ -219,38 +219,71 @@ _HOST_SELF_GAMEOBJECT_HEAD_RES = (
 # A (possibly dotted/generic/array) C# type token preceding a bound identifier.
 _TYPE = r"[\w.<>\[\],\s]*?[\w>\]]"
 
+# C# keywords that can syntactically sit in the ``<word> IDENT`` slot where a TYPE
+# is expected but DON'T introduce a binding of ``IDENT``. A bare-word typed-decl
+# pattern (``<word> transform [;)]``) false-matches these (``return transform;`` —
+# a super-common getter idiom; ``in transform)`` — ``transform`` as a foreach
+# COLLECTION, not a binding), over-abstaining the whole script. The type-token
+# immediately preceding the shadowed identifier must NOT be one of these. ``var``
+# is deliberately EXCLUDED — it is the contextual type in ``var gameObject =`` and
+# DOES introduce a binding (kept via its own dedicated pattern), so it is not a
+# keyword for this purpose.
+_CS_KEYWORDS_NOT_TYPE: frozenset[str] = frozenset({
+    "return", "in", "is", "as", "new", "out", "ref", "await", "yield", "throw",
+    "case", "when", "where", "select", "from", "let", "by", "on", "equals",
+    "into", "group", "orderby", "do", "else", "typeof", "sizeof", "nameof",
+    "default", "checked", "unchecked", "stackalloc", "and", "or", "not",
+})
+
 
 def _ident_in_group(ident: str, body: str) -> bool:
     """True if ``ident`` appears as a whole word token in ``body``."""
     return re.search(r"(?:^|[^\w])" + re.escape(ident) + r"(?:[^\w]|$)", body) is not None
 
 
-def _shadow_decl_res(ident: str) -> tuple[tuple[re.Pattern[str], bool], ...]:
-    """Per-identifier binding-context matchers, each paired with a ``body`` flag.
+@dataclass(frozen=True)
+class _ShadowPat:
+    """One binding-context matcher.
 
-    ``body=False``: a match anywhere (at a code position) is a shadow binding.
-    ``body=True``: the pattern captures a parenthesized list in group 1 REGARDLESS
-    of ``ident`` (a lambda param list / ``var (...)`` deconstruction target); it
-    counts only when ``ident`` is a whole token inside that group."""
+    ``body``: the pattern captures a parenthesized list in group ``body_group``
+    REGARDLESS of ``ident`` (a lambda param list / ``var (...)`` deconstruction
+    target); it counts only when ``ident`` is a whole token inside that group.
+    ``type_group``: when set, the group holds the TYPE token immediately preceding
+    the bound identifier — the match is NOT a binding when that token is a C#
+    keyword (``return transform;`` / ``in transform)`` are not declarations)."""
+
+    pat: re.Pattern[str]
+    body: bool = False
+    body_group: int = 1
+    type_group: int | None = None
+
+
+def _shadow_decl_res(ident: str) -> tuple[_ShadowPat, ...]:
+    """Per-identifier binding-context matchers."""
     i = re.escape(ident)
     return (
         # typed local / field / param-with-initializer / param followed by , or )
-        (re.compile(r"\b[A-Za-z_]\w*\s+" + i + r"\s*(?:[=;,)])"), False),
+        # The leading word (group 1) is the TYPE token: it must NOT be a C# keyword
+        # (so ``return transform;`` / ``in transform)`` are not read as bindings).
+        _ShadowPat(re.compile(r"\b([A-Za-z_]\w*)\s+" + i + r"\s*(?:[=;,)])"), type_group=1),
         # ``var <ident> =`` local
-        (re.compile(r"\bvar\s+" + i + r"\s*="), False),
+        _ShadowPat(re.compile(r"\bvar\s+" + i + r"\s*=")),
         # foreach binding: ``foreach (var <ident> in`` | ``foreach (T <ident> in``
-        (re.compile(r"\bforeach\s*\(\s*(?:var|" + _TYPE + r")\s+" + i + r"\s+in\b"), False),
+        # ``<ident>`` is the BINDING (loop variable) here, immediately before ``in``;
+        # the foreach COLLECTION tail (``foreach (var c in <ident>)``) is NOT a
+        # binding and is correctly NOT matched by this position-anchored pattern.
+        _ShadowPat(re.compile(r"\bforeach\s*\(\s*(?:var|" + _TYPE + r")\s+" + i + r"\s+in\b")),
         # lambda parameter, single unparenthesized: ``<ident> =>``
-        (re.compile(r"\b" + i + r"\s*=>"), False),
+        _ShadowPat(re.compile(r"\b" + i + r"\s*=>")),
         # lambda parameter inside a parenthesized list immediately before ``=>``
         # (``(gameObject) =>``, ``(GameObject gameObject) =>``, ``(a, gameObject) =>``).
-        (re.compile(r"\(([^()]*)\)\s*=>"), True),
+        _ShadowPat(re.compile(r"\(([^()]*)\)\s*=>"), body=True),
         # tuple deconstruction with a ``var ( ... )`` target.
-        (re.compile(r"\bvar\s*\(([^()]*)\)"), True),
+        _ShadowPat(re.compile(r"\bvar\s*\(([^()]*)\)"), body=True),
         # mixed deconstruction ``(var <ident>, ...)`` / ``(..., var <ident>)``
-        (re.compile(r"\bvar\s+" + i + r"\s*(?=[,)])"), False),
+        _ShadowPat(re.compile(r"\bvar\s+" + i + r"\s*(?=[,)])")),
         # declaration pattern: ``case T <ident>:`` | ``is T <ident>``
-        (re.compile(r"\b(?:case|is)\s+" + _TYPE + r"\s+" + i + r"\b"), False),
+        _ShadowPat(re.compile(r"\b(?:case|is)\s+" + _TYPE + r"\s+" + i + r"\b")),
     )
 
 
@@ -261,12 +294,14 @@ def _declares_shadow(source: str, ident: str) -> bool:
     that would shadow an inherited MonoBehaviour member. Scans code positions only
     (skips strings/comments). Conservative — one binding anywhere is enough;
     biases to the safe ABSTAIN direction."""
-    for pat, body in _shadow_decl_res(ident):
-        for m in pat.finditer(source):
+    for sp in _shadow_decl_res(ident):
+        for m in sp.pat.finditer(source):
             if not _cs_pos_is_code(source, m.start()):
                 continue
-            if body and not _ident_in_group(ident, m.group(1)):
+            if sp.body and not _ident_in_group(ident, m.group(sp.body_group)):
                 continue
+            if sp.type_group is not None and m.group(sp.type_group) in _CS_KEYWORDS_NOT_TYPE:
+                continue  # the "type" is a C# keyword -> not a binding declaration
             return True
     return False
 

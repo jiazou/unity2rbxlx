@@ -866,6 +866,86 @@ def test_unshadowed_forms_still_resolve_under_broadened_detector(
         assert entry.facts[0].child_name == "Base", body
 
 
+# --- round-5 finding: C# keyword in the type slot is NOT a shadow binding ---
+# The typed-declaration pattern (``<word> IDENT [;)]``) must reject a C# KEYWORD
+# in the type slot, so common non-shadow idioms (``return transform;``,
+# ``in transform)`` foreach-collection tail) don't over-abstain the whole script.
+
+
+def test_return_transform_getter_idiom_resolves(tmp_path: Path) -> None:
+    # ``return transform;`` — super-common getter idiom; ``return`` is a keyword,
+    # NOT the type of a ``transform`` declaration -> a real ``transform.GetChild``
+    # elsewhere still RESOLVES {1,1}.
+    entry = _map_for_body(
+        tmp_path,
+        "Transform Self(){ return transform; } void G(){ transform.GetChild(0); }",
+    )
+    assert (entry.getchild_total, entry.resolved_total) == (1, 1)
+    assert entry.facts[0].child_name == "Base"
+
+
+def test_return_gameObject_getter_idiom_resolves(tmp_path: Path) -> None:
+    # ``return gameObject;`` — ``return`` is a keyword -> not a gameObject binding
+    # -> ``gameObject.transform.GetChild(0)`` resolves via the host-self alias.
+    entry = _map_for_body(
+        tmp_path,
+        "GameObject Self(){ return gameObject; } "
+        "void G(){ gameObject.transform.GetChild(0); }",
+    )
+    assert (entry.getchild_total, entry.resolved_total) == (1, 1)
+    assert entry.facts[0].child_name == "Base"
+
+
+def test_foreach_collection_transform_resolves(tmp_path: Path) -> None:
+    # ``foreach (var c in transform)`` — ``transform`` is the COLLECTION being
+    # iterated (``in transform`` — ``in`` is a keyword), NOT a binding -> a later
+    # ``transform.GetChild(0)`` site still RESOLVES.
+    entry = _map_for_body(
+        tmp_path,
+        "foreach(var c in transform){} transform.GetChild(0);",
+    )
+    assert (entry.getchild_total, entry.resolved_total) == (1, 1)
+    assert entry.facts[0].child_name == "Base"
+
+
+def test_foreach_binding_gameObject_still_abstains(tmp_path: Path) -> None:
+    # Discriminator: ``foreach(var gameObject in xs)`` — ``gameObject`` is the
+    # BINDING (loop variable), not the collection -> still ABSTAIN {1,0}.
+    entry = _map_for_body(
+        tmp_path,
+        "foreach(var gameObject in xs){ gameObject.transform.GetChild(0); }",
+    )
+    assert (entry.getchild_total, entry.resolved_total) == (1, 0)
+    assert entry.facts == ()
+
+
+def test_param_gameObject_typed_decl_still_abstains(tmp_path: Path) -> None:
+    # ``void F(GameObject gameObject)`` — ``GameObject`` is NOT a keyword, a real
+    # typed param binding -> still ABSTAIN {1,0}.
+    src = ("public class H : MonoBehaviour { "
+           "void F(GameObject gameObject){ gameObject.transform.GetChild(0); } }")
+    cs = _write(tmp_path, "H.cs", src)
+    m = build_child_ref_map(
+        script_infos=[ScriptInfo(path=cs, class_name="H")],
+        parsed_scenes=None, prefab_library=_single_child_host(),
+        guid_index=_guid_index(cs),
+    )
+    entry = m[str(cs.resolve())]
+    assert (entry.getchild_total, entry.resolved_total) == (1, 0)
+    assert entry.facts == ()
+
+
+def test_var_gameObject_local_still_abstains(tmp_path: Path) -> None:
+    # ``var gameObject = x;`` — ``var`` is the contextual type and DOES bind ->
+    # still ABSTAIN {1,0} (var deliberately not treated as a keyword).
+    entry = _map_for_body(
+        tmp_path,
+        "var gameObject = x; gameObject.transform.GetChild(0);",
+    )
+    assert (entry.getchild_total, entry.resolved_total) == (1, 0)
+    assert entry.facts == ()
+
+
 # --- finding 5: GetChild inside a comment/string is NOT rewritten -----------
 
 
