@@ -413,3 +413,129 @@ def test_prerewrite_noop_when_no_facts() -> None:
     out, n = prerewrite_child_index(src, ChildRefScript(facts=(), getchild_total=1,
                                                         resolved_total=0))
     assert (out, n) == (src, 0)
+
+
+# --- finding 1: foreign ``X.transform.GetChild(n)`` must ABSTAIN -------------
+
+
+def _single_child_host(name: str = "Host") -> PrefabLibrary:
+    root = _pnode(name, children=[_pnode("Base")], comp_guid=_GUID)
+    return PrefabLibrary(prefabs=[
+        PrefabTemplate(prefab_path=Path(f"/p/{name}.prefab"), name=name, root=root)
+    ])
+
+
+def test_foreign_camera_main_transform_abstains(tmp_path: Path) -> None:
+    # ``Camera.main.transform.GetChild(0)`` — the trailing ``transform`` matches
+    # the site regex but is a MEMBER access on a foreign camera, NOT the host.
+    src = ("public class H : MonoBehaviour { "
+           "void F(){ var x = Camera.main.transform.GetChild(0); } }")
+    cs = _write(tmp_path, "H.cs", src)
+    m = build_child_ref_map(
+        script_infos=[ScriptInfo(path=cs, class_name="H")],
+        parsed_scenes=None, prefab_library=_single_child_host(),
+        guid_index=_guid_index(cs),
+    )
+    entry = m[str(cs.resolve())]
+    # Counted toward total, but NO fact -> abstain (not rewritten to Find).
+    assert (entry.getchild_total, entry.resolved_total) == (1, 0)
+    assert entry.facts == ()
+    out, n = prerewrite_child_index(src, entry)
+    assert n == 0
+    assert "Camera.main.transform.GetChild(0)" in out
+
+
+def test_foreign_member_transform_abstains(tmp_path: Path) -> None:
+    # ``foo.transform.GetChild(0)`` — member access on a foreign ``foo``.
+    src = ("public class H : MonoBehaviour { "
+           "void F(){ var x = foo.transform.GetChild(0); } }")
+    cs = _write(tmp_path, "H.cs", src)
+    m = build_child_ref_map(
+        script_infos=[ScriptInfo(path=cs, class_name="H")],
+        parsed_scenes=None, prefab_library=_single_child_host(),
+        guid_index=_guid_index(cs),
+    )
+    entry = m[str(cs.resolve())]
+    assert (entry.getchild_total, entry.resolved_total) == (1, 0)
+    assert entry.facts == ()
+
+
+def test_bare_transform_still_resolves(tmp_path: Path) -> None:
+    # Regression guard: bare ``transform.GetChild(0)`` still resolves to Base.
+    src = ("public class H : MonoBehaviour { "
+           "void F(){ var x = transform.GetChild(0); } }")
+    cs = _write(tmp_path, "H.cs", src)
+    m = build_child_ref_map(
+        script_infos=[ScriptInfo(path=cs, class_name="H")],
+        parsed_scenes=None, prefab_library=_single_child_host(),
+        guid_index=_guid_index(cs),
+    )
+    entry = m[str(cs.resolve())]
+    assert (entry.getchild_total, entry.resolved_total) == (1, 1)
+    assert entry.facts[0].child_name == "Base"
+
+
+def test_this_transform_resolves(tmp_path: Path) -> None:
+    # ``this.transform`` IS the host transform — must resolve, not abstain.
+    src = ("public class H : MonoBehaviour { "
+           "void F(){ var x = this.transform.GetChild(0); } }")
+    cs = _write(tmp_path, "H.cs", src)
+    m = build_child_ref_map(
+        script_infos=[ScriptInfo(path=cs, class_name="H")],
+        parsed_scenes=None, prefab_library=_single_child_host(),
+        guid_index=_guid_index(cs),
+    )
+    entry = m[str(cs.resolve())]
+    assert (entry.getchild_total, entry.resolved_total) == (1, 1)
+    assert entry.facts[0].child_name == "Base"
+
+
+# --- finding 5: GetChild inside a comment/string is NOT rewritten -----------
+
+
+def test_line_commented_getchild_not_rewritten(tmp_path: Path) -> None:
+    src = ("public class H : MonoBehaviour { void F(){ "
+           "// transform.GetChild(0)\n"
+           "var y = 1; } }")
+    cs = _write(tmp_path, "H.cs", src)
+    m = build_child_ref_map(
+        script_infos=[ScriptInfo(path=cs, class_name="H")],
+        parsed_scenes=None, prefab_library=_single_child_host(),
+        guid_index=_guid_index(cs),
+    )
+    # The only GetChild is inside a ``//`` comment -> 0 sites -> absent from map.
+    assert str(cs.resolve()) not in m
+
+
+def test_block_commented_getchild_not_rewritten(tmp_path: Path) -> None:
+    # A ``/* ... */`` block comment spanning the GetChild must be skipped.
+    src = ("public class H : MonoBehaviour { void F(){ "
+           "/* transform.GetChild(0) */\n"
+           "var y = transform.GetChild(0); } }")
+    cs = _write(tmp_path, "H.cs", src)
+    m = build_child_ref_map(
+        script_infos=[ScriptInfo(path=cs, class_name="H")],
+        parsed_scenes=None, prefab_library=_single_child_host(),
+        guid_index=_guid_index(cs),
+    )
+    entry = m[str(cs.resolve())]
+    # Only the REAL (non-comment) site counts + resolves.
+    assert (entry.getchild_total, entry.resolved_total) == (1, 1)
+    out, n = prerewrite_child_index(src, entry)
+    assert n == 1
+    # The commented occurrence is left verbatim; only the real one is rewritten.
+    assert "/* transform.GetChild(0) */" in out
+    assert 'transform.Find("Base")' in out
+
+
+def test_verbatim_string_getchild_not_counted(tmp_path: Path) -> None:
+    # A ``@"..."`` verbatim string containing the pattern is not code.
+    src = ('public class H : MonoBehaviour { void F(){ '
+           'var s = @"transform.GetChild(0)"; } }')
+    cs = _write(tmp_path, "H.cs", src)
+    m = build_child_ref_map(
+        script_infos=[ScriptInfo(path=cs, class_name="H")],
+        parsed_scenes=None, prefab_library=_single_child_host(),
+        guid_index=_guid_index(cs),
+    )
+    assert str(cs.resolve()) not in m

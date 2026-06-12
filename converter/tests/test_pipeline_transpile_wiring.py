@@ -457,3 +457,69 @@ class TestLegacyRepairPassesGatedInGeneric:
         pipeline._subphase_cohere_scripts()
 
         assert "_AutoFpsDoorTweenInjected" in door.source
+
+
+# ---------------------------------------------------------------------------
+# Finding 4: ``_rehydrate_scripts_from_disk`` must carry child_ref_resolution
+# through a preserve/resume assemble (else check D pure-abstains on that path).
+# ---------------------------------------------------------------------------
+
+
+class TestRehydrateCarriesChildRefResolution:
+
+    def test_rehydrated_script_retains_child_ref_resolution(
+        self, tmp_path: Path,
+    ) -> None:
+        import json as _json
+
+        pipeline = _make_pipeline(tmp_path)
+        out = Path(pipeline.output_dir)
+        scripts_dir = out / "scripts"
+        scripts_dir.mkdir()
+        (scripts_dir / "Turret.luau").write_text(
+            "local Turret = {}\nreturn Turret\n", encoding="utf-8",
+        )
+        # A prior run persisted the per-script tally into conversion_plan.json.
+        (out / "conversion_plan.json").write_text(
+            _json.dumps({
+                "storage_plan": {},
+                "child_ref_resolution": {
+                    "Turret": {"getchild_total": 3, "resolved_total": 3},
+                },
+            }),
+            encoding="utf-8",
+        )
+
+        pipeline.state.rbx_place.scripts = []
+        pipeline._rehydrate_scripts_from_disk(scripts_dir)
+
+        turret = next(
+            s for s in pipeline.state.rbx_place.scripts if s.name == "Turret"
+        )
+        assert turret.child_ref_resolution == {
+            "getchild_total": 3, "resolved_total": 3,
+        }
+
+    def test_rehydrate_without_field_leaves_none(self, tmp_path: Path) -> None:
+        # A pre-field plan (no child_ref_resolution block) -> tally stays None
+        # -> check D abstains (preserves pre-field behaviour).
+        import json as _json
+
+        pipeline = _make_pipeline(tmp_path)
+        out = Path(pipeline.output_dir)
+        scripts_dir = out / "scripts"
+        scripts_dir.mkdir()
+        (scripts_dir / "Turret.luau").write_text(
+            "local Turret = {}\nreturn Turret\n", encoding="utf-8",
+        )
+        (out / "conversion_plan.json").write_text(
+            _json.dumps({"storage_plan": {}}), encoding="utf-8",
+        )
+
+        pipeline.state.rbx_place.scripts = []
+        pipeline._rehydrate_scripts_from_disk(scripts_dir)
+
+        turret = next(
+            s for s in pipeline.state.rbx_place.scripts if s.name == "Turret"
+        )
+        assert turret.child_ref_resolution is None

@@ -108,6 +108,35 @@ def test_variable_index_is_not_lowered() -> None:
     assert s.luau_source == before
 
 
+def test_block_comment_getchildren_not_lowered() -> None:
+    """Finding 5: a ``GetChildren()[N]`` inside a Luau ``--[[ ]]`` block comment
+    is NOT code, so the lowering must leave it untouched."""
+    src = textwrap.dedent("""\
+        --[[ self.gameObject:GetChildren()[1] ]]
+        function M:noop()
+            return nil
+        end
+    """)
+    s = _S(src)
+    before = s.luau_source
+    n = lower_child_index([s])
+    assert n == 0
+    assert s.luau_source == before
+
+
+def test_long_string_getchildren_not_lowered() -> None:
+    """A ``GetChildren()[N]`` inside a Luau ``[[ ]]`` long string is not code."""
+    src = textwrap.dedent("""\
+        local doc = [[ self.gameObject:GetChildren()[1] ]]
+        return doc
+    """)
+    s = _S(src)
+    before = s.luau_source
+    n = lower_child_index([s])
+    assert n == 0
+    assert s.luau_source == before
+
+
 def test_helper_in_comment_only_still_injects_real_helper() -> None:
     """P1 #1 (code-aware guard): a source whose ONLY
     ``local function __unityChild(`` occurrence is inside a comment -- AND which

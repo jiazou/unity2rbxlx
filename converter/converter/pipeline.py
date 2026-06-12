@@ -4404,6 +4404,7 @@ script.Disabled = true
         """
 
         plan_lookup = self._load_storage_plan_for_rehydration()
+        child_ref_lookup = self._load_child_ref_resolution_for_rehydration()
         luau_files = sorted(scripts_dir.rglob("*.luau"))
         from_plan = 0
         rehydrated = 0
@@ -4457,6 +4458,12 @@ script.Disabled = true
             )
             if parent_path and hasattr(script, "parent_path"):
                 script.parent_path = parent_path
+            # Restore the child-ref resolution tally so the contract verifier's
+            # check-D backstop has the fact on a preserve/resume assemble (else
+            # it would pure-abstain on every rehydrated script).
+            crr = child_ref_lookup.get(name)
+            if crr is not None:
+                script.child_ref_resolution = crr
             self.state.rbx_place.scripts.append(script)
             rehydrated += 1
 
@@ -4531,6 +4538,40 @@ script.Disabled = true
                 )
         return lookup
 
+    def _load_child_ref_resolution_for_rehydration(
+        self,
+    ) -> dict[str, dict[str, int]]:
+        """Load the persisted per-script child-ref resolution tally from
+        ``conversion_plan.json`` into ``name -> {getchild_total, resolved_total}``.
+
+        Mirrors ``_classify_storage``'s ``child_ref_resolution`` write. Returns
+        ``{}`` on a missing/malformed plan or a plan that pre-dates the field
+        (older serialized run) — the rehydrate path then leaves
+        ``RbxScript.child_ref_resolution`` unset (``None``), so check D abstains
+        for those scripts, preserving pre-field behaviour. Only well-formed int
+        tallies are forwarded."""
+        plan_path = self.output_dir / "conversion_plan.json"
+        if not plan_path.exists():
+            return {}
+        import json as _json
+        try:
+            raw = _json.loads(plan_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            log.debug("[rehydrate] conversion_plan.json unreadable: %s", exc)
+            return {}
+        block = raw.get("child_ref_resolution")
+        if not isinstance(block, dict):
+            return {}
+        out: dict[str, dict[str, int]] = {}
+        for name, tally in block.items():
+            if not isinstance(name, str) or not isinstance(tally, dict):
+                continue
+            gt = tally.get("getchild_total")
+            rt = tally.get("resolved_total")
+            if isinstance(gt, int) and isinstance(rt, int):
+                out[name] = {"getchild_total": gt, "resolved_total": rt}
+        return out
+
     def _classify_storage(self) -> None:
         """Phase 4a.5: run the storage classifier on populated scripts.
 
@@ -4603,6 +4644,18 @@ script.Disabled = true
                 script_paths.setdefault(
                     luau_path.stem, str(luau_path.relative_to(scripts_dir)),
                 )
+
+        # Persist each script's child-ref resolution tally so a preserve/resume
+        # assemble that rehydrates RbxScripts from disk
+        # (``_rehydrate_scripts_from_disk``) can restore it — without it, check D
+        # would pure-abstain on that path (same gap class as the regen field
+        # fix). Keyed by script name; ``None`` tallies are dropped (absent ==
+        # no fact).
+        child_ref_resolution: dict[str, dict[str, int]] = {
+            s.name: s.child_ref_resolution
+            for s in self.state.rbx_place.scripts
+            if s.child_ref_resolution is not None
+        }
 
         # Animation routing (Phase 4.5): per-clip target + reason.
         animation_routing: dict[str, dict[str, dict[str, str]]] = {}
@@ -4766,6 +4819,7 @@ script.Disabled = true
             _json.dumps({
                 "storage_plan": plan.to_dict(),
                 "script_paths": script_paths,
+                "child_ref_resolution": child_ref_resolution,
                 "animation_routing": animation_routing,
                 "scene_runtime": scene_runtime,
             }, indent=2),

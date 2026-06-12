@@ -25,10 +25,7 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 
-from converter.child_index_lowering import (
-    _luau_pos_is_code,
-    source_has_child_index,
-)
+from converter.child_index_lowering import _luau_pos_is_code
 from converter.scene_runtime_topology.build_topology import TopologyArtifact
 from core.roblox_types import RbxScript
 
@@ -561,18 +558,38 @@ def _check_cross_domain_attribute(
 # ABSTAINS — never reds the corpus. Keyed on the deterministic resolver tally, not
 # a fragile C#-symbol->Luau-name match (the AI does not preserve the symbol names).
 
+# Adjacent survivor shape: ``<recv>:GetChildren()[N]`` where ``<recv>`` is a
+# simple dotted name OR a method call (``self:_tBase()``) — the latter is what an
+# AI factored survivor looks like (``self:_tBase():GetChildren()[1]``). A
+# variable index (``[i]``) is a genuine dynamic lookup, not a flattened ordinal,
+# so N must be an integer literal.
+_GETCHILDREN_INDEX_ANY_RE = re.compile(
+    r"(?:[A-Za-z_][\w.]*(?::[A-Za-z_]\w*\(\))?):GetChildren\(\)\s*\[\s*(\d+)\s*\]"
+)
+
 # Two-line factored shape (E5): ``local v = X:GetChildren()`` then a later
-# ``v[<int>]`` positional index. The adjacent shape ``X:GetChildren()[n]`` is
-# covered by ``source_has_child_index``; this catches the across-lines factoring.
+# ``v[<int>]`` positional index. ``X`` may be a simple dotted name OR a method
+# call (``self:_tBase():GetChildren()``), so a method-receiver factored survivor
+# is caught too. The trailing ``(?!\s*\[)`` excludes the ADJACENT form
+# (``X:GetChildren()[N]``, already counted by ``_GETCHILDREN_INDEX_ANY_RE``) so
+# a single site is not double-counted.
 _GETCHILDREN_ASSIGN_RE = re.compile(
-    r"\blocal\s+([A-Za-z_]\w*)\s*=\s*[A-Za-z_][\w.]*:GetChildren\(\)"
+    r"\blocal\s+([A-Za-z_]\w*)\s*=\s*"
+    r"[A-Za-z_][\w.]*(?::[A-Za-z_]\w*\(\))?:GetChildren\(\)(?!\s*\[)"
 )
 
 
-def _source_has_factored_child_ordinal(source: str) -> bool:
-    """True if ``source`` factors a positional GetChildren index across two
-    lines: ``local v = X:GetChildren()`` then a later ``v[<int>]`` index on the
-    captured identifier ``v``, both at real code positions."""
+def _count_surviving_child_ordinals(source: str) -> int:
+    """Count POSITIONAL child-ordinal survivor SITES in ``source`` — the
+    adjacent shape ``<recv>:GetChildren()[N]`` (simple OR method-call receiver)
+    plus the across-lines factored shape (``local v = X:GetChildren()`` then a
+    later ``v[<int>]``). Per-site (not boolean) so the backstop can fail-close
+    when survivors exceed the script's unresolved-site budget. Code-position
+    aware; counts each factored ``local v`` chain ONCE."""
+    count = 0
+    for m in _GETCHILDREN_INDEX_ANY_RE.finditer(source):
+        if _luau_pos_is_code(source, m.start()):
+            count += 1
     for m in _GETCHILDREN_ASSIGN_RE.finditer(source):
         if not _luau_pos_is_code(source, m.start()):
             continue
@@ -580,8 +597,9 @@ def _source_has_factored_child_ordinal(source: str) -> bool:
         index_re = re.compile(r"\b" + re.escape(ident) + r"\s*\[\s*\d+\s*\]")
         for im in index_re.finditer(source, m.end()):
             if _luau_pos_is_code(source, im.start()):
-                return True
-    return False
+                count += 1
+                break  # one factored chain == one survivor site
+    return count
 
 
 def _check_surviving_child_ordinal(
@@ -591,12 +609,16 @@ def _check_surviving_child_ordinal(
     """Backstop for relation #2 (child/path-ref), FACT-BASED.
 
     Reads each script's ``child_ref_resolution`` dict with a None/absent guard.
-    A FULLY-resolved script (``getchild_total > 0 and resolved_total ==
-    getchild_total``) with a surviving positional ordinal -> ``warning``
-    ``child_ordinal_survivor`` (fail-closed). A script with the fact present but
-    ``resolved_total < getchild_total`` AND a surviving ordinal -> non-promoting
-    ``info`` ``child_ordinal_coverage_gap`` (a tracked Phase-2/3 gap). A script
-    with NO fact (absent/``None``) -> pure abstain (no row), so pre-field
+    PER-SITE fail-close: a survivor lands on a RESOLVED site (a regression) when
+    the number of surviving positional ordinals (``S``) EXCEEDS the script's
+    unresolved-site budget (``getchild_total - resolved_total``) — the unresolved
+    sites can legitimately account for at most that many survivors, so any excess
+    must be a resolved site whose ``Find("<name>")`` rewrite was lost. That is
+    ``warning`` ``child_ordinal_survivor`` (fail-closed) and covers the
+    fully-resolved case (budget 0 -> any survivor fires). Survivors WITHIN budget
+    on a partially-resolved script (``resolved_total < getchild_total``) ->
+    non-promoting ``info`` ``child_ordinal_coverage_gap`` (a tracked gap). A
+    script with NO fact (absent/``None``) -> pure abstain (no row), so pre-field
     fixtures load with zero count drift.
     """
     violations: list[ContractViolation] = []
@@ -608,25 +630,26 @@ def _check_surviving_child_ordinal(
         rt = r.get("resolved_total")
         if gt is None or rt is None or gt <= 0:
             continue
-        has_survivor = (
-            source_has_child_index(script.source)
-            or _source_has_factored_child_ordinal(script.source)
-        )
-        if not has_survivor:
+        survivors = _count_surviving_child_ordinals(script.source)
+        if survivors <= 0:
             continue
-        fully_resolved = rt == gt
-        if fully_resolved:
+        unresolved_budget = gt - rt
+        # A survivor on a RESOLVED site iff survivors exceed the unresolved
+        # budget. Fully-resolved scripts have budget 0, so ANY survivor fires.
+        if survivors > unresolved_budget:
             violations.append(
                 ContractViolation(
                     check="child_ordinal_survivor",
                     severity="warning",
                     script=script.name,
                     detail=(
-                        f"{script.name}: a positional child ordinal survived "
-                        f"the pre-rewrite in a fully-resolved script "
-                        f"(getchild_total={gt}, resolved_total={rt}); the "
-                        f"resolved Find(\"<name>\") lookup should have replaced "
-                        f"every GetChild(n) — this is a child-ref regression"
+                        f"{script.name}: {survivors} positional child "
+                        f"ordinal(s) survived the pre-rewrite, exceeding the "
+                        f"unresolved-site budget {unresolved_budget} "
+                        f"(getchild_total={gt}, resolved_total={rt}); at least "
+                        f"one survivor lands on a RESOLVED site whose "
+                        f"Find(\"<name>\") lookup should have replaced its "
+                        f"GetChild(n) — this is a child-ref regression"
                     ),
                     identity=f"child_ordinal_survivor:{script.name}",
                 )

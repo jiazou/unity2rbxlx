@@ -144,3 +144,94 @@ def test_check_d_wired_into_verify_contract() -> None:
                   child_ref_resolution={"getchild_total": 1, "resolved_total": 1})
     res = verify_contract(_TOPOLOGY, [s])
     assert any(v.check == "child_ordinal_survivor" for v in res.violations)
+
+
+# --- finding 3: PER-SITE fail-close (no whole-script abstain bypass) ---------
+
+
+def test_partial_resolved_survivor_exceeds_budget_fires() -> None:
+    # {2,1}: budget = 1 unresolved site. TWO surviving ordinals -> at least one
+    # lands on the RESOLVED site -> fail-closed (no blanket abstain).
+    s = RbxScript(
+        name="Turret",
+        source=(
+            "local a = base:GetChildren()[1]\n"
+            "local b = self.cam:GetChildren()[1]\n"
+            "return a, b"
+        ),
+        child_ref_resolution={"getchild_total": 2, "resolved_total": 1},
+    )
+    survivors = [v for v in _check_d([s]) if v.check == "child_ordinal_survivor"]
+    assert len(survivors) == 1
+    res = verify_contract(_TOPOLOGY, [s])
+    assert any("child_ordinal_survivor" in e for e in fail_closed_errors(res))
+
+
+def test_partial_resolved_survivor_within_budget_only_info() -> None:
+    # {2,1}: budget 1, ONE survivor -> attributable to the unresolved site ->
+    # non-promoting info (the resolved site is clean).
+    s = RbxScript(
+        name="Turret",
+        source="local b = self.cam:GetChildren()[1]\nreturn b",
+        child_ref_resolution={"getchild_total": 2, "resolved_total": 1},
+    )
+    rows = _check_d([s])
+    assert [v.check for v in rows] == ["child_ordinal_coverage_gap"]
+    assert rows[0].severity == "info"
+    res = verify_contract(_TOPOLOGY, [s])
+    assert fail_closed_errors(res) == []
+
+
+def test_method_receiver_factored_survivor_fires() -> None:
+    # {3,3} with a method-call-receiver factored survivor:
+    # ``local kids = self:_tBase():GetChildren(); local first = kids[1]``.
+    s = RbxScript(
+        name="Turret",
+        source=(
+            "local kids = self:_tBase():GetChildren()\n"
+            "local first = kids[1]\n"
+            "return first"
+        ),
+        child_ref_resolution={"getchild_total": 3, "resolved_total": 3},
+    )
+    survivors = [v for v in _check_d([s]) if v.check == "child_ordinal_survivor"]
+    assert len(survivors) == 1
+
+
+def test_method_receiver_adjacent_survivor_fires() -> None:
+    # Adjacent method-receiver form ``self:_tBase():GetChildren()[1]``.
+    s = RbxScript(
+        name="Turret",
+        source="local b = self:_tBase():GetChildren()[1]\nreturn b",
+        child_ref_resolution={"getchild_total": 3, "resolved_total": 3},
+    )
+    survivors = [v for v in _check_d([s]) if v.check == "child_ordinal_survivor"]
+    assert len(survivors) == 1
+
+
+# --- finding 5: a survivor inside a Luau block comment/string does NOT fire --
+
+
+def test_luau_block_comment_survivor_does_not_fire() -> None:
+    s = RbxScript(
+        name="Turret",
+        source=(
+            "--[[ x:GetChildren()[1] ]]\n"
+            'local b = base:FindFirstChild("Base")\n'
+            "return b"
+        ),
+        child_ref_resolution={"getchild_total": 3, "resolved_total": 3},
+    )
+    assert _check_d([s]) == []
+
+
+def test_luau_long_string_survivor_does_not_fire() -> None:
+    s = RbxScript(
+        name="Turret",
+        source=(
+            "local doc = [[ base:GetChildren()[1] ]]\n"
+            "return doc"
+        ),
+        child_ref_resolution={"getchild_total": 3, "resolved_total": 3},
+    )
+    assert _check_d([s]) == []

@@ -92,25 +92,103 @@ _CS_GETCHILD_GETTER_EXPR_RE = re.compile(  # Transform x => recv.GetChild(0);
 
 def _cs_pos_is_code(source: str, pos: int) -> bool:
     """True if char index ``pos`` is real C# code, not inside a string literal
-    or a ``//`` line comment. Scans from the start of ``pos``'s line, tracking
-    single/double-quoted strings (with backslash escapes) and ``//`` comments —
-    the forms the textual matchers must avoid firing inside."""
-    i = source.rfind("\n", 0, pos) + 1
-    quote: str | None = None
+    or a comment. Scans from the START of the file (block comments and verbatim
+    strings can open on a prior line, so a per-line scan would miss them),
+    tracking: ``//`` line comments, ``/* */`` block comments, regular
+    ``"..."`` strings (``\\`` escapes), verbatim ``@"..."`` strings (``""`` is an
+    escaped quote, ``\\`` is literal), and ``'...'`` char literals — the forms
+    the textual matchers must avoid firing inside."""
+    i = 0
+    n = len(source)
     while i < pos:
         ch = source[i]
-        if quote is not None:
-            if ch == "\\":
-                i += 2
-                continue
-            if ch == quote:
-                quote = None
-        elif ch in ("'", '"'):
-            quote = ch
-        elif ch == "/" and i + 1 < pos and source[i + 1] == "/":
-            return False  # rest of the line (incl. pos) is a comment
+        # Line comment — skip to end of line.
+        if ch == "/" and i + 1 < n and source[i + 1] == "/":
+            nl = source.find("\n", i)
+            if nl == -1 or nl >= pos:
+                return False  # comment runs through pos
+            i = nl + 1
+            continue
+        # Block comment — skip to closing ``*/``.
+        if ch == "/" and i + 1 < n and source[i + 1] == "*":
+            end = source.find("*/", i + 2)
+            if end == -1 or end + 2 > pos:
+                return False  # block comment encloses pos
+            i = end + 2
+            continue
+        # Verbatim string ``@"..."`` — ``""`` escapes a quote, ``\`` is literal.
+        if ch == "@" and i + 1 < n and source[i + 1] == '"':
+            j = i + 2
+            while j < n:
+                if source[j] == '"':
+                    if j + 1 < n and source[j + 1] == '"':
+                        j += 2
+                        continue
+                    break
+                j += 1
+            if j >= pos:
+                return False  # string encloses pos
+            i = j + 1
+            continue
+        # Regular string ``"..."`` — ``\`` escapes.
+        if ch == '"':
+            j = i + 1
+            while j < n:
+                if source[j] == "\\":
+                    j += 2
+                    continue
+                if source[j] == '"':
+                    break
+                j += 1
+            if j >= pos:
+                return False
+            i = j + 1
+            continue
+        # Char literal ``'...'`` — ``\`` escapes.
+        if ch == "'":
+            j = i + 1
+            while j < n:
+                if source[j] == "\\":
+                    j += 2
+                    continue
+                if source[j] == "'":
+                    break
+                j += 1
+            if j >= pos:
+                return False
+            i = j + 1
+            continue
         i += 1
-    return quote is None
+    return True
+
+
+# ``head`` ends right before the ``.`` that precedes the receiver, so a
+# ``this.`` qualifier leaves ``this`` as the trailing token (the ``.`` is
+# stripped). ``\b`` guards against matching the tail of an identifier like
+# ``mything``.
+_THIS_PREFIX_RE = re.compile(r"\bthis\s*$")
+
+
+def _receiver_is_member_access(source: str, recv_start: int) -> bool:
+    """True if the receiver token starting at ``recv_start`` is a MEMBER ACCESS
+    on a foreign expression (``X.recv.GetChild(n)``) rather than the script's own
+    bare symbol. A receiver immediately preceded by ``.`` is a member of
+    something else and must NOT be treated as host-rooted — EXCEPT ``this.recv``,
+    where ``this`` is the host instance (so ``this.transform`` IS the bare host
+    ``transform``). Looks only at the text BEFORE the receiver, code-position
+    aware via the caller's match gate."""
+    # Walk back over the immediate ``.`` (with surrounding whitespace) preceding
+    # the receiver; if there is none, the receiver is bare (not a member access).
+    j = recv_start
+    k = j
+    while k > 0 and source[k - 1] in " \t":
+        k -= 1
+    if k == 0 or source[k - 1] != ".":
+        return False  # no leading dot -> bare receiver, host-rooted
+    # There IS a leading ``.`` -> a member access. Host-rooted only if the
+    # qualifier is exactly ``this`` (``this.transform`` == the host transform).
+    head = source[:k - 1]
+    return _THIS_PREFIX_RE.search(head) is None
 
 
 def _resolve_child(node: HostNode, ordinal: int) -> HostNode | None:
@@ -152,6 +230,10 @@ def _build_symbol_table(source: str, host_node: HostNode) -> dict[str, HostNode]
     ):
         for m in pat.finditer(source):
             if not _cs_pos_is_code(source, m.start()):
+                continue
+            # The receiver (group 2) must be a bare host symbol, not a member
+            # access on a foreign expression (``a.tBase.GetChild(0)``).
+            if _receiver_is_member_access(source, m.start(2)):
                 continue
             pending.append((m.group(1), m.group(2), int(m.group(3))))
 
@@ -254,6 +336,12 @@ def _resolve_script(source: str, host_node: HostNode) -> ChildRefScript | None:
             continue
         getchild_total += 1
         recv, ordinal = m.group(1), int(m.group(2))
+        # A receiver that is a MEMBER ACCESS on a foreign expression
+        # (``Camera.main.transform.GetChild(0)``, ``foo.transform.GetChild(0)``)
+        # is NOT the script's own host — abstain (counts toward getchild_total,
+        # produces no fact) so the backstop treats it as a coverage gap.
+        if _receiver_is_member_access(source, m.start(1)):
+            continue  # foreign member-access receiver — abstain (E9)
         recv_node = table.get(recv)
         if recv_node is None:
             continue  # receiver not transform-rooted — abstain (E9)
