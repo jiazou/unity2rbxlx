@@ -10,9 +10,18 @@ Re-baselined 2026-05-22 (68 upstream commits) and 2026-05-23 (9 more) — see "D
 >
 > **Gate superseded:** the blanket "hold all PRs until scene-runtime lands" is replaced by the per-file gating in `docs/design/scene-runtime-and-refactor-execution.md` — `scene_converter.py` (PR-G/PR-H) runs **in parallel now**; both collision-file splits gate behind **PR8**. The scene-runtime work itself is the **recut** (Slice T/H → PR6 → PR7 → PR8), not the original #122–#133 drafts.
 
+> **⚠️ 2026-06-11 — pack-split lane DROPPED (legacy retirement).** The converter is moving to
+> generic-only (`TODO.md` § "Legacy retirement"): `script_coherence_packs.py` + its test file are
+> slated for **deletion** once the retirement gates pass, so splitting them is wasted motion.
+> **PR-E0 / PR-E / PR-F are dropped; lane D disappears.** PR-B / PR-C / PR-D (pipeline) and
+> PR-G / PR-H (scene_converter) stand — with two ripples: PR-C's `cohere_scripts.py` extraction
+> becomes a thin move of a deletion candidate (don't invest in its internals), and PR-D's
+> `PipelineServices` should plan for `apply_scaffolding` to disappear (reinforces the existing
+> PR8 note).
+
 ## In one paragraph
 
-Eight PRs (PR-B through PR-H, plus PR-E0 ordering audit) reshape three mega-files (`pipeline.py` 4917 LOC, `script_coherence_packs.py` 5051 LOC, `scene_converter.py` 5542 LOC) into focused modules without behavior change. (PR-A — the `CLAUDE.md` trim — was absorbed by upstream PR #137/#138 and dropped.) **All PRs are held** until the scene-runtime-contract effort fully lands upstream: PR1/2/3a/3b/3c/4 plus the wiring-fix (#134) and classifier-v2 (#135) have merged; PR5-PR8 remain. Phase 1 PRs touch only non-`scene_converter.py` files but are still held to avoid two concurrent multi-PR efforts diluting review attention (user decision, reaffirmed 2026-05-23). Phase 2 is additionally blocked by the `scene_converter.py` lock. Total ~3 engineer-weeks once execution begins.
+Eight PRs (PR-B through PR-H, plus PR-E0 ordering audit) reshape three mega-files (`pipeline.py` 4917 LOC, `script_coherence_packs.py` 5051 LOC, `scene_converter.py` 5542 LOC) into focused modules without behavior change. (PR-A — the `CLAUDE.md` trim — was absorbed by upstream PR #137/#138 and dropped. **Update 2026-06-11:** the pack lane PR-E0/PR-E/PR-F is dropped too — `script_coherence_packs.py` is slated for deletion under legacy retirement, see banner — leaving five PRs, B/C/D/G/H, reshaping the two surviving mega-files.) **All PRs are held** until the scene-runtime-contract effort fully lands upstream: PR1/2/3a/3b/3c/4 plus the wiring-fix (#134) and classifier-v2 (#135) have merged; PR5-PR8 remain. Phase 1 PRs touch only non-`scene_converter.py` files but are still held to avoid two concurrent multi-PR efforts diluting review attention (user decision, reaffirmed 2026-05-23). Phase 2 is additionally blocked by the `scene_converter.py` lock. Total ~3 engineer-weeks once execution begins.
 
 ## Drift re-baseline
 
@@ -45,7 +54,7 @@ Material changes folded in:
 ## Eng-review decisions (locked 2026-05-21)
 
 1. **Dispatch:** PR-D replaces 49 `Pipeline` methods with `PHASE_FUNCS: dict[str, Callable]`. Per-phase methods deleted. Tests use new public `pipeline.run_phase(name)`.
-2. **PR-E shim:** explicit submodule imports — `from .packs import fps, doors, pickups, proximity, misc`. No `import *`.
+2. **PR-E shim:** explicit submodule imports — `from .packs import fps, doors, pickups, proximity, misc`. No `import *`. *(VOID 2026-06-11 — pack lane dropped, see banner.)*
 3. **Script-assembly split:** PR-D extracts the 15-helper grab bag into 5 themed modules now, not deferred.
 4. **Golden snapshot:** canonicalize-then-hash, scheme fully specified:
    - JSON document with **sorted keys**, but **list / sibling order PRESERVED** — parent/child hierarchy is load-bearing in the rbxlx writer (cf. `roblox/rbxlx_writer.py:810`, `core/roblox_types.py:118`); flat-sorting siblings erases real regressions.
@@ -59,7 +68,7 @@ Material changes folded in:
    - Config fields: `output_dir`, `skip_binary_rbxl`, `context_path`, `is_resume`, `fps_artifacts_at_init`.
    - Bound helper callables (the 8 cross-cutting helpers extracted from `class Pipeline`): `classify_storage`, `bind_scripts_to_parts`, `rehydrate_scripts_from_disk`, `inject_runtime_modules`, `generate_prefab_packages`, `collect_all_scripts`, `collect_method_warnings`, `apply_scaffolding`.
 8. **Test rewrites in PR-D:** 16+ sites calling `pipeline.<phase>()` rewrite to `pipeline.run_phase('<phase>')`.
-9. **PR-E0 prelude:** audit pack execution order on `origin/main`; add explicit `@patch_pack(after=...)` edges so the split can't reorder behavior. **27 packs as of 2026-05-22** (was 24; PR #139 added transform-child-indexing + door key-flag packs).
+9. **PR-E0 prelude:** audit pack execution order on `origin/main`; add explicit `@patch_pack(after=...)` edges so the split can't reorder behavior. **27 packs as of 2026-05-22** (was 24; PR #139 added transform-child-indexing + door key-flag packs). *(VOID 2026-06-11 — pack lane dropped, see banner.)*
 
 ## Per-PR done criteria (template)
 
@@ -80,13 +89,13 @@ Per-PR sections below list only additions to this template.
 | 1 | PR-B — Frozen-hash assertion on `test_offline_assembly.py` | 1 | 1 | — | tests |
 | 2 | PR-C — `write_output` → `phases/output/*` + `PipelineServices` | 1 | 3 | PR-B | pipeline |
 | 3 | PR-D — Pipeline dispatch table + 14 phase modules + test rewrites | 1 | 4 | PR-C | pipeline, tests |
-| 4 | PR-E0 — Pack ordering audit + `after=` edges (27 packs) | 1 | 1 | PR-B | coherence |
-| 5 | PR-E — Split `script_coherence_packs.py` | 1 | 2 | PR-E0 | coherence |
-| 6 | PR-F — Mirror split of `test_script_coherence_packs.py` | 1 | 1 | PR-E | tests |
+| — | ~~PR-E0 — Pack ordering audit~~ | — | — | — | **dropped 2026-06-11 — legacy retirement** |
+| — | ~~PR-E — Split `script_coherence_packs.py`~~ | — | — | — | **dropped 2026-06-11 — file slated for deletion** |
+| — | ~~PR-F — Mirror split of `test_script_coherence_packs.py`~~ | — | — | — | **dropped 2026-06-11 — follows PR-E** |
 | 7 | PR-G — Eliminate `_ctx()` (~58 sites, use grep) | 2 | 1.5 | scene-runtime landed | scene_converter |
 | 8 | PR-H — Split `scene_converter.py` → 11 modules | 2 | 4 | PR-G | scene_converter |
 
-After execution unblocks (scene-runtime-contract lands upstream) and PR-B has merged, lane C (PR-C → PR-D) and lane D (PR-E0 → PR-E → PR-F) can run in parallel worktrees. Phase 2 is strictly sequential.
+After execution unblocks (scene-runtime-contract lands upstream) and PR-B has merged, lane C (PR-C → PR-D) runs; lane D (the pack split) is dropped per the 2026-06-11 banner. Phase 2 is strictly sequential.
 
 ## PR detail
 
@@ -153,34 +162,13 @@ New `phases/services.py` with `PipelineServices` dataclass (decision #7). New `p
 
 **+ done criteria:** `pipeline.py` ≤ 800 LOC; `class Pipeline` ≤ 15 methods; `python -c "from converter.pipeline import Pipeline; from converter.phases import PHASE_FUNCS"` succeeds; from the `converter/` directory, `grep -rn 'pipeline\.\(parse\|extract_assets\|moderate_assets\|upload_assets\|convert_materials\|transpile_scripts\|convert_animations\|resolve_assets\|convert_scene\|write_output\)\s*(' tests/` returns zero matches.
 
-### PR-E0 — Pack ordering audit
+### ~~PR-E0 / PR-E / PR-F — pack ordering audit + pack split + test split~~ (DROPPED — legacy retirement, 2026-06-11)
 
-Dump current execution order on `origin/main`: `_topological_order(PatchPack._registry)` → checked-in `tests/fixtures/pack_execution_order.txt`. For every pack that detects against an earlier pack's post-rewrite shape (cf. `test_script_coherence_packs.py:894`, `TestProducerConsumerBindableEventGuard`), add `@patch_pack(after=('producer_name',))` to its decorator. New `TestPackOrderFrozenOnMain` asserts post-topo order matches the fixture. After PR-E0, registration order becomes irrelevant.
-
-### PR-E — Split `script_coherence_packs.py`
-
-New `converter/converter/coherence/`:
-
-| Module | Contents | ~LOC |
-|---|---|---:|
-| `__init__.py` | Explicit submodule imports trigger registration; re-exports `run_packs`, `PatchPack`, `patch_pack` | 15 |
-| `registry.py` | `PatchPack`, `patch_pack`, `_topological_order`, `run_packs` | 200 |
-| `helpers.py` | Cross-pack helpers + shared regexes (`_LUA_BLOCK_OPEN_RE`, `_TOUCH_CALLBACK_RE`, etc.) | 250 |
-| `packs/fps.py` | Weapon mount + `WEAPON_MOUNTS`, default controls, camera pitch, bullet physics + `_PICKUP_REPLACEMENT`, `_PICKUP_TOUCHED_*` | 1000 |
-| `packs/doors.py` | Global player lookup, AI rotation strip, tween open, module player attr + `_DOOR_GLOBAL_PLAYER_*_RE` | 600 |
-| `packs/pickups.py` | Remote event conversion, visual target, listener fanout + `_PICKUP_SETATTRIBUTE_RE`, `_PICKUP_HAS_ATTR_INJECTED_RE`, `_PICKUP_REMOTE_ALIAS_RE`, `_GETITEM_SYMBOL_RE` | 900 |
-| `packs/proximity.py` | Trigger stay polling, proximity fanout | 400 |
-| `packs/misc.py` | Template clone visibility (`_inject_template_clone_visibility`), LocalScript API shim (`_build_shim_source`, `_classify_api`), BindableEvent guard, self-destroying template guard + `_SELF_DESTROY_RE`, `_TEMPLATE_GUARD_*` | 700 |
-
-Existing `script_coherence_packs.py` (now 5051 LOC) → ~15-line back-compat shim per decision #2.
-
-**New packs to place (added by PR #139, 2026-05-22):** transform-child indexing → `packs/proximity.py` or a new `packs/transforms.py` if it doesn't fit; door key-flag → `packs/doors.py`. Confirm placement against the actual pack names during PR-E0.
-
-**+ done criteria:** No file in `coherence/` exceeds 1100 LOC (re-check `packs/fps.py` and `packs/pickups.py` against the +384 LOC growth — may need a 6th pack module); names assertion on **27** specific pack names (not just count); `TestPackOrderFrozenOnMain` still passes; `TODO.md` P1.a/P1.b/P1.c entries rewritten to point at new `coherence/packs/misc.py` locations.
-
-### PR-F — Mirror test split
-
-`tests/coherence/test_registry.py`, `test_packs_fps.py`, `test_packs_doors.py`, `test_packs_pickups.py`, `test_packs_proximity.py`, `test_packs_misc.py`. Delete `tests/test_script_coherence_packs.py`. Pure relocation. **+ done criteria:** `pytest tests/coherence/ -v` collects the same test count as before.
+The converter is going generic-only; `script_coherence_packs.py` and
+`tests/test_script_coherence_packs.py` are slated for **deletion** once the retirement gates
+pass (`TODO.md` § "Legacy retirement"). Splitting a file scheduled for deletion is wasted
+motion, so the entire lane (ordering audit, `coherence/` package split, mirror test split) is
+dropped. Full original plan for these three PRs: git history of this file (pre-2026-06-11).
 
 ### PR-G — Eliminate `_ctx()` in `scene_converter.py`
 
@@ -240,8 +228,7 @@ Old `scene_converter.py` → back-compat shim.
 | PR-C | Subphase order mutation | Frozen baseline |
 | PR-D | Phase-module import error / missing `services` field | Test collection + e2e |
 | PR-D | Test still calls deleted `pipeline.parse()` | Collection failure |
-| PR-E0 | Missing `after=` edge | `TestPackOrderFrozenOnMain` |
-| PR-E | Pack module not imported in `coherence/__init__.py` | Names assertion (27 specific names) |
+| ~~PR-E0 / PR-E~~ | — | dropped 2026-06-11 (legacy retirement) |
 | PR-G | Helper still references `_ctx()` after grep | No-global-state test |
 | PR-H | Circular import between `scene/` modules | Smoke import test |
 
@@ -249,7 +236,7 @@ No critical silent gaps.
 
 ## Next step
 
-When scene-runtime-contract PR5-PR8 merge into ntornow upstream (PR1-4 + 3c already landed): re-baseline file line numbers and the pack set (may drift further), then execute PR-B → PR-C → PR-D → PR-E0 → PR-E → PR-F. Phase 2 (PR-G → PR-H) follows. PR-A is dropped (absorbed upstream).
+When scene-runtime-contract PR5-PR8 merge into ntornow upstream (PR1-4 + 3c already landed): re-baseline file line numbers, then execute PR-B → PR-C → PR-D. Phase 2 (PR-G → PR-H) follows. PR-A is dropped (absorbed upstream); PR-E0/PR-E/PR-F are dropped (legacy retirement, 2026-06-11 — `script_coherence_packs.py` is deleted, not split).
 
 ---
 

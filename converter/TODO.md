@@ -115,9 +115,20 @@ cache. The items below are where code or docs are stale or wrong.
     HudControl binding) verified on a generic conversion.
   Then delete: `script_coherence_packs.py` + its test file, `--scaffolding=fps` +
   `converter/scaffolding/` + `_fps_artifacts_*` back-compat in `pipeline.py`, the
-  `detect_fps_game` autogen heuristic, and the legacy `scene_runtime_mode` branch. NOTE: this
-  moots the refactor plan's pack-split lane (PR-E0 → PR-E → PR-F in `docs/refactor_plan.md`)
-  — update that plan rather than splitting a file slated for deletion.
+  `detect_fps_game` autogen heuristic, and the legacy `scene_runtime_mode` branch.
+  `docs/refactor_plan.md` updated 2026-06-11: pack-split lane (PR-E0/E/F) dropped.
+
+- [ ] **P1 — Gate (c) execution: generic fidelity homes for the pack-covered gaps.** Status:
+  Turret child-index lowering is LANDED and wired (`child_index_lowering.lower_child_index`
+  called from `contract_pipeline`; reuses the `__unityChild` pack helper) — needs Studio
+  verification on a fresh generic conversion. HudControl now classifies
+  client/ModuleScript/ReplicatedStorage correctly (Slice H was stale per
+  `.harness/followups.md`); residual risk is runtime boot/binding (SceneRuntimeClient not
+  constructing the requireable client module, or `self.gameObject` not binding to the
+  ScreenGui) — if the canary shows a dead HUD, capture the real root cause, don't fix blind.
+  KNOWN_ISSUES § "Scene-runtime generic mode" is the running queue for further pack-covered
+  gaps found on generic conversions; new entries get deterministic-lowering or host-runtime
+  homes, never per-game packs.
 
 ## Materials & meshes
 
