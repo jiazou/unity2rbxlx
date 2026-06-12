@@ -704,12 +704,6 @@ def _canonical_receiver(source: str, recv: str, use_pos: int) -> str | None:
             break  # past the use site -> later bindings cannot be live here
         if not _cs_pos_is_code(source, m.start()):
             continue
-        # The seed LHS must be a BARE symbol, not the tail of a member access:
-        # ``other.cam = ...`` writes ANOTHER object's field, not the local ``cam``
-        # read at the GetChild. ``\b`` matches the boundary between a ``.`` member
-        # dot and ``cam``, so reject when the preceding char is that dot.
-        if m.start() > 0 and source[m.start() - 1] == ".":
-            continue
         nearest_start = m.start()
     if nearest_start == -1:
         return None  # no binding before the use site -> not seed-resolvable

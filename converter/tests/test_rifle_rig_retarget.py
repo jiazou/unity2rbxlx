@@ -16,6 +16,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from converter.child_ref_resolver import (  # noqa: E402
@@ -1676,6 +1678,11 @@ def test_r5_structural_balance_skips_block_comment_brackets(monkeypatch) -> None
     assert _structural_balance_ok(unbalanced) is False
 
 
+@pytest.mark.xfail(
+    reason="accepted residual (user 2026-06-12): foreign-member seed false-admit; "
+    "netted by S1b independent verifier; not fixed via C# regex",
+    strict=False,
+)
 def test_r6_member_write_does_not_seed_bare_cam(tmp_path: Path) -> None:
     # R6 BLOCKING (resolver:_canonical_receiver): ``other.cam = Camera.main.transform``
     # is a member write on ANOTHER object — it must NOT seed the bare local ``cam``
@@ -1702,6 +1709,29 @@ def test_r6_bare_local_seed_still_admits(tmp_path: Path) -> None:
         "  Transform cam; public Transform weaponSlot;\n"
         "  void Awake() {\n"
         "    cam = Camera.main.transform;\n"
+        "    weaponSlot = cam.GetChild(0);\n"
+        "  }\n}\n"
+    )
+    entry = _build(tmp_path, src, _fps_library())
+    assert entry is not None
+    assert entry.rig_facts == (
+        RigRootedRetargetFact(
+            field_name="weaponSlot", child_name="WeaponSlot", cam_receiver="cam"),
+    )
+    assert entry.resolved_total == 1
+
+
+def test_r7_this_dot_cam_field_seed_admits(tmp_path: Path) -> None:
+    # R7 (resolver:_canonical_receiver revert): ``this.cam = Camera.main.transform``
+    # is a SAME-OBJECT field seed for the bare local ``cam`` read at the GetChild —
+    # it must ADMIT. The round-6 member-dot seed filter wrongly false-rejected this
+    # (the ``.`` before ``cam`` looked like a foreign member write); reverting it
+    # restores the legitimate ``this.``-qualified field seed.
+    src = (
+        "public class Player : MonoBehaviour {\n"
+        "  Transform cam; public Transform weaponSlot;\n"
+        "  void Awake() {\n"
+        "    this.cam = Camera.main.transform;\n"
         "    weaponSlot = cam.GetChild(0);\n"
         "  }\n}\n"
     )
