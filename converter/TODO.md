@@ -45,8 +45,8 @@ cache. The items below are where code or docs are stale or wrong.
 - [ ] **P1 — Contract verifier ships shadow-mode against a fail-closed contract.**
   `scene-runtime-contract.md` promises fail-closed; `contract_verifier.py` "never fails the
   build" (only `FAIL_CLOSED_CHECKS` members can trip), and the status lives only in
-  `.harness/followups.md`. Either flip to enforced (PR6/PR8 territory per the recut plan) or
-  amend the contract doc + KNOWN_ISSUES so the docs stop overpromising.
+  `.harness/followups.md`. Flip to enforced (PR6/PR8 territory per the recut plan) — now also
+  gate (b) of legacy retirement below; until it lands, note shadow status in KNOWN_ISSUES.
 
 - [ ] **P1 — Output boundary doesn't sanitize foreign strings.** (a) `rbxlx_writer.py`
   `_add_string`/`_add_float` pass control chars (U+0000–001F) and inf/nan into XML — one NaN
@@ -100,39 +100,24 @@ cache. The items below are where code or docs are stale or wrong.
   hardcoded Quad/InOut at all four TweenInfo emit sites in `animation_converter.py` — Unity
   AnimationCurve easing is parsed but dropped.
 
-## Pipeline / runtime gaps
+## Legacy retirement (strategic direction, 2026-06-11)
 
-- [ ] **P1 — Door/weapon coherence-pack hardening** (PR #121 review, codex + Claude 2026-05-21):
-  - `_detect/_fix_door_module_player_lookup` covers 3 emit shapes + 3 Player-resolution paths
-    but has 1 fixture covering 1 shape — add 2 fixtures + a unit test on the attribute-name
-    regex.
-  - Tighten the door-helper regex `(?:get)?[pP]layer[Hh]as\w+` → `[Hh]as[A-Z]\w*`
-    (currently matches `playerHash`/`Hasher`).
-  - `_apply_weapon_mount` workspace fallback (no `_MainCameraRig`) does one `PivotTo` then
-    anchors — rifle freezes in world space on non-FPS projects. Emit a per-frame
-    `RenderStepped` follower in that branch + a no-rig fixture.
-  - `_equip_function_variants` is exact-spelling with no documented contract — add the
-    docstring constraint (single PascalCase verb-noun pair) + a registry-shape validator.
-
-- [ ] **P1 — Genre-genericness follow-ups** (PR #96 deferred, codex 2026-05-17) — non-FPS
-  projects may regress until these land:
-  - `localscript_api_shim` `_classify_api` treats any bare-identifier return as boolean →
-    non-boolean APIs (ammo, cooldowns) become "always false". Infer backing-literal type.
-  - Shim's `_resolveCharacter` falls back to `Players.LocalPlayer` → nil on server Scripts;
-    detect call-site context or rewrite call sites to pass `character`.
-  - `template_clone_visibility` fires on ANY `cloneTemplate(...)` and forces
-    Transparency/CanCollide/welds — narrow to weapon-slot-style consumers or gate on the
-    template's parts being invisible at clone time.
-  - Gate FPS-shaped transpiler rules (mouse-look, HRP camera, jumpSpeed) behind an explicit
-    first-person prelude; add genre-negative `run_packs()` fixtures (BoatAttack/RedRunner/
-    ChopChop-style sets assert zero pack fires).
-
-- [ ] **P2 — Persistent prefab/asset cache.** In-memory only today; needs a cache-schema design
-  pass first — see FUTURE_IMPROVEMENTS § "Persistent prefab/asset cache".
-
-- [ ] **P3 — Component-aware autogen injection.** Replace the heuristic `detect_fps_game` soft
-  hint with component-gated injection (e.g. Cinemachine bridge only when the scene has a
-  CinemachineVirtualCamera). History: PRs #66/#68 + scaffolding split — see TODO_archive.md.
+- [ ] **P1 — Retire legacy mode + the coherence-pack layer; generic is the only path forward.**
+  Decision 2026-06-11: stop hardening legacy. Pack bug-fix/fixture work (door/weapon packs,
+  `localscript_api_shim`, `template_clone_visibility`, genre-negative pack fixtures — the
+  PR #96/#121 follow-ups formerly tracked here) is dropped; semantic-fidelity jobs relocate to
+  the deterministic lowering layer / host-runtime services instead (the Turret/HudControl
+  pattern — KNOWN_ISSUES § "Scene-runtime generic mode"). Gates before deleting legacy:
+  - (a) generic parity on the e2e fixture set — player-bind Phase 2 (`self.host.player`
+    authority, then `REQUIRE_PLAYER_BIND` 0→1 in `test.yml`);
+  - (b) contract verifier flipped fail-closed (Architecture section above);
+  - (c) deterministic-lowering homes for the known pack-covered gaps (Turret child-index,
+    HudControl binding) verified on a generic conversion.
+  Then delete: `script_coherence_packs.py` + its test file, `--scaffolding=fps` +
+  `converter/scaffolding/` + `_fps_artifacts_*` back-compat in `pipeline.py`, the
+  `detect_fps_game` autogen heuristic, and the legacy `scene_runtime_mode` branch. NOTE: this
+  moots the refactor plan's pack-split lane (PR-E0 → PR-E → PR-F in `docs/refactor_plan.md`)
+  — update that plan rather than splitting a file slated for deletion.
 
 ## Materials & meshes
 
@@ -189,18 +174,17 @@ cache. The items below are where code or docs are stale or wrong.
 
 - [ ] **P1 — Storage classifier's ModuleScript path is fragile and under-tested.**
   Script/LocalScript route by simple type rules; ModuleScripts route by a regex-scanned
-  caller-graph heuristic that (a) ignores the module's own client/server API surface, (b) is
-  poisoned by the synthesized ServerStorage require-fallback string, and (c) is skipped by both
-  correction passes. SimpleFPS (76% Script) routes around it; module-heavy trash-dash (88%
-  ModuleScript) fell over. Fix direction: inspect the module's own API surface, extend
-  correction passes to modules, harden the call graph, add a module-heavy fixture project.
-  ALSO evaluate `Script.RunContext=Client` (runs from anywhere replicated, incl.
-  ReplicatedStorage — purpose-built for world-attached client behavior, the path's hardest
-  case); constraint: never in Starter containers (double-execution).
+  caller-graph heuristic that ignores the module's own client/server API surface and is
+  poisoned by the synthesized ServerStorage require-fallback string. SimpleFPS (76% Script)
+  routes around it; module-heavy trash-dash (88% ModuleScript) fell over. Fix direction
+  (generic-first): route modules from topology `module_domain` evidence + the module's own
+  API surface, not the legacy caller-graph regex; evaluate `Script.RunContext=Client` (runs
+  from anywhere replicated, incl. ReplicatedStorage — purpose-built for world-attached client
+  behavior, the path's hardest case; never in Starter containers — double-execution); add a
+  module-heavy fixture project.
 
-- [ ] **P2 — Retire genre-specific scaffolding** (`--scaffolding=fps`, `converter/scaffolding`,
-  `_fps_artifacts_*` back-compat in `pipeline.py`) once no live flow relies on it — cuts
-  against the genre-agnostic direction.
+- [ ] **P2 — Persistent prefab/asset cache.** In-memory only today; needs a cache-schema design
+  pass first — see FUTURE_IMPROVEMENTS § "Persistent prefab/asset cache".
 
 - [ ] **P2 — Three-flow byte-equivalence:** `test_three_flows_produce_identical_rbxlx` is
   xfailed — the in-memory u2r.py path inlines scripts via `_convert_prefab_node` while the
