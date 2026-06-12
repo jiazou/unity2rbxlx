@@ -81,6 +81,22 @@ def lower_rifle_rig_retarget(
         rig_facts = _rig_facts_for(script, child_ref_map)
         if not rig_facts:
             continue
+        # >1 rig fact on ONE script: the single-dict carrier (§1.5) can represent
+        # exactly one binding, and the design (§1.5, edge 9) frames multi-fact as a
+        # two-SCRIPTS case (the corpus is one-fact-per-script). Rather than silently
+        # keep only the LAST fact's carrier (dropping the earlier bindings'
+        # discharge from the verifier), FAIL CLOSED: stamp a single overflow
+        # carrier (present=False, multi_fact=True) and ABSTAIN on all edits, so the
+        # verifier fail-closes LOUD instead of shipping an unverifiable binding.
+        if len(rig_facts) > 1:
+            first = rig_facts[0]
+            script.rig_binding = {
+                "field": first.field_name,
+                "child": first.child_name,
+                "present": False,
+                "multi_fact": True,
+            }
+            continue
         # One carrier per script. Stamp from the FACT SET (default present=False)
         # so a script whose lowering ABSTAINS still carries the binding -> the
         # verifier fail-closes loud rather than abstaining silently.
@@ -100,14 +116,22 @@ def lower_rifle_rig_retarget(
                     new_src, _neutralized = _neutralize_assignment(
                         new_src, field, child
                     )
-                    if _binding_discharged(new_src, field, child):
+                    # Re-check Luau syntax on the FINAL source AFTER ALL rewrites
+                    # (inject + read-rewrite + neutralize) — a read-rewrite or a
+                    # neutralize can corrupt the module (e.g. drop a closing
+                    # ``end``) AFTER the post-inject check, and ``_binding_discharged``
+                    # is shape-only, so it would stamp present=True on broken Luau.
+                    # If the FINAL source fails to parse, abstain/revert.
+                    if not _luau_syntax_ok(new_src):
+                        script.luau_source = original  # never ship unloadable Luau
+                    elif _binding_discharged(new_src, field, child):
                         script.luau_source = new_src
                         changed = True
                     else:
                         # Discharge could not be confirmed on the final source
-                        # (e.g. a syntax-reverted inject, or reads/write the
-                        # lowering couldn't anchor). Abstain: leave the script
-                        # unedited so the verifier sees the un-discharged binding.
+                        # (e.g. reads/write the lowering couldn't anchor). Abstain:
+                        # leave the script unedited so the verifier sees the
+                        # un-discharged binding.
                         script.luau_source = original
             # Re-derive discharge from the FINAL committed source (independent of
             # the in-flight locals): True only when the resolver method + rewritten
@@ -259,6 +283,10 @@ def _rewrite_field_reads(
             j -= 1
         if j >= 0 and source[j] == ".":
             continue  # x.self.<field> -> not a bare self read
+        # Shadowed-``self`` guard: abstain if ``self`` here is a local/param shadow
+        # (a closure ``function(self)`` or a ``local self``), NOT the colon-receiver.
+        if _self_is_shadowed_at(source, start):
+            continue  # shadowed self -> wrong object -> abstain
         # NOT the assignment LHS: a single ``=`` (not ``==``) immediately after.
         after = m.end()
         a = after
@@ -278,6 +306,100 @@ def _rewrite_field_reads(
         rewritten += 1
     out.append(source[pos:])
     return "".join(out), rewritten
+
+
+# Block keywords that OPEN a lexical scope and are closed by ``end``. ``if``/
+# ``elseif``/``else``/``while``/``for`` headers and ``do``/``function`` bodies all
+# nest under one ``end``; ``repeat`` closes with ``until`` (handled separately).
+_BLOCK_OPEN_RE = re.compile(
+    r"\b(function|do|then|repeat)\b"
+)
+_BLOCK_TOKEN_RE = re.compile(
+    r"\b(function|if|for|while|do|then|repeat|until|end|local|elseif)\b"
+)
+# A ``function`` whose parameter list contains a bare ``self`` parameter — a
+# nested closure that SHADOWS the method receiver (``function(self)`` /
+# ``function foo(self, x)``).
+_FUNCTION_SELF_PARAM_RE = re.compile(
+    r"\bfunction\b[^\(]*\(\s*([^)]*)\)"
+)
+
+
+def _self_is_shadowed_at(source: str, pos: int) -> bool:
+    """True if the ``self`` token at ``pos`` resolves to a SHADOWED binding — a
+    ``local self`` or a ``function(... self ...)`` parameter that is NOT the
+    enclosing ``function <Class>:<method>()`` colon-receiver — in scope at ``pos``.
+
+    Walks the lexical block structure outward from the nearest enclosing
+    colon-method declaration to ``pos`` (code-position-aware), tracking block
+    depth. A shadowing ``self`` introduced at some depth shadows the read iff that
+    depth is still OPEN at ``pos``. The colon-method's implicit ``self`` is the
+    real receiver and never counts as a shadow."""
+    # The enclosing colon-method's body start (its receiver is the real ``self``).
+    method_body_start = 0
+    for m in _FUNCTION_METHOD_RE.finditer(source):
+        if m.start() >= pos:
+            break
+        if not _luau_pos_is_code(source, m.start()):
+            continue
+        if _luau_pos_in_long_bracket(source, m.start()):
+            continue
+        method_body_start = m.end()  # after the ``(`` of the colon-method header
+
+    # Scan from the colon-method body to ``pos``, tracking the lexical block depth
+    # and the depths at which a shadowing ``self`` was introduced. ``depth`` 0 is
+    # the colon-method body itself (its ``self`` is the receiver).
+    depth = 0
+    shadow_depths: list[int] = []  # depths whose block introduced a ``self`` shadow
+    i = method_body_start
+    n = len(source)
+    while i < pos:
+        if not _luau_pos_is_code(source, i) or _luau_pos_in_long_bracket(source, i):
+            i += 1
+            continue
+        tok = _BLOCK_TOKEN_RE.match(source, i)
+        if tok is None:
+            # A ``local self`` declaration shadows the receiver in the CURRENT block.
+            decl = re.match(r"local\s+self\b", source[i:])
+            if decl is not None and _luau_pos_is_code(source, i):
+                shadow_depths.append(depth)
+            i += 1
+            continue
+        word = tok.group(1)
+        if word == "function":
+            # Does this function declare a ``self`` parameter? If so, its BODY
+            # (depth+1) shadows the receiver.
+            fm = _FUNCTION_SELF_PARAM_RE.match(source, i)
+            params = fm.group(1) if fm else ""
+            has_self_param = any(
+                p.strip() == "self" for p in params.split(",")
+            )
+            depth += 1
+            if has_self_param:
+                shadow_depths.append(depth)
+            i = (fm.end() if fm else tok.end())
+            continue
+        if word in ("do", "then", "repeat"):
+            depth += 1
+            i = tok.end()
+            continue
+        if word in ("end", "until"):
+            shadow_depths[:] = [d for d in shadow_depths if d < depth]
+            depth -= 1
+            i = tok.end()
+            continue
+        if word == "local":
+            decl = re.match(r"local\s+self\b", source[i:])
+            if decl is not None:
+                shadow_depths.append(depth)
+            i = tok.end()
+            continue
+        # ``if``/``for``/``while``/``elseif`` headers don't open the block until
+        # their ``do``/``then``; skip the keyword and continue.
+        i = tok.end()
+    # ``self`` at ``pos`` is shadowed iff a shadow was introduced at a depth still
+    # open here.
+    return any(d <= depth for d in shadow_depths)
 
 
 def _enclosing_method(source: str, pos: int) -> str | None:
@@ -479,6 +601,8 @@ def _has_surviving_field_read(source: str, field: str) -> bool:
             j -= 1
         if j >= 0 and source[j] == ".":
             continue  # x.self.<field> -> not a bare read
+        if _self_is_shadowed_at(source, start):
+            continue  # shadowed self -> foreign object, not this script's consumer
         a = m.end()
         while a < len(source) and source[a] in " \t":
             a += 1

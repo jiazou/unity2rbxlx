@@ -523,75 +523,109 @@ def _canon_key(path: Path) -> str:
 _CAMERA_MAIN_TRANSFORM = "Camera.main.transform"
 
 
+def _owning_node_collection(
+    host_node: HostNode,
+    parsed_scenes: list[ParsedScene] | None,
+    prefab_library: PrefabLibrary | None,
+) -> list[HostNode] | None:
+    """The full node list of the scene OR prefab template the ``host_node`` lives
+    in (matched by object identity). None if the host cannot be located in any
+    parsed collection (the caller then abstains — it cannot scope uniqueness)."""
+    for scene in parsed_scenes or ():
+        if scene is None:
+            continue
+        nodes = list(getattr(scene, "all_nodes", {}).values())
+        if any(node is host_node for node in nodes):
+            return nodes
+    if prefab_library is not None:
+        for template in getattr(prefab_library, "prefabs", []) or ():
+            nodes_p: list[PrefabNode] = []
+            _walk_prefab(getattr(template, "root", None), nodes_p)
+            if any(node is host_node for node in nodes_p):
+                return list(nodes_p)
+    return None
+
+
 def _main_camera_node(
     host_node: HostNode,
     parsed_scenes: list[ParsedScene] | None,
     prefab_library: PrefabLibrary | None,
 ) -> HostNode | None:
-    """The UNIQUE parsed node tagged ``MainCamera`` in the scene/prefab the host
-    lives in. Returns None if absent or non-unique (>1) — abstain
+    """The UNIQUE parsed node tagged ``MainCamera`` in the SCENE/PREFAB the host
+    lives in (scoped by ``host_node``'s owning collection — codex MAJOR). Returns
+    None if absent or non-unique (>1) WITHIN that scope — abstain
     (E-no-tag / E-non-unique).
 
-    Walks the SAME full-fidelity collections ``_node_by_cs_path`` walks
-    (``scene.all_nodes`` + every prefab template's node tree), filtering on
-    ``tag == "MainCamera"`` — the same upstream signal ``scene_converter`` uses to
-    stamp ``_MainCameraRig`` (mode-independent). ``host_node`` is unused for the
-    lookup itself (the tag is scene-/library-global), kept in the signature so a
-    future per-scene scoping can narrow without a call-site change."""
-    found: list[HostNode] = []
-    for scene in parsed_scenes or ():
-        if scene is None:
-            continue
-        for node in getattr(scene, "all_nodes", {}).values():
-            if getattr(node, "tag", "") == "MainCamera":
-                found.append(node)
-    if prefab_library is not None:
-        for template in getattr(prefab_library, "prefabs", []) or ():
-            nodes: list[PrefabNode] = []
-            _walk_prefab(getattr(template, "root", None), nodes)
-            for node in nodes:
-                if getattr(node, "tag", "") == "MainCamera":
-                    found.append(node)
+    Filters on ``tag == "MainCamera"`` — the same upstream signal
+    ``scene_converter`` uses to stamp ``_MainCameraRig`` (mode-independent). The
+    uniqueness check is SCOPED to the host's owning scene/prefab, so an unrelated
+    MainCamera-tagged node in a DIFFERENT scene/prefab no longer suppresses the
+    fact (silent drop). If the host cannot be located in any parsed collection,
+    abstain (no scope to assert uniqueness within)."""
+    collection = _owning_node_collection(host_node, parsed_scenes, prefab_library)
+    if collection is None:
+        return None  # host not locatable -> cannot scope uniqueness -> abstain
+    found = [n for n in collection if getattr(n, "tag", "") == "MainCamera"]
     if len(found) != 1:
         return None  # zero -> E-no-tag; >1 -> E-non-unique; both abstain
     return found[0]
 
 
-def _canonical_receiver(source: str, recv: str) -> str | None:
+def _canonical_receiver(source: str, recv: str, use_pos: int) -> str | None:
     """Resolve the receiver-expression text ``recv`` (group 2 of
-    ``_CS_CAM_GETCHILD_RE``) to its canonical receiver chain for the rig path.
+    ``_CS_CAM_GETCHILD_RE``) to its canonical receiver chain for the rig path,
+    AS SEEN AT the GetChild use site ``use_pos``.
 
     Returns the literal ``Camera.main.transform`` iff ``recv`` roots there —
     either:
       - the DIRECT form: ``recv`` is EXACTLY ``Camera.main.transform`` (so
         ``weaponSlot = Camera.main.transform.GetChild(0)`` is admitted even with
         no cam-symbol seed), OR
-      - a per-script SYMBOL whose seed definition is EXACTLY
-        ``<sym> = Camera.main.transform`` (one hop).
+      - a per-script SYMBOL whose NEAREST PRECEDING binding before ``use_pos`` is
+        EXACTLY ``<sym> = Camera.main.transform`` (one hop, anchored to the use
+        site by scope/order — NOT any file-wide occurrence).
     Returns None for any foreign chain (``enemy.cam``, ``other.cam.transform``, a
-    bare symbol with no such seed). EXACT match, NOT ``endswith``/substring."""
+    bare symbol with no such seed). EXACT match, NOT ``endswith``/substring.
+
+    Anchored to ``use_pos`` (codex BLOCKING): a later/unrelated
+    ``cam = Camera.main.transform`` after the GetChild does NOT admit when the
+    binding live AT the GetChild is foreign (``cam = enemy.transform``). The seed
+    is the LAST ``<sym> = <rhs>`` strictly before ``use_pos``; it admits iff that
+    nearest preceding binding is exactly ``Camera.main.transform``."""
     if recv == _CAMERA_MAIN_TRANSFORM:
         return _CAMERA_MAIN_TRANSFORM
     # ``recv`` must be a bare symbol (no dot) to be seed-resolvable; a dotted
     # foreign chain (``enemy.cam``) is rejected outright.
     if "." in recv:
         return None
-    # One-hop seed lookup: ``<recv> = Camera.main.transform`` at a code position.
+    # Find the NEAREST PRECEDING binding of ``recv`` before the use site — any
+    # ``<recv> = <rhs>`` (not ``==``) at a code position with start < use_pos.
+    # Whichever is last wins (it is the binding live at the GetChild line).
+    any_assign_re = re.compile(r"\b" + re.escape(recv) + r"\s*=(?!=)")
+    nearest_start = -1
+    for m in any_assign_re.finditer(source):
+        if m.start() >= use_pos:
+            break  # past the use site -> later bindings cannot be live here
+        if not _cs_pos_is_code(source, m.start()):
+            continue
+        nearest_start = m.start()
+    if nearest_start == -1:
+        return None  # no binding before the use site -> not seed-resolvable
+    # Is that nearest preceding binding EXACTLY ``<recv> = Camera.main.transform``?
     seed_re = re.compile(
         r"\b" + re.escape(recv) + r"\s*=\s*"
         + re.escape(_CAMERA_MAIN_TRANSFORM) + r"\b"
     )
-    for m in seed_re.finditer(source):
-        if not _cs_pos_is_code(source, m.start()):
-            continue
-        # The RHS must be EXACTLY Camera.main.transform (not a longer chain like
-        # Camera.main.transform.parent). The matcher's ``\b`` after the literal
-        # already prevents ``...transformX``; reject a trailing ``.`` member.
-        end = m.end()
-        if end < len(source) and source[end] == ".":
-            continue  # longer chain -> not the exact one-hop seed
-        return _CAMERA_MAIN_TRANSFORM
-    return None
+    m = seed_re.match(source, nearest_start)
+    if m is None:
+        return None  # the live binding is something else (e.g. enemy.transform)
+    # The RHS must be EXACTLY Camera.main.transform (not a longer chain like
+    # Camera.main.transform.parent). The matcher's ``\b`` after the literal
+    # already prevents ``...transformX``; reject a trailing ``.`` member.
+    end = m.end()
+    if end < len(source) and source[end] == ".":
+        return None  # longer chain -> not the exact one-hop seed
+    return _CAMERA_MAIN_TRANSFORM
 
 
 def _lhs_is_bare_field(source: str, field_start: int, full_lhs: str) -> str | None:
@@ -637,7 +671,7 @@ def _resolve_rig_facts(
         field = _lhs_is_bare_field(source, m.start(1), m.group(1))
         if field is None:
             continue  # foreign member-access LHS -> abstain
-        canon = _canonical_receiver(source, m.group(2))
+        canon = _canonical_receiver(source, m.group(2), m.start())
         if canon != _CAMERA_MAIN_TRANSFORM:
             continue  # receiver does not root at Camera.main.transform -> abstain
         ordinal = int(m.group(3))

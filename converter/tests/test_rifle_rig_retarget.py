@@ -625,3 +625,220 @@ def test_prerewrite_child_index_no_double_count_with_host_facts(tmp_path: Path) 
     )
     assert entry is not None
     assert entry.resolved_total == len(entry.facts) + len(entry.rig_facts)
+
+
+# === round-2 P1 fixes =======================================================
+
+
+def test_p1_final_syntax_check_after_rewrites_stamps_false() -> None:
+    # P1 (codex BLOCKING): the Luau syntax re-check must run AFTER ALL rewrites
+    # (inject + read-rewrite + neutralize), not just after inject. Here the
+    # neutralize swallows the inline ``if ... then ... end``'s closing ``end``
+    # (the RHS span runs to the newline), producing UNLOADABLE Luau — yet the
+    # shape-only ``_binding_discharged`` would stamp present=True. The final
+    # syntax gate must catch it -> abstain/revert -> present=False.
+    src = (
+        "function Player:Awake()\n"
+        "    if self.cam then self.weaponSlot = self.cam:GetChildren()[1] end\n"
+        "end\n\n"
+        "function Player:GetRifle()\n"
+        "    return pivotOf(self.weaponSlot)\n"
+        "end\n\n"
+        "return Player\n"
+    )
+    s = _Script(src)
+    n = lower_rifle_rig_retarget([s], _rig_map())
+    assert n == 0  # abstained — never shipped broken Luau
+    assert s.rig_binding == {
+        "field": "weaponSlot", "child": "WeaponSlot", "present": False,
+    }
+    # Source reverted to the original (camera-child write intact for the verifier).
+    assert "self.cam:GetChildren()[1]" in s.luau_source
+    assert "_resolveWeaponSlot" not in s.luau_source
+    # If luau-analyze is installed, prove the would-be FINAL source is unloadable
+    # while the post-INJECT-only source parses (so only the FINAL gate catches it).
+    if luau_analyze_path():
+        from converter.rifle_rig_retarget_lowering import (
+            _inject_resolver_method,
+            _neutralize_assignment,
+            _rewrite_field_reads,
+        )
+        ns, inj = _inject_resolver_method(src, "Player", "WeaponSlot", "weaponSlot")
+        assert inj and syntax_errors_for_source(ns) == []  # post-inject parses
+        ns, _ = _rewrite_field_reads(ns, "weaponSlot", "_resolveWeaponSlot")
+        ns, _ = _neutralize_assignment(ns, "weaponSlot", "WeaponSlot")
+        assert syntax_errors_for_source(ns) != []  # FINAL source is unloadable
+
+
+def test_p4_unrelated_main_camera_in_other_prefab_does_not_suppress(
+    tmp_path: Path,
+) -> None:
+    # P4 (codex MAJOR): an unrelated MainCamera-tagged node in a DIFFERENT
+    # prefab/scene must NOT suppress the host's rig fact (the uniqueness check is
+    # scoped to the host's owning scene/prefab, not global).
+    cam = _pnode("MainCamera", tag="MainCamera", children=[_pnode("WeaponSlot")])
+    player = _pnode("Player", children=[cam], comp_guid=_GUID)
+    t1 = PrefabTemplate(prefab_path=Path("/p/Player.prefab"),
+                        name="Player", root=player)
+    # A second, unrelated prefab elsewhere ALSO carries a MainCamera tag.
+    other_cam = _pnode("MainCamera", tag="MainCamera", children=[_pnode("Slot")])
+    other = _pnode("Enemy", children=[other_cam])
+    t2 = PrefabTemplate(prefab_path=Path("/p/Enemy.prefab"),
+                        name="Enemy", root=other)
+    lib = PrefabLibrary(prefabs=[t1, t2])
+    src = (
+        "public class Player : MonoBehaviour {\n"
+        "  public Transform weaponSlot;\n"
+        "  void Awake() { weaponSlot = Camera.main.transform.GetChild(0); }\n}\n"
+    )
+    entry = _build(tmp_path, src, lib)
+    assert entry is not None
+    assert entry.rig_facts == (
+        RigRootedRetargetFact(field_name="weaponSlot", child_name="WeaponSlot"),
+    )
+
+
+def test_p4_non_unique_within_owning_prefab_still_abstains(tmp_path: Path) -> None:
+    # The scoping does NOT weaken the in-scope uniqueness gate: two MainCamera
+    # tags WITHIN the host's own prefab still abstain.
+    cam1 = _pnode("MainCamera", tag="MainCamera", children=[_pnode("WeaponSlot")])
+    cam2 = _pnode("MainCamera2", tag="MainCamera", children=[_pnode("WeaponSlot")])
+    player = _pnode("Player", children=[cam1, cam2], comp_guid=_GUID)
+    lib = PrefabLibrary(prefabs=[PrefabTemplate(
+        prefab_path=Path("/p/Player.prefab"), name="Player", root=player)])
+    src = (
+        "public class Player : MonoBehaviour {\n"
+        "  public Transform weaponSlot;\n"
+        "  void Awake() { weaponSlot = Camera.main.transform.GetChild(0); }\n}\n"
+    )
+    entry = _build(tmp_path, src, lib)
+    assert entry is not None
+    assert entry.rig_facts == ()
+
+
+def test_p2_seed_anchored_to_getchild_site_not_filewide(tmp_path: Path) -> None:
+    # P2 (codex BLOCKING): a file-wide ``cam = Camera.main.transform`` seed that is
+    # NOT the binding live AT the GetChild site must NOT admit a rig fact. Here the
+    # binding live at ``weaponSlot = cam.GetChild(0)`` is ``cam = enemy.transform``
+    # (foreign); a LATER ``cam = Camera.main.transform`` must not back-admit it.
+    src = (
+        "public class Player : MonoBehaviour {\n"
+        "  Transform cam; public Transform weaponSlot; Enemy enemy;\n"
+        "  void Awake() {\n"
+        "    cam = enemy.transform;\n"
+        "    weaponSlot = cam.GetChild(0);\n"
+        "    cam = Camera.main.transform;\n"
+        "  }\n}\n"
+    )
+    entry = _build(tmp_path, src, _fps_library())
+    assert entry is not None
+    assert entry.rig_facts == ()  # foreign live binding at the use site -> abstain
+
+
+def test_p2_rebind_to_foreign_before_use_abstains(tmp_path: Path) -> None:
+    # The NEAREST PRECEDING binding wins: a Camera.main seed REBOUND to a foreign
+    # receiver before the GetChild abstains.
+    src = (
+        "public class Player : MonoBehaviour {\n"
+        "  Transform cam; public Transform weaponSlot; Enemy enemy;\n"
+        "  void Awake() {\n"
+        "    cam = Camera.main.transform;\n"
+        "    cam = enemy.transform;\n"
+        "    weaponSlot = cam.GetChild(0);\n"
+        "  }\n}\n"
+    )
+    entry = _build(tmp_path, src, _fps_library())
+    assert entry is not None
+    assert entry.rig_facts == ()
+
+
+def test_p3_shadowed_self_closure_not_rewritten() -> None:
+    # P3 (both voices, h.4 half): a ``self`` shadowed by a closure parameter must
+    # NOT be rewritten (wrong-object bind); only the real colon-receiver read is.
+    src = (
+        "function Player:GetRifle()\n"
+        "    local fn = function(self) return self.weaponSlot end\n"
+        "    return self.weaponSlot\n"
+        "end\n\n"
+        "return Player\n"
+    )
+    s = _Script(src)
+    lower_rifle_rig_retarget([s], _rig_map())
+    out = s.luau_source
+    # The shadowed read inside the closure is LEFT (its self is a foreign param).
+    assert "function(self) return self.weaponSlot end" in out
+    # The real colon-receiver read IS rewritten.
+    assert "return self:_resolveWeaponSlot()" in out
+
+
+def test_p3_shadowed_local_self_not_rewritten() -> None:
+    # A ``local self`` in an inner block shadows the receiver for reads in that
+    # block; reads OUTSIDE the shadow's scope are still rewritten.
+    src = (
+        "function Player:GetRifle()\n"
+        "    do\n"
+        "        local self = other\n"
+        "        local x = self.weaponSlot\n"
+        "    end\n"
+        "    return self.weaponSlot\n"
+        "end\n\n"
+        "return Player\n"
+    )
+    s = _Script(src)
+    lower_rifle_rig_retarget([s], _rig_map())
+    out = s.luau_source
+    assert "local x = self.weaponSlot" in out  # shadowed -> left
+    assert "return self:_resolveWeaponSlot()" in out  # real receiver -> rewritten
+
+
+def test_p3_shadowed_self_mirror_in_surviving_field_read() -> None:
+    # The mirror guard: a shadowed-self read must NOT count as a surviving consumer
+    # read against discharge (so a script with ONLY a closure-self read + a real
+    # rewritten read still discharges, and a stamp is never inflated by the shadow).
+    from converter.rifle_rig_retarget_lowering import _has_surviving_field_read
+    # After lowering the corpus-style closure case: the closure read survives by
+    # design (it's foreign), but it must not block discharge.
+    rewritten = (
+        "function Player:GetRifle()\n"
+        "    local fn = function(self) return self.weaponSlot end\n"
+        "    return self:_resolveWeaponSlot()\n"
+        "end\n"
+    )
+    # Only the foreign closure read remains; it is NOT a surviving consumer read.
+    assert _has_surviving_field_read(rewritten, "weaponSlot") is False
+
+
+def test_p5_multi_rig_fact_per_script_fails_closed() -> None:
+    # P5 (codex MAJOR / claude MINOR): a script bearing >1 rig fact must NOT
+    # silently keep only the last. The single-dict carrier fails closed
+    # (present=False, multi_fact=True) and the lowering abstains on all edits.
+    src = (
+        "function Player:Awake()\n"
+        "    self.weaponSlot = self.cam:GetChildren()[1]\n"
+        "    self.shieldSlot = self.cam:GetChildren()[2]\n"
+        "end\n\n"
+        "function Player:GetRifle()\n"
+        "    return pivotOf(self.weaponSlot) + pivotOf(self.shieldSlot)\n"
+        "end\n\n"
+        "return Player\n"
+    )
+    s = _Script(src)
+    multi_map = {"/proj/Player.cs": ChildRefScript(
+        facts=(),
+        getchild_total=2,
+        resolved_total=2,
+        rig_facts=(
+            RigRootedRetargetFact(field_name="weaponSlot", child_name="WeaponSlot"),
+            RigRootedRetargetFact(field_name="shieldSlot", child_name="ShieldSlot"),
+        ),
+    )}
+    n = lower_rifle_rig_retarget([s], multi_map)
+    assert n == 0  # abstained on all edits — never an unverifiable partial discharge
+    assert s.rig_binding == {
+        "field": "weaponSlot", "child": "WeaponSlot",
+        "present": False, "multi_fact": True,
+    }
+    # No edits applied — both camera-child writes survive for the loud fail-close.
+    assert "self.cam:GetChildren()[1]" in s.luau_source
+    assert "self.cam:GetChildren()[2]" in s.luau_source
+    assert "_resolveWeaponSlot" not in s.luau_source
