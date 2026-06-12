@@ -179,25 +179,69 @@ def _cs_pos_is_code(source: str, pos: int) -> bool:
 # ``(?:^|...)`` anchors the start so ``mygameObject`` / ``a.gameObject`` are
 # rejected; ``\Z`` anchors the end at the receiver. Order longest-first so the
 # two-token ``this.gameObject`` form is recognized before a bare ``gameObject``.
-_HOST_SELF_HEAD_RES = (
-    re.compile(r"(?:^|[^\w.])\s*this\s*\.\s*gameObject\s*\Z"),
+#
+# Split into two groups by SHADOWABILITY: ``this`` and ``base`` are C# keywords
+# (cannot be shadowed by a local/param) so their forms are ALWAYS host-self;
+# ``gameObject`` is an inherited MonoBehaviour MEMBER that a local/parameter can
+# shadow, so the ``gameObject``-bearing forms (bare ``gameObject`` and
+# ``this.gameObject``) only count as host-self when the script does NOT declare a
+# shadowing local/param named ``gameObject``.
+_HOST_SELF_KEYWORD_HEAD_RES = (
     re.compile(r"(?:^|[^\w.])\s*this\s*\Z"),
-    re.compile(r"(?:^|[^\w.])\s*gameObject\s*\Z"),
     re.compile(r"(?:^|[^\w.])\s*base\s*\Z"),
 )
+_HOST_SELF_GAMEOBJECT_HEAD_RES = (
+    re.compile(r"(?:^|[^\w.])\s*this\s*\.\s*gameObject\s*\Z"),
+    re.compile(r"(?:^|[^\w.])\s*gameObject\s*\Z"),
+)
+
+# Shadow-declaration matchers for an inherited member that a local/parameter can
+# shadow. ``{ident}`` is interpolated per identifier (``gameObject`` |
+# ``transform``). Each matches a declaration TEXTUALLY (code positions only, via
+# ``_cs_pos_is_code``): a typed/`var` local (``GameObject gameObject =`` |
+# ``var gameObject =`` | ``Transform transform;``) or a typed parameter
+# (``GameObject gameObject`` followed by ``,`` or ``)`` — the param-list shapes).
+# Conservative: a single matching declaration ANYWHERE disables the alias for the
+# whole script (bias to the safe ABSTAIN direction).
+def _shadow_decl_res(ident: str) -> tuple[re.Pattern[str], ...]:
+    i = re.escape(ident)
+    return (
+        # typed local / field / param-with-initializer / param followed by , or )
+        re.compile(r"\b[A-Za-z_]\w*\s+" + i + r"\s*(?:[=;,)])"),
+        # ``var <ident> =`` local
+        re.compile(r"\bvar\s+" + i + r"\s*="),
+    )
 
 
-def _receiver_is_member_access(source: str, recv_start: int) -> bool:
+def _declares_shadow(source: str, ident: str) -> bool:
+    """True if ``source`` TEXTUALLY declares a local/parameter named ``ident``
+    that would shadow an inherited MonoBehaviour member. Scans code positions
+    only (skips strings/comments). Conservative — one declaration anywhere is
+    enough; biases to the safe ABSTAIN direction."""
+    for pat in _shadow_decl_res(ident):
+        for m in pat.finditer(source):
+            if _cs_pos_is_code(source, m.start()):
+                return True
+    return False
+
+
+def _receiver_is_member_access(
+    source: str, recv_start: int, *, gameobject_shadowed: bool
+) -> bool:
     """True if the receiver token starting at ``recv_start`` is a FOREIGN member
     access (``X.recv.GetChild(n)``) rather than the host's own transform.
 
     The receiver is HOST-ROOTED (returns False) iff it is a bare symbol (no
     leading ``.``) OR it is ``<host-self>.transform`` where the qualifier chain is
-    a host-self alias (``this``, ``gameObject``, ``base``, ``this.gameObject``).
+    a host-self alias (``this``, ``base``, ``gameObject``, ``this.gameObject``).
     It is FOREIGN (returns True) when the qualifier before the receiver is
     anything else (``Camera.main.transform``, ``foo.transform``,
-    ``enemy.gameObject.transform``). Looks only at the text BEFORE the receiver,
-    code-position aware via the caller's match gate."""
+    ``enemy.gameObject.transform``). When ``gameobject_shadowed`` is True, the
+    ``gameObject``-bearing aliases (``gameObject.transform`` /
+    ``this.gameObject.transform``) are treated as FOREIGN too — a local/param
+    named ``gameObject`` shadows the inherited member, so the receiver is the
+    shadow's transform, not the host's. Looks only at the text BEFORE the
+    receiver, code-position aware via the caller's match gate."""
     # Walk back over the immediate ``.`` (with surrounding whitespace) preceding
     # the receiver; if there is none, the receiver is bare (not a member access).
     k = recv_start
@@ -209,10 +253,14 @@ def _receiver_is_member_access(source: str, recv_start: int) -> bool:
     # qualifier head is a host-self alias (``X.gameObject.transform`` is foreign:
     # the alias is itself a member of ``X``, so the anchored head won't match).
     head = source[: k - 1]
-    for qre in _HOST_SELF_HEAD_RES:
+    for qre in _HOST_SELF_KEYWORD_HEAD_RES:
         if qre.search(head) is not None:
-            return False  # bare host-self qualifier -> host-rooted
-    return True  # foreign qualifier (Camera.main, a field, a method call)
+            return False  # this/base keyword qualifier -> always host-rooted
+    if not gameobject_shadowed:
+        for qre in _HOST_SELF_GAMEOBJECT_HEAD_RES:
+            if qre.search(head) is not None:
+                return False  # un-shadowed gameObject alias -> host-rooted
+    return True  # foreign qualifier (Camera.main, a field, a shadowed gameObject)
 
 
 def _resolve_child(node: HostNode, ordinal: int) -> HostNode | None:
@@ -238,12 +286,16 @@ def _resolve_child(node: HostNode, ordinal: int) -> HostNode | None:
 def _build_symbol_table(source: str, host_node: HostNode) -> dict[str, HostNode]:
     """Build the per-script Transform-symbol table by local dataflow.
 
-    Seed ``transform -> host_node``, then resolve to a fixpoint over the three
+    Seed ``transform -> host_node`` (UNLESS a local/param shadows the inherited
+    ``transform`` member, in which case the seed is withheld and every
+    bare-``transform`` site abstains), then resolve to a fixpoint over the three
     C# definition shapes (local-var assignment, block-bodied getter,
     expression-bodied getter): each ``<sym> = <recv>.GetChild(n)`` is a pending
     edge resolved once ``<recv>`` is in the table. A guard failure (E1–E3) drops
     the edge — its ``<sym>`` stays unresolved, so any later site on it abstains.
     """
+    gameobject_shadowed = _declares_shadow(source, "gameObject")
+    transform_shadowed = _declares_shadow(source, "transform")
     # Collect pending edges (sym, recv, ordinal) from all three shapes, at code
     # positions only.
     pending: list[tuple[str, str, int]] = []
@@ -257,11 +309,16 @@ def _build_symbol_table(source: str, host_node: HostNode) -> dict[str, HostNode]
                 continue
             # The receiver (group 2) must be a bare host symbol, not a member
             # access on a foreign expression (``a.tBase.GetChild(0)``).
-            if _receiver_is_member_access(source, m.start(2)):
+            if _receiver_is_member_access(
+                source, m.start(2), gameobject_shadowed=gameobject_shadowed
+            ):
                 continue
             pending.append((m.group(1), m.group(2), int(m.group(3))))
 
-    table: dict[str, HostNode] = {"transform": host_node}
+    # A local/param named ``transform`` shadows the inherited Component property,
+    # so bare ``transform`` is NOT the host's transform -> withhold the seed and
+    # let every bare-``transform`` site abstain (bias to safe abstain).
+    table: dict[str, HostNode] = {} if transform_shadowed else {"transform": host_node}
     # Iterate to a fixpoint: each pass resolves any edge whose receiver is now
     # known. Stop when a full pass binds nothing new.
     remaining = list(pending)
@@ -352,6 +409,7 @@ def _resolve_script(source: str, host_node: HostNode) -> ChildRefScript | None:
     """Resolve one script's GetChild sites against ``host_node``. Returns
     ``None`` when the script has NO GetChild site at all (absent from the map)."""
     table = _build_symbol_table(source, host_node)
+    gameobject_shadowed = _declares_shadow(source, "gameObject")
 
     facts: list[ChildRefFact] = []
     getchild_total = 0
@@ -361,10 +419,14 @@ def _resolve_script(source: str, host_node: HostNode) -> ChildRefScript | None:
         getchild_total += 1
         recv, ordinal = m.group(1), int(m.group(2))
         # A receiver that is a MEMBER ACCESS on a foreign expression
-        # (``Camera.main.transform.GetChild(0)``, ``foo.transform.GetChild(0)``)
-        # is NOT the script's own host — abstain (counts toward getchild_total,
-        # produces no fact) so the backstop treats it as a coverage gap.
-        if _receiver_is_member_access(source, m.start(1)):
+        # (``Camera.main.transform.GetChild(0)``, ``foo.transform.GetChild(0)``,
+        # or a ``gameObject.transform`` whose ``gameObject`` is shadowed by a
+        # local/param) is NOT the script's own host — abstain (counts toward
+        # getchild_total, produces no fact) so the backstop treats it as a
+        # coverage gap.
+        if _receiver_is_member_access(
+            source, m.start(1), gameobject_shadowed=gameobject_shadowed
+        ):
             continue  # foreign member-access receiver — abstain (E9)
         recv_node = table.get(recv)
         if recv_node is None:

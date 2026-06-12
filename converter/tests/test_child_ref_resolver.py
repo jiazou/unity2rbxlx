@@ -575,6 +575,128 @@ def test_host_alias_seeds_symbol_table(tmp_path: Path) -> None:
     assert names == {"Base", "Tip"}
 
 
+# --- round-3 finding: gameObject/transform shadowed by a local/param --------
+
+
+def test_param_gameObject_shadow_abstains(tmp_path: Path) -> None:
+    # ``void TakeDamage(GameObject gameObject)`` shadows the inherited member, so
+    # ``gameObject.transform`` is the PARAMETER's transform, not the host's ->
+    # ABSTAIN {1,0} (the backstop then guards it).
+    src = ("public class H : MonoBehaviour { "
+           "void TakeDamage(GameObject gameObject){ "
+           "var x = gameObject.transform.GetChild(0); } }")
+    cs = _write(tmp_path, "H.cs", src)
+    m = build_child_ref_map(
+        script_infos=[ScriptInfo(path=cs, class_name="H")],
+        parsed_scenes=None, prefab_library=_single_child_host(),
+        guid_index=_guid_index(cs),
+    )
+    entry = m[str(cs.resolve())]
+    assert (entry.getchild_total, entry.resolved_total) == (1, 0)
+    assert entry.facts == ()
+    out, n = prerewrite_child_index(src, entry)
+    assert n == 0
+    assert "gameObject.transform.GetChild(0)" in out
+
+
+def test_local_gameObject_shadow_abstains(tmp_path: Path) -> None:
+    # ``var gameObject = enemy;`` shadows the inherited member, so the later
+    # ``gameObject.transform.GetChild(0)`` is the LOCAL's transform -> ABSTAIN.
+    src = ("public class H : MonoBehaviour { "
+           "void F(GameObject enemy){ var gameObject = enemy; "
+           "var x = gameObject.transform.GetChild(0); } }")
+    cs = _write(tmp_path, "H.cs", src)
+    m = build_child_ref_map(
+        script_infos=[ScriptInfo(path=cs, class_name="H")],
+        parsed_scenes=None, prefab_library=_single_child_host(),
+        guid_index=_guid_index(cs),
+    )
+    entry = m[str(cs.resolve())]
+    assert (entry.getchild_total, entry.resolved_total) == (1, 0)
+    assert entry.facts == ()
+
+
+def test_unshadowed_gameObject_still_resolves(tmp_path: Path) -> None:
+    # No local/param named ``gameObject`` -> the inherited member alias holds ->
+    # the normal MonoBehaviour ``gameObject.transform.GetChild(0)`` RESOLVES.
+    src = ("public class H : MonoBehaviour { "
+           "void F(){ var x = gameObject.transform.GetChild(0); } }")
+    cs = _write(tmp_path, "H.cs", src)
+    m = build_child_ref_map(
+        script_infos=[ScriptInfo(path=cs, class_name="H")],
+        parsed_scenes=None, prefab_library=_single_child_host(),
+        guid_index=_guid_index(cs),
+    )
+    entry = m[str(cs.resolve())]
+    assert (entry.getchild_total, entry.resolved_total) == (1, 1)
+    assert entry.facts[0].child_name == "Base"
+
+
+def test_this_gameObject_shadow_abstains(tmp_path: Path) -> None:
+    # A shadow disables the two-token ``this.gameObject`` alias too: the
+    # ``gameObject`` member it dots into is shadowed -> ABSTAIN.
+    src = ("public class H : MonoBehaviour { "
+           "void F(GameObject gameObject){ "
+           "var x = this.gameObject.transform.GetChild(0); } }")
+    cs = _write(tmp_path, "H.cs", src)
+    m = build_child_ref_map(
+        script_infos=[ScriptInfo(path=cs, class_name="H")],
+        parsed_scenes=None, prefab_library=_single_child_host(),
+        guid_index=_guid_index(cs),
+    )
+    entry = m[str(cs.resolve())]
+    assert (entry.getchild_total, entry.resolved_total) == (1, 0)
+
+
+def test_bare_transform_no_shadow_resolves(tmp_path: Path) -> None:
+    # Regression: bare ``transform.GetChild(0)`` with NO shadow declaration still
+    # resolves; ``this``/``base``/un-shadowed ``gameObject`` qualifiers too.
+    for expr in (
+        "transform.GetChild(0)",
+        "this.transform.GetChild(0)",
+        "base.transform.GetChild(0)",
+        "gameObject.transform.GetChild(0)",
+    ):
+        entry = _resolve_one(tmp_path, expr)
+        assert (entry.getchild_total, entry.resolved_total) == (1, 1), expr
+        assert entry.facts[0].child_name == "Base", expr
+
+
+def test_transform_local_shadow_abstains(tmp_path: Path) -> None:
+    # A local/param named ``transform`` shadows the inherited Component property,
+    # so bare ``transform.GetChild(0)`` is the SHADOW's transform -> ABSTAIN.
+    src = ("public class H : MonoBehaviour { "
+           "void F(Transform transform){ var x = transform.GetChild(0); } }")
+    cs = _write(tmp_path, "H.cs", src)
+    m = build_child_ref_map(
+        script_infos=[ScriptInfo(path=cs, class_name="H")],
+        parsed_scenes=None, prefab_library=_single_child_host(),
+        guid_index=_guid_index(cs),
+    )
+    entry = m[str(cs.resolve())]
+    assert (entry.getchild_total, entry.resolved_total) == (1, 0)
+    assert entry.facts == ()
+
+
+def test_this_base_still_resolve_under_gameObject_shadow(tmp_path: Path) -> None:
+    # ``this``/``base`` are C# keywords (unshadowable): even with a ``gameObject``
+    # shadow present, ``this.transform`` / ``base.transform`` stay host-self.
+    src = ("public class H : MonoBehaviour { "
+           "void F(GameObject gameObject){ "
+           "var a = this.transform.GetChild(0); "
+           "var b = base.transform.GetChild(0); } }")
+    cs = _write(tmp_path, "H.cs", src)
+    m = build_child_ref_map(
+        script_infos=[ScriptInfo(path=cs, class_name="H")],
+        parsed_scenes=None, prefab_library=_single_child_host(),
+        guid_index=_guid_index(cs),
+    )
+    entry = m[str(cs.resolve())]
+    # Both this.transform and base.transform resolve to Base; gameObject sites: 0.
+    assert (entry.getchild_total, entry.resolved_total) == (2, 2)
+    assert {f.child_name for f in entry.facts} == {"Base"}
+
+
 # --- finding 5: GetChild inside a comment/string is NOT rewritten -----------
 
 
