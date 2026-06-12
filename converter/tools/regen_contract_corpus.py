@@ -73,6 +73,11 @@ _FIELDS = (
     # The child-ref resolution tally the check-D backstop reads. Without it the
     # field is never copied into fixture.json and check D goes DEAD on the corpus.
     "child_ref_resolution",
+    # The rig-retarget binding carrier ({field, child, present}) the binding-present
+    # fail-closed check reads. Without it the field is never copied into fixture.json
+    # and rig_binding_present goes DEAD on the corpus (abstains green-for-the-wrong-
+    # reason instead of asserting the discharged Player binding).
+    "rig_binding",
 )
 
 _FIXTURE_ROOT = _REPO / "tests" / "fixtures" / "contract_corpus"
