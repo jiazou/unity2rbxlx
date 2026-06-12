@@ -697,6 +697,175 @@ def test_this_base_still_resolve_under_gameObject_shadow(tmp_path: Path) -> None
     assert {f.child_name for f in entry.facts} == {"Base"}
 
 
+# --- round-4 finding: comprehensive shadow-binding contexts -----------------
+# foreach / lambda / tuple-deconstruction / pattern bindings of ``gameObject`` /
+# ``transform`` ALSO shadow the inherited member -> the receiver is foreign ->
+# the script's GetChild sites ABSTAIN ({n,0}).
+
+
+def _map_for_body(tmp_path: Path, body: str) -> "object":
+    """Build the child-ref map for a single-method script whose method body is
+    ``body`` against the one-child (``Base``) host; return its ChildRefScript."""
+    src = f"public class H : MonoBehaviour {{ void F(){{ {body} }} }}"
+    cs = _write(tmp_path, "H.cs", src)
+    m = build_child_ref_map(
+        script_infos=[ScriptInfo(path=cs, class_name="H")],
+        parsed_scenes=None, prefab_library=_single_child_host(),
+        guid_index=_guid_index(cs),
+    )
+    return m[str(cs.resolve())]
+
+
+def test_foreach_gameObject_shadow_abstains(tmp_path: Path) -> None:
+    # ``foreach (var gameObject in xs)`` binds a loop variable named gameObject ->
+    # the inherited member is shadowed -> the site abstains.
+    entry = _map_for_body(
+        tmp_path,
+        "foreach (var gameObject in xs) { var x = gameObject.transform.GetChild(0); }",
+    )
+    assert (entry.getchild_total, entry.resolved_total) == (1, 0)
+    assert entry.facts == ()
+
+
+def test_foreach_typed_gameObject_shadow_abstains(tmp_path: Path) -> None:
+    entry = _map_for_body(
+        tmp_path,
+        "foreach (GameObject gameObject in xs) "
+        "{ var x = gameObject.transform.GetChild(0); }",
+    )
+    assert (entry.getchild_total, entry.resolved_total) == (1, 0)
+
+
+def test_lambda_gameObject_shadow_abstains(tmp_path: Path) -> None:
+    # ``xs.ForEach(gameObject => gameObject.transform.GetChild(0))`` — the lambda
+    # parameter shadows the inherited member -> abstain.
+    entry = _map_for_body(
+        tmp_path,
+        "xs.ForEach(gameObject => gameObject.transform.GetChild(0));",
+    )
+    assert (entry.getchild_total, entry.resolved_total) == (1, 0)
+    assert entry.facts == ()
+
+
+def test_lambda_paren_gameObject_shadow_abstains(tmp_path: Path) -> None:
+    # Parenthesized lambda param list, both bare and typed.
+    for body in (
+        "xs.ForEach((gameObject) => { var x = gameObject.transform.GetChild(0); });",
+        "xs.ForEach((GameObject gameObject) => "
+        "{ var x = gameObject.transform.GetChild(0); });",
+        "xs.Each((a, gameObject) => { var x = gameObject.transform.GetChild(0); });",
+    ):
+        entry = _map_for_body(tmp_path, body)
+        assert (entry.getchild_total, entry.resolved_total) == (1, 0), body
+
+
+def test_tuple_deconstruction_gameObject_shadow_abstains(tmp_path: Path) -> None:
+    # ``var (gameObject, i) = pair;`` deconstructs into a local named gameObject.
+    entry = _map_for_body(
+        tmp_path,
+        "var (gameObject, i) = pair; var x = gameObject.transform.GetChild(0);",
+    )
+    assert (entry.getchild_total, entry.resolved_total) == (1, 0)
+    assert entry.facts == ()
+
+
+def test_tuple_mixed_gameObject_shadow_abstains(tmp_path: Path) -> None:
+    # ``(var gameObject, var i) = pair;`` — mixed-declaration deconstruction.
+    entry = _map_for_body(
+        tmp_path,
+        "(var gameObject, var i) = pair; var x = gameObject.transform.GetChild(0);",
+    )
+    assert (entry.getchild_total, entry.resolved_total) == (1, 0)
+
+
+def test_case_pattern_gameObject_shadow_abstains(tmp_path: Path) -> None:
+    # ``case GameObject gameObject:`` declaration pattern binds gameObject.
+    entry = _map_for_body(
+        tmp_path,
+        "switch (o) { case GameObject gameObject: "
+        "var x = gameObject.transform.GetChild(0); break; }",
+    )
+    assert (entry.getchild_total, entry.resolved_total) == (1, 0)
+    assert entry.facts == ()
+
+
+def test_is_pattern_gameObject_shadow_abstains(tmp_path: Path) -> None:
+    # ``o is GameObject gameObject`` is-pattern binds gameObject.
+    entry = _map_for_body(
+        tmp_path,
+        "if (o is GameObject gameObject) { var x = gameObject.transform.GetChild(0); }",
+    )
+    assert (entry.getchild_total, entry.resolved_total) == (1, 0)
+
+
+def test_foreach_transform_shadow_abstains(tmp_path: Path) -> None:
+    # transform analogue: ``foreach (var transform in xs)`` shadows the inherited
+    # Component property -> bare ``transform.GetChild(0)`` abstains.
+    entry = _map_for_body(
+        tmp_path,
+        "foreach (var transform in xs) { var x = transform.GetChild(0); }",
+    )
+    assert (entry.getchild_total, entry.resolved_total) == (1, 0)
+    assert entry.facts == ()
+
+
+def test_lambda_transform_shadow_abstains(tmp_path: Path) -> None:
+    entry = _map_for_body(
+        tmp_path,
+        "xs.ForEach(transform => transform.GetChild(0));",
+    )
+    assert (entry.getchild_total, entry.resolved_total) == (1, 0)
+
+
+def test_tuple_transform_shadow_abstains(tmp_path: Path) -> None:
+    entry = _map_for_body(
+        tmp_path,
+        "var (transform, i) = pair; var x = transform.GetChild(0);",
+    )
+    assert (entry.getchild_total, entry.resolved_total) == (1, 0)
+
+
+def test_case_transform_shadow_abstains(tmp_path: Path) -> None:
+    entry = _map_for_body(
+        tmp_path,
+        "switch (o) { case Transform transform: "
+        "var x = transform.GetChild(0); break; }",
+    )
+    assert (entry.getchild_total, entry.resolved_total) == (1, 0)
+
+
+def test_turret_getter_chain_still_resolves_under_broadened_detector(
+    tmp_path: Path,
+) -> None:
+    # CRITICAL regression guard: the turret's ``return transform.GetChild(0)``
+    # getter chain has NO local/param named transform/gameObject — the broadened
+    # binding detector must NOT false-match the ``return`` keyword before
+    # ``transform`` -> all 3 hops still resolve {3,3}.
+    cs = _write(tmp_path, "Turret.cs", _TURRET_CS_BLOCK)
+    m = build_child_ref_map(
+        script_infos=[ScriptInfo(path=cs, class_name="Turret")],
+        parsed_scenes=None, prefab_library=_turret_hierarchy(),
+        guid_index=_guid_index(cs),
+    )
+    entry = m[str(cs.resolve())]
+    assert (entry.getchild_total, entry.resolved_total) == (3, 3)
+    assert [f.child_name for f in entry.facts] == ["Base", "Weapon", "Origin"]
+
+
+def test_unshadowed_forms_still_resolve_under_broadened_detector(
+    tmp_path: Path,
+) -> None:
+    # Un-shadowed ``gameObject.transform.GetChild(0)`` and bare
+    # ``transform.GetChild(0)`` (no foreach/lambda/tuple/case binding) RESOLVE.
+    for body in (
+        "var x = gameObject.transform.GetChild(0);",
+        "var x = transform.GetChild(0);",
+    ):
+        entry = _map_for_body(tmp_path, body)
+        assert (entry.getchild_total, entry.resolved_total) == (1, 1), body
+        assert entry.facts[0].child_name == "Base", body
+
+
 # --- finding 5: GetChild inside a comment/string is NOT rewritten -----------
 
 

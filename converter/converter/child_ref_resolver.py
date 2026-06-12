@@ -195,33 +195,79 @@ _HOST_SELF_GAMEOBJECT_HEAD_RES = (
     re.compile(r"(?:^|[^\w.])\s*gameObject\s*\Z"),
 )
 
-# Shadow-declaration matchers for an inherited member that a local/parameter can
+# Shadow-binding matchers for an inherited member that a local/parameter can
 # shadow. ``{ident}`` is interpolated per identifier (``gameObject`` |
-# ``transform``). Each matches a declaration TEXTUALLY (code positions only, via
-# ``_cs_pos_is_code``): a typed/`var` local (``GameObject gameObject =`` |
-# ``var gameObject =`` | ``Transform transform;``) or a typed parameter
-# (``GameObject gameObject`` followed by ``,`` or ``)`` — the param-list shapes).
-# Conservative: a single matching declaration ANYWHERE disables the alias for the
-# whole script (bias to the safe ABSTAIN direction).
-def _shadow_decl_res(ident: str) -> tuple[re.Pattern[str], ...]:
+# ``transform``). Each matches a binding-INTRODUCTION context TEXTUALLY (code
+# positions only, via ``_cs_pos_is_code``) — every C# form that introduces a
+# local symbol named ``ident`` shadowing the inherited member:
+#   - typed/`var` local, field, param-with-initializer, param before ``,``/``)``
+#     (``GameObject gameObject =`` | ``var gameObject =`` | ``Transform transform;``)
+#   - ``foreach`` binding (``foreach (var gameObject in xs)``)
+#   - lambda parameter (single ``gameObject =>`` | parenthesized ``(gameObject) =>``
+#     / ``(GameObject gameObject) =>`` / ``(a, gameObject) =>``)
+#   - tuple deconstruction (``var (gameObject, i) =`` | ``(var gameObject, var i) =``)
+#   - declaration pattern (``case GameObject gameObject:`` | ``is GameObject gameObject``)
+# Conservative: a single matching binding ANYWHERE disables the alias for the
+# whole script (bias to the safe ABSTAIN direction). The patterns are anchored so
+# a ``return transform.GetChild(0)`` / ``return transform;`` (the ``return``
+# keyword before ``transform`` is NOT a binding) does NOT false-match, and a bare
+# ``transform.GetChild(0)`` site is untouched.
+#
+# ``_TYPE`` is a (possibly dotted/generic/array) C# type token used where a type
+# precedes the bound identifier; ``_NESTED`` allows nested parens inside a tuple
+# deconstruction target so ``var ((a, gameObject), c) =`` is seen.
+# A (possibly dotted/generic/array) C# type token preceding a bound identifier.
+_TYPE = r"[\w.<>\[\],\s]*?[\w>\]]"
+
+
+def _ident_in_group(ident: str, body: str) -> bool:
+    """True if ``ident`` appears as a whole word token in ``body``."""
+    return re.search(r"(?:^|[^\w])" + re.escape(ident) + r"(?:[^\w]|$)", body) is not None
+
+
+def _shadow_decl_res(ident: str) -> tuple[tuple[re.Pattern[str], bool], ...]:
+    """Per-identifier binding-context matchers, each paired with a ``body`` flag.
+
+    ``body=False``: a match anywhere (at a code position) is a shadow binding.
+    ``body=True``: the pattern captures a parenthesized list in group 1 REGARDLESS
+    of ``ident`` (a lambda param list / ``var (...)`` deconstruction target); it
+    counts only when ``ident`` is a whole token inside that group."""
     i = re.escape(ident)
     return (
         # typed local / field / param-with-initializer / param followed by , or )
-        re.compile(r"\b[A-Za-z_]\w*\s+" + i + r"\s*(?:[=;,)])"),
+        (re.compile(r"\b[A-Za-z_]\w*\s+" + i + r"\s*(?:[=;,)])"), False),
         # ``var <ident> =`` local
-        re.compile(r"\bvar\s+" + i + r"\s*="),
+        (re.compile(r"\bvar\s+" + i + r"\s*="), False),
+        # foreach binding: ``foreach (var <ident> in`` | ``foreach (T <ident> in``
+        (re.compile(r"\bforeach\s*\(\s*(?:var|" + _TYPE + r")\s+" + i + r"\s+in\b"), False),
+        # lambda parameter, single unparenthesized: ``<ident> =>``
+        (re.compile(r"\b" + i + r"\s*=>"), False),
+        # lambda parameter inside a parenthesized list immediately before ``=>``
+        # (``(gameObject) =>``, ``(GameObject gameObject) =>``, ``(a, gameObject) =>``).
+        (re.compile(r"\(([^()]*)\)\s*=>"), True),
+        # tuple deconstruction with a ``var ( ... )`` target.
+        (re.compile(r"\bvar\s*\(([^()]*)\)"), True),
+        # mixed deconstruction ``(var <ident>, ...)`` / ``(..., var <ident>)``
+        (re.compile(r"\bvar\s+" + i + r"\s*(?=[,)])"), False),
+        # declaration pattern: ``case T <ident>:`` | ``is T <ident>``
+        (re.compile(r"\b(?:case|is)\s+" + _TYPE + r"\s+" + i + r"\b"), False),
     )
 
 
 def _declares_shadow(source: str, ident: str) -> bool:
-    """True if ``source`` TEXTUALLY declares a local/parameter named ``ident``
-    that would shadow an inherited MonoBehaviour member. Scans code positions
-    only (skips strings/comments). Conservative — one declaration anywhere is
-    enough; biases to the safe ABSTAIN direction."""
-    for pat in _shadow_decl_res(ident):
+    """True if ``source`` TEXTUALLY introduces a local/parameter binding named
+    ``ident`` (in ANY C# binding context: typed/var local, field, out/ref param,
+    using var, foreach, lambda param, tuple deconstruction, declaration pattern)
+    that would shadow an inherited MonoBehaviour member. Scans code positions only
+    (skips strings/comments). Conservative — one binding anywhere is enough;
+    biases to the safe ABSTAIN direction."""
+    for pat, body in _shadow_decl_res(ident):
         for m in pat.finditer(source):
-            if _cs_pos_is_code(source, m.start()):
-                return True
+            if not _cs_pos_is_code(source, m.start()):
+                continue
+            if body and not _ident_in_group(ident, m.group(1)):
+                continue
+            return True
     return False
 
 
