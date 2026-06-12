@@ -882,7 +882,7 @@ local services = {
         local tpl = _resolveTemplate(prefabId)
         if not tpl then return nil end
         local clone = tpl:Clone()
-        if parent then clone.Parent = parent end
+        clone.Parent = parent or workspace
         if cframe and clone:IsA("Model") then
             clone:PivotTo(cframe)
         end
@@ -1036,7 +1036,7 @@ local services = {
         local tpl = _resolveTemplate(prefabId)
         if not tpl then return nil end
         local clone = tpl:Clone()
-        if parent then clone.Parent = parent end
+        clone.Parent = parent or workspace
         if cframe and clone:IsA("Model") then
             clone:PivotTo(cframe)
         end
