@@ -76,17 +76,24 @@ ChildRefMap = dict[str, ChildRefScript]  # {canonical_cs_path_str: ChildRefScrip
 _CS_GETCHILD_RE = re.compile(r"\b([A-Za-z_]\w*)\.GetChild\(\s*(\d+)\s*\)")
 
 # Definition matchers — discover the symbol-table edges (<sym> <- <recv>.GetChild(n)).
+# The receiver capture (group 2) is the LAST identifier before ``.GetChild``; an
+# optional NON-captured dotted qualifier prefix (``gameObject.``, ``Camera.main.``)
+# is consumed before it so ``<host-self>.transform.GetChild(n)`` definitions seed
+# the chain. Group 2's start sits at that final identifier, so
+# ``_receiver_is_member_access`` (called on m.start(2)) applies the SAME host-self
+# allowlist as the site matcher: a host-self prefix resolves, a foreign one abstains.
+_CS_RECV = r"(?:[A-Za-z_][\w.]*\.)?([A-Za-z_]\w*)"
 _CS_GETCHILD_LOCAL_RE = re.compile(  # Transform x = recv.GetChild(0); | var x = ...
     r"\b(?:Transform|var)\s+([A-Za-z_]\w*)\s*=\s*"
-    r"([A-Za-z_]\w*)\.GetChild\(\s*(\d+)\s*\)"
+    + _CS_RECV + r"\.GetChild\(\s*(\d+)\s*\)"
 )
 _CS_GETCHILD_GETTER_BLOCK_RE = re.compile(  # Transform x { get { return recv.GetChild(0); } }
     r"\bTransform\s+([A-Za-z_]\w*)\s*\{\s*get\s*\{\s*return\s+"
-    r"([A-Za-z_]\w*)\.GetChild\(\s*(\d+)\s*\)\s*;\s*\}"
+    + _CS_RECV + r"\.GetChild\(\s*(\d+)\s*\)\s*;\s*\}"
 )
 _CS_GETCHILD_GETTER_EXPR_RE = re.compile(  # Transform x => recv.GetChild(0);
     r"\bTransform\s+([A-Za-z_]\w*)\s*=>\s*"
-    r"([A-Za-z_]\w*)\.GetChild\(\s*(\d+)\s*\)"
+    + _CS_RECV + r"\.GetChild\(\s*(\d+)\s*\)"
 )
 
 
@@ -162,33 +169,50 @@ def _cs_pos_is_code(source: str, pos: int) -> bool:
     return True
 
 
-# ``head`` ends right before the ``.`` that precedes the receiver, so a
-# ``this.`` qualifier leaves ``this`` as the trailing token (the ``.`` is
-# stripped). ``\b`` guards against matching the tail of an identifier like
-# ``mything``.
-_THIS_PREFIX_RE = re.compile(r"\bthis\s*$")
+# Host-self aliases: in Unity C#, ``transform``, ``this.transform``,
+# ``gameObject.transform``, ``base.transform`` and ``this.gameObject.transform``
+# all refer to the HOST's own transform. The qualifier chain immediately
+# preceding ``.transform`` is host-rooted iff it is EXACTLY one of these
+# single/double-token forms — anchored so the ENTIRE head (after stripping
+# surrounding whitespace) is the alias, not a member of a longer foreign chain
+# (``enemy.gameObject.transform`` -> head ``enemy.gameObject`` matches none).
+# ``(?:^|...)`` anchors the start so ``mygameObject`` / ``a.gameObject`` are
+# rejected; ``\Z`` anchors the end at the receiver. Order longest-first so the
+# two-token ``this.gameObject`` form is recognized before a bare ``gameObject``.
+_HOST_SELF_HEAD_RES = (
+    re.compile(r"(?:^|[^\w.])\s*this\s*\.\s*gameObject\s*\Z"),
+    re.compile(r"(?:^|[^\w.])\s*this\s*\Z"),
+    re.compile(r"(?:^|[^\w.])\s*gameObject\s*\Z"),
+    re.compile(r"(?:^|[^\w.])\s*base\s*\Z"),
+)
 
 
 def _receiver_is_member_access(source: str, recv_start: int) -> bool:
-    """True if the receiver token starting at ``recv_start`` is a MEMBER ACCESS
-    on a foreign expression (``X.recv.GetChild(n)``) rather than the script's own
-    bare symbol. A receiver immediately preceded by ``.`` is a member of
-    something else and must NOT be treated as host-rooted — EXCEPT ``this.recv``,
-    where ``this`` is the host instance (so ``this.transform`` IS the bare host
-    ``transform``). Looks only at the text BEFORE the receiver, code-position
-    aware via the caller's match gate."""
+    """True if the receiver token starting at ``recv_start`` is a FOREIGN member
+    access (``X.recv.GetChild(n)``) rather than the host's own transform.
+
+    The receiver is HOST-ROOTED (returns False) iff it is a bare symbol (no
+    leading ``.``) OR it is ``<host-self>.transform`` where the qualifier chain is
+    a host-self alias (``this``, ``gameObject``, ``base``, ``this.gameObject``).
+    It is FOREIGN (returns True) when the qualifier before the receiver is
+    anything else (``Camera.main.transform``, ``foo.transform``,
+    ``enemy.gameObject.transform``). Looks only at the text BEFORE the receiver,
+    code-position aware via the caller's match gate."""
     # Walk back over the immediate ``.`` (with surrounding whitespace) preceding
     # the receiver; if there is none, the receiver is bare (not a member access).
-    j = recv_start
-    k = j
+    k = recv_start
     while k > 0 and source[k - 1] in " \t":
         k -= 1
     if k == 0 or source[k - 1] != ".":
         return False  # no leading dot -> bare receiver, host-rooted
-    # There IS a leading ``.`` -> a member access. Host-rooted only if the
-    # qualifier is exactly ``this`` (``this.transform`` == the host transform).
-    head = source[:k - 1]
-    return _THIS_PREFIX_RE.search(head) is None
+    # There IS a leading ``.`` -> a member access. Host-rooted only if the WHOLE
+    # qualifier head is a host-self alias (``X.gameObject.transform`` is foreign:
+    # the alias is itself a member of ``X``, so the anchored head won't match).
+    head = source[: k - 1]
+    for qre in _HOST_SELF_HEAD_RES:
+        if qre.search(head) is not None:
+            return False  # bare host-self qualifier -> host-rooted
+    return True  # foreign qualifier (Camera.main, a field, a method call)
 
 
 def _resolve_child(node: HostNode, ordinal: int) -> HostNode | None:

@@ -490,6 +490,91 @@ def test_this_transform_resolves(tmp_path: Path) -> None:
     assert entry.facts[0].child_name == "Base"
 
 
+# --- round-2 finding 1: host-self alias allowlist ---------------------------
+
+
+def _resolve_one(tmp_path: Path, expr: str) -> "object":
+    """Build the map for a single-statement script whose body is ``var x =
+    <expr>;`` against a one-child (``Base``) host, returning its ChildRefScript."""
+    from converter.child_ref_resolver import ChildRefScript  # noqa: F401
+    src = (f"public class H : MonoBehaviour {{ void F(){{ var x = {expr}; }} }}")
+    cs = _write(tmp_path, "H.cs", src)
+    m = build_child_ref_map(
+        script_infos=[ScriptInfo(path=cs, class_name="H")],
+        parsed_scenes=None, prefab_library=_single_child_host(),
+        guid_index=_guid_index(cs),
+    )
+    return m[str(cs.resolve())]
+
+
+def test_gameObject_transform_resolves(tmp_path: Path) -> None:
+    # ``gameObject.transform`` IS the host transform -> RESOLVE {1,1}.
+    entry = _resolve_one(tmp_path, "gameObject.transform.GetChild(0)")
+    assert (entry.getchild_total, entry.resolved_total) == (1, 1)
+    assert entry.facts[0].child_name == "Base"
+
+
+def test_base_transform_resolves(tmp_path: Path) -> None:
+    # ``base.transform`` IS the host transform -> RESOLVE.
+    entry = _resolve_one(tmp_path, "base.transform.GetChild(0)")
+    assert (entry.getchild_total, entry.resolved_total) == (1, 1)
+    assert entry.facts[0].child_name == "Base"
+
+
+def test_this_gameObject_transform_resolves(tmp_path: Path) -> None:
+    # ``this.gameObject.transform`` IS the host transform -> RESOLVE.
+    entry = _resolve_one(tmp_path, "this.gameObject.transform.GetChild(0)")
+    assert (entry.getchild_total, entry.resolved_total) == (1, 1)
+    assert entry.facts[0].child_name == "Base"
+
+
+def test_camera_main_transform_still_abstains(tmp_path: Path) -> None:
+    # Round-1 guard kept: ``Camera.main.transform`` is foreign -> abstain {1,0}.
+    entry = _resolve_one(tmp_path, "Camera.main.transform.GetChild(0)")
+    assert (entry.getchild_total, entry.resolved_total) == (1, 0)
+    assert entry.facts == ()
+
+
+def test_enemy_transform_still_abstains(tmp_path: Path) -> None:
+    # ``enemy.transform`` is a member of a foreign field -> abstain.
+    entry = _resolve_one(tmp_path, "enemy.transform.GetChild(0)")
+    assert (entry.getchild_total, entry.resolved_total) == (1, 0)
+    assert entry.facts == ()
+
+
+def test_foreign_gameObject_member_abstains(tmp_path: Path) -> None:
+    # ``enemy.gameObject.transform`` — ``gameObject`` is a member of a foreign
+    # field, NOT the host self-alias -> abstain.
+    entry = _resolve_one(tmp_path, "enemy.gameObject.transform.GetChild(0)")
+    assert (entry.getchild_total, entry.resolved_total) == (1, 0)
+    assert entry.facts == ()
+
+
+def test_host_alias_seeds_symbol_table(tmp_path: Path) -> None:
+    # The host-alias rule applies to symbol-table DEFINITION matchers too: a
+    # symbol defined as ``gameObject.transform.GetChild(0)`` resolves and seeds
+    # the chain, so a later site on it also resolves.
+    root = _pnode("Host", children=[
+        _pnode("Base", children=[_pnode("Tip")]),
+    ], comp_guid=_GUID)
+    lib = PrefabLibrary(prefabs=[
+        PrefabTemplate(prefab_path=Path("/p/Host.prefab"), name="Host", root=root)
+    ])
+    src = ("public class H : MonoBehaviour { void F(){ "
+           "Transform tBase = gameObject.transform.GetChild(0); "
+           "var tip = tBase.GetChild(0); } }")
+    cs = _write(tmp_path, "H.cs", src)
+    m = build_child_ref_map(
+        script_infos=[ScriptInfo(path=cs, class_name="H")],
+        parsed_scenes=None, prefab_library=lib, guid_index=_guid_index(cs),
+    )
+    entry = m[str(cs.resolve())]
+    # Both the definition site (->Base) and the chained site (->Tip) resolve.
+    assert (entry.getchild_total, entry.resolved_total) == (2, 2)
+    names = {f.child_name for f in entry.facts}
+    assert names == {"Base", "Tip"}
+
+
 # --- finding 5: GetChild inside a comment/string is NOT rewritten -----------
 
 

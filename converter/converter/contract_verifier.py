@@ -562,9 +562,10 @@ def _check_cross_domain_attribute(
 # simple dotted name OR a method call (``self:_tBase()``) — the latter is what an
 # AI factored survivor looks like (``self:_tBase():GetChildren()[1]``). A
 # variable index (``[i]``) is a genuine dynamic lookup, not a flattened ordinal,
-# so N must be an integer literal.
+# so N must be an integer literal. Group 1 captures the receiver expression so
+# the engine-global filter can read its ROOT token.
 _GETCHILDREN_INDEX_ANY_RE = re.compile(
-    r"(?:[A-Za-z_][\w.]*(?::[A-Za-z_]\w*\(\))?):GetChildren\(\)\s*\[\s*(\d+)\s*\]"
+    r"([A-Za-z_][\w.]*(?::[A-Za-z_]\w*\(\))?):GetChildren\(\)\s*\[\s*(\d+)\s*\]"
 )
 
 # Two-line factored shape (E5): ``local v = X:GetChildren()`` then a later
@@ -572,11 +573,34 @@ _GETCHILDREN_INDEX_ANY_RE = re.compile(
 # call (``self:_tBase():GetChildren()``), so a method-receiver factored survivor
 # is caught too. The trailing ``(?!\s*\[)`` excludes the ADJACENT form
 # (``X:GetChildren()[N]``, already counted by ``_GETCHILDREN_INDEX_ANY_RE``) so
-# a single site is not double-counted.
+# a single site is not double-counted. Group 1 captures the ``local`` ident;
+# group 2 captures the receiver expression for the engine-global filter.
 _GETCHILDREN_ASSIGN_RE = re.compile(
     r"\blocal\s+([A-Za-z_]\w*)\s*=\s*"
-    r"[A-Za-z_][\w.]*(?::[A-Za-z_]\w*\(\))?:GetChildren\(\)(?!\s*\[)"
+    r"([A-Za-z_][\w.]*(?::[A-Za-z_]\w*\(\))?):GetChildren\(\)(?!\s*\[)"
 )
+
+# Known-safe Roblox ENGINE GLOBALS: a ``<root>...:GetChildren()[N]`` rooted at one
+# of these is an engine-tree iteration (``workspace.Folder:GetChildren()[1]``),
+# NOT an unresolved child-ref ordinal, so it must NOT count against the per-site
+# unresolved-site budget. Conservative — only CLEARLY-global roots; ``self`` and
+# locals are NOT here (they are child-ref-plausible and DO count).
+_ENGINE_GLOBAL_ROOTS = frozenset({"workspace", "game", "script", "Players"})
+
+# The ROOT token of a receiver expression is its first identifier (before the
+# first ``.``, ``:`` or ``(``). ``game:GetService("Players").Foo`` and
+# ``game.Players.Foo`` both root at ``game`` -> engine-global.
+_RECEIVER_ROOT_RE = re.compile(r"^([A-Za-z_]\w*)")
+
+
+def _receiver_roots_at_engine_global(receiver: str) -> bool:
+    """True if the survivor's receiver expression roots at a known-safe Roblox
+    engine global (``workspace``/``game``/``script``/``Players``), so it is an
+    engine-tree iteration, not a child-ref ordinal. Conservative: only the
+    clearly-global roots; ``self`` and local variables return False (they ARE
+    child-ref-plausible and count against the budget)."""
+    m = _RECEIVER_ROOT_RE.match(receiver.strip())
+    return m is not None and m.group(1) in _ENGINE_GLOBAL_ROOTS
 
 
 def _count_surviving_child_ordinals(source: str) -> int:
@@ -585,14 +609,21 @@ def _count_surviving_child_ordinals(source: str) -> int:
     plus the across-lines factored shape (``local v = X:GetChildren()`` then a
     later ``v[<int>]``). Per-site (not boolean) so the backstop can fail-close
     when survivors exceed the script's unresolved-site budget. Code-position
-    aware; counts each factored ``local v`` chain ONCE."""
+    aware; counts each factored ``local v`` chain ONCE. Survivors whose receiver
+    roots at a known-safe ENGINE GLOBAL (``workspace``/``game``/...) are EXCLUDED
+    — they are engine-tree iterations, not unresolved child-ref ordinals."""
     count = 0
     for m in _GETCHILDREN_INDEX_ANY_RE.finditer(source):
-        if _luau_pos_is_code(source, m.start()):
-            count += 1
+        if not _luau_pos_is_code(source, m.start()):
+            continue
+        if _receiver_roots_at_engine_global(m.group(1)):
+            continue  # engine-global iteration — not a child-ref survivor
+        count += 1
     for m in _GETCHILDREN_ASSIGN_RE.finditer(source):
         if not _luau_pos_is_code(source, m.start()):
             continue
+        if _receiver_roots_at_engine_global(m.group(2)):
+            continue  # engine-global iteration — not a child-ref survivor
         ident = m.group(1)
         index_re = re.compile(r"\b" + re.escape(ident) + r"\s*\[\s*\d+\s*\]")
         for im in index_re.finditer(source, m.end()):

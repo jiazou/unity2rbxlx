@@ -209,6 +209,58 @@ def test_method_receiver_adjacent_survivor_fires() -> None:
     assert len(survivors) == 1
 
 
+# --- round-2 finding 2: engine-global GetChildren excluded from the budget ---
+
+
+def test_global_getchildren_not_counted_within_budget() -> None:
+    # {2,1}: one REAL child-ref survivor + one unrelated engine-global
+    # ``workspace.Folder:GetChildren()[1]``. The global is excluded, so only the
+    # 1 real survivor counts == budget 1 -> does NOT fire (info only).
+    s = RbxScript(
+        name="Turret",
+        source=(
+            "local a = self.cam:GetChildren()[1]\n"
+            "local g = workspace.Folder:GetChildren()[1]\n"
+            "return a, g"
+        ),
+        child_ref_resolution={"getchild_total": 2, "resolved_total": 1},
+    )
+    survivors = [v for v in _check_d([s]) if v.check == "child_ordinal_survivor"]
+    assert survivors == []
+    res = verify_contract(_TOPOLOGY, [s])
+    assert fail_closed_errors(res) == []
+
+
+def test_two_real_survivors_still_fire_with_global_present() -> None:
+    # {2,1}: budget 1, but TWO real child-ref survivors (resolved-site regression)
+    # plus an engine-global. The global is excluded; 2 > budget 1 -> FIRES.
+    s = RbxScript(
+        name="Turret",
+        source=(
+            "local a = base:GetChildren()[1]\n"
+            "local b = self.cam:GetChildren()[1]\n"
+            "local g = workspace.Folder:GetChildren()[1]\n"
+            "return a, b, g"
+        ),
+        child_ref_resolution={"getchild_total": 2, "resolved_total": 1},
+    )
+    survivors = [v for v in _check_d([s]) if v.check == "child_ordinal_survivor"]
+    assert len(survivors) == 1
+    res = verify_contract(_TOPOLOGY, [s])
+    assert any("child_ordinal_survivor" in e for e in fail_closed_errors(res))
+
+
+def test_fully_resolved_only_global_survivor_does_not_fire() -> None:
+    # {1,1}: the ONLY GetChildren survivor is ``workspace:GetChildren()[1]`` (an
+    # engine-tree iteration). Excluded -> 0 counted survivors -> does NOT fire.
+    s = RbxScript(
+        name="Turret",
+        source="local g = workspace:GetChildren()[1]\nreturn g",
+        child_ref_resolution={"getchild_total": 1, "resolved_total": 1},
+    )
+    assert _check_d([s]) == []
+
+
 # --- finding 5: a survivor inside a Luau block comment/string does NOT fire --
 
 
