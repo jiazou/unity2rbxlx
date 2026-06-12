@@ -139,12 +139,14 @@ class _Script:
 
 
 def _rig_map(field: str = "weaponSlot", child: str = "WeaponSlot",
-             path: str = "/proj/Player.cs") -> dict[str, ChildRefScript]:
+             path: str = "/proj/Player.cs",
+             cam_receiver: str = "cam") -> dict[str, ChildRefScript]:
     return {path: ChildRefScript(
         facts=(),
         getchild_total=1,
         resolved_total=1,
-        rig_facts=(RigRootedRetargetFact(field_name=field, child_name=child),),
+        rig_facts=(RigRootedRetargetFact(
+            field_name=field, child_name=child, cam_receiver=cam_receiver),),
     )}
 
 
@@ -167,8 +169,10 @@ def test_a_resolver_admits_seeded_camera_main(tmp_path: Path) -> None:
     assert entry.facts == ()
     assert entry.getchild_total == 1
     assert entry.resolved_total == 1
+    # The seeded form records the C# camera symbol (``cam``) as the receiver anchor.
     assert entry.rig_facts == (
-        RigRootedRetargetFact(field_name="weaponSlot", child_name="WeaponSlot"),
+        RigRootedRetargetFact(
+            field_name="weaponSlot", child_name="WeaponSlot", cam_receiver="cam"),
     )
 
 
@@ -182,8 +186,11 @@ def test_a_resolver_admits_direct_camera_main_no_seed(tmp_path: Path) -> None:
     )
     entry = _build(tmp_path, src, _fps_library())
     assert entry is not None
+    # The direct form records the literal ``Camera.main.transform`` as the anchor.
     assert entry.rig_facts == (
-        RigRootedRetargetFact(field_name="weaponSlot", child_name="WeaponSlot"),
+        RigRootedRetargetFact(
+            field_name="weaponSlot", child_name="WeaponSlot",
+            cam_receiver="Camera.main.transform"),
     )
     assert entry.resolved_total == 1
 
@@ -318,6 +325,7 @@ def test_b_abstain_no_matchable_read_stamps_present_false() -> None:
     # An AI shape with the write+return but NO consumer read of self.weaponSlot.
     src = (
         "function Player:Awake()\n"
+        "    self.cam = workspace.CurrentCamera\n"
         "    self.weaponSlot = self.cam:GetChildren()[1]\n"
         "end\n\n"
         "return Player\n"
@@ -408,6 +416,7 @@ def test_h3_neutralize_fact_anchored_skips_unrelated_config() -> None:
         "    return setmetatable({}, Player)\n"
         "end\n\n"
         "function Player:Awake()\n"
+        "    self.cam = workspace.CurrentCamera\n"
         "    self.weaponSlot = self.cam:GetChildren()[1]\n"
         "end\n\n"
         "function Player:GetRifle()\n"
@@ -426,6 +435,7 @@ def test_h3_neutralize_fact_anchored_skips_unrelated_config() -> None:
 def test_h3_multiline_camera_child_rhs_fully_replaced() -> None:
     src = (
         "function Player:Awake()\n"
+        "    self.cam = workspace.CurrentCamera\n"
         "    self.weaponSlot = self.cam\n"
         "        and self.cam:GetChildren()[1]\n"
         "end\n\n"
@@ -451,6 +461,7 @@ def test_h3_desync_coupling_surviving_consumer_read_stamps_false() -> None:
     # independent source scan, so a half-applied lowering can never present green.
     src = (
         "function Player:Awake()\n"
+        "    self.cam = workspace.CurrentCamera\n"
         "    self.weaponSlot = self.cam:GetChildren()[1]\n"
         "end\n\n"
         "function Player:GetRifle()\n"
@@ -461,11 +472,15 @@ def test_h3_desync_coupling_surviving_consumer_read_stamps_false() -> None:
     )
     s = _Script(src)
     lower_rifle_rig_retarget([s], _rig_map())
-    from converter.rifle_rig_retarget_lowering import _binding_discharged
+    from converter.rifle_rig_retarget_lowering import (
+        _binding_discharged,
+        _camera_anchor,
+    )
     assert s.rig_binding is not None
     # present MUST equal the independent scan (no stamp-only fake green).
     assert s.rig_binding["present"] == _binding_discharged(
-        s.luau_source, "weaponSlot", "WeaponSlot"
+        s.luau_source, "weaponSlot", "WeaponSlot", "WeaponSlot",
+        _camera_anchor("cam"),
     )
 
 
@@ -478,6 +493,7 @@ def test_h3_no_consumer_read_means_no_silent_green() -> None:
     # the binding-present check, not check D, is the authority on "discharged".)
     src = (
         "function Player:Awake()\n"
+        "    self.cam = workspace.CurrentCamera\n"
         "    self.weaponSlot = self.cam:GetChildren()[1]\n"
         "end\n\n"
         "return Player\n"
@@ -497,6 +513,10 @@ def test_h3_no_consumer_read_means_no_silent_green() -> None:
 def test_h4_member_tail_self_not_rewritten() -> None:
     # ``other.self.weaponSlot`` is a member tail -> NOT rewritten.
     src = (
+        "function Player:Awake()\n"
+        "    self.cam = workspace.CurrentCamera\n"
+        "    self.weaponSlot = self.cam:GetChildren()[1]\n"
+        "end\n\n"
         "function Player:GetRifle()\n"
         "    local x = other.self.weaponSlot\n"
         "    return self.weaponSlot\n"
@@ -515,6 +535,7 @@ def test_h5_yield_guard_abstains_in_awake_rewrites_in_getrifle() -> None:
     # GetRifle is rewritten.
     src = (
         "function Player:Awake()\n"
+        "    self.cam = workspace.CurrentCamera\n"
         "    local cached = self.weaponSlot\n"  # non-yielding -> abstain
         "    self.weaponSlot = self.cam:GetChildren()[1]\n"
         "end\n\n"
@@ -536,7 +557,9 @@ def test_h5_yield_guard_abstains_in_awake_rewrites_in_getrifle() -> None:
 def test_h5_start_is_non_yielding() -> None:
     src = (
         "function Player:Start()\n"
+        "    self.cam = workspace.CurrentCamera\n"
         "    local cached = self.weaponSlot\n"
+        "    self.weaponSlot = self.cam:GetChildren()[1]\n"
         "end\n\n"
         "function Player:GetRifle()\n"
         "    return pivotOf(self.weaponSlot)\n"
@@ -568,6 +591,7 @@ def test_h6_stray_marker_comment_does_not_suppress_injection() -> None:
     src = (
         "-- _RIG_RETARGET_WeaponSlot (a stray comment, no method)\n"
         "function Player:Awake()\n"
+        "    self.cam = workspace.CurrentCamera\n"
         "    self.weaponSlot = self.cam:GetChildren()[1]\n"
         "end\n\n"
         "function Player:GetRifle()\n"
@@ -630,15 +654,17 @@ def test_prerewrite_child_index_no_double_count_with_host_facts(tmp_path: Path) 
 # === round-2 P1 fixes =======================================================
 
 
-def test_p1_final_syntax_check_after_rewrites_stamps_false() -> None:
-    # P1 (codex BLOCKING): the Luau syntax re-check must run AFTER ALL rewrites
-    # (inject + read-rewrite + neutralize), not just after inject. Here the
-    # neutralize swallows the inline ``if ... then ... end``'s closing ``end``
-    # (the RHS span runs to the newline), producing UNLOADABLE Luau — yet the
-    # shape-only ``_binding_discharged`` would stamp present=True. The final
-    # syntax gate must catch it -> abstain/revert -> present=False.
+def test_p1_single_line_if_neutralize_abstains_whole_rhs_guard() -> None:
+    # P1 (codex BLOCKING) was: the neutralize swallowed an inline
+    # ``if ... then self.weaponSlot = ... end``'s closing ``end`` (RHS span to the
+    # newline) -> UNLOADABLE Luau. The WHOLE-RHS guard now PREVENTS that at the
+    # source: the camera-child access must BE the whole RHS value, so an RHS that
+    # trails ``... end`` does NOT match -> the neutralize ABSTAINS (no corruption).
+    # Discharge is then not confirmed -> present=False (fail-closed), and the
+    # camera-child write is left intact for the verifier.
     src = (
         "function Player:Awake()\n"
+        "    self.cam = workspace.CurrentCamera\n"
         "    if self.cam then self.weaponSlot = self.cam:GetChildren()[1] end\n"
         "end\n\n"
         "function Player:GetRifle()\n"
@@ -652,22 +678,24 @@ def test_p1_final_syntax_check_after_rewrites_stamps_false() -> None:
     assert s.rig_binding == {
         "field": "weaponSlot", "child": "WeaponSlot", "present": False,
     }
-    # Source reverted to the original (camera-child write intact for the verifier).
-    assert "self.cam:GetChildren()[1]" in s.luau_source
+    assert "self.cam:GetChildren()[1] end" in s.luau_source  # untouched, loadable
     assert "_resolveWeaponSlot" not in s.luau_source
-    # If luau-analyze is installed, prove the would-be FINAL source is unloadable
-    # while the post-INJECT-only source parses (so only the FINAL gate catches it).
+    # Direct: the neutralize ABSTAINS on the single-line-if shape (WHOLE-RHS guard),
+    # so the would-be FINAL source stays loadable (no swallowed ``end``).
+    from converter.rifle_rig_retarget_lowering import (
+        _camera_anchor,
+        _neutralize_assignment,
+    )
+    out, neutralized = _neutralize_assignment(
+        src, "weaponSlot", "WeaponSlot", _camera_anchor("cam")
+    )
+    assert neutralized is False  # WHOLE-RHS guard -> abstain, never corrupt
+    assert out == src
+    # Belt-and-suspenders: the final syntax gate still backstops OTHER corruptions —
+    # a genuinely unbalanced final source is rejected by _luau_syntax_ok.
     if luau_analyze_path():
-        from converter.rifle_rig_retarget_lowering import (
-            _inject_resolver_method,
-            _neutralize_assignment,
-            _rewrite_field_reads,
-        )
-        ns, inj = _inject_resolver_method(src, "Player", "WeaponSlot", "weaponSlot", "WeaponSlot")
-        assert inj and syntax_errors_for_source(ns) == []  # post-inject parses
-        ns, _ = _rewrite_field_reads(ns, "weaponSlot", "_resolveWeaponSlot")
-        ns, _ = _neutralize_assignment(ns, "weaponSlot", "WeaponSlot")
-        assert syntax_errors_for_source(ns) != []  # FINAL source is unloadable
+        assert syntax_errors_for_source(src) == []  # the well-formed source parses
+        assert syntax_errors_for_source(src + "if x then\n") != []  # broken -> caught
 
 
 def test_p4_unrelated_main_camera_in_other_prefab_does_not_suppress(
@@ -694,7 +722,9 @@ def test_p4_unrelated_main_camera_in_other_prefab_does_not_suppress(
     entry = _build(tmp_path, src, lib)
     assert entry is not None
     assert entry.rig_facts == (
-        RigRootedRetargetFact(field_name="weaponSlot", child_name="WeaponSlot"),
+        RigRootedRetargetFact(
+            field_name="weaponSlot", child_name="WeaponSlot",
+            cam_receiver="Camera.main.transform"),
     )
 
 
@@ -756,6 +786,10 @@ def test_p3_shadowed_self_closure_not_rewritten() -> None:
     # P3 (both voices, h.4 half): a ``self`` shadowed by a closure parameter must
     # NOT be rewritten (wrong-object bind); only the real colon-receiver read is.
     src = (
+        "function Player:Awake()\n"
+        "    self.cam = workspace.CurrentCamera\n"
+        "    self.weaponSlot = self.cam:GetChildren()[1]\n"
+        "end\n\n"
         "function Player:GetRifle()\n"
         "    local fn = function(self) return self.weaponSlot end\n"
         "    return self.weaponSlot\n"
@@ -775,6 +809,10 @@ def test_p3_shadowed_local_self_not_rewritten() -> None:
     # A ``local self`` in an inner block shadows the receiver for reads in that
     # block; reads OUTSIDE the shadow's scope are still rewritten.
     src = (
+        "function Player:Awake()\n"
+        "    self.cam = workspace.CurrentCamera\n"
+        "    self.weaponSlot = self.cam:GetChildren()[1]\n"
+        "end\n\n"
         "function Player:GetRifle()\n"
         "    do\n"
         "        local self = other\n"
@@ -814,6 +852,7 @@ def test_p5_multi_rig_fact_per_script_fails_closed() -> None:
     # (present=False, multi_fact=True) and the lowering abstains on all edits.
     src = (
         "function Player:Awake()\n"
+        "    self.cam = workspace.CurrentCamera\n"
         "    self.weaponSlot = self.cam:GetChildren()[1]\n"
         "    self.shieldSlot = self.cam:GetChildren()[2]\n"
         "end\n\n"
@@ -850,14 +889,34 @@ def test_p5_multi_rig_fact_per_script_fails_closed() -> None:
 def test_r3_fallback_validates_if_then_end_block_balance(monkeypatch) -> None:
     # R3 P1 (codex BLOCKING, lowering:641): in an ANALYZER-ABSENT env the fallback
     # ``_structural_balance_ok`` must validate ``if``/``then``/``end`` block balance.
-    # A single-line-``if`` neutralize whose RHS span swallows the closing ``end``
-    # produces UNLOADABLE Luau; the fallback must FAIL it -> revert -> present=False
-    # (NOT a stamp of present=True off the broken output). Force the fallback by
-    # making ``luau_analyze_path`` report the binary absent.
+    # A source that swallowed a single-line-``if``'s closing ``end`` is UNLOADABLE
+    # Luau and the fallback must FAIL it (NOT a stamp of present=True off broken
+    # output). Force the fallback by making ``luau_analyze_path`` report absent.
     import utils.luau_analyze as ula
     monkeypatch.setattr(ula, "luau_analyze_path", lambda: None)
+    from converter.rifle_rig_retarget_lowering import _structural_balance_ok
+    # Well-formed single-line-if -> accepted.
+    good = (
+        "function Player:Awake()\n"
+        "    if self.cam then self.weaponSlot = nil end\n"
+        "end\n\n"
+        "return Player\n"
+    )
+    assert _structural_balance_ok(good) is True
+    # The same shape with the inline ``end`` SWALLOWED (the bug a corrupting
+    # neutralize would produce) -> the unclosed ``then`` block FAILS.
+    swallowed = (
+        "function Player:Awake()\n"
+        "    if self.cam then self.weaponSlot = nil\n"
+        "end\n\n"
+        "return Player\n"
+    )
+    assert _structural_balance_ok(swallowed) is False  # unbalanced then -> reject
+    # And the WHOLE-RHS-aware lowering ABSTAINS on the single-line-if camera write
+    # (it never corrupts the ``end`` in the first place) -> present=False.
     src = (
         "function Player:Awake()\n"
+        "    self.cam = workspace.CurrentCamera\n"
         "    if self.cam then self.weaponSlot = self.cam:GetChildren()[1] end\n"
         "end\n\n"
         "function Player:GetRifle()\n"
@@ -867,26 +926,11 @@ def test_r3_fallback_validates_if_then_end_block_balance(monkeypatch) -> None:
     )
     s = _Script(src)
     n = lower_rifle_rig_retarget([s], _rig_map())
-    assert n == 0  # fallback caught the swallowed ``end`` -> abstained/reverted
+    assert n == 0
     assert s.rig_binding == {
         "field": "weaponSlot", "child": "WeaponSlot", "present": False,
     }
-    assert "self.cam:GetChildren()[1]" in s.luau_source  # reverted
-    assert "_resolveWeaponSlot" not in s.luau_source
-    # Direct proof the fallback rejects the broken FINAL shape but accepts the
-    # well-formed original (so the gate is the discriminator, not a blanket reject).
-    from converter.rifle_rig_retarget_lowering import (
-        _inject_resolver_method,
-        _neutralize_assignment,
-        _rewrite_field_reads,
-        _structural_balance_ok,
-    )
-    assert _structural_balance_ok(src) is True
-    ns, inj = _inject_resolver_method(src, "Player", "WeaponSlot", "weaponSlot", "WeaponSlot")
-    assert inj
-    ns, _ = _rewrite_field_reads(ns, "weaponSlot", "_resolveWeaponSlot")
-    ns, _ = _neutralize_assignment(ns, "weaponSlot", "WeaponSlot")
-    assert _structural_balance_ok(ns) is False  # swallowed ``end`` caught
+    assert "self.cam:GetChildren()[1] end" in s.luau_source  # untouched
 
 
 def test_r3_fallback_accepts_well_formed_if_elseif_else() -> None:
@@ -970,7 +1014,8 @@ def test_r3_straight_line_seed_still_admits(tmp_path: Path) -> None:
     entry = _build(tmp_path, src, _fps_library())
     assert entry is not None
     assert entry.rig_facts == (
-        RigRootedRetargetFact(field_name="weaponSlot", child_name="WeaponSlot"),
+        RigRootedRetargetFact(
+            field_name="weaponSlot", child_name="WeaponSlot", cam_receiver="cam"),
     )
 
 
@@ -1016,6 +1061,10 @@ def test_r3_for_loop_self_does_not_block_real_receiver_read() -> None:
     # The loop-var shadow must be scoped to the loop BODY only: a real receiver
     # read OUTSIDE the loop is still rewritten (no over-abstain).
     src = (
+        "function Player:Awake()\n"
+        "    self.cam = workspace.CurrentCamera\n"
+        "    self.weaponSlot = self.cam:GetChildren()[1]\n"
+        "end\n\n"
         "function Player:GetRifle()\n"
         "    for _, self in ipairs(xs) do\n"
         "        local x = self.weaponSlot\n"
@@ -1036,23 +1085,28 @@ def test_r3_neutralize_anchor_requires_ordinal_child_access() -> None:
     # ``self.cam`` but performs NO ordinal child lookup
     # (``self.weaponSlot = self.cam and self.defaultSlot``) must NOT be neutralized
     # to ``nil`` — that would be a false-green. The neutralizer must ABSTAIN.
-    from converter.rifle_rig_retarget_lowering import _neutralize_assignment
+    from converter.rifle_rig_retarget_lowering import (
+        _camera_anchor,
+        _neutralize_assignment,
+    )
+    cam = _camera_anchor("cam")
     src = (
         "function Player:Awake()\n"
         "    self.weaponSlot = self.cam and self.defaultSlot\n"
         "end\n"
     )
-    out, neutralized = _neutralize_assignment(src, "weaponSlot", "WeaponSlot")
+    out, neutralized = _neutralize_assignment(src, "weaponSlot", "WeaponSlot", cam)
     assert neutralized is False  # no ordinal child access -> abstain
     assert out == src  # untouched
     assert "self.weaponSlot = nil" not in out
     # And the real ordinal RHS IS still neutralized (discriminator, not blanket).
     src2 = (
         "function Player:Awake()\n"
+        "    self.cam = workspace.CurrentCamera\n"
         "    self.weaponSlot = self.cam:GetChildren()[1]\n"
         "end\n"
     )
-    out2, neutralized2 = _neutralize_assignment(src2, "weaponSlot", "WeaponSlot")
+    out2, neutralized2 = _neutralize_assignment(src2, "weaponSlot", "WeaponSlot", cam)
     assert neutralized2 is True
     assert "self.weaponSlot = nil" in out2
 
@@ -1128,20 +1182,21 @@ def test_r4_preexisting_foreign_resolver_method_not_false_discharged() -> None:
 
 
 def test_r4_foreign_resolver_alone_is_not_own_emit() -> None:
-    # Unit: a foreign ``_resolveWeaponSlot`` (no own-emit body marker) is NOT
-    # recognized as the lowering's own method; the lowering's OWN emit IS.
+    # Unit: a foreign ``_resolveWeaponSlot`` (different body) is NOT recognized as
+    # the lowering's own method (structural equality to the canonical emit); the
+    # lowering's OWN emit IS.
     from converter.rifle_rig_retarget_lowering import (
         _has_own_resolver_method,
         _resolver_method_text,
     )
+    own = _resolver_method_text("Player", "WeaponSlot", "weaponSlot", "WeaponSlot")
     foreign = (
         "function Player:_resolveWeaponSlot()\n"
         "    return nil\n"
         "end\n"
     )
-    assert _has_own_resolver_method(foreign, "WeaponSlot") is False
-    own = _resolver_method_text("Player", "WeaponSlot", "weaponSlot", "WeaponSlot")
-    assert _has_own_resolver_method(own, "WeaponSlot") is True
+    assert _has_own_resolver_method(foreign, "WeaponSlot", own) is False
+    assert _has_own_resolver_method(own, "WeaponSlot", own) is True
 
 
 def test_r4_fallback_tail_scan_allows_trailing_comment(monkeypatch) -> None:
@@ -1200,7 +1255,9 @@ def test_r4_typed_local_decl_abstains_field_write_admits(tmp_path: Path) -> None
     entry2 = _build(tmp_path, field_write, _fps_library())
     assert entry2 is not None
     assert entry2.rig_facts == (
-        RigRootedRetargetFact(field_name="weaponSlot", child_name="WeaponSlot"),
+        RigRootedRetargetFact(
+            field_name="weaponSlot", child_name="WeaponSlot",
+            cam_receiver="Camera.main.transform"),
     )
 
 
@@ -1216,3 +1273,404 @@ def test_r4_var_local_decl_abstains(tmp_path: Path) -> None:
     entry = _build(tmp_path, src, _fps_library())
     assert entry is not None
     assert entry.rig_facts == ()
+
+
+# === round-5 P1 fixes =======================================================
+
+
+def test_r5_neutralize_anchored_on_camera_receiver_not_field_ordinal() -> None:
+    # R5 BLOCKING (lowering:524): the neutralize must be CAMERA-RECEIVER-anchored,
+    # not match ANY ordinal RHS on the field. A same-field ordinal on a NON-camera
+    # receiver (``self.weaponSlot = self.defaultSlots:GetChildren()[1]``) must NOT
+    # be neutralized and must NOT stamp present=True — the AI output never carried
+    # the camera-child binding the fact recorded (cam receiver ``cam``).
+    src = (
+        "function Player:Awake()\n"
+        "    self.weaponSlot = self.defaultSlots:GetChildren()[1]\n"
+        "end\n\n"
+        "function Player:GetRifle()\n"
+        "    return pivotOf(self.weaponSlot)\n"
+        "end\n\n"
+        "return Player\n"
+    )
+    s = _Script(src)
+    n = lower_rifle_rig_retarget([s], _rig_map(cam_receiver="cam"))
+    # The non-camera ordinal write is NOT the fact's binding -> not neutralized,
+    # discharge cannot be confirmed -> abstain + present=False.
+    assert n == 0
+    assert s.rig_binding == {
+        "field": "weaponSlot", "child": "WeaponSlot", "present": False,
+    }
+    assert "self.defaultSlots:GetChildren()[1]" in s.luau_source  # untouched
+    assert "self.weaponSlot = nil" not in s.luau_source
+    assert "_resolveWeaponSlot" not in s.luau_source
+    # The REAL camera-rooted RHS on the SAME field still discharges present=True.
+    real = (
+        "function Player:Awake()\n"
+        "    self.cam = workspace.CurrentCamera\n"
+        "    self.weaponSlot = self.cam:GetChildren()[1]\n"
+        "end\n\n"
+        "function Player:GetRifle()\n"
+        "    return pivotOf(self.weaponSlot)\n"
+        "end\n\n"
+        "return Player\n"
+    )
+    s2 = _Script(real)
+    n2 = lower_rifle_rig_retarget([s2], _rig_map(cam_receiver="cam"))
+    assert n2 == 1
+    assert s2.rig_binding == {
+        "field": "weaponSlot", "child": "WeaponSlot", "present": True,
+    }
+    assert "self.weaponSlot = nil" in s2.luau_source
+
+
+def test_r5_camera_symbol_rebound_to_non_camera_in_luau_abstains() -> None:
+    # R5 BLOCKING (codex follow-up): the seeded-symbol receiver anchor must not be a
+    # bare NAME match. STRICT: the symbol must be PROVABLY camera (its nearest
+    # preceding binding is a canonical camera literal). A rebind to a NON-camera
+    # (``self.cam = self.defaultSlots; self.weaponSlot = self.cam:GetChildren()[1]``)
+    # -> NOT neutralized, present=False. Only a binding to a canonical camera literal
+    # admits.
+    src = (
+        "function Player:Awake()\n"
+        "    self.cam = self.defaultSlots\n"
+        "    self.weaponSlot = self.cam:GetChildren()[1]\n"
+        "end\n\n"
+        "function Player:GetRifle()\n"
+        "    return pivotOf(self.weaponSlot)\n"
+        "end\n\n"
+        "return Player\n"
+    )
+    s = _Script(src)
+    n = lower_rifle_rig_retarget([s], _rig_map(cam_receiver="cam"))
+    assert n == 0
+    assert s.rig_binding == {
+        "field": "weaponSlot", "child": "WeaponSlot", "present": False,
+    }
+    assert "self.cam:GetChildren()[1]" in s.luau_source  # NOT neutralized
+    # A binding to the canonical camera literal DOES admit (discriminator).
+    src_ok = (
+        "function Player:Awake()\n"
+        "    self.cam = workspace.CurrentCamera\n"
+        "    self.weaponSlot = self.cam:GetChildren()[1]\n"
+        "end\n\n"
+        "function Player:GetRifle()\n"
+        "    return pivotOf(self.weaponSlot)\n"
+        "end\n\n"
+        "return Player\n"
+    )
+    s_ok = _Script(src_ok)
+    assert lower_rifle_rig_retarget([s_ok], _rig_map(cam_receiver="cam")) == 1
+    assert s_ok.rig_binding["present"] is True
+
+
+def test_r5_mixed_disjunction_rhs_is_not_neutralized() -> None:
+    # R5 (codex R2): the camera-child access must BE the WHOLE RHS value, not merely
+    # appear in a mixed expression. A disjunction whose live value can be the
+    # NON-camera primary (``self.defaultSlots or self.cam:GetChildren()[1]``) must
+    # NOT be neutralized nor stamp present=True.
+    src = (
+        "function Player:Awake()\n"
+        "    self.cam = workspace.CurrentCamera\n"
+        "    self.weaponSlot = self.defaultSlots or self.cam:GetChildren()[1]\n"
+        "end\n\n"
+        "function Player:GetRifle()\n"
+        "    return pivotOf(self.weaponSlot)\n"
+        "end\n\n"
+        "return Player\n"
+    )
+    s = _Script(src)
+    n = lower_rifle_rig_retarget([s], _rig_map(cam_receiver="cam"))
+    assert n == 0
+    assert s.rig_binding == {
+        "field": "weaponSlot", "child": "WeaponSlot", "present": False,
+    }
+    assert "self.defaultSlots or self.cam:GetChildren()[1]" in s.luau_source
+    assert "self.weaponSlot = nil" not in s.luau_source
+    # The corpus nil-GUARD conjunction (result IS the ordinal) still admits.
+    guarded = (
+        "function Player:Awake()\n"
+        "    self.cam = workspace.CurrentCamera\n"
+        "    self.weaponSlot = self.cam and self.cam:GetChildren()[1]\n"
+        "end\n\n"
+        "function Player:GetRifle()\n"
+        "    return pivotOf(self.weaponSlot)\n"
+        "end\n\n"
+        "return Player\n"
+    )
+    g = _Script(guarded)
+    assert lower_rifle_rig_retarget([g], _rig_map(cam_receiver="cam")) == 1
+    assert g.rig_binding["present"] is True
+    # A FOREIGN ``and`` guard (not the camera receiver) makes the value conditional
+    # on a NON-camera (nil when the guard is falsy) -> must NOT be neutralized.
+    foreign_guard = (
+        "function Player:Awake()\n"
+        "    self.cam = workspace.CurrentCamera\n"
+        "    self.weaponSlot = self.defaultSlots and self.cam:GetChildren()[1]\n"
+        "end\n\n"
+        "function Player:GetRifle()\n"
+        "    return pivotOf(self.weaponSlot)\n"
+        "end\n\n"
+        "return Player\n"
+    )
+    fg = _Script(foreign_guard)
+    assert lower_rifle_rig_retarget([fg], _rig_map(cam_receiver="cam")) == 0
+    assert fg.rig_binding["present"] is False
+    assert "self.defaultSlots and self.cam:GetChildren()[1]" in fg.luau_source
+
+
+def test_r5_camera_symbol_as_param_or_loopvar_abstains() -> None:
+    # R5 (codex R2): a symbol with NO preceding canonical-camera binding — a function
+    # PARAMETER (``local function pick(cam) ... cam:GetChildren()[1] end``) or a
+    # for-loop variable — is NOT proven camera (the AI is not trusted) -> abstain,
+    # present=False. (Strict: fail-closed on the absence of positive proof.)
+    param_src = (
+        "function Player:Awake()\n"
+        "    local function pick(cam) self.weaponSlot = cam:GetChildren()[1] end\n"
+        "    pick(self.defaultSlots)\n"
+        "end\n\n"
+        "function Player:GetRifle()\n"
+        "    return pivotOf(self.weaponSlot)\n"
+        "end\n\n"
+        "return Player\n"
+    )
+    s = _Script(param_src)
+    n = lower_rifle_rig_retarget([s], _rig_map(cam_receiver="cam"))
+    assert n == 0
+    assert s.rig_binding == {
+        "field": "weaponSlot", "child": "WeaponSlot", "present": False,
+    }
+    assert "cam:GetChildren()[1]" in s.luau_source  # NOT neutralized
+
+
+def test_r5_camera_binding_in_closed_or_dead_scope_does_not_dominate() -> None:
+    # R5 (codex R3): a canonical-camera binding that does NOT REACH the use — inside
+    # a ``do ... end`` that closes before the use, or a ``if false then ... end`` dead
+    # branch — must NOT prove the symbol camera (the binding's scope exited). The use
+    # site's ``cam`` is then unproven -> abstain, present=False.
+    for src in (
+        # closed ``do`` scope
+        "function Player:Awake()\n"
+        "    do\n        local cam = workspace.CurrentCamera\n    end\n"
+        "    self.weaponSlot = cam:GetChildren()[1]\n"
+        "end\n\nfunction Player:GetRifle()\n"
+        "    return pivotOf(self.weaponSlot)\nend\n\nreturn Player\n",
+        # dead ``if false then`` branch
+        "function Player:Awake()\n"
+        "    if false then\n        cam = workspace.CurrentCamera\n    end\n"
+        "    self.weaponSlot = cam:GetChildren()[1]\n"
+        "end\n\nfunction Player:GetRifle()\n"
+        "    return pivotOf(self.weaponSlot)\nend\n\nreturn Player\n",
+    ):
+        s = _Script(src)
+        n = lower_rifle_rig_retarget([s], _rig_map(cam_receiver="cam"))
+        assert n == 0, src
+        assert s.rig_binding["present"] is False
+        assert "cam:GetChildren()[1]" in s.luau_source  # NOT neutralized
+    # A binding at the SAME level that REACHES the use (incl. through an enclosing
+    # ``if self.cam then`` block whose write is guarded) still admits.
+    ok = (
+        "function Player:Awake()\n"
+        "    self.cam = workspace.CurrentCamera\n"
+        "    if self.cam then\n"
+        "        self.weaponSlot = self.cam:GetChildren()[1]\n"
+        "    end\n"
+        "end\n\nfunction Player:GetRifle()\n"
+        "    return pivotOf(self.weaponSlot)\nend\n\nreturn Player\n"
+    )
+    s_ok = _Script(ok)
+    assert lower_rifle_rig_retarget([s_ok], _rig_map(cam_receiver="cam")) == 1
+    assert s_ok.rig_binding["present"] is True
+
+
+def test_r5_structural_balance_fails_closed_on_unterminated_long_bracket(
+    monkeypatch,
+) -> None:
+    # R5 (codex follow-up): the analyzer-absent fallback must FAIL CLOSED on an
+    # UNTERMINATED long-bracket comment/string or a short string spanning a newline
+    # (all invalid Luau) — never treat "rest of file is a comment/string" as valid.
+    import utils.luau_analyze as ula
+    monkeypatch.setattr(ula, "luau_analyze_path", lambda: None)
+    from converter.rifle_rig_retarget_lowering import _structural_balance_ok
+    assert _structural_balance_ok("--[[ unterminated block comment\n") is False
+    assert _structural_balance_ok("local s = [[ unterminated long string\n") is False
+    assert _structural_balance_ok('local s = "oops\nreturn Player\n') is False
+    # A properly TERMINATED block comment + valid module still passes.
+    assert _structural_balance_ok(
+        "--[[ terminated ]]\nfunction P:F()\n    return 1\nend\n\nreturn P\n"
+    ) is True
+
+
+def test_r5_lhs_abstains_on_every_typed_local_form(tmp_path: Path) -> None:
+    # R5 (codex follow-up): the typed-local guard ALLOW-LISTS by statement terminator
+    # (fail-closed). It must ABSTAIN on EVERY typed-local form a single-char reject-
+    # list could not enumerate — simple, generic, array, qualified, NULLABLE
+    # (``Transform?``), TUPLE (``(Transform, int)``), and COMMENT-separated
+    # (``Transform /*c*/``) — admitting a typed local would be a bogus rig fact
+    # (a false fail-close on valid code). A plain-statement bare write still admits.
+    for body in (
+        "Transform weaponSlot = Camera.main.transform.GetChild(0);",
+        "List<Transform> weaponSlot = Camera.main.transform.GetChild(0);",
+        "Transform[] weaponSlot = Camera.main.transform.GetChild(0);",
+        "System.Collections.Generic.List<Transform> weaponSlot = "
+        "Camera.main.transform.GetChild(0);",
+        "Transform? weaponSlot = Camera.main.transform.GetChild(0);",
+        "(Transform, int) weaponSlot = Camera.main.transform.GetChild(0);",
+        "Transform /*c*/ weaponSlot = Camera.main.transform.GetChild(0);",
+    ):
+        src = (
+            "public class Player : MonoBehaviour {\n"
+            "  public Transform weaponSlot;\n"
+            f"  void Awake() {{ {body} }}\n}}\n"
+        )
+        entry = _build(tmp_path, src, _fps_library())
+        assert entry is not None, body
+        assert entry.rig_facts == (), f"typed local must abstain: {body!r}"
+    # A plain-statement bare field write still admits.
+    plain = (
+        "public class Player : MonoBehaviour {\n"
+        "  public Transform weaponSlot;\n"
+        "  void Awake() { weaponSlot = Camera.main.transform.GetChild(0); }\n}\n"
+    )
+    entry = _build(tmp_path, plain, _fps_library())
+    assert entry is not None
+    assert len(entry.rig_facts) == 1
+
+
+def test_r5_foreign_resolver_with_marker_is_not_own_emit() -> None:
+    # R5 BLOCKING (lowering:687): a FOREIGN ``_resolveWeaponSlot`` whose body USES
+    # the ``_MainCameraRig`` marker as live code (but differs from the canonical
+    # emit) must NOT count as the lowering's own emit. With such a method + an
+    # existing call already present and NO write/read for the lowering to edit, the
+    # old marker-substring check false-discharged present=True on modified=0.
+    foreign_src = (
+        "function Player:GetRifle()\n"
+        "    return self:_resolveWeaponSlot()\n"
+        "end\n\n"
+        "function Player:_resolveWeaponSlot()\n"
+        "    -- a DIFFERENT, foreign body that merely uses the marker as live code\n"
+        '    local m = workspace:FindFirstChild("Rig")\n'
+        '    if m and m:GetAttribute("_MainCameraRig") then return m end\n'
+        "    return nil\n"
+        "end\n\n"
+        "return Player\n"
+    )
+    s = _Script(foreign_src)
+    n = lower_rifle_rig_retarget([s], _rig_map(cam_receiver="cam"))
+    # The foreign method is NOT the canonical emit -> the lowering RE-INJECTS its
+    # own (real work) when it can. present=True is earned ONLY when the OWN method
+    # landed this run (n == 1), never a marker-substring false-green on modified=0.
+    assert s.rig_binding is not None
+    if s.rig_binding["present"] is True:
+        assert n == 1
+        from converter.rifle_rig_retarget_lowering import (
+            _has_own_resolver_method,
+            _resolver_method_text,
+        )
+        own = _resolver_method_text("Player", "WeaponSlot", "weaponSlot", "WeaponSlot")
+        assert _has_own_resolver_method(s.luau_source, "WeaponSlot", own) is True
+    else:
+        assert n == 0
+        assert s.rig_binding["present"] is False
+
+
+def test_r5_has_own_resolver_rejects_foreign_marker_body() -> None:
+    # Unit for the structural-equality own-emit check (R5 BLOCKING): a foreign
+    # same-named method that merely USES the marker is NOT the own emit; the
+    # canonical emit IS.
+    from converter.rifle_rig_retarget_lowering import (
+        _has_own_resolver_method,
+        _resolver_method_text,
+    )
+    own = _resolver_method_text("Player", "WeaponSlot", "weaponSlot", "WeaponSlot")
+    # The EXACT own-emit marker (``m:GetAttribute("_MainCameraRig")``) used as live
+    # code in a DIFFERENT body — the adversarial case the round-4 marker-substring
+    # check false-passed. Structural equality rejects it.
+    foreign_with_marker = (
+        "function Player:_resolveWeaponSlot()\n"
+        "    for _, m in workspace:GetDescendants() do\n"
+        '        if m:GetAttribute("_MainCameraRig") then return m end\n'
+        "    end\n"
+        "    return nil\n"
+        "end\n"
+    )
+    assert _has_own_resolver_method(foreign_with_marker, "WeaponSlot", own) is False
+    assert _has_own_resolver_method(own, "WeaponSlot", own) is True
+
+
+def test_r5_resolver_abstains_generic_array_qualified_typed_locals(
+    tmp_path: Path,
+) -> None:
+    # R5 MAJOR (resolver:723): a GENERIC / ARRAY / QUALIFIED-GENERIC typed local
+    # declaration must ABSTAIN (the round-4 check only rejected an alnum preceding
+    # char, so a type ending in ``>``/``]``/``.`` false-admitted). Only a bare field
+    # write admits.
+    for decl in (
+        "List<Transform> weaponSlot = Camera.main.transform.GetChild(0);",
+        "Transform[] weaponSlot = Camera.main.transform.GetChild(0);",
+        "System.Collections.Generic.List<Transform> weaponSlot = "
+        "Camera.main.transform.GetChild(0);",
+        "IDictionary<int,Transform> weaponSlot = Camera.main.transform.GetChild(0);",
+    ):
+        src = (
+            "public class Player : MonoBehaviour {\n"
+            "  void Awake() {\n"
+            f"    {decl}\n"
+            "  }\n}\n"
+        )
+        entry = _build(tmp_path, src, _fps_library())
+        assert entry is not None, decl
+        assert entry.rig_facts == (), f"typed local must abstain: {decl}"
+    # The bare field write still admits.
+    field_write = (
+        "public class Player : MonoBehaviour {\n"
+        "  public Transform weaponSlot;\n"
+        "  void Awake() { weaponSlot = Camera.main.transform.GetChild(0); }\n}\n"
+    )
+    entry = _build(tmp_path, field_write, _fps_library())
+    assert entry is not None
+    assert entry.rig_facts == (
+        RigRootedRetargetFact(
+            field_name="weaponSlot", child_name="WeaponSlot",
+            cam_receiver="Camera.main.transform"),
+    )
+
+
+def test_r5_structural_balance_skips_block_comment_brackets(monkeypatch) -> None:
+    # R5 MAJOR (lowering:_structural_balance_ok): the analyzer-absent fallback must
+    # SKIP Luau long-bracket block comments/strings before counting brackets, so a
+    # valid source carrying a ``--[[ ... ]]`` block comment with brackets/keywords
+    # is NOT false-rejected (the ``]]`` closer leaked as a code-level ``]`` closer).
+    import utils.luau_analyze as ula
+    monkeypatch.setattr(ula, "luau_analyze_path", lambda: None)
+    from converter.rifle_rig_retarget_lowering import _structural_balance_ok
+    # A valid module with a multi-line block comment containing brackets + keywords.
+    valid = (
+        "--[[ a block comment\n"
+        "  containing ] brackets [ and the words function end if then do\n"
+        "  and a long string [=[ nested ]=] inside\n"
+        "]]\n"
+        "function Player:Foo()\n"
+        "    local t = { a = 1, b = 2 }\n"
+        "    if t.a then return t.b end\n"
+        "end\n\n"
+        "return Player\n"
+    )
+    assert _structural_balance_ok(valid) is True
+    # A long STRING with brackets is likewise skipped.
+    valid_str = (
+        "function Player:Bar()\n"
+        "    local s = [[ ] [ ]]\n"
+        "    return s\n"
+        "end\n\n"
+        "return Player\n"
+    )
+    assert _structural_balance_ok(valid_str) is True
+    # A GENUINELY unbalanced source still fails (an extra code-level ``)``).
+    unbalanced = (
+        "function Player:Baz()\n"
+        "    return (1 + 2))\n"
+        "end\n\n"
+        "return Player\n"
+    )
+    assert _structural_balance_ok(unbalanced) is False

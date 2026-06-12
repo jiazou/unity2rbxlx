@@ -63,9 +63,20 @@ class RigRootedRetargetFact:
     resolved child lives under the converted _MainCameraRig Model at runtime, so
     the receiver is DISCARDED and the binding is retargeted to the rig. Consumed
     by the post-transpile rifle_rig_retarget_lowering, NOT by prerewrite_child_index.
+
+    ``cam_receiver`` carries the EXACT camera receiver expression text the
+    admission resolved (the C# group-2 receiver of ``<field> = <camrecv>.GetChild(n)``,
+    e.g. ``cam`` for a seeded symbol or ``Camera.main.transform`` for the direct
+    form). It is the lowering's RECEIVER ANCHOR: the lowering neutralizes ONLY the
+    Luau assignment whose ordinal-RHS receiver matches THIS camera receiver, never a
+    same-field ordinal on a different (non-camera) receiver. Without it the lowering
+    could only match field+ordinal-shape and would neutralize an unrelated
+    ``self.<field> = self.<other>:GetChildren()[n]``. Defaults to "" (the lowering
+    then falls back to the canonical camera literals only).
     """
     field_name: str  # the assignment LHS field ("weaponSlot"), from `<field> = cam.GetChild(n)`
-    child_name: str  # resolved authored child name under the MainCamera node ("WeaponSlot"), E1–E3 guarded
+    child_name: str  # resolved authored child name under the MainCamera node ("WeaponSlot"), E1-E3 guarded
+    cam_receiver: str = ""  # the C# group-2 camera receiver text (the lowering's RECEIVER ANCHOR)
 
 
 # Per-script resolution outcome, keyed on the canonical .cs path key. Carries
@@ -729,10 +740,27 @@ def _lhs_is_bare_field(source: str, field_start: int, full_lhs: str) -> str | No
       - a FOREIGN member-access LHS like ``x.weaponSlot`` (round-1 BLOCKING #2 /
         edge 11) — a foreign ``.`` qualifier precedes the LHS; and
       - a TYPED LOCAL DECLARATION like ``Transform weaponSlot = ...`` / ``var x = ...``
-        (round-4 MAJOR) — a leading type/`var` TOKEN precedes the field. A local
-        temp is NOT a rig fact (the field never persists on the instance), so
-        admitting it would flip ``resolved_total`` and create a bogus fail-closed
-        path for valid code."""
+        / a GENERIC ``List<Transform> weaponSlot = ...`` / an ARRAY ``Transform[]
+        weaponSlot = ...`` / a QUALIFIED-GENERIC
+        ``System.Collections.Generic.List<Transform> weaponSlot = ...`` (round-5
+        MAJOR) — a leading type TOKEN precedes the field. A local temp is NOT a rig
+        fact (the field never persists on the instance), so admitting it would flip
+        ``resolved_total`` and create a bogus fail-closed path for valid code.
+
+    A bare field write (``weaponSlot = ...`` / ``this.weaponSlot = ...``) is the
+    ONLY admitted shape. ALLOW-LIST BY TERMINATOR: a bare field write's preceding
+    non-blank char in C# is always a STATEMENT TERMINATOR (``;``/``{``/``}``) or
+    start-of-file; ANY other preceding char means a leading token precedes the field.
+    This is the FAIL-CLOSED choice: it ABSTAINS on every typed-local form — simple
+    (``Transform``), generic (``List<T>``, prev ``>``), array (``T[]``, prev ``]``),
+    qualified (``A.B.T``, prev ``.``), nullable (``Transform?``, prev ``?``), tuple
+    (``(T, int)``, prev ``)``), comment-separated (``T /*c*/``, prev ``/``) — none of
+    which a single-char REJECT-list could enumerate (codex round-5: ``Transform?`` /
+    ``(T,int)`` escaped a reject-list, and ``)``/``:`` are AMBIGUOUS between a tuple
+    type and an ``if (ok) x``). Over-abstaining a rare conditional/labeled camera
+    write (``if (ok) weaponSlot = ...``) is fail-closed-safe; ADMITTING a typed local
+    (a bogus rig fact -> a false fail-close on valid code) is not. The corpus write
+    is a plain statement, so this admits the happy-path and never a typed local."""
     parts = full_lhs.split(".")
     if len(parts) == 1:
         field = parts[0]
@@ -746,16 +774,9 @@ def _lhs_is_bare_field(source: str, field_start: int, full_lhs: str) -> str | No
         k -= 1
     if k <= 0:
         return field  # start of file -> bare write
-    prev = source[k - 1]
-    if prev == ".":
-        return None  # a foreign ``.`` qualifier precedes the LHS
-    # A preceding IDENTIFIER char means a leading token (a TYPE like ``Transform``
-    # or ``var``) immediately precedes the field -> a typed local DECLARATION, not a
-    # bare field write. C# statements terminate with ``;``/``{``/``}`` (or start of
-    # file), so a bare field write's preceding non-blank char is never a word char.
-    if prev.isalnum() or prev == "_":
-        return None  # typed local declaration -> abstain
-    return field
+    if source[k - 1] in ";{}":
+        return field  # statement terminator precedes -> bare field write
+    return None  # any leading token (a type, a control-flow head) -> abstain
 
 
 def _resolve_rig_facts(
@@ -791,7 +812,11 @@ def _resolve_rig_facts(
         if child is None:
             continue  # E1–E3 -> abstain
         name = getattr(child, "name", "") or ""
-        rig_facts.append(RigRootedRetargetFact(field_name=field, child_name=name))
+        rig_facts.append(
+            RigRootedRetargetFact(
+                field_name=field, child_name=name, cam_receiver=m.group(2)
+            )
+        )
     return rig_facts
 
 

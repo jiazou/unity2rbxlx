@@ -14,7 +14,9 @@ editing the AI's emitted Luau (the AI is NOT trusted to preserve the binding):
      ``self:_resolve<Child>()`` (abstain in the non-yielding lifecycle methods
      ``Awake``/``Start``);
   3. neutralize the AI's camera-child Awake WRITE ``self.<field> = <camera-child>``
-     to ``self.<field> = nil`` (fact-anchored on the camera-child RHS shape).
+     to ``self.<field> = nil`` — anchored on the CAMERA receiver the fact recorded
+     (the whole RHS value must BE a camera-rooted ordinal access whose receiver is
+     PROVABLY the camera), never a same-field ordinal on a different receiver.
 
 The lowering STAMPS the ``rig_binding`` carrier for EVERY script with >=1 rig fact
 (default ``present=False``); it flips ``present=True`` only after RE-DERIVING
@@ -35,11 +37,13 @@ from __future__ import annotations
 
 import hashlib
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
 from converter.child_ref_resolver import ChildRefMap, RigRootedRetargetFact
 from converter.trigger_stay_lowering import (
+    _long_bracket_open_level,
     _luau_pos_in_long_bracket,
     _luau_pos_is_code,
 )
@@ -135,6 +139,7 @@ def lower_rifle_rig_retarget(
         for fact in rig_facts:
             field = fact.field_name
             child = fact.child_name
+            anchor = _camera_anchor(fact.cam_receiver)
             # The method-name suffix is a VALID Luau identifier derived from the
             # child name (which may carry spaces/special chars); the rig LOOKUP
             # still uses the real ``child`` string. The cache local ``_<field>Cache``
@@ -159,7 +164,7 @@ def lower_rifle_rig_retarget(
                 if injected:
                     new_src, _reads = _rewrite_field_reads(new_src, field, method)
                     new_src, _neutralized = _neutralize_assignment(
-                        new_src, field, suffix
+                        new_src, field, suffix, anchor
                     )
                     # Re-check Luau syntax on the FINAL source AFTER ALL rewrites
                     # (inject + read-rewrite + neutralize) — a read-rewrite or a
@@ -169,7 +174,9 @@ def lower_rifle_rig_retarget(
                     # If the FINAL source fails to parse, abstain/revert.
                     if not _luau_syntax_ok(new_src):
                         script.luau_source = original  # never ship unloadable Luau
-                    elif _binding_discharged(new_src, field, suffix):
+                    elif _binding_discharged(
+                        new_src, field, child, suffix, anchor
+                    ):
                         script.luau_source = new_src
                         changed = True
                     else:
@@ -183,7 +190,9 @@ def lower_rifle_rig_retarget(
             # reads + neutralized write actually landed. This re-stamps identically
             # on an idempotent second call (the method is already present) and
             # never stamps True off a reverted edit.
-            present = _binding_discharged(script.luau_source, field, suffix)
+            present = _binding_discharged(
+                script.luau_source, field, child, suffix, anchor
+            )
             script.rig_binding = {
                 "field": field,
                 "child": child,
@@ -292,10 +301,12 @@ def _inject_resolver_method(
     bare name presence). On a syntax-check failure, abstain (return the pre-edit
     source, False)."""
     # Idempotency: guard on the lowering's OWN injected method's presence at a code
-    # position (own-emit body match), NOT a bare same-named declaration (round-4
-    # BLOCKING: a foreign ``_resolve<Child>`` body of ``return nil`` must not be
-    # treated as already-injected).
-    if _has_own_resolver_method(source, suffix):
+    # position (STRUCTURAL equality to the canonical emit), NOT a bare same-named
+    # declaration NOR a marker substring (round-5 BLOCKING: a foreign
+    # ``_resolve<Child>`` whose body merely uses ``m:GetAttribute("_MainCameraRig")``
+    # must not be treated as already-injected).
+    method_text = _resolver_method_text(class_name, child, field, suffix)
+    if _has_own_resolver_method(source, suffix, method_text):
         return source, False  # the lowering's own method already present -> no re-inject
 
     span = _last_module_return_span(source, class_name)
@@ -303,7 +314,6 @@ def _inject_resolver_method(
         return source, False  # no module epilogue to splice before -> abstain
 
     ins_at = span[0]
-    method_text = _resolver_method_text(class_name, child, field, suffix)
     new_source = source[:ins_at] + method_text + source[ins_at:]
 
     if not _luau_syntax_ok(new_source):
@@ -510,32 +520,180 @@ def _enclosing_method(source: str, pos: int) -> str | None:
     return method
 
 
-# A camera-child RHS shape: the AI's positional ORDINAL child access the resolver
-# fact says this field was bound from (``self.cam:GetChildren()[n]`` /
-# ``...:GetChild(n)``). The neutralizer anchors on a ``self.<field> =`` whose RHS
-# textually carries ONE OF THESE ordinal accesses — NOT a bare ``self.cam`` mention
-# (a boolean/config RHS like ``self.cam and self.defaultSlot`` merely NAMES the
-# camera but performs no child lookup; neutralizing it to ``nil`` would be a
-# false-green — codex round-3 MAJOR). When the RHS carries no ordinal child access
-# the neutralizer ABSTAINS (leaves the write -> the verifier sees an
-# un-discharged binding). The leading ``[:.]`` requires the ordinal access to be
-# rooted on a RECEIVER expression (``cam:GetChild(n)`` / ``cam.GetChild(n)``), not
-# a bare ``GetChild(`` token inside a string the code-position gate already skips.
-_CAMERA_CHILD_RHS_RE = re.compile(
-    r"[:.]GetChildren\(\)\s*\[\s*\d+\s*\]"
-    r"|[:.]GetChild\(\s*\d+\s*\)"
+# A WHOLE-RHS camera-child value: optional ``<guard> and`` nil-guards (the corpus
+# ``self.cam and self.cam:GetChildren()[1]``) then the ordinal child access
+# ``<recv>:GetChildren()[n]`` / ``<recv>:GetChild(n)`` / ``<recv>.GetChild(n)``, to
+# end of value. Group 1 captures the whole guard prefix, group 2 the RECEIVER chain.
+# Anchored ``^...$`` against the STRIPPED RHS so the access must BE the value, not
+# merely appear inside a mixed expression — a trailing ``or <other>`` / any extra
+# operand fails to match (codex round-5 R2). The guard prefix is then required to be
+# ONLY the SAME camera receiver (codex round-5 R3): a foreign guard
+# ``self.defaultSlots and self.cam:GetChild(0)`` makes the value conditional on a
+# NON-camera (``nil`` when ``defaultSlots`` is falsy), so it must NOT be neutralized.
+_CAMERA_CHILD_VALUE_RE = re.compile(
+    r"^((?:[A-Za-z_][\w.]*\s+and\s+)*)"
+    r"([A-Za-z_][\w.]*)"
+    r"(?::GetChildren\(\)\s*\[\s*\d+\s*\]|[:.]GetChild\(\s*\d+\s*\))$"
 )
+
+# The canonical Luau main-camera receiver literals a transpiled ``Camera.main`` /
+# ``Camera.main.transform`` resolves to (``api_mappings``: ``Camera.main`` ->
+# ``workspace.CurrentCamera``). Case-insensitive ``workspace``/``Workspace``.
+_CANONICAL_CAMERA_RECEIVERS: frozenset[str] = frozenset({
+    "workspace.CurrentCamera",
+    "Workspace.CurrentCamera",
+    "game.Workspace.CurrentCamera",
+})
+
+
+@dataclass(frozen=True)
+class _CamAnchor:
+    """The lowering's RECEIVER ANCHOR for the camera-child write (round-5 BLOCKING).
+
+    ``symbols`` are the Luau receiver forms of a SEEDED C# symbol (``cam`` ->
+    ``self.cam`` and ``cam``). A symbol receiver is only PROVABLY the camera when the
+    Luau ALSO binds it to a canonical camera literal at a code position before the
+    use — so a re-aliased ``local cam = self.defaultSlots`` is NOT admitted (codex
+    round-5: a textual symbol-name match alone false-stamped a wrong binding green).
+    The canonical literals (``workspace.CurrentCamera`` ...) are ALWAYS camera."""
+    symbols: frozenset[str]
+
+
+def _camera_anchor(cam_receiver: str) -> _CamAnchor:
+    """Build the receiver anchor from the fact's recorded C# camera receiver.
+
+    The C# receiver is EITHER the literal ``Camera.main.transform`` (direct form,
+    transpiles to a canonical camera literal — no symbol forms) OR a bare symbol
+    ``cam`` seeded from ``Camera.main.transform`` (its Luau receiver is ``self.cam``
+    / ``cam``, admitted only with a proven camera binding). ``cam_receiver`` empty or
+    dotted (``Camera.main.transform``) contributes no symbol forms — canonical
+    literals only."""
+    recv = cam_receiver.strip()
+    if recv and recv != "Camera.main.transform" and "." not in recv:
+        return _CamAnchor(symbols=frozenset({f"self.{recv}", recv}))
+    return _CamAnchor(symbols=frozenset())
+
+
+def _luau_symbol_is_camera(source: str, recv: str, use_pos: int) -> bool:
+    """STRICT: True only when the Luau receiver ``recv`` (``self.cam`` / ``cam``) is
+    PROVABLY the camera at ``use_pos`` — its NEAREST PRECEDING code-position binding
+    before ``use_pos`` is ``<recv> = <canonical-camera-literal>`` (the transpiled
+    ``self.cam = workspace.CurrentCamera`` the real corpus always carries before the
+    ordinal write). The AI is NOT trusted to preserve the binding, so a symbol with
+    NO preceding camera binding — a function PARAMETER, a ``for``-loop variable, or a
+    rebind to a non-camera — is NOT proven and ABSTAINS (codex round-5 R2:
+    ``local function pick(cam) ... cam:GetChildren()[1] end`` / ``local cam =
+    self.defaultSlots`` must NOT stamp green). Fail-closed on the absence of POSITIVE
+    proof, never trust the symbol name alone."""
+    # Left-bounded so ``self.cam`` does not match inside ``myself.cam`` / ``a.self.cam``.
+    assign_re = re.compile(r"(?<![\w.])" + re.escape(recv) + r"\s*=(?!=)")
+    nearest_start = -1
+    nearest_rhs: str | None = None
+    for m in assign_re.finditer(source):
+        if m.start() >= use_pos:
+            break
+        if not _luau_pos_is_code(source, m.start()):
+            continue
+        if _luau_pos_in_long_bracket(source, m.start()):
+            continue
+        rhs_end = _statement_rhs_end(source, m.end())
+        nearest_start = m.start()
+        nearest_rhs = source[m.end():rhs_end].strip()
+    if nearest_rhs is None or nearest_rhs not in _CANONICAL_CAMERA_RECEIVERS:
+        return False
+    # DOMINANCE (codex round-5 R3): the binding must be on the straight-line path to
+    # the use, not in a block (``do``/``then``/``function``) that CLOSED before it
+    # (``do local cam = workspace.CurrentCamera end; ... cam:GetChildren()[1]`` /
+    # ``if false then cam = ... end``). If a block enclosing the binding closes
+    # between it and the use, the binding does not reach the use -> NOT proven.
+    return _binding_reaches_use(source, nearest_start, use_pos)
+
+
+def _binding_reaches_use(source: str, bind_pos: int, use_pos: int) -> bool:
+    """True if no block enclosing ``bind_pos`` is CLOSED (its ``end``/``until``)
+    before ``use_pos`` — i.e. the binding's scope still contains the use. Tracks
+    block depth (``function``/``do``/``then``/``repeat`` open; ``end``/``until``
+    close) from ``bind_pos`` to ``use_pos``, code-position-aware; if depth ever drops
+    BELOW the binding's level, an enclosing block exited -> the binding does not
+    reach the use (a closed-scope / dead-branch seed)."""
+    depth = 0
+    i = bind_pos
+    while i < use_pos:
+        if not _luau_pos_is_code(source, i) or _luau_pos_in_long_bracket(source, i):
+            i += 1
+            continue
+        tok = _BLOCK_TOKEN_RE.match(source, i)
+        if tok is None:
+            i += 1
+            continue
+        word = tok.group(1)
+        if word in ("function", "do", "then", "repeat"):
+            depth += 1
+        elif word in ("end", "until"):
+            depth -= 1
+            if depth < 0:
+                return False  # an enclosing block of the binding closed before use
+        i = tok.end()
+    return True
+
+
+def _rhs_is_camera_child(
+    source: str, rhs_abs_start: int, rhs_abs_end: int, anchor: _CamAnchor
+) -> bool:
+    """True iff the WHOLE RHS value ``source[rhs_abs_start:rhs_abs_end]`` IS a
+    camera-rooted ordinal child access — ``(<cam> and )* <camrecv>:GetChildren()[n]``
+    (the corpus nil-guard shape), nothing else — whose ``<camrecv>`` is PROVABLY the
+    camera: a canonical camera literal, OR a seeded-symbol form (``self.cam``/``cam``)
+    proven camera-bound by ``_luau_symbol_is_camera``.
+
+    WHOLE-RHS (codex round-5 R2): the access must BE the value, not merely appear in
+    a mixed expression — a disjunction ``self.defaultSlots or self.cam:GetChildren()
+    [1]`` (live value can be the NON-camera primary) does NOT match. Any ``and`` GUARD
+    must be the SAME proven-camera receiver (codex round-5 R3) — a foreign guard
+    ``self.defaultSlots and self.cam:GetChild(0)`` makes the value conditional on a
+    NON-camera (nil when the guard is falsy), so it does NOT match. A same-field
+    ordinal on a non-camera receiver, or a bare ``self.cam`` mention with no ordinal
+    access, also does not match."""
+    raw = source[rhs_abs_start:rhs_abs_end]
+    lead_ws = len(raw) - len(raw.lstrip())
+    m = _CAMERA_CHILD_VALUE_RE.match(raw.strip())
+    if m is None:
+        return False
+    guards = [g.strip() for g in m.group(1).split(" and ") if g.strip()]
+    recv = m.group(2)
+    # Every ``and`` guard must be the SAME token as the receiver (the corpus nil-guard
+    # ``self.cam and self.cam:...``); a foreign guard makes the value non-camera-
+    # conditional -> abstain.
+    if any(g != recv for g in guards):
+        return False
+    if recv in _CANONICAL_CAMERA_RECEIVERS:
+        return True
+    # Map the receiver offset (in the stripped RHS) back to a source position for
+    # the camera-binding proof.
+    return recv in anchor.symbols and _luau_symbol_is_camera(
+        source, recv, rhs_abs_start + lead_ws + m.start(2)
+    )
+
+
+def _neutralized_marker(suffix: str) -> str:
+    """The lowering's OWN deterministic neutralize comment for ``_resolve<suffix>``.
+    Emitted on the neutralized camera-child write (``self.<field> = nil <marker>``)
+    so discharge can POSITIVELY confirm the camera write was found + neutralized BY
+    THIS LOWERING (round-5 BLOCKING) — not merely that no camera write survives
+    (which is trivially true when the AI output never had one)."""
+    return f" -- rig-retargeted: resolved lazily at use via _resolve{suffix}"
 
 
 def _neutralize_assignment(
-    source: str, field: str, suffix: str
+    source: str, field: str, suffix: str, anchor: _CamAnchor
 ) -> tuple[str, bool]:
     """Replace the RHS of the camera-child Awake write ``self.<field> = <rhs>``
-    with ``nil``, FACT-ANCHORED on the camera-child RHS shape (not the first
-    ``self.<field> =`` anywhere), multiline-aware. Abstain-safe (no-op if no
-    camera-child write exists). ``suffix`` is the VALID-LUAU-IDENTIFIER method-name
-    suffix (only used in the rig-retarget comment). Returns
-    ``(new_source, neutralized)``."""
+    with ``nil``, FACT-ANCHORED on the CAMERA receiver (``anchor``) the fact
+    recorded — never a same-field ordinal on a different (non-camera) receiver
+    (round-5 BLOCKING). Not the first ``self.<field> =`` anywhere; multiline-aware.
+    Abstain-safe (no-op if no camera-rooted child write exists). ``suffix`` is the
+    VALID-LUAU-IDENTIFIER method-name suffix (only used in the rig-retarget
+    comment). Returns ``(new_source, neutralized)``."""
     assign_re = re.compile(r"self\." + re.escape(field) + r"\s*=(?!=)")
     for m in assign_re.finditer(source):
         if not _luau_pos_is_code(source, m.start()):
@@ -544,12 +702,10 @@ def _neutralize_assignment(
             continue
         rhs_start = m.end()
         rhs_end = _statement_rhs_end(source, rhs_start)
-        rhs = source[rhs_start:rhs_end]
-        if _CAMERA_CHILD_RHS_RE.search(rhs) is None:
-            continue  # not the camera-child write -> leave it (e.g. a config)
-        comment = f" -- rig-retargeted: resolved lazily at use via _resolve{suffix}"
+        if not _rhs_is_camera_child(source, rhs_start, rhs_end, anchor):
+            continue  # not the camera-rooted child write -> leave it (config/other)
         new_source = (
-            source[:rhs_start] + " nil" + comment + source[rhs_end:]
+            source[:rhs_start] + " nil" + _neutralized_marker(suffix) + source[rhs_end:]
         )
         return new_source, True
     return source, False
@@ -631,29 +787,46 @@ def _line_continues(source: str, start: int, nl_pos: int) -> bool:
     return _CONTINUATION_HEAD_RE.match(source[j:j + 4]) is not None
 
 
-def _binding_discharged(source: str, field: str, suffix: str) -> bool:
+def _binding_discharged(
+    source: str, field: str, child: str, suffix: str, anchor: _CamAnchor
+) -> bool:
     """INDEPENDENT, code-position-aware derivation: is ``field``'s binding
     discharged via the rig retarget in THIS source? Mirrors the verifier's
     authority (S1b owns the verifier copy; this is the lowering's own re-derive so
     it never stamps ``present=True`` off a reverted edit).
 
+    ``child`` is the REAL rig-child name (for reconstructing the canonical emit);
     ``suffix`` is the VALID-LUAU-IDENTIFIER method-name suffix (``_resolve<suffix>``).
 
     True IFF:
       (1) the LOWERING'S OWN resolver method ``function <Class>:_resolve<suffix>(``
-          (own-emit body, NOT a preexisting foreign same-named method) exists AND
-          >=1 ``self:_resolve<suffix>(`` call exists AND NO bare ``self.<field>``
-          READ survives at a consumer; AND
-      (2) the camera-child WRITE is gone — no surviving
-          ``self.<field> = <... :GetChildren()[n] | :GetChild(n) | self.cam ...>``.
+          (STRUCTURALLY equal to the canonical emit, NOT a preexisting foreign
+          same-named method) exists AND >=1 ``self:_resolve<suffix>(`` call exists
+          AND NO bare ``self.<field>`` READ survives at a consumer; AND
+      (2) the CAMERA-rooted child write was found + NEUTRALIZED BY THIS LOWERING —
+          its OWN neutralize marker (``self.<field> = nil <marker>``) is present at a
+          code position AND no surviving camera-rooted ``self.<field> =
+          <camrecv>:GetChildren()[n]`` (``<camrecv>`` proven camera by ``anchor``).
 
-    Round-4 BLOCKING: condition (1a) requires the lowering's OWN emit, so a
-    preexisting foreign ``_resolve<suffix>`` method (e.g. body ``return nil``) that
-    the lowering never wrote this run cannot false-discharge ``present=True`` on an
-    unchanged source."""
+    Round-5 BLOCKING (two parts):
+      - condition (1a) requires STRUCTURAL equality to the lowering's OWN canonical
+        emit, so a preexisting foreign ``_resolve<suffix>`` method that merely uses
+        the ``_MainCameraRig`` marker cannot false-discharge on a source the lowering
+        never wrote this run; and
+      - condition (2) requires POSITIVE evidence the CAMERA write was neutralized by
+        this lowering (its own marker), NOT merely that no camera write survives —
+        the latter is trivially true when the AI output bound the field from a
+        NON-camera receiver (``self.<field> = self.defaultSlots:GetChildren()[n]``),
+        which the fact's camera-rooted premise never described."""
     method_call = f"self:_resolve{suffix}("
-    # (1a) the lowering's OWN resolver method is present at a code position.
-    if not _has_own_resolver_method(source, suffix):
+    # (1a) the lowering's OWN resolver method is present at a code position
+    # (structural equality to the canonical emit). The class name is read from the
+    # final source so the expected emit is reconstructed exactly.
+    class_name = _read_class_name(source)
+    if class_name is None:
+        return False
+    expected = _resolver_method_text(class_name, child, field, suffix)
+    if not _has_own_resolver_method(source, suffix, expected):
         return False
     # (1b) >=1 ``self:_resolve<suffix>(`` CALL (distinct from the declaration).
     if not _code_contains_token(source, method_call):
@@ -662,10 +835,38 @@ def _binding_discharged(source: str, field: str, suffix: str) -> bool:
     # the neutralized ``self.<field> = nil`` keeps the field a member).
     if _has_surviving_field_read(source, field):
         return False
-    # (2) the camera-child write is gone.
-    if _has_camera_child_write(source, field):
+    # (2a) POSITIVE: the lowering's OWN neutralized write
+    # (``self.<field> = nil <marker>``) is present at a code position (the
+    # camera-child write was found + neutralized THIS run / idempotent re-run over
+    # our own prior output). Absent -> the camera write never existed (a non-camera-
+    # receiver binding the fact's premise didn't describe) -> NOT discharged.
+    if not _has_neutralized_write(source, field, suffix):
+        return False
+    # (2b) and no surviving camera-rooted child write (camera-receiver-anchored).
+    if _has_camera_child_write(source, field, anchor):
         return False
     return True
+
+
+def _has_neutralized_write(source: str, field: str, suffix: str) -> bool:
+    """True if the lowering's OWN neutralized write ``self.<field> = nil <marker>``
+    is present at a code position — POSITIVE evidence the camera-child write was
+    found + neutralized by THIS lowering (its deterministic ``_resolve<suffix>``
+    marker). A non-camera-receiver binding the lowering never neutralized leaves no
+    such marker."""
+    assign_re = re.compile(r"self\." + re.escape(field) + r"\s*=(?!=)")
+    marker = _neutralized_marker(suffix)
+    for m in assign_re.finditer(source):
+        if not _luau_pos_is_code(source, m.start()):
+            continue
+        if _luau_pos_in_long_bracket(source, m.start()):
+            continue
+        # RHS must be exactly ``nil`` followed by the lowering's own marker comment.
+        rest = source[m.end():]
+        stripped = rest.lstrip(" \t")
+        if stripped.startswith("nil" + marker):
+            return True
+    return False
 
 
 def _code_contains_token(source: str, token: str) -> bool:
@@ -677,19 +878,43 @@ def _code_contains_token(source: str, token: str) -> bool:
     return False
 
 
-# The lowering's OWN-EMIT body signature — the distinctive rig-scan line every
-# emitted resolver carries. A preexisting FOREIGN ``_resolve<suffix>`` method (e.g.
-# ``return nil``) will NOT contain it, so discharge / idempotency can bind to the
-# lowering's own emit rather than a bare same-named declaration (round-4 BLOCKING).
-_OWN_EMIT_BODY_MARKER = 'm:GetAttribute("_MainCameraRig")'
+def _normalize_lines(text: str) -> list[str]:
+    """The non-blank lines of ``text``, each stripped of surrounding whitespace.
+    Used for STRUCTURAL equality that tolerates indentation / blank-line drift
+    while still requiring the FULL canonical body, line for line."""
+    return [line.strip() for line in text.splitlines() if line.strip()]
 
 
-def _has_own_resolver_method(source: str, suffix: str) -> bool:
+def _has_own_resolver_method(
+    source: str, suffix: str, expected_method_text: str
+) -> bool:
     """True if the LOWERING'S OWN ``function <Class>:_resolve<suffix>(`` method is
-    present at a code position — identified by the own-emit body signature
-    (``_OWN_EMIT_BODY_MARKER``) appearing inside the method body, NOT by the bare
-    declaration. A preexisting foreign same-named method (different body) returns
-    False."""
+    present at a code position — identified by STRUCTURAL EQUALITY of the emitted
+    method (from its ``function`` declaration through its closing ``end``) to the
+    EXACT canonical emit (``expected_method_text``), NOT a marker substring (round-5
+    BLOCKING: a FOREIGN same-named method whose body merely CONTAINS
+    ``m:GetAttribute("_MainCameraRig")`` as live code must NOT count as the
+    lowering's own emit).
+
+    Comparison is line-normalized (each non-blank line stripped) over the
+    function-declaration-through-closing-``end`` portion of the canonical emit
+    (its leading rig-retarget COMMENT is cosmetic and excluded). A preexisting
+    foreign method with a different body returns False; the lowering's own
+    byte-identical prior output (idempotent re-run) returns True because its
+    normalized body equals the canonical emit line for line."""
+    # The load-bearing portion of the canonical emit: from the ``function`` line
+    # through its closing ``end`` (drop the leading cosmetic comment + trailing
+    # blank lines). These are the lines that must match at a candidate site.
+    expected_lines = _normalize_lines(expected_method_text)
+    try:
+        fn_idx = next(
+            i for i, ln in enumerate(expected_lines) if ln.startswith("function ")
+        )
+    except StopIteration:
+        return False  # malformed canonical emit -> never claim own-emit
+    expected_body = expected_lines[fn_idx:]
+    n_lines = len(expected_body)
+
     pat = re.compile(
         r"\bfunction\s+[A-Za-z_]\w*[:.]_resolve" + re.escape(suffix) + r"\s*\("
     )
@@ -698,30 +923,12 @@ def _has_own_resolver_method(source: str, suffix: str) -> bool:
             continue
         if _luau_pos_in_long_bracket(source, m.start()):
             continue
-        # The body runs from the declaration to the NEXT code-level module ``function``
-        # (or EOF). The own-emit body marker must appear within it at a code position.
-        body_end = _next_module_function_start(source, m.end())
-        body = source[m.start():body_end]
-        marker_idx = body.find(_OWN_EMIT_BODY_MARKER)
-        while marker_idx != -1:
-            abs_idx = m.start() + marker_idx
-            if _luau_pos_is_code(source, abs_idx) and not _luau_pos_in_long_bracket(source, abs_idx):
-                return True
-            marker_idx = body.find(_OWN_EMIT_BODY_MARKER, marker_idx + 1)
+        # Take the same number of normalized non-blank lines from the declaration
+        # onward and compare line for line to the canonical function body.
+        tail = _normalize_lines(source[m.start():])
+        if tail[:n_lines] == expected_body:
+            return True
     return False
-
-
-def _next_module_function_start(source: str, after: int) -> int:
-    """The char index of the next code-level ``function <Class>:<m>(`` declaration
-    at or after ``after``, or ``len(source)`` if none. Bounds a resolver method's
-    body for the own-emit body scan."""
-    for m in _FUNCTION_METHOD_RE.finditer(source, after):
-        if not _luau_pos_is_code(source, m.start()):
-            continue
-        if _luau_pos_in_long_bracket(source, m.start()):
-            continue
-        return m.start()
-    return len(source)
 
 
 def _has_surviving_field_read(source: str, field: str) -> bool:
@@ -757,9 +964,13 @@ def _has_surviving_field_read(source: str, field: str) -> bool:
     return False
 
 
-def _has_camera_child_write(source: str, field: str) -> bool:
+def _has_camera_child_write(
+    source: str, field: str, anchor: _CamAnchor
+) -> bool:
     """True if a code-position camera-child write ``self.<field> = <camera-child>``
-    survives."""
+    survives, where the child access is rooted on the CAMERA receiver (``anchor``)
+    the fact recorded (round-5 BLOCKING). A same-field ordinal on a non-camera
+    receiver is NOT a surviving camera-child write."""
     assign_re = re.compile(r"self\." + re.escape(field) + r"\s*=(?!=)")
     for m in assign_re.finditer(source):
         if not _luau_pos_is_code(source, m.start()):
@@ -767,8 +978,7 @@ def _has_camera_child_write(source: str, field: str) -> bool:
         if _luau_pos_in_long_bracket(source, m.start()):
             continue
         rhs_end = _statement_rhs_end(source, m.end())
-        rhs = source[m.end():rhs_end]
-        if _CAMERA_CHILD_RHS_RE.search(rhs) is not None:
+        if _rhs_is_camera_child(source, m.end(), rhs_end, anchor):
             return True
     return False
 
@@ -825,10 +1035,54 @@ def _structural_balance_ok(source: str) -> bool:
     i = 0
     n = len(source)
     while i < n:
-        if not _luau_pos_is_code(source, i) or _luau_pos_in_long_bracket(source, i):
-            i += 1
-            continue
         ch = source[i]
+        # Skip Luau long-bracket COMMENTS and STRINGS wholesale (round-5 MAJOR):
+        # the per-char ``_luau_pos_in_long_bracket`` guard reports False at the
+        # SECOND ``]`` of a closing ``]=*]`` (it sits just past the close), so that
+        # ``]`` leaked as a code-level bracket closer -> a ``--[[ ... ]]`` block
+        # comment containing brackets false-rejected valid Luau. Advancing past the
+        # ENTIRE span (opener through closer) makes neither delimiter char count.
+        if ch == "-" and i + 1 < n and source[i + 1] == "-":
+            j = i + 2
+            level = _long_bracket_open_level(source, j)
+            if level is not None:
+                close = source.find("]" + "=" * level + "]", j)
+                if close == -1:
+                    return False  # UNTERMINATED block comment -> invalid Luau (codex)
+                i = close + level + 2
+                continue
+            nl = source.find("\n", j)  # plain ``--`` line comment
+            i = n if nl == -1 else nl + 1
+            continue
+        # A long-bracket STRING ``[=*[ ... ]=*]`` (not preceded by ``--``).
+        if ch == "[":
+            level = _long_bracket_open_level(source, i)
+            if level is not None:
+                close = source.find("]" + "=" * level + "]", i + level + 2)
+                if close == -1:
+                    return False  # UNTERMINATED long string -> invalid Luau (codex)
+                i = close + level + 2
+                continue
+        # A short quoted string -- skip it so its bracket/keyword chars don't count.
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            closed = False
+            while i < n:
+                c = source[i]
+                if c == "\\":
+                    i += 2
+                    continue
+                if c == "\n":
+                    return False  # short string spans a newline -> invalid Luau (codex)
+                if c == quote:
+                    closed = True
+                    i += 1
+                    break
+                i += 1
+            if not closed:
+                return False  # UNTERMINATED short string -> invalid Luau (codex)
+            continue
         if ch in "([{":
             depth += 1
             i += 1
