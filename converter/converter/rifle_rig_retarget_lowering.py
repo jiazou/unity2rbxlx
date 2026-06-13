@@ -611,32 +611,47 @@ def _neutralized_marker(suffix: str) -> str:
 def _neutralize_assignment(
     source: str, field: str, suffix: str, cam_symbols: frozenset[str]
 ) -> tuple[str, bool]:
-    """Tier-2 BEST-EFFORT HYGIENE (Path A, SKIP-on-ambiguity): replace the RHS of an
-    UNAMBIGUOUS camera-child write ``self.<field> = <camera-ordinal>`` with ``nil``,
-    recognized via ``_rhs_is_camera_child`` (whole-RHS camera-rooted ordinal access
-    on a canonical camera literal or a recorded camera-symbol form). Multiline-aware.
+    """Tier-2 BEST-EFFORT HYGIENE (Path A, SKIP-on-ambiguity): replace the RHS of the
+    UNIQUE dominating camera-child init-write ``self.<field> = <camera-ordinal>`` with
+    ``nil``, recognized via ``_rhs_is_camera_child`` (whole-RHS camera-rooted ordinal
+    access on a canonical camera literal or a recorded camera-symbol form).
+    Multiline-aware.
+
+    SKIP-ON-AMBIGUITY (D-P1-PATHA.tier2): the init-write is only safe to neutralize
+    when it is UNIQUELY identifiable. If there is MORE THAN ONE code-position
+    ``self.<field> = ...`` write anywhere in the module, the "init" write can no
+    longer be uniquely distinguished from a later (possibly legitimate, non-init)
+    write — so the lowering SKIPS, neutralizing NOTHING (a stray neutralize would
+    clobber the later write). Only when there is EXACTLY ONE such write, and it is the
+    unambiguous camera-child shape, is it neutralized.
 
     DECOUPLED from discharge (Path A): the read reroute already left no raw read, so
     a leftover/collapsed write (``self.<field> = self.gameObject`` / ``__unityChild(...)``)
-    is dead data — on any shape this recognizer does not match, the lowering SKIPS
-    (no-op, NOT a failure, does NOT affect ``present``). ``suffix`` is the
-    VALID-LUAU-IDENTIFIER method-name suffix (only used in the rig-retarget comment).
-    Returns ``(new_source, neutralized)``."""
+    is dead data — on any shape this recognizer does not match (or on ambiguity), the
+    lowering SKIPS (no-op, NOT a failure, does NOT affect ``present``). ``suffix`` is
+    the VALID-LUAU-IDENTIFIER method-name suffix (only used in the rig-retarget
+    comment). Returns ``(new_source, neutralized)``."""
     assign_re = re.compile(r"self\." + re.escape(field) + r"\s*=(?!=)")
-    for m in assign_re.finditer(source):
-        if not _luau_pos_is_code(source, m.start()):
-            continue
-        if _luau_pos_in_long_bracket(source, m.start()):
-            continue
-        rhs_start = m.end()
-        rhs_end = _statement_rhs_end(source, rhs_start)
-        if not _rhs_is_camera_child(source, rhs_start, rhs_end, cam_symbols):
-            continue  # not a clear camera-rooted child write -> SKIP (config/collapsed)
-        new_source = (
-            source[:rhs_start] + " nil" + _neutralized_marker(suffix) + source[rhs_end:]
-        )
-        return new_source, True
-    return source, False
+    writes = [
+        m
+        for m in assign_re.finditer(source)
+        if _luau_pos_is_code(source, m.start())
+        and not _luau_pos_in_long_bracket(source, m.start())
+    ]
+    # SKIP-on-ambiguity: a unique dominating init-write must be provable. Multiple
+    # same-field writes -> the init one can't be uniquely identified -> neutralize
+    # nothing (never clobber a later legitimate write).
+    if len(writes) != 1:
+        return source, False
+    m = writes[0]
+    rhs_start = m.end()
+    rhs_end = _statement_rhs_end(source, rhs_start)
+    if not _rhs_is_camera_child(source, rhs_start, rhs_end, cam_symbols):
+        return source, False  # not a clear camera-rooted child write -> SKIP
+    new_source = (
+        source[:rhs_start] + " nil" + _neutralized_marker(suffix) + source[rhs_end:]
+    )
+    return new_source, True
 
 
 def _statement_rhs_end(source: str, start: int) -> int:

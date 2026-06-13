@@ -471,14 +471,52 @@ def test_h1_no_module_return_abstains() -> None:
     assert "_resolveWeaponSlot" not in s.luau_source
 
 
-def test_h3_neutralize_fact_anchored_skips_unrelated_config() -> None:
-    # h.3: an EARLIER unrelated ``self.weaponSlot = someConfig`` is UNTOUCHED;
-    # only the camera-child write is neutralized.
+def test_h3_neutralize_skips_on_ambiguity_two_same_field_writes() -> None:
+    # D-P1-PATHA.tier2 SKIP-ON-AMBIGUITY: with MORE THAN ONE ``self.weaponSlot = ...``
+    # write the "init" write cannot be UNIQUELY identified, so the Tier-2 neutralize
+    # SKIPS — it neutralizes NOTHING. Here a camera-child write in Awake AND a later
+    # legitimate ``self.weaponSlot = config.defaultSlot`` write coexist; neither is
+    # rewritten to ``nil`` (the later legit write must be left untouched — neutralizing
+    # the first ordinal match would clobber a legitimate non-init write). Discharge is
+    # UNAFFECTED (decoupled from neutralize): the GetRifle read reroutes -> present=True.
     src = (
         "function Player.new(config)\n"
-        "    self.weaponSlot = config.defaultSlot\n"
         "    return setmetatable({}, Player)\n"
         "end\n\n"
+        "function Player:Awake()\n"
+        "    self.cam = workspace.CurrentCamera\n"
+        "    self.weaponSlot = self.cam:GetChildren()[1]\n"
+        "end\n\n"
+        "function Player:Reset()\n"
+        "    self.weaponSlot = config.defaultSlot\n"  # later legitimate non-init write
+        "end\n\n"
+        "function Player:GetRifle()\n"
+        "    return pivotOf(self.weaponSlot)\n"
+        "end\n\n"
+        "return Player\n"
+    )
+    s = _Script(src)
+    n = lower_rifle_rig_retarget([s], _rig_map())
+    assert n == 1
+    out = s.luau_source
+    # SKIP-on-ambiguity: NOTHING neutralized. The later legit write AND the camera
+    # write both survive verbatim; no write was rewritten to nil.
+    assert "self.weaponSlot = config.defaultSlot" in out  # later legit write untouched
+    assert "self.weaponSlot = self.cam:GetChildren()[1]" in out  # camera write untouched
+    assert "self.weaponSlot = nil" not in out
+    # Discharge is decoupled -> the GetRifle read rerouted -> present=True.
+    assert "return pivotOf(self:_resolveWeaponSlot())" in out
+    assert s.rig_binding == {
+        "field": "weaponSlot", "child": "WeaponSlot", "present": True,
+    }
+
+
+def test_h3_single_unique_camera_write_still_neutralizes() -> None:
+    # SKIP-on-ambiguity HAPPY PATH: when there is EXACTLY ONE ``self.weaponSlot = ...``
+    # write and it is the unambiguous camera-child shape, the unique dominating
+    # init-write IS provable -> neutralize it (the corpus shape; the single-write
+    # behavior is unchanged by the SKIP-on-ambiguity guard).
+    src = (
         "function Player:Awake()\n"
         "    self.cam = workspace.CurrentCamera\n"
         "    self.weaponSlot = self.cam:GetChildren()[1]\n"
@@ -491,7 +529,6 @@ def test_h3_neutralize_fact_anchored_skips_unrelated_config() -> None:
     s = _Script(src)
     lower_rifle_rig_retarget([s], _rig_map())
     out = s.luau_source
-    assert "self.weaponSlot = config.defaultSlot" in out  # untouched config
     assert "self.weaponSlot = self.cam:GetChildren()[1]" not in out  # neutralized
     assert "self.weaponSlot = nil" in out
 
