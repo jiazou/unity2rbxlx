@@ -630,8 +630,25 @@ def _receiver_roots_at_engine_global(receiver: str) -> bool:
     return m is not None and m.group(1) in _ENGINE_GLOBAL_ROOTS
 
 
+@dataclass(frozen=True)
+class _RigDeadWriteExempt:
+    """The deterministic upstream identity of the ONE rig dead-init-write that check
+    D may exempt (REDESIGN r3). All three are projections of the resolver fact carried
+    on ``RbxScript.rig_binding`` — the AI-STABLE identity, NOT an output-shape
+    fingerprint. A surviving ``self.<field> = self.<cam_receiver>:GetChildren()[k]``
+    site is exempted ONLY when it matches this EXACT triple (field + receiver +
+    ordinal) AND the statement-anchored shape; every mismatch biases to COUNT."""
+
+    field_name: str       # the rig field (``weaponSlot``) — the assignment LHS
+    cam_receiver: str     # the C# receiver text (``cam`` seeded / ``Camera.main.transform``
+                          #   direct — never ``""``); the site receiver must be
+                          #   exactly ``self.<cam_receiver>``
+    cam_ordinal: int      # the 0-based ``GetChild(n)``; the site's 1-based ``[k]`` must
+                          #   equal ``cam_ordinal + 1``
+
+
 def _count_surviving_child_ordinals(
-    source: str, exempt_field: str | None = None
+    source: str, exempt: _RigDeadWriteExempt | None = None
 ) -> int:
     """Count POSITIONAL child-ordinal survivor SITES in ``source`` — the
     adjacent shape ``<recv>:GetChildren()[N]`` (simple OR method-call receiver)
@@ -642,26 +659,26 @@ def _count_surviving_child_ordinals(
     roots at a known-safe ENGINE GLOBAL (``workspace``/``game``/...) are EXCLUDED
     — they are engine-tree iterations, not unresolved child-ref ordinals.
 
-    RIG-AWARE exemption (SITE-ANCHORED): when ``exempt_field`` is set (the caller
-    has independently confirmed a DISCHARGED rig binding on that field), AT MOST
-    ONE adjacent ``self.<field> = <recv>:GetChildren()[n]`` dead init-write site is
-    skipped from the count — the dead write the Path-A read-reroute superseded. The
-    decision is made INSIDE this same walk, AFTER the identical ``_luau_pos_is_code``
-    + engine-global filters that COUNT a site, and ONLY by parsing the single Luau
-    STATEMENT that physically CONTAINS that counted site
-    (``_site_is_discharged_rig_dead_write``): the enclosing statement is bounded by
-    its own depth-0 ``;`` / newline boundaries and must be EXACTLY an assignment whose
-    LHS is the standalone lvalue ``self.<field>`` (rejecting ``myself`` / ``a.self`` /
-    ``weaponSlotBackup`` look-alikes) with the GetChildren site on its RHS. So the
-    exemption can only ever remove a site this function WOULD have counted
-    (``exempt ⊆ counted-survivors``, structurally — there is no separate number to
-    subtract), it never spans the across-lines factored form (a write is the adjacent
-    form), and the ``< 1`` cap exempts only the SINGLE dead init-write — a second
-    same-field write, a READ survivor, an UNRELATED survivor sharing a ``;``-line, a
-    different field, or an engine-global/bracket-receiver write that this function did
-    NOT count all REMAIN counted and still fail closed. An AMBIGUOUS site
-    (statement can't be cleanly parsed as ``self.<field> = ...``) is NOT exempted —
-    it is counted (fail closed)."""
+    RIG-AWARE exemption (SITE-ANCHORED, POSITIVELY anchored — REDESIGN r3): when
+    ``exempt`` is set (the caller has independently confirmed a DISCHARGED rig
+    binding) AT MOST ONE adjacent ``self.<field> = self.<cam_receiver>:GetChildren()[k]``
+    dead init-write site is skipped from the count — the EXACT credited site the
+    Path-A read-reroute superseded. The decision is made INSIDE this same walk,
+    AFTER the identical ``_luau_pos_is_code`` + engine-global filters that COUNT a
+    site, and ONLY when ``_site_is_discharged_rig_dead_write`` confirms a TIGHT
+    POSITIVE match of the credited site: the r7 statement identity (the enclosing Luau
+    statement is EXACTLY ``self.<field> = <site>``, the site being its whole RHS) ANDed
+    with the r3 receiver anchor (receiver is exactly ``self.<cam_receiver>``, never a
+    bare local) AND the r3 ordinal anchor (the surviving ``[k]`` equals
+    ``cam_ordinal + 1``). So the exemption can only ever remove a site this function
+    WOULD have counted (``exempt ⊆ counted-survivors``, structurally), it never spans
+    the across-lines factored form, and the ``< 1`` cap exempts only the SINGLE credited
+    write — a second same-shape write, a READ survivor, a DIFFERENT-receiver write
+    (``self.muzzle:...`` — codex r8), a SAME-receiver DIFFERENT-ordinal write
+    (``...[2]`` when the credited init was ``[1]`` — codex r3), a bare-``cam`` receiver,
+    the direct no-seed form, a substring-LHS look-alike, or an engine-global/bracket
+    survivor this function did NOT count all REMAIN counted and still fail closed.
+    Any mismatch / ambiguous site is NOT exempted — it is counted (fail closed)."""
     exempted = 0
     count = 0
     for m in _GETCHILDREN_INDEX_ANY_RE.finditer(source):
@@ -671,13 +688,20 @@ def _count_surviving_child_ordinals(
             continue  # engine-global iteration — not a child-ref survivor
         if (
             exempted < 1
-            and exempt_field
+            and exempt is not None
             and _site_is_discharged_rig_dead_write(
-                source, m.start(), m.end(), exempt_field
+                source,
+                m.start(),
+                m.end(),
+                exempt.field_name,
+                m.group(1),
+                int(m.group(2)),
+                exempt.cam_receiver,
+                exempt.cam_ordinal,
             )
         ):
-            # The dead init-write of the discharged rig field — superseded by the
-            # read reroute (Path A). Skip exactly this one counted site.
+            # The EXACT credited dead init-write of the discharged rig field —
+            # superseded by the read reroute (Path A). Skip exactly this one site.
             exempted += 1
             continue
         count += 1
@@ -854,30 +878,65 @@ def _rig_statement_bounds(projected: str, pos: int) -> tuple[int, int]:
 
 
 def _site_is_discharged_rig_dead_write(
-    source: str, site_start: int, site_end: int, field: str
+    source: str,
+    site_start: int,
+    site_end: int,
+    field: str,
+    site_receiver: str,
+    site_ordinal: int,
+    cam_receiver: str,
+    cam_ordinal: int,
 ) -> bool:
     """True iff the GetChildren survivor SITE spanning ``[site_start, site_end)`` is the
-    dead init-write of a discharged rig binding's ``field`` — i.e. the single Luau
-    statement physically containing the site is EXACTLY the assignment
-    ``self.<field> = <recv>:GetChildren()[n]`` whose ENTIRE RHS is that one site.
+    EXACT credited dead init-write of a discharged rig binding — a TIGHT POSITIVE match
+    of the one site the resolver fact credited (REDESIGN r3), NOT a negative text filter.
+    ALL of the following must hold; every mismatch biases to COUNT (return False):
 
-    The identity is STATEMENT-ANCHORED (not a forward span from a loose LHS substring):
-    we locate the site's enclosing statement bounds over the position-preserving
-    ``_rig_code_projection`` and require, in order:
-      (1) the statement OPENS with the standalone lvalue ``self.<field>`` then a real
-          assignment ``=`` (``_rig_exempt_lhs_re`` — rejects ``myself``/``a.self``
-          look-alikes, the ``weaponSlot``/``weaponSlotBackup`` prefix collision, and
-          every comparison operator); AND
-      (2) the GetChildren site is the WHOLE RHS — its receiver starts exactly at the
-          first RHS token (no leading ``nil or ...`` / other operand) and nothing but
-          whitespace follows the site to the statement end (no trailing ``+ bar:Get...``
-          operand). So an arbitrary RHS expression that merely CONTAINS a GetChildren
-          (``self.<field> = nil or foo:GetChildren()[1]``, ``... = a[1] + b[2]``) is NOT
-          the dead init-write and is NOT exempted.
-    Any statement that fails either gate (incl. an un-parseable / ambiguous one) returns
-    False — the site is counted, fail closed (a false-positive is safe; a mask is not)."""
-    if not field:
+      (statement identity — the r7 protections, RETAINED and ANDed, NOT replaced)
+        the single Luau statement physically containing the site is EXACTLY the
+        assignment ``self.<field> = <recv>:GetChildren()[k]`` whose ENTIRE RHS is that
+        one site:
+          (1) the statement OPENS with the standalone lvalue ``self.<field>`` then a
+              real assignment ``=`` (``_rig_exempt_lhs_re`` — rejects ``myself``/
+              ``a.self`` look-alikes, the ``weaponSlot``/``weaponSlotBackup`` prefix
+              collision, and every comparison operator); AND
+          (2) the GetChildren site is the WHOLE RHS — its receiver starts exactly at the
+              first RHS token (no leading ``nil or ...`` / other operand) and nothing but
+              whitespace follows the site to the statement end (no trailing
+              ``+ bar:Get...`` operand). So an arbitrary RHS that merely CONTAINS a
+              GetChildren (``self.<field> = nil or foo:GetChildren()[1]``) is NOT exempt.
+
+      (receiver anchor — REDESIGN r3, NEW) the GetChildren RECEIVER is exactly
+        ``self.<cam_receiver>`` — the dot-form member access of the carrier's deterministic
+        C# receiver text, matched ONLY in the ``self.<member>`` form. A bare-``cam`` local,
+        a DIFFERENT receiver (``self.muzzle`` — codex r8), or the direct no-seed form
+        (``cam_receiver=="Camera.main.transform"`` forms no ``self.<member>``) does NOT
+        match -> COUNTED (the direct form is a SAFE false-positive).
+
+      (ordinal anchor — REDESIGN r3, NEW) the surviving ``:GetChildren()[k]`` ordinal
+        ``k`` equals ``cam_ordinal + 1`` (the carrier's 0-based ``GetChild(n)``; Luau
+        ``GetChildren()`` is 1-based). A same-receiver write at a DIFFERENT ordinal
+        (``self.cam:GetChildren()[2]`` when the credited init was ``[1]`` — codex r3)
+        does NOT match -> COUNTED.
+
+    Any gate failure (incl. an un-parseable/ambiguous statement, an empty ``field``, or
+    an empty ``cam_receiver``) returns False — the site is counted, fail closed (a
+    false-positive is safe; a silent mask is not)."""
+    if not field or not cam_receiver:
         return False
+    # (receiver anchor) the site's GetChildren receiver must be EXACTLY
+    # ``self.<cam_receiver>`` — the dot-form member, never a bare local. The direct
+    # no-seed form (``cam_receiver == "Camera.main.transform"``) forms no valid
+    # ``self.<member>`` (a dotted receiver makes ``self.Camera.main.transform``, which
+    # the resolver never emits), so it correctly never matches -> the rig's own write
+    # COUNTS (a safe false-positive).
+    if site_receiver.strip() != f"self.{cam_receiver}":
+        return False
+    # (ordinal anchor) the surviving 1-based ``[k]`` must be the credited 0-based
+    # ``GetChild(n)`` + 1.
+    if site_ordinal != cam_ordinal + 1:
+        return False
+    # (statement identity — r7) the credited dead init-write statement shape.
     projected = _rig_code_projection(source)
     start, end = _rig_statement_bounds(projected, site_start)
     if not (start <= site_start and site_end <= end):
@@ -924,31 +983,44 @@ def _check_surviving_child_ordinal(
         rt = r.get("resolved_total")
         if gt is None or rt is None or gt <= 0:
             continue
-        # RIG-AWARE exemption: a surviving positional ordinal that is the dead
-        # init-WRITE of a DISCHARGED rig binding's field (``self.<field> =
-        # <recv>:GetChildren()[n]``) is superseded by the read reroute (Path A) —
-        # it is "resolved-but-left-behind", NOT an unresolved child-ref survivor,
-        # and the rig fact already bumped ``resolved_total``. The exemption is
-        # applied SITE-ALIGNED INSIDE ``_count_surviving_child_ordinals`` (skip AT
-        # MOST the one counted dead-init-write site), so it can never subtract a
-        # site check D did not count. It is gated on the binding being PRESENT
-        # (stamp) AND INDEPENDENTLY discharged in the real source; a READ survivor,
-        # a non-/un-discharged-binding script, or any survivor beyond the single
-        # dead write is NOT exempted and still fails closed.
-        exempt_field: str | None = None
+        # RIG-AWARE exemption (POSITIVELY anchored — REDESIGN r3): a surviving
+        # positional ordinal that is the EXACT credited dead init-WRITE of a
+        # DISCHARGED rig binding (``self.<field> = self.<cam_receiver>:GetChildren()[k]``,
+        # ``k == cam_ordinal + 1``) is superseded by the read reroute (Path A) — it is
+        # "resolved-but-left-behind", NOT an unresolved child-ref survivor, and the rig
+        # fact already bumped ``resolved_total``. The exemption is applied SITE-ALIGNED
+        # INSIDE ``_count_surviving_child_ordinals`` (skip AT MOST the one counted
+        # credited site), so it can never subtract a site check D did not count. It is
+        # gated on (a) the binding PRESENT stamp AND the INDEPENDENT
+        # ``_rig_binding_discharged`` re-derivation, AND (b) the carrier's deterministic
+        # ``cam_receiver``/``cam_ordinal`` anchors (the AI-stable upstream identity, NOT
+        # an output fingerprint). A DIFFERENT-receiver write (codex r8), a SAME-receiver
+        # DIFFERENT-ordinal write (codex r3), a bare-``cam`` receiver, the direct
+        # no-seed form, a READ survivor, a non-/un-discharged script, or any survivor
+        # beyond the single credited write is NOT exempted and still fails closed.
+        exempt: _RigDeadWriteExempt | None = None
         rb = script.rig_binding
         if rb:
             field = str(rb.get("field") or "")
             child = str(rb.get("child") or "")
+            cam_receiver = str(rb.get("cam_receiver") or "")
+            cam_ordinal_raw = rb.get("cam_ordinal")
             stamp = rb.get("present") is True
             if (
                 field
                 and child
+                and cam_receiver
+                and isinstance(cam_ordinal_raw, int)
+                and not isinstance(cam_ordinal_raw, bool)
                 and stamp
                 and _rig_binding_discharged(script.source, field, child)
             ):
-                exempt_field = field
-        survivors = _count_surviving_child_ordinals(script.source, exempt_field)
+                exempt = _RigDeadWriteExempt(
+                    field_name=field,
+                    cam_receiver=cam_receiver,
+                    cam_ordinal=cam_ordinal_raw,
+                )
+        survivors = _count_surviving_child_ordinals(script.source, exempt)
         if survivors <= 0:
             continue
         unresolved_budget = gt - rt

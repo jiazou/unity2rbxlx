@@ -38,6 +38,7 @@ from converter.child_ref_resolver import (  # noqa: E402
 )
 from converter.contract_verifier import (  # noqa: E402
     FAIL_CLOSED_CHECKS,
+    _RigDeadWriteExempt,
     _check_rig_binding_present,
     _check_surviving_child_ordinal,
     _count_surviving_child_ordinals,
@@ -113,6 +114,33 @@ def _rbx(name: str, source: str, rig_binding: dict[str, object] | None) -> RbxSc
     return RbxScript(name=name, source=source, rig_binding=rig_binding)
 
 
+def _carrier(
+    *,
+    field: str = "weaponSlot",
+    child: str = "WeaponSlot",
+    present: bool = True,
+    cam_receiver: str = "cam",
+    cam_ordinal: int = 0,
+) -> dict[str, object]:
+    """The 5-key ``rig_binding`` carrier shape slice 1.1 now stamps (field/child/
+    present + the REDESIGN r3 ``cam_receiver``/``cam_ordinal`` anchors)."""
+    return {
+        "field": field,
+        "child": child,
+        "present": present,
+        "cam_receiver": cam_receiver,
+        "cam_ordinal": cam_ordinal,
+    }
+
+
+# The credited dead-write exemption spec for the on-corpus shape: field
+# ``weaponSlot``, receiver ``self.cam`` (``cam_receiver="cam"``), ordinal
+# ``GetChildren()[1]`` (``cam_ordinal=0``, +1 -> 1).
+_CORPUS_EXEMPT = _RigDeadWriteExempt(
+    field_name="weaponSlot", cam_receiver="cam", cam_ordinal=0
+)
+
+
 def _rig_rows(scripts: list[RbxScript]) -> list:
     res = verify_contract(_TOPOLOGY, scripts)
     return [v for v in res.violations if v.check == "rig_binding_present"]
@@ -121,11 +149,7 @@ def _rig_rows(scripts: list[RbxScript]) -> list:
 # Sanity: the real lowering discharges the on-corpus shape.
 def test_real_lowering_discharges_corpus_shape() -> None:
     s = _lower()
-    assert s.rig_binding == {
-        "field": "weaponSlot",
-        "child": "WeaponSlot",
-        "present": True,
-    }
+    assert s.rig_binding == _carrier()
     assert "function Player:_resolveWeaponSlot()" in s.luau_source
     assert "self:_resolveWeaponSlot()" in s.luau_source
     assert "self.weaponSlot = nil" in s.luau_source
@@ -882,11 +906,9 @@ def test_pathA_discharges_on_all_five_real_write_shapes(shape_name: str) -> None
     assert _rig_binding_discharged(
         lowered.luau_source, "weaponSlot", "WeaponSlot"
     ) is True
-    assert lowered.rig_binding == {
-        "field": "weaponSlot",
-        "child": "WeaponSlot",
-        "present": True,
-    }
+    # The 5-key carrier is stamped RHS-agnostically — cam_receiver/cam_ordinal ride
+    # along on every write shape (the credited GetChild(0) on receiver ``cam``).
+    assert lowered.rig_binding == _carrier()
     script = _rbx("Player", lowered.luau_source, lowered.rig_binding)
     assert _rig_rows([script]) == []
 
@@ -1046,11 +1068,7 @@ def test_g_generic_different_game_torchmount_discharges_green() -> None:
     assert _rig_binding_discharged(
         lowered.luau_source, "torchMount", "TorchAnchor"
     ) is True
-    assert lowered.rig_binding == {
-        "field": "torchMount",
-        "child": "TorchAnchor",
-        "present": True,
-    }
+    assert lowered.rig_binding == _carrier(field="torchMount", child="TorchAnchor")
     # The verifier is GREEN, and keys on the carrier's field/child, not a hardcode.
     assert _rig_rows([_rbx("Hero", lowered.luau_source, lowered.rig_binding)]) == []
     # No rifle/weaponSlot leaked into the lowered output.
@@ -1642,11 +1660,7 @@ def test_checkD_no_false_positive_on_discharged_rig_dead_write() -> None:
         _rig_binding_discharged(lowered.luau_source, "weaponSlot", "WeaponSlot")
         is True
     )
-    assert lowered.rig_binding == {
-        "field": "weaponSlot",
-        "child": "WeaponSlot",
-        "present": True,
-    }
+    assert lowered.rig_binding == _carrier()
     # The REAL pipeline accounting: getchild_total=1 (the one Camera.main
     # GetChild), resolved_total=1 (the rig fact bumped it) -> 0 unresolved budget.
     script = _rbx_with_accounting(
@@ -1826,7 +1840,7 @@ def test_checkD_engine_global_dead_write_does_not_mask_separate_survivor() -> No
     script = _rbx_with_accounting(
         "Player",
         src,
-        {"field": "weaponSlot", "child": "WeaponSlot", "present": True},
+        _carrier(),
         getchild_total=1,
         resolved_total=1,  # budget 0 -> the separate survivor must fire
     )
@@ -1855,7 +1869,7 @@ def test_checkD_bracket_receiver_dead_write_does_not_mask_separate_survivor() ->
     script = _rbx_with_accounting(
         "Player",
         src,
-        {"field": "weaponSlot", "child": "WeaponSlot", "present": True},
+        _carrier(),
         getchild_total=1,
         resolved_total=1,
     )
@@ -1884,14 +1898,14 @@ def test_checkD_exempts_only_one_same_field_write() -> None:
     script = _rbx_with_accounting(
         "Player",
         src,
-        {"field": "weaponSlot", "child": "WeaponSlot", "present": True},
+        _carrier(),
         getchild_total=1,
-        resolved_total=1,  # budget 0; 2 counted - 1 exempt = 1 > 0 -> fires
+        resolved_total=1,  # budget 0; credited cam write exempt, muzzle write fires
     )
     cd = _check_surviving_child_ordinal(_TOPOLOGY, [script])
     assert any(v.check == "child_ordinal_survivor" for v in cd), (
-        "only the SINGLE dead rig init-write is exempt — a second same-field write "
-        "must STILL fail closed"
+        "only the SINGLE credited dead rig init-write is exempt — a second same-field "
+        "write through a DIFFERENT receiver (codex r8) must STILL fail closed"
     )
 
 
@@ -1922,7 +1936,7 @@ def test_checkD_round6_pre_fix_red_proof() -> None:
         old_path.unlink(missing_ok=True)
 
     base = _lower(_SKIPPED_NEUTRALIZE_SINGLELINE_IF).luau_source
-    rb = {"field": "weaponSlot", "child": "WeaponSlot", "present": True}
+    rb = _carrier()
 
     # BYPASS-1 scenario: engine-global dead write + separate genuine survivor.
     b1 = base.replace(
@@ -1997,11 +2011,11 @@ def test_checkD_semicolon_separated_survivor_still_fires() -> None:
     assert "self.weaponSlot = nil ; local stray = foo:GetChildren()[1]" in src
     assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is True
     # The genuine survivor must be counted (NOT swallowed by the exempt skip).
-    assert _count_surviving_child_ordinals(src, "weaponSlot") == 1
+    assert _count_surviving_child_ordinals(src, _CORPUS_EXEMPT) == 1
     script = _rbx_with_accounting(
         "Player",
         src,
-        {"field": "weaponSlot", "child": "WeaponSlot", "present": True},
+        _carrier(),
         getchild_total=1,
         resolved_total=1,  # budget 0 -> the unrelated survivor must fire
     )
@@ -2025,11 +2039,11 @@ def test_checkD_myself_substring_lhs_survivor_still_fires() -> None:
     )
     assert "myself.weaponSlot = foo:GetChildren()[2]" in src
     assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is True
-    assert _count_surviving_child_ordinals(src, "weaponSlot") == 1
+    assert _count_surviving_child_ordinals(src, _CORPUS_EXEMPT) == 1
     script = _rbx_with_accounting(
         "Player",
         src,
-        {"field": "weaponSlot", "child": "WeaponSlot", "present": True},
+        _carrier(),
         getchild_total=1,
         resolved_total=1,
     )
@@ -2052,11 +2066,11 @@ def test_checkD_dotted_self_substring_lhs_survivor_still_fires() -> None:
     )
     assert "other.self.weaponSlot = foo:GetChildren()[2]" in src
     assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is True
-    assert _count_surviving_child_ordinals(src, "weaponSlot") == 1
+    assert _count_surviving_child_ordinals(src, _CORPUS_EXEMPT) == 1
     script = _rbx_with_accounting(
         "Player",
         src,
-        {"field": "weaponSlot", "child": "WeaponSlot", "present": True},
+        _carrier(),
         getchild_total=1,
         resolved_total=1,
     )
@@ -2079,12 +2093,12 @@ def test_checkD_field_prefix_collision_does_not_exempt() -> None:
     )
     assert "self.weaponSlotBackup = foo:GetChildren()[1]" in src
     assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is True
-    # exempt_field="weaponSlot" must NOT exempt the ``weaponSlotBackup`` write.
-    assert _count_surviving_child_ordinals(src, "weaponSlot") == 1
+    # exempt field ``weaponSlot`` must NOT exempt the ``weaponSlotBackup`` write.
+    assert _count_surviving_child_ordinals(src, _CORPUS_EXEMPT) == 1
     script = _rbx_with_accounting(
         "Player",
         src,
-        {"field": "weaponSlot", "child": "WeaponSlot", "present": True},
+        _carrier(),
         getchild_total=1,
         resolved_total=1,
     )
@@ -2100,9 +2114,13 @@ def test_checkD_field_prefix_collision_reverse() -> None:
     ``self.weaponSlot = ...`` but the exempt field is the LONGER ``weaponSlotBackup``;
     the shorter write must NOT be exempted (word boundary both directions)."""
     # A standalone unit assertion is cleanest here: a single dead write on field
-    # ``weaponSlot`` is NOT exempted when the exempt_field is ``weaponSlotBackup``.
-    one_write = "self.weaponSlot = foo:GetChildren()[1]\n"
-    assert _count_surviving_child_ordinals(one_write, "weaponSlotBackup") == 1
+    # ``weaponSlot`` is NOT exempted when the exempt field is ``weaponSlotBackup``.
+    # Receiver + ordinal match (``self.cam``/[1]); ONLY the field differs -> counted.
+    one_write = "self.weaponSlot = self.cam:GetChildren()[1]\n"
+    exempt = _RigDeadWriteExempt(
+        field_name="weaponSlotBackup", cam_receiver="cam", cam_ordinal=0
+    )
+    assert _count_surviving_child_ordinals(one_write, exempt) == 1
 
 
 def test_checkD_comparison_on_lhs_line_not_exempted() -> None:
@@ -2113,13 +2131,14 @@ def test_checkD_comparison_on_lhs_line_not_exempted() -> None:
     Asserted at the ``_count_surviving_child_ordinals`` boundary (a surviving
     ``self.weaponSlot ==`` READ would itself fail discharge upstream, so this isolates
     the assignment-vs-comparison discrimination in the site anchor)."""
-    src = "if self.weaponSlot == foo:GetChildren()[1] then end\n"
-    # exempt_field set, but the statement is a comparison -> NOT exempted -> counted.
-    assert _count_surviving_child_ordinals(src, "weaponSlot") == 1
+    # Receiver + ordinal MATCH (``self.cam``/[1]) so the ONLY discriminator under test
+    # is assignment-vs-comparison; the comparison must NOT be exempted -> counted.
+    src = "if self.weaponSlot == self.cam:GetChildren()[1] then end\n"
+    assert _count_surviving_child_ordinals(src, _CORPUS_EXEMPT) == 1
     # And every comparison operator on the LHS is rejected as a non-assignment.
     for op in ("==", "<=", ">=", "~="):
-        cmp_src = f"if self.weaponSlot {op} foo:GetChildren()[1] then end\n"
-        assert _count_surviving_child_ordinals(cmp_src, "weaponSlot") == 1, op
+        cmp_src = f"if self.weaponSlot {op} self.cam:GetChildren()[1] then end\n"
+        assert _count_surviving_child_ordinals(cmp_src, _CORPUS_EXEMPT) == 1, op
 
 
 def test_checkD_rhs_with_leading_operand_not_exempted() -> None:
@@ -2129,8 +2148,11 @@ def test_checkD_rhs_with_leading_operand_not_exempted() -> None:
     (``self.weaponSlot = nil or foo:GetChildren()[1]``) is NOT the dead init-write — the
     ``foo:GetChildren()[1]`` is a genuine survivor and must STILL be counted. Against the
     statement-anchored draft (before the whole-RHS guard) this masked the survivor."""
-    src = "self.weaponSlot = nil or foo:GetChildren()[1]\n"
-    assert _count_surviving_child_ordinals(src, "weaponSlot") == 1
+    # Receiver + ordinal MATCH (``self.cam``/[1]) so the ONLY discriminator is the
+    # whole-RHS constraint; the leading ``nil or`` operand means the site is NOT the
+    # whole RHS -> NOT the dead init-write -> counted.
+    src = "self.weaponSlot = nil or self.cam:GetChildren()[1]\n"
+    assert _count_surviving_child_ordinals(src, _CORPUS_EXEMPT) == 1
 
 
 def test_checkD_rhs_with_multiple_getchildren_operands_all_counted() -> None:
@@ -2138,43 +2160,46 @@ def test_checkD_rhs_with_multiple_getchildren_operands_all_counted() -> None:
     BINARY expression of two GetChildren sites (``self.weaponSlot = a:GetChildren()[1] +
     b:GetChildren()[2]``) is not a dead init-write; NEITHER site is the whole RHS, so
     BOTH are counted (no exemption spent)."""
-    src = "self.weaponSlot = foo:GetChildren()[1] + bar:GetChildren()[2]\n"
-    assert _count_surviving_child_ordinals(src, "weaponSlot") == 2
+    # The first operand has the matching receiver+ordinal (``self.cam``/[1]) but is NOT
+    # the whole RHS (a ``+ bar:...`` follows), so it is NOT exempt; both are counted.
+    src = "self.weaponSlot = self.cam:GetChildren()[1] + bar:GetChildren()[2]\n"
+    assert _count_surviving_child_ordinals(src, _CORPUS_EXEMPT) == 2
 
 
 def test_checkD_bare_dead_write_shapes_still_exempt() -> None:
-    """ROUND-7 CODEX GUARD (companion) — the whole-RHS constraint does NOT break the
-    legitimate bare dead-write shapes the exemption exists for: a simple receiver, a
-    method receiver, an ``if c then ... end`` single-line block, and a multiline
-    continuation all still exempt their single dead init-write site."""
+    """ROUND-7 CODEX GUARD (companion) + REDESIGN r3 — the whole-RHS constraint does
+    NOT break the legitimate credited dead-write shapes the exemption exists for: a
+    plain ``self.cam`` receiver, an ``if c then ... end`` single-line block, and a
+    multiline continuation all still exempt their single credited dead init-write site
+    (receiver ``self.cam`` + ordinal [1] both anchor on ``_CORPUS_EXEMPT``)."""
     for src in (
-        "self.weaponSlot = foo:GetChildren()[1]\n",
         "self.weaponSlot = self.cam:GetChildren()[1]\n",
         "if self.cam then self.weaponSlot = self.cam:GetChildren()[1] end\n",
-        "self.weaponSlot =\n    foo:GetChildren()[1]\n",
+        "self.weaponSlot =\n    self.cam:GetChildren()[1]\n",
     ):
-        assert _count_surviving_child_ordinals(src, "weaponSlot") == 0, src
+        assert _count_surviving_child_ordinals(src, _CORPUS_EXEMPT) == 0, src
 
 
 def test_checkD_two_dead_writes_only_one_exempt() -> None:
-    """ROUND-7 NEIGHBOR GUARD (cap) — two legitimate ``self.<rigfield> =
-    <recv>:GetChildren()[n]`` writes: only ONE is exempt, the second STILL fires.
-    Statement-anchored identity + the ``< 1`` cap together exempt at most the single
-    dead init-write."""
+    """ROUND-7 NEIGHBOR GUARD (cap) — two IDENTICAL credited ``self.weaponSlot =
+    self.cam:GetChildren()[1]`` writes (both matching the exemption's receiver +
+    ordinal): only ONE is exempt, the second STILL fires. Statement-anchored identity
+    + the r3 receiver/ordinal anchors + the ``< 1`` cap together exempt at most the
+    single credited dead init-write."""
     base = _lower(_SKIPPED_NEUTRALIZE_SINGLELINE_IF).luau_source
     src = base.replace(
         "if self.cam then self.weaponSlot = self.cam:GetChildren()[1] end\n",
         "self.weaponSlot = self.cam:GetChildren()[1]\n"
-        "    self.weaponSlot = self.muzzle:GetChildren()[2]\n",
+        "    self.weaponSlot = self.cam:GetChildren()[1]\n",
     )
-    assert "self.weaponSlot = self.muzzle:GetChildren()[2]" in src
+    assert src.count("self.weaponSlot = self.cam:GetChildren()[1]") == 2
     assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is True
-    # 2 counted writes - 1 exempt = 1 survivor.
-    assert _count_surviving_child_ordinals(src, "weaponSlot") == 1
+    # 2 counted writes - 1 exempt = 1 survivor (the cap allows AT MOST one).
+    assert _count_surviving_child_ordinals(src, _CORPUS_EXEMPT) == 1
     script = _rbx_with_accounting(
         "Player",
         src,
-        {"field": "weaponSlot", "child": "WeaponSlot", "present": True},
+        _carrier(),
         getchild_total=1,
         resolved_total=1,
     )
@@ -2213,7 +2238,7 @@ def test_checkD_round7_pre_fix_red_proof() -> None:
         old_path.unlink(missing_ok=True)
 
     base = _lower(_SKIPPED_NEUTRALIZE_SINGLELINE_IF).luau_source
-    rb = {"field": "weaponSlot", "child": "WeaponSlot", "present": True}
+    rb = _carrier()
 
     # BYPASS-A scenario: ``;``-separated unrelated survivor.
     a = base.replace(
@@ -2244,3 +2269,237 @@ def test_checkD_round7_pre_fix_red_proof() -> None:
         v.check == "child_ordinal_survivor"
         for v in _check_surviving_child_ordinal(_TOPOLOGY, [sb])
     )
+
+
+# ===========================================================================
+# §4 (f-r3) — check D's RIG-AWARE exemption is POSITIVELY anchored on
+# cam_receiver + cam_ordinal: it exempts ONLY the rig's EXACT credited dead write,
+# never masks another survivor (REDESIGN r3). Drives the REAL helpers /
+# verify_contract; each case maps to the design's (i)-(x).
+# ===========================================================================
+
+
+def _discharged_with_write(write_line: str) -> str:
+    """A FULLY-DISCHARGED rig source (resolver method + rerouted reads + no raw
+    ``self.weaponSlot`` read) whose surviving dead init-write line is ``write_line``.
+    Built by lowering the corpus shape (which discharges) then swapping the single
+    surviving ``if self.cam then ... end`` write for the supplied statement."""
+    base = _lower(_SKIPPED_NEUTRALIZE_SINGLELINE_IF).luau_source
+    src = base.replace(
+        "if self.cam then self.weaponSlot = self.cam:GetChildren()[1] end\n",
+        write_line + "\n",
+    )
+    assert write_line in src
+    # The swap must not disturb discharge (still the read reroute + resolver).
+    assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is True
+    return src
+
+
+def _fr3_script(src: str, carrier: dict[str, object] | None) -> RbxScript:
+    """A budget-0 ({1,1}) ``RbxScript`` carrying ``carrier`` + ``src``."""
+    return _rbx_with_accounting(
+        "Player", src, carrier, getchild_total=1, resolved_total=1
+    )
+
+
+def _checkD_fires(script: RbxScript) -> bool:
+    return any(
+        v.check == "child_ordinal_survivor"
+        for v in _check_surviving_child_ordinal(_TOPOLOGY, [script])
+    )
+
+
+def test_fr3_i_exempt_exact_credited_dead_write() -> None:
+    """(i) EXEMPT — the credited dead init-write ``self.weaponSlot =
+    self.cam:GetChildren()[1]`` (receiver ``self.cam`` == self.<cam_receiver>, ordinal
+    1 == cam_ordinal+1) is exempted -> NO child_ordinal_survivor (the r1 false-positive
+    is gone)."""
+    src = _discharged_with_write("self.weaponSlot = self.cam:GetChildren()[1]")
+    assert _count_surviving_child_ordinals(src, _CORPUS_EXEMPT) == 0
+    assert not _checkD_fires(_fr3_script(src, _carrier()))
+
+
+def test_fr3_ii_fires_on_different_receiver_codex_r8() -> None:
+    """(ii) STILL FIRES — DIFFERENT receiver (codex r8): ``self.weaponSlot =
+    self.muzzle:GetChildren()[2]`` -> receiver ``self.muzzle`` != ``self.cam`` ->
+    COUNTED. The receiver-blind r8 exemption masked this."""
+    src = _discharged_with_write("self.weaponSlot = self.muzzle:GetChildren()[2]")
+    assert _count_surviving_child_ordinals(src, _CORPUS_EXEMPT) == 1
+    assert _checkD_fires(_fr3_script(src, _carrier()))
+
+
+def test_fr3_iii_fires_on_same_receiver_different_ordinal_codex_r3() -> None:
+    """(iii) STILL FIRES — SAME receiver, DIFFERENT ordinal (codex r3): the credited
+    init ``[1]`` was neutralized away and a stray ``self.weaponSlot =
+    self.cam:GetChildren()[2]`` survives -> ordinal 2 != cam_ordinal+1 (==1) ->
+    COUNTED (a genuine survivor, not masked)."""
+    src = _discharged_with_write("self.weaponSlot = self.cam:GetChildren()[2]")
+    assert _count_surviving_child_ordinals(src, _CORPUS_EXEMPT) == 1
+    assert _checkD_fires(_fr3_script(src, _carrier()))
+
+
+def test_fr3_iv_fires_on_bare_receiver() -> None:
+    """(iv) STILL FIRES — bare-receiver guard (review MAJOR #3): a write whose receiver
+    is a bare local ``cam`` (``self.weaponSlot = cam:GetChildren()[1]``, NOT
+    ``self.cam``) -> not the ``self.<member>`` form -> COUNTED. ``cam_receiver`` matches
+    only ``self.cam``, never a bare ``cam`` local that could be an unrelated symbol."""
+    src = _discharged_with_write("self.weaponSlot = cam:GetChildren()[1]")
+    assert _count_surviving_child_ordinals(src, _CORPUS_EXEMPT) == 1
+    assert _checkD_fires(_fr3_script(src, _carrier()))
+
+
+def test_fr3_v_fires_on_second_credited_write_at_most_one() -> None:
+    """(v) STILL FIRES — second credited-shape write past the one exemption: two
+    identical ``self.weaponSlot = self.cam:GetChildren()[1]`` writes -> at-most-one
+    exempt, the second fires."""
+    src = _discharged_with_write(
+        "self.weaponSlot = self.cam:GetChildren()[1]\n"
+        "    self.weaponSlot = self.cam:GetChildren()[1]"
+    )
+    assert _count_surviving_child_ordinals(src, _CORPUS_EXEMPT) == 1
+    assert _checkD_fires(_fr3_script(src, _carrier()))
+
+
+def test_fr3_vi_fires_on_read_survivor() -> None:
+    """(vi-a) STILL FIRES — a surviving READ ordinal (a consumption, not a
+    ``self.<field> =`` write) on a discharged rig is NOT the credited dead write ->
+    COUNTED. The credited cam write is itself exempt, the extra READ still fires."""
+    src = _discharged_with_write("self.weaponSlot = self.cam:GetChildren()[1]")
+    src = src.replace(
+        "function Player:GetRifle()\n",
+        "function Player:GetRifle()\n    local extra = self.muzzle:GetChildren()[2]\n",
+    )
+    assert _count_surviving_child_ordinals(src, _CORPUS_EXEMPT) == 1
+    assert _checkD_fires(_fr3_script(src, _carrier()))
+
+
+def test_fr3_vi_fires_on_none_carrier_non_rig() -> None:
+    """(vi-b) STILL FIRES — a non-rig script (``rig_binding=None``) gets NO exemption;
+    a surviving ordinal fails closed."""
+    src = _discharged_with_write("self.weaponSlot = self.cam:GetChildren()[1]")
+    assert _checkD_fires(_fr3_script(src, None))
+
+
+def test_fr3_vi_fires_on_undischarged_stamp_true() -> None:
+    """(vi-c) STILL FIRES — gated on REAL discharge, not the stamp: ``present=True`` but
+    the source is NOT discharged (raw reads survive, no resolver) -> the independent
+    ``_rig_binding_discharged`` returns False -> no exemption -> the surviving ordinal
+    fires."""
+    raw = _AI_OUTPUT_SHAPE  # un-lowered: raw reads survive, no resolver
+    assert _rig_binding_discharged(raw, "weaponSlot", "WeaponSlot") is False
+    assert "self.cam:GetChildren()[1]" in raw
+    assert _checkD_fires(_fr3_script(raw, _carrier(present=True)))
+
+
+def test_fr3_vii_safe_false_positive_on_direct_no_seed_form() -> None:
+    """(vii) SAFE false-positive — the direct no-seed form has
+    ``cam_receiver=="Camera.main.transform"`` (NEVER ""); it forms no valid
+    ``self.<member>`` match, so the rig's own dead write is COUNTED (fail-closed, never
+    silently exempted)."""
+    # The surviving write IS the direct-form camera-child write the resolver credited.
+    src = _discharged_with_write(
+        "self.weaponSlot = Camera.main.transform:GetChildren()[1]"
+    )
+    direct = _RigDeadWriteExempt(
+        field_name="weaponSlot",
+        cam_receiver="Camera.main.transform",
+        cam_ordinal=0,
+    )
+    # No ``self.<member>`` match -> the credited write is COUNTED (safe false-positive).
+    assert _count_surviving_child_ordinals(src, direct) == 1
+    carrier = _carrier(cam_receiver="Camera.main.transform")
+    assert _checkD_fires(_fr3_script(src, carrier))
+
+
+def test_fr3_viii_statement_anchored_retained_semicolon_and_substring() -> None:
+    """(viii) Statement-anchored RETAINED (r7) — the r3 anchors are ANDed onto
+    ``_site_is_discharged_rig_dead_write``, not a replacement: a ``;``-separated
+    survivor and a substring-LHS ``myself.weaponSlot`` survivor BOTH still fire even
+    when the receiver+ordinal happen to match the credited triple."""
+    # ``;``-span: the credited write became ``nil``; a SEPARATE survivor shares the
+    # physical line via ``;`` with the matching receiver+ordinal — must still fire
+    # (the exempt skip is statement-bounded, not line-bounded).
+    semi = _discharged_with_write(
+        "self.weaponSlot = nil ; local stray = self.cam:GetChildren()[1]"
+    )
+    assert _count_surviving_child_ordinals(semi, _CORPUS_EXEMPT) == 1
+    assert _checkD_fires(_fr3_script(semi, _carrier()))
+    # substring-LHS: ``myself.weaponSlot`` with the matching receiver+ordinal is NOT the
+    # standalone ``self.<field>`` lvalue -> still fires.
+    sub = _discharged_with_write(
+        "myself.weaponSlot = self.cam:GetChildren()[1]"
+    )
+    assert _count_surviving_child_ordinals(sub, _CORPUS_EXEMPT) == 1
+    assert _checkD_fires(_fr3_script(sub, _carrier()))
+
+
+def test_fr3_ix_threading_proof_rehydrated_carrier_still_anchors() -> None:
+    """(ix) Threading proof (review BLOCKING #1) — a carrier that carries
+    ``cam_receiver``+``cam_ordinal`` (as the widened LOAD validator rehydrates) still
+    anchors the exemption: the credited write is exempt and the DIFFERENT-receiver
+    survivor (ii) still fires. A carrier that DROPPED those keys (the pre-fix field-only
+    LOAD filter) would re-mask (ii) — asserted as the delta."""
+    # The credited write — exempt only because the rehydrated carrier carries the keys.
+    credited = _discharged_with_write("self.weaponSlot = self.cam:GetChildren()[1]")
+    full_carrier = _carrier()  # 5-key, as the widened validator rehydrates
+    assert not _checkD_fires(_fr3_script(credited, full_carrier))
+    # The DIFFERENT-receiver survivor — fires under the full carrier (anchored).
+    diff = _discharged_with_write("self.weaponSlot = self.muzzle:GetChildren()[2]")
+    assert _checkD_fires(_fr3_script(diff, full_carrier))
+    # DELTA: a carrier that DROPPED cam_receiver/cam_ordinal (the pre-fix 3-key LOAD
+    # filter) yields NO exemption at all in our entry-point guard -> the credited write
+    # is no longer exempt (so the exemption is provably keyed on the threaded keys).
+    dropped = {"field": "weaponSlot", "child": "WeaponSlot", "present": True}
+    assert _checkD_fires(_fr3_script(credited, dropped))
+
+
+def test_fr3_x_pre_fix_red_proof_receiver_blind_r8_masks() -> None:
+    """(x) Pre-fix proof — the receiver-blind r8 exemption (HEAD 91a19d4, field-only
+    ``_count_surviving_child_ordinals(source, exempt_field)``) MASKS the
+    different-receiver (ii) and different-ordinal (iii) survivors; the r3 anchored
+    exemption does not. Loads the ACTUAL 91a19d4 verifier blob from git and runs ITS
+    check D on the same inputs."""
+    import importlib.util
+    import subprocess
+
+    repo_root = Path(__file__).resolve().parent.parent.parent  # worktree root
+    blob = subprocess.run(
+        ["git", "show", "91a19d4:converter/converter/contract_verifier.py"],
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    old_path = Path(__file__).parent / "_old_cv_r8_91a19d4.py"
+    old_path.write_text(blob, encoding="utf-8")
+    try:
+        spec = importlib.util.spec_from_file_location("_old_cv_r8", str(old_path))
+        assert spec is not None and spec.loader is not None
+        old = importlib.util.module_from_spec(spec)
+        sys.modules["_old_cv_r8"] = old
+        spec.loader.exec_module(old)
+    finally:
+        old_path.unlink(missing_ok=True)
+
+    carrier = _carrier()  # the old verifier reads only field/child/present
+    # (ii) DIFFERENT-receiver survivor: the r8 field-only exemption MASKS it.
+    diff_recv = _discharged_with_write(
+        "self.weaponSlot = self.muzzle:GetChildren()[2]"
+    )
+    s_ii = _fr3_script(diff_recv, carrier)
+    assert not any(
+        v.check == "child_ordinal_survivor"
+        for v in old._check_surviving_child_ordinal(_TOPOLOGY, [s_ii])
+    ), "the receiver-blind r8 exemption MUST mask the different-receiver survivor"
+    assert _checkD_fires(s_ii)  # r3 does not mask it
+
+    # (iii) SAME-receiver DIFFERENT-ordinal survivor: the r8 field-only exemption MASKS.
+    diff_ord = _discharged_with_write(
+        "self.weaponSlot = self.cam:GetChildren()[2]"
+    )
+    s_iii = _fr3_script(diff_ord, carrier)
+    assert not any(
+        v.check == "child_ordinal_survivor"
+        for v in old._check_surviving_child_ordinal(_TOPOLOGY, [s_iii])
+    ), "the receiver-blind r8 exemption MUST mask the different-ordinal survivor"
+    assert _checkD_fires(s_iii)  # r3 does not mask it
