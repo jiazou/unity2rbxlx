@@ -67,12 +67,10 @@ class RigRootedRetargetFact:
     ``cam_receiver`` carries the EXACT camera receiver expression text the
     admission resolved (the C# group-2 receiver of ``<field> = <camrecv>.GetChild(n)``,
     e.g. ``cam`` for a seeded symbol or ``Camera.main.transform`` for the direct
-    form). It is the lowering's RECEIVER ANCHOR: the lowering neutralizes ONLY the
-    Luau assignment whose ordinal-RHS receiver matches THIS camera receiver, never a
-    same-field ordinal on a different (non-camera) receiver. Without it the lowering
-    could only match field+ordinal-shape and would neutralize an unrelated
-    ``self.<field> = self.<other>:GetChildren()[n]``. Defaults to "" (the lowering
-    then falls back to the canonical camera literals only).
+    form). Path A re-anchor: this is now an OPTIONAL Tier-2 refinement — the lowering
+    uses it ONLY to opportunistically pick the camera-child init-write to clean
+    (best-effort hygiene); it is NEVER required for the read-reroute discharge. Its
+    absence (the AI collapsed the RHS) is a SKIP, not a failure. Defaults to "".
     """
     field_name: str  # the assignment LHS field ("weaponSlot"), from `<field> = cam.GetChild(n)`
     child_name: str  # resolved authored child name under the MainCamera node ("WeaponSlot"), E1-E3 guarded

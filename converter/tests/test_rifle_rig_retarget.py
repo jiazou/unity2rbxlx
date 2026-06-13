@@ -323,6 +323,68 @@ def test_b_lowering_full_discharge() -> None:
     }
 
 
+def test_b_pathA_self_gameobject_shape_discharges_present_true() -> None:
+    # PATH A — THE case epoch-1 abstained on (D-S2-REDESIGN): the live AI output
+    # collapsed the Camera.main ordinal to ``self.weaponSlot = self.gameObject`` (NO
+    # camera-child ordinal anywhere). The write-anchored epoch-1 lowering returned
+    # modified=0 / present=False; under Path A the consumer READ reroute discharges
+    # present=True regardless of the write shape. RED-vs-epoch-1.
+    src = (
+        "function Player:Awake()\n"
+        "    self.cam = workspace.CurrentCamera\n"
+        "    -- weaponSlot was cam.GetChild(0)\n"
+        "    self.weaponSlot = self.gameObject\n"
+        "end\n\n"
+        "function Player:GetRifle()\n"
+        "    local rifle = self.host.instantiatePrefab(self.riflePrefab, self.weaponSlot, pivotOf(self.weaponSlot))\n"
+        "    if self.weaponSlot then rifle:PivotTo(pivotOf(self.weaponSlot)) end\n"
+        "end\n\n"
+        "return Player\n"
+    )
+    s = _Script(src)
+    n = lower_rifle_rig_retarget([s], _rig_map())
+    assert n == 1  # epoch-1 returned 0 here (the abstain the re-anchor fixes)
+    out = s.luau_source
+    # All 4 reads rerouted; the resolver injected before return Player.
+    assert out.count("self:_resolveWeaponSlot()") == 4
+    assert out.count("function Player:_resolveWeaponSlot()") == 1
+    assert out.index("function Player:_resolveWeaponSlot()") < out.index("return Player")
+    # The Tier-2 neutralize SKIPPED (self.gameObject is not a camera ordinal) — the
+    # leftover write is dead data, harmless because no raw read survives.
+    assert "self.weaponSlot = self.gameObject" in out
+    assert "self.weaponSlot = nil" not in out
+    # Discharge is the read reroute, RHS-agnostic -> present=True.
+    assert s.rig_binding == {
+        "field": "weaponSlot", "child": "WeaponSlot", "present": True,
+    }
+
+
+def test_b_neutralize_skipped_ambiguous_but_reads_rerouted_discharges() -> None:
+    # PATH A: the Tier-2 init-write neutralize is SKIP-on-ambiguity (here TWO
+    # same-field writes -> the recognizer cannot prove a unique dominating init), but
+    # the read reroute still discharges present=True. Proves discharge is decoupled
+    # from neutralize.
+    src = (
+        "function Player:Awake()\n"
+        "    self.cam = workspace.CurrentCamera\n"
+        "    self.weaponSlot = self.defaultSlots\n"      # ambiguous first write
+        "    self.weaponSlot = self.cam:GetChildren()[1]\n"  # camera ordinal
+        "end\n\n"
+        "function Player:GetRifle()\n"
+        "    return pivotOf(self.weaponSlot)\n"
+        "end\n\n"
+        "return Player\n"
+    )
+    s = _Script(src)
+    n = lower_rifle_rig_retarget([s], _rig_map())
+    assert n == 1
+    # The GetRifle read rerouted -> present=True regardless of how the writes resolved.
+    assert s.rig_binding == {
+        "field": "weaponSlot", "child": "WeaponSlot", "present": True,
+    }
+    assert "return pivotOf(self:_resolveWeaponSlot())" in s.luau_source
+
+
 def test_b_abstain_no_matchable_read_stamps_present_false() -> None:
     # An AI shape with the write+return but NO consumer read of self.weaponSlot.
     src = (
@@ -453,14 +515,12 @@ def test_h3_multiline_camera_child_rhs_fully_replaced() -> None:
     assert "self.weaponSlot = nil" in out
 
 
-def test_h3_desync_coupling_surviving_consumer_read_stamps_false() -> None:
-    # h.3 DESYNC-COUPLING: a consumer read the rewrite CANNOT reach (an ALIASED
-    # local, not bare ``self.weaponSlot``) leaves the read surviving via the alias
-    # WHILE the camera-child write neutralizes -> the camera-child write is gone
-    # (condition 2 holds) but the consumer still reads through the field name in a
-    # yielding method -> discharge tracks the SCAN, never a fake green from the
-    # pre-flipped resolved_total. The decisive guard: ``present`` ALWAYS equals the
-    # independent source scan, so a half-applied lowering can never present green.
+def test_h3_decoupling_present_always_equals_independent_scan() -> None:
+    # PATH A DECOUPLING (supersedes the round-1 BLOCKING #3 desync): discharge keys
+    # on the READ reroute, NOT on the neutralize/resolved_total, so a half-applied
+    # lowering can never present green off a stamp. The decisive guard: ``present``
+    # ALWAYS equals the independent source scan. Here the bare ``self.weaponSlot``
+    # read in the yielding GetRifle IS rerouted, so discharge is True.
     src = (
         "function Player:Awake()\n"
         "    self.cam = workspace.CurrentCamera\n"
@@ -474,16 +534,15 @@ def test_h3_desync_coupling_surviving_consumer_read_stamps_false() -> None:
     )
     s = _Script(src)
     lower_rifle_rig_retarget([s], _rig_map())
-    from converter.rifle_rig_retarget_lowering import (
-        _binding_discharged,
-        _camera_anchor,
-    )
+    from converter.rifle_rig_retarget_lowering import _binding_discharged
     assert s.rig_binding is not None
     # present MUST equal the independent scan (no stamp-only fake green).
     assert s.rig_binding["present"] == _binding_discharged(
         s.luau_source, "weaponSlot", "WeaponSlot", "WeaponSlot",
-        _camera_anchor("cam"),
     )
+    # The bare read was rerouted -> discharge True (RHS-agnostic, decoupled).
+    assert s.rig_binding["present"] is True
+    assert "local w = self:_resolveWeaponSlot()" in s.luau_source
 
 
 def test_h3_no_consumer_read_means_no_silent_green() -> None:
@@ -656,14 +715,14 @@ def test_prerewrite_child_index_no_double_count_with_host_facts(tmp_path: Path) 
 # === round-2 P1 fixes =======================================================
 
 
-def test_p1_single_line_if_neutralize_abstains_whole_rhs_guard() -> None:
-    # P1 (codex BLOCKING) was: the neutralize swallowed an inline
+def test_p1_single_line_if_neutralize_skips_whole_rhs_guard_still_discharges() -> None:
+    # P1 (codex BLOCKING) was: the Tier-2 neutralize swallowed an inline
     # ``if ... then self.weaponSlot = ... end``'s closing ``end`` (RHS span to the
-    # newline) -> UNLOADABLE Luau. The WHOLE-RHS guard now PREVENTS that at the
-    # source: the camera-child access must BE the whole RHS value, so an RHS that
-    # trails ``... end`` does NOT match -> the neutralize ABSTAINS (no corruption).
-    # Discharge is then not confirmed -> present=False (fail-closed), and the
-    # camera-child write is left intact for the verifier.
+    # newline) -> UNLOADABLE Luau. The WHOLE-RHS guard PREVENTS that at the source:
+    # the camera-child access must BE the whole RHS value, so an RHS that trails
+    # ``... end`` does NOT match -> the neutralize SKIPS (no corruption).
+    # PATH A: the neutralize SKIP no longer blocks discharge — the GetRifle read is
+    # rerouted, so present=True even though the if-write is left intact (dead data).
     src = (
         "function Player:Awake()\n"
         "    self.cam = workspace.CurrentCamera\n"
@@ -676,28 +735,27 @@ def test_p1_single_line_if_neutralize_abstains_whole_rhs_guard() -> None:
     )
     s = _Script(src)
     n = lower_rifle_rig_retarget([s], _rig_map())
-    assert n == 0  # abstained — never shipped broken Luau
+    assert n == 1  # the read reroute discharged; the if-write neutralize SKIPPED
     assert s.rig_binding == {
-        "field": "weaponSlot", "child": "WeaponSlot", "present": False,
+        "field": "weaponSlot", "child": "WeaponSlot", "present": True,
     }
-    assert "self.cam:GetChildren()[1] end" in s.luau_source  # untouched, loadable
-    assert "_resolveWeaponSlot" not in s.luau_source
-    # Direct: the neutralize ABSTAINS on the single-line-if shape (WHOLE-RHS guard),
-    # so the would-be FINAL source stays loadable (no swallowed ``end``).
+    # The if-write is left intact + LOADABLE (the whole-RHS guard never swallowed ``end``).
+    assert "self.cam:GetChildren()[1] end" in s.luau_source
+    # The GetRifle read was rerouted (the load-bearing discharge).
+    assert "return pivotOf(self:_resolveWeaponSlot())" in s.luau_source
+    # Direct: the neutralize SKIPS on the single-line-if shape (WHOLE-RHS guard),
+    # so the FINAL source stays loadable (no swallowed ``end``).
     from converter.rifle_rig_retarget_lowering import (
-        _camera_anchor,
+        _camera_symbol_forms,
         _neutralize_assignment,
     )
     out, neutralized = _neutralize_assignment(
-        src, "weaponSlot", "WeaponSlot", _camera_anchor("cam")
+        src, "weaponSlot", "WeaponSlot", _camera_symbol_forms("cam")
     )
-    assert neutralized is False  # WHOLE-RHS guard -> abstain, never corrupt
+    assert neutralized is False  # WHOLE-RHS guard -> SKIP, never corrupt
     assert out == src
-    # Belt-and-suspenders: the final syntax gate still backstops OTHER corruptions —
-    # a genuinely unbalanced final source is rejected by _luau_syntax_ok.
     if luau_analyze_path():
-        assert syntax_errors_for_source(src) == []  # the well-formed source parses
-        assert syntax_errors_for_source(src + "if x then\n") != []  # broken -> caught
+        assert syntax_errors_for_source(s.luau_source) == []  # final source loadable
 
 
 def test_p4_unrelated_main_camera_in_other_prefab_does_not_suppress(
@@ -914,8 +972,9 @@ def test_r3_fallback_validates_if_then_end_block_balance(monkeypatch) -> None:
         "return Player\n"
     )
     assert _structural_balance_ok(swallowed) is False  # unbalanced then -> reject
-    # And the WHOLE-RHS-aware lowering ABSTAINS on the single-line-if camera write
-    # (it never corrupts the ``end`` in the first place) -> present=False.
+    # PATH A: the WHOLE-RHS-aware Tier-2 neutralize SKIPS the single-line-if camera
+    # write (it never corrupts the ``end``), but the GetRifle read STILL reroutes ->
+    # present=True, and the final source stays loadable under the fallback.
     src = (
         "function Player:Awake()\n"
         "    self.cam = workspace.CurrentCamera\n"
@@ -928,11 +987,13 @@ def test_r3_fallback_validates_if_then_end_block_balance(monkeypatch) -> None:
     )
     s = _Script(src)
     n = lower_rifle_rig_retarget([s], _rig_map())
-    assert n == 0
+    assert n == 1
     assert s.rig_binding == {
-        "field": "weaponSlot", "child": "WeaponSlot", "present": False,
+        "field": "weaponSlot", "child": "WeaponSlot", "present": True,
     }
-    assert "self.cam:GetChildren()[1] end" in s.luau_source  # untouched
+    assert "self.cam:GetChildren()[1] end" in s.luau_source  # if-write untouched
+    assert "return pivotOf(self:_resolveWeaponSlot())" in s.luau_source
+    assert _structural_balance_ok(s.luau_source) is True  # final source loadable
 
 
 def test_r3_fallback_accepts_well_formed_if_elseif_else() -> None:
@@ -1088,20 +1149,20 @@ def test_r3_neutralize_anchor_requires_ordinal_child_access() -> None:
     # (``self.weaponSlot = self.cam and self.defaultSlot``) must NOT be neutralized
     # to ``nil`` — that would be a false-green. The neutralizer must ABSTAIN.
     from converter.rifle_rig_retarget_lowering import (
-        _camera_anchor,
+        _camera_symbol_forms,
         _neutralize_assignment,
     )
-    cam = _camera_anchor("cam")
+    cam = _camera_symbol_forms("cam")
     src = (
         "function Player:Awake()\n"
         "    self.weaponSlot = self.cam and self.defaultSlot\n"
         "end\n"
     )
     out, neutralized = _neutralize_assignment(src, "weaponSlot", "WeaponSlot", cam)
-    assert neutralized is False  # no ordinal child access -> abstain
+    assert neutralized is False  # no ordinal child access -> SKIP (Tier-2 best-effort)
     assert out == src  # untouched
     assert "self.weaponSlot = nil" not in out
-    # And the real ordinal RHS IS still neutralized (discriminator, not blanket).
+    # And the real camera ordinal RHS IS still neutralized (discriminator, not blanket).
     src2 = (
         "function Player:Awake()\n"
         "    self.cam = workspace.CurrentCamera\n"
@@ -1280,210 +1341,41 @@ def test_r4_var_local_decl_abstains(tmp_path: Path) -> None:
 # === round-5 P1 fixes =======================================================
 
 
-def test_r5_neutralize_anchored_on_camera_receiver_not_field_ordinal() -> None:
-    # R5 BLOCKING (lowering:524): the neutralize must be CAMERA-RECEIVER-anchored,
-    # not match ANY ordinal RHS on the field. A same-field ordinal on a NON-camera
-    # receiver (``self.weaponSlot = self.defaultSlots:GetChildren()[1]``) must NOT
-    # be neutralized and must NOT stamp present=True — the AI output never carried
-    # the camera-child binding the fact recorded (cam receiver ``cam``).
-    src = (
-        "function Player:Awake()\n"
-        "    self.weaponSlot = self.defaultSlots:GetChildren()[1]\n"
-        "end\n\n"
-        "function Player:GetRifle()\n"
-        "    return pivotOf(self.weaponSlot)\n"
-        "end\n\n"
-        "return Player\n"
+def test_r5_discharge_is_rhs_agnostic_across_write_shapes() -> None:
+    # PATH A re-anchor: discharge keys on the consumer-READ reroute (the AI-STABLE
+    # member access), NOT on matching the camera-child WRITE shape. So the field's
+    # binding discharges present=True REGARDLESS of the RHS the AI emitted — the 5
+    # real shapes (:GetChildren()[1], self.gameObject, __unityChild(...), a multi-step
+    # local, a FindFirstChild fallback). The Tier-2 neutralize SKIPS the shapes it
+    # cannot recognize as a camera ordinal (harmless: no raw read survives). This
+    # REPLACES the epoch-1 r5 tests that (under the superseded coupling) asserted
+    # present=False whenever the neutralize could not camera-anchor the write.
+    shapes = (
+        "self.cam and self.cam:GetChildren()[1]",   # corpus ordinal (neutralized)
+        "self.gameObject",                          # AI collapsed to GameObject
+        "self.cam and __unityChild(self.cam, 1)",   # __unityChild helper
+        "self.defaultSlots:GetChildren()[1]",       # ordinal on a NON-camera receiver
+        "self.defaultSlots or self.cam:GetChildren()[1]",  # mixed disjunction
     )
-    s = _Script(src)
-    n = lower_rifle_rig_retarget([s], _rig_map(cam_receiver="cam"))
-    # The non-camera ordinal write is NOT the fact's binding -> not neutralized,
-    # discharge cannot be confirmed -> abstain + present=False.
-    assert n == 0
-    assert s.rig_binding == {
-        "field": "weaponSlot", "child": "WeaponSlot", "present": False,
-    }
-    assert "self.defaultSlots:GetChildren()[1]" in s.luau_source  # untouched
-    assert "self.weaponSlot = nil" not in s.luau_source
-    assert "_resolveWeaponSlot" not in s.luau_source
-    # The REAL camera-rooted RHS on the SAME field still discharges present=True.
-    real = (
-        "function Player:Awake()\n"
-        "    self.cam = workspace.CurrentCamera\n"
-        "    self.weaponSlot = self.cam:GetChildren()[1]\n"
-        "end\n\n"
-        "function Player:GetRifle()\n"
-        "    return pivotOf(self.weaponSlot)\n"
-        "end\n\n"
-        "return Player\n"
-    )
-    s2 = _Script(real)
-    n2 = lower_rifle_rig_retarget([s2], _rig_map(cam_receiver="cam"))
-    assert n2 == 1
-    assert s2.rig_binding == {
-        "field": "weaponSlot", "child": "WeaponSlot", "present": True,
-    }
-    assert "self.weaponSlot = nil" in s2.luau_source
-
-
-def test_r5_camera_symbol_rebound_to_non_camera_in_luau_abstains() -> None:
-    # R5 BLOCKING (codex follow-up): the seeded-symbol receiver anchor must not be a
-    # bare NAME match. STRICT: the symbol must be PROVABLY camera (its nearest
-    # preceding binding is a canonical camera literal). A rebind to a NON-camera
-    # (``self.cam = self.defaultSlots; self.weaponSlot = self.cam:GetChildren()[1]``)
-    # -> NOT neutralized, present=False. Only a binding to a canonical camera literal
-    # admits.
-    src = (
-        "function Player:Awake()\n"
-        "    self.cam = self.defaultSlots\n"
-        "    self.weaponSlot = self.cam:GetChildren()[1]\n"
-        "end\n\n"
-        "function Player:GetRifle()\n"
-        "    return pivotOf(self.weaponSlot)\n"
-        "end\n\n"
-        "return Player\n"
-    )
-    s = _Script(src)
-    n = lower_rifle_rig_retarget([s], _rig_map(cam_receiver="cam"))
-    assert n == 0
-    assert s.rig_binding == {
-        "field": "weaponSlot", "child": "WeaponSlot", "present": False,
-    }
-    assert "self.cam:GetChildren()[1]" in s.luau_source  # NOT neutralized
-    # A binding to the canonical camera literal DOES admit (discriminator).
-    src_ok = (
-        "function Player:Awake()\n"
-        "    self.cam = workspace.CurrentCamera\n"
-        "    self.weaponSlot = self.cam:GetChildren()[1]\n"
-        "end\n\n"
-        "function Player:GetRifle()\n"
-        "    return pivotOf(self.weaponSlot)\n"
-        "end\n\n"
-        "return Player\n"
-    )
-    s_ok = _Script(src_ok)
-    assert lower_rifle_rig_retarget([s_ok], _rig_map(cam_receiver="cam")) == 1
-    assert s_ok.rig_binding["present"] is True
-
-
-def test_r5_mixed_disjunction_rhs_is_not_neutralized() -> None:
-    # R5 (codex R2): the camera-child access must BE the WHOLE RHS value, not merely
-    # appear in a mixed expression. A disjunction whose live value can be the
-    # NON-camera primary (``self.defaultSlots or self.cam:GetChildren()[1]``) must
-    # NOT be neutralized nor stamp present=True.
-    src = (
-        "function Player:Awake()\n"
-        "    self.cam = workspace.CurrentCamera\n"
-        "    self.weaponSlot = self.defaultSlots or self.cam:GetChildren()[1]\n"
-        "end\n\n"
-        "function Player:GetRifle()\n"
-        "    return pivotOf(self.weaponSlot)\n"
-        "end\n\n"
-        "return Player\n"
-    )
-    s = _Script(src)
-    n = lower_rifle_rig_retarget([s], _rig_map(cam_receiver="cam"))
-    assert n == 0
-    assert s.rig_binding == {
-        "field": "weaponSlot", "child": "WeaponSlot", "present": False,
-    }
-    assert "self.defaultSlots or self.cam:GetChildren()[1]" in s.luau_source
-    assert "self.weaponSlot = nil" not in s.luau_source
-    # The corpus nil-GUARD conjunction (result IS the ordinal) still admits.
-    guarded = (
-        "function Player:Awake()\n"
-        "    self.cam = workspace.CurrentCamera\n"
-        "    self.weaponSlot = self.cam and self.cam:GetChildren()[1]\n"
-        "end\n\n"
-        "function Player:GetRifle()\n"
-        "    return pivotOf(self.weaponSlot)\n"
-        "end\n\n"
-        "return Player\n"
-    )
-    g = _Script(guarded)
-    assert lower_rifle_rig_retarget([g], _rig_map(cam_receiver="cam")) == 1
-    assert g.rig_binding["present"] is True
-    # A FOREIGN ``and`` guard (not the camera receiver) makes the value conditional
-    # on a NON-camera (nil when the guard is falsy) -> must NOT be neutralized.
-    foreign_guard = (
-        "function Player:Awake()\n"
-        "    self.cam = workspace.CurrentCamera\n"
-        "    self.weaponSlot = self.defaultSlots and self.cam:GetChildren()[1]\n"
-        "end\n\n"
-        "function Player:GetRifle()\n"
-        "    return pivotOf(self.weaponSlot)\n"
-        "end\n\n"
-        "return Player\n"
-    )
-    fg = _Script(foreign_guard)
-    assert lower_rifle_rig_retarget([fg], _rig_map(cam_receiver="cam")) == 0
-    assert fg.rig_binding["present"] is False
-    assert "self.defaultSlots and self.cam:GetChildren()[1]" in fg.luau_source
-
-
-def test_r5_camera_symbol_as_param_or_loopvar_abstains() -> None:
-    # R5 (codex R2): a symbol with NO preceding canonical-camera binding — a function
-    # PARAMETER (``local function pick(cam) ... cam:GetChildren()[1] end``) or a
-    # for-loop variable — is NOT proven camera (the AI is not trusted) -> abstain,
-    # present=False. (Strict: fail-closed on the absence of positive proof.)
-    param_src = (
-        "function Player:Awake()\n"
-        "    local function pick(cam) self.weaponSlot = cam:GetChildren()[1] end\n"
-        "    pick(self.defaultSlots)\n"
-        "end\n\n"
-        "function Player:GetRifle()\n"
-        "    return pivotOf(self.weaponSlot)\n"
-        "end\n\n"
-        "return Player\n"
-    )
-    s = _Script(param_src)
-    n = lower_rifle_rig_retarget([s], _rig_map(cam_receiver="cam"))
-    assert n == 0
-    assert s.rig_binding == {
-        "field": "weaponSlot", "child": "WeaponSlot", "present": False,
-    }
-    assert "cam:GetChildren()[1]" in s.luau_source  # NOT neutralized
-
-
-def test_r5_camera_binding_in_closed_or_dead_scope_does_not_dominate() -> None:
-    # R5 (codex R3): a canonical-camera binding that does NOT REACH the use — inside
-    # a ``do ... end`` that closes before the use, or a ``if false then ... end`` dead
-    # branch — must NOT prove the symbol camera (the binding's scope exited). The use
-    # site's ``cam`` is then unproven -> abstain, present=False.
-    for src in (
-        # closed ``do`` scope
-        "function Player:Awake()\n"
-        "    do\n        local cam = workspace.CurrentCamera\n    end\n"
-        "    self.weaponSlot = cam:GetChildren()[1]\n"
-        "end\n\nfunction Player:GetRifle()\n"
-        "    return pivotOf(self.weaponSlot)\nend\n\nreturn Player\n",
-        # dead ``if false then`` branch
-        "function Player:Awake()\n"
-        "    if false then\n        cam = workspace.CurrentCamera\n    end\n"
-        "    self.weaponSlot = cam:GetChildren()[1]\n"
-        "end\n\nfunction Player:GetRifle()\n"
-        "    return pivotOf(self.weaponSlot)\nend\n\nreturn Player\n",
-    ):
+    for rhs in shapes:
+        src = (
+            "function Player:Awake()\n"
+            "    self.cam = workspace.CurrentCamera\n"
+            f"    self.weaponSlot = {rhs}\n"
+            "end\n\n"
+            "function Player:GetRifle()\n"
+            "    return pivotOf(self.weaponSlot)\n"
+            "end\n\n"
+            "return Player\n"
+        )
         s = _Script(src)
         n = lower_rifle_rig_retarget([s], _rig_map(cam_receiver="cam"))
-        assert n == 0, src
-        assert s.rig_binding["present"] is False
-        assert "cam:GetChildren()[1]" in s.luau_source  # NOT neutralized
-    # A binding at the SAME level that REACHES the use (incl. through an enclosing
-    # ``if self.cam then`` block whose write is guarded) still admits.
-    ok = (
-        "function Player:Awake()\n"
-        "    self.cam = workspace.CurrentCamera\n"
-        "    if self.cam then\n"
-        "        self.weaponSlot = self.cam:GetChildren()[1]\n"
-        "    end\n"
-        "end\n\nfunction Player:GetRifle()\n"
-        "    return pivotOf(self.weaponSlot)\nend\n\nreturn Player\n"
-    )
-    s_ok = _Script(ok)
-    assert lower_rifle_rig_retarget([s_ok], _rig_map(cam_receiver="cam")) == 1
-    assert s_ok.rig_binding["present"] is True
-
+        # The yielding GetRifle read is rerouted on EVERY shape -> discharge True.
+        assert n == 1, rhs
+        assert s.rig_binding == {
+            "field": "weaponSlot", "child": "WeaponSlot", "present": True,
+        }, rhs
+        assert "return pivotOf(self:_resolveWeaponSlot())" in s.luau_source, rhs
 
 def test_r5_structural_balance_fails_closed_on_unterminated_long_bracket(
     monkeypatch,
