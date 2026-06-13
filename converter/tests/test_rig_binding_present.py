@@ -1284,3 +1284,123 @@ def test_pathA_r2_decoy_resolver_body_does_not_exempt_foreign_read() -> None:
         {"field": "weaponSlot", "child": "WeaponSlot", "present": True},
     )
     assert len(_rig_rows([script])) == 1
+
+
+# ===========================================================================
+# Dual-voice REVIEW round 3 (D-S1b-PATHA-r3) — ``_rig_has_computed_field_key`` was
+# OVER-BROAD: it (a) flagged any concatenated bracket key whose string fragments
+# merely CONTAINED ``<field>`` as a SUBSTRING (not an exact constant-fold), and (b)
+# never applied the assignment-LHS exception. So a computed-key WRITE
+# (``self["weapon".."Slot"] = x``) and an unrelated substring-containing key
+# (``self["preweaponSlotpost".."x"]``) both false-FAILED discharge. The fix: flag a
+# computed key ONLY when it CONSTANT-FOLDS (string-literals only) to EXACTLY
+# ``<field>``, honor the LHS exception, and never flag a non-foldable dynamic key.
+# ===========================================================================
+
+def test_pathA_r3_computed_key_write_lhs_exempt_discharges() -> None:
+    """D-S1b-PATHA-r3 — a computed-key WRITE ``self["weapon".."Slot"] = x`` folds to
+    exactly ``weaponSlot`` but is an assignment LHS (a Tier-2-skipped write may
+    survive), so it does NOT block discharge — discharges True (was false-FAILED)."""
+    src = _green_plus_boundary_read('self["weapon".."Slot"] = somethingElse')
+    assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is True
+    assert _rig_rows([
+        _rbx("Player", src, {"field": "weaponSlot", "child": "WeaponSlot", "present": True})
+    ]) == []
+
+
+def test_pathA_r3_computed_key_substring_not_exact_does_not_fail() -> None:
+    """D-S1b-PATHA-r3 — a computed key ``self["preweaponSlotpost".."x"]`` folds to
+    ``preweaponSlotpostx`` which CONTAINS ``weaponSlot`` as a substring but is NOT the
+    field, so it must NOT block discharge — discharges True (was false-FAILED on the
+    substring match)."""
+    src = _green_plus_boundary_read('local x = self["preweaponSlotpost".."x"]')
+    assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is True
+    assert _rig_rows([
+        _rbx("Player", src, {"field": "weaponSlot", "child": "WeaponSlot", "present": True})
+    ]) == []
+
+
+def test_pathA_r3_computed_key_read_exact_fold_fails_closed() -> None:
+    """D-S1b-PATHA-r3 — a computed-key READ ``self["weapon".."Slot"]`` that folds to
+    EXACTLY ``weaponSlot`` is a surviving raw field consumption the reroute cannot
+    rewrite, so discharge still FAILS CLOSED (no regression of the exact-fold read)."""
+    src = _green_plus_boundary_read('local x = self["weapon".."Slot"]')
+    assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is False
+    assert len(_rig_rows([
+        _rbx("Player", src, {"field": "weaponSlot", "child": "WeaponSlot", "present": True})
+    ])) == 1
+
+
+@pytest.mark.parametrize(
+    "dynamic_key",
+    [
+        "local x = self[someVar]",
+        "local x = self[getKey()]",
+        'local x = self["weapon"..suffix]',
+    ],
+)
+def test_pathA_r3_dynamic_non_foldable_key_does_not_false_fail(dynamic_key: str) -> None:
+    """D-S1b-PATHA-r3 — a fully-dynamic / non-constant-foldable key (``self[someVar]``,
+    ``self[fn()]``, ``self["a"..var]``) is NOT provably the field, so flagging it would
+    false-fail unrelated table accesses. It must NOT block discharge — discharges
+    True (only the constant-foldable-to-exactly-``<field>`` case is a provable read)."""
+    src = _green_plus_boundary_read(dynamic_key)
+    assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is True
+    assert _rig_rows([
+        _rbx("Player", src, {"field": "weaponSlot", "child": "WeaponSlot", "present": True})
+    ]) == []
+
+
+def test_pathA_r3_false_fail_shapes_red_against_041e0ec() -> None:
+    """D-S1b-PATHA-r3 pre-fix-RED proof (narrator-INDEPENDENT) — load the ACTUAL
+    041e0ec (over-broad computed-key) verifier blob from git. The WRITE / substring /
+    dynamic shapes false-FAIL there (discharged=False — over-strict) and discharge
+    True now, proving the tightening is load-bearing. The exact-fold READ stays
+    fail-closed in BOTH (no regression of the realistic case)."""
+    import importlib.util
+    import subprocess
+
+    repo_root = Path(__file__).resolve().parent.parent.parent  # the worktree root
+    blob = subprocess.run(
+        ["git", "show", "041e0ec:converter/converter/contract_verifier.py"],
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    old_path = Path(__file__).parent / "_old_contract_verifier_041e0ec.py"
+    old_path.write_text(blob, encoding="utf-8")
+    try:
+        spec = importlib.util.spec_from_file_location("_old_cv_041e0ec", str(old_path))
+        assert spec is not None and spec.loader is not None
+        old = importlib.util.module_from_spec(spec)
+        sys.modules["_old_cv_041e0ec"] = old
+        spec.loader.exec_module(old)
+    finally:
+        old_path.unlink(missing_ok=True)
+
+    # The shapes the over-broad gate false-FAILED (over-strict): each discharges True
+    # now. (The fully-dynamic keys — ``self[someVar]`` / ``self[fn()]`` /
+    # ``self["weapon"..suffix]`` — were NOT false-failed by 041e0ec either: no ``..``
+    # reconstructs the field token, so the old gate already passed them; their
+    # non-regression is covered by ``test_pathA_r3_dynamic_non_foldable_key_*``.)
+    false_fail_shapes = {
+        "computed_write_lhs": 'self["weapon".."Slot"] = somethingElse',
+        "substring_not_exact": 'local x = self["preweaponSlotpost".."x"]',
+    }
+    for name, stmt in false_fail_shapes.items():
+        src = _green_plus_boundary_read(stmt)
+        # PRE-FIX (041e0ec over-broad): false-FAILS (discharged=False — over-strict).
+        assert old._rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is False, (
+            f"{name}: the real 041e0ec over-broad gate must false-FAIL (proving the "
+            f"tightening is load-bearing)"
+        )
+        # POST-FIX: discharges True (no longer false-fails).
+        assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is True, (
+            f"{name}: the tightened gate must no longer false-fail"
+        )
+
+    # The exact-fold READ stays fail-closed in BOTH versions (no regression).
+    exact_read = _green_plus_boundary_read('local x = self["weapon".."Slot"]')
+    assert old._rig_binding_discharged(exact_read, "weaponSlot", "WeaponSlot") is False
+    assert _rig_binding_discharged(exact_read, "weaponSlot", "WeaponSlot") is False

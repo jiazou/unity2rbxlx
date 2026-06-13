@@ -882,24 +882,57 @@ def _rig_pos_is_assignment_lhs(proj: str, end: int) -> bool:
     )
 
 
+def _rig_constant_folds_to(interior: str, field: str) -> bool:
+    """True if ``interior`` (a bracket-key expression) is a concatenation of STRING
+    LITERALS ONLY that CONSTANT-FOLDS to EXACTLY ``<field>``.
+
+    SOUNDNESS: the whole interior must be ``"lit" .. "lit" .. ...`` — string literals
+    joined by ``..`` and nothing else. A single non-string-literal operand (a var, a
+    call, an arithmetic term) makes the value DYNAMIC and not provably ``<field>``, so
+    we abstain (do NOT fold). Only a fully constant-foldable key whose folded value
+    EQUALS ``<field>`` (not merely contains it as a substring) is a provable field
+    access."""
+    if not field:
+        return False
+    # Split on the ``..`` concatenation operator; every operand must be a clean,
+    # single string literal (``"..."`` / ``'...'``) for the key to constant-fold.
+    operand_re = re.compile(r"^\s*(['\"])([^'\"]*)\1\s*$")
+    fragments = []
+    for operand in interior.split(".."):
+        mo = operand_re.match(operand)
+        if mo is None:
+            return False  # a dynamic / non-string-literal operand -> not foldable
+        fragments.append(mo.group(2))
+    return "".join(fragments) == field
+
+
 def _rig_has_computed_field_key(source: str, field: str) -> bool:
-    """True if a bracket access carries a COMPUTED/CONCATENATED key that produces
-    ``<field>`` (e.g. ``["weapon".."Slot"]``). A computed key is a raw consumption
-    the reroute cannot rewrite, so it fails closed. Detected structurally on the
-    RAW source: a ``[ ... ]`` access whose interior contains a string-concatenation
-    (``..``) AND whose concatenated string FRAGMENTS, joined, contain ``<field>``.
-    Conservative — only fires on a concatenation that reconstructs the field token,
-    never on an unrelated dynamic index."""
+    """True if a bracket access carries a COMPUTED/CONCATENATED key that CONSTANT-
+    FOLDS to EXACTLY ``<field>`` (e.g. ``["weapon".."Slot"]`` -> ``"weaponSlot"``) and
+    is a READ. A computed-key READ is a raw consumption the reroute cannot rewrite, so
+    it fails closed. Detected structurally on the RAW source: a ``[ ... ]`` access
+    whose interior is a string-literal concatenation folding to exactly ``<field>``.
+
+    Two known-good non-firings (mirroring the dot/literal-bracket paths):
+
+      * ASSIGNMENT LHS (``self["weapon".."Slot"] = x``) -> a WRITE may legitimately
+        survive (discharge decoupled from neutralize);
+      * a NON-constant-foldable / fully-dynamic key (``self[someVar]``, ``self[fn()]``,
+        ``self["a"..var]``) -> not provably the field, never flagged (flagging it
+        false-fails unrelated table accesses).
+
+    Conservative — fires ONLY on a literal concatenation that PROVABLY reconstructs the
+    exact field token, never on a substring match or an unrelated dynamic index."""
+    proj = _rig_code_projection(source)
     bracket_re = re.compile(r"\[([^\[\]]*\.\.[^\[\]]*)\]")
     for m in bracket_re.finditer(source):
         if not _rig_pos_is_real_code(source, m.start()):
             continue
-        interior = m.group(1)
-        # Join the string-literal fragments inside the bracket; if the
-        # concatenation reconstructs the field token, it is a computed field read.
-        joined = "".join(re.findall(r"['\"]([^'\"]*)['\"]", interior))
-        if field and field in joined:
-            return True
+        if not _rig_constant_folds_to(m.group(1), field):
+            continue
+        if _rig_pos_is_assignment_lhs(proj, m.end()):
+            continue  # WRITE LHS -> a Tier-2-skipped write may survive
+        return True
     return False
 
 
