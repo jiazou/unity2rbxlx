@@ -66,7 +66,10 @@ class TranspiledScript:
     child_ref_resolution: dict[str, int] | None = None
     # Per-script rig-retarget binding carrier from the generic-mode post-transpile
     # ``rifle_rig_retarget_lowering``: a JSON-native dict
-    # ``{"field": str, "child": str, "present": bool}`` or ``None``. Copied onto
+    # ``{"field": str, "child": str, "present": bool, "cam_receiver": str,
+    # "cam_ordinal": int}`` or ``None``. ``cam_receiver``/``cam_ordinal``
+    # (REDESIGN r3) are deterministic projections of the resolver fact that anchor
+    # check D's dead-write exemption (stamped regardless of discharge). Copied onto
     # the produced ``RbxScript.rig_binding`` so the contract verifier's
     # binding-present fail-closed check (``_check_rig_binding_present``) can assert
     # the IR-declared rig binding was discharged. ``None`` ONLY when the script has

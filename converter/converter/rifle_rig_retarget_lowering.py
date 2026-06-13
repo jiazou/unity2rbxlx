@@ -132,15 +132,22 @@ def lower_rifle_rig_retarget(
         # exactly one binding, and the design (§1.5, edge 9) frames multi-fact as a
         # two-SCRIPTS case (the corpus is one-fact-per-script). Rather than silently
         # keep only the LAST fact's carrier (dropping the earlier bindings'
-        # discharge from the verifier), FAIL CLOSED: stamp a single overflow
-        # carrier (present=False, multi_fact=True) and ABSTAIN on all edits, so the
-        # verifier fail-closes LOUD instead of shipping an unverifiable binding.
+        # discharge from the verifier), FAIL CLOSED: stamp a FULL 5-key carrier
+        # (present=False, multi_fact=True) from the FIRST rig fact and ABSTAIN on all
+        # edits, so the verifier fail-closes LOUD instead of shipping an unverifiable
+        # binding. REDESIGN r3 (close the resume-path hole): the carrier MUST be the
+        # full 5-key shape — a 2-key carrier would be DROPPED to None by the 5-key
+        # rehydrate LOAD validator, so the verifier would ABSTAIN (not fire) on a
+        # preserve/resume assemble. Full-keyed -> round-trips the validator -> fires
+        # loud on the resume path exactly as on the fresh path.
         if len(rig_facts) > 1:
             first = rig_facts[0]
             script.rig_binding = {
                 "field": first.field_name,
                 "child": first.child_name,
                 "present": False,
+                "cam_receiver": first.cam_receiver,
+                "cam_ordinal": first.ordinal,
                 "multi_fact": True,
             }
             continue
@@ -166,6 +173,8 @@ def lower_rifle_rig_retarget(
                     "field": field,
                     "child": child,
                     "present": False,
+                    "cam_receiver": fact.cam_receiver,
+                    "cam_ordinal": fact.ordinal,
                 }
                 continue
             method = f"_resolve{suffix}"
@@ -205,10 +214,15 @@ def lower_rifle_rig_retarget(
             # re-stamps identically on an idempotent second call (the method is already
             # present) and never stamps True off a reverted edit.
             present = _binding_discharged(script.luau_source, field, child, suffix)
+            # REDESIGN r3: cam_receiver + cam_ordinal are deterministic projections of
+            # the resolver fact, stamped regardless of discharge outcome — they anchor
+            # check D's dead-write exemption (slice 1.2), NOT discharge.
             script.rig_binding = {
                 "field": field,
                 "child": child,
                 "present": present,
+                "cam_receiver": fact.cam_receiver,
+                "cam_ordinal": fact.ordinal,
             }
         if changed:
             modified += 1

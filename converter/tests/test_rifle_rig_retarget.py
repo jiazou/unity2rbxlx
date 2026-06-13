@@ -317,9 +317,10 @@ def test_b_lowering_full_discharge() -> None:
     assert "self.weaponSlot = nil" in out
     # (v) the original ordinal is gone.
     assert "self.cam:GetChildren()[1]" not in out
-    # (vi) the carrier is stamped present=True.
+    # (vi) the carrier is stamped present=True, with the r3 fact-projection keys.
     assert s.rig_binding == {
         "field": "weaponSlot", "child": "WeaponSlot", "present": True,
+        "cam_receiver": "cam", "cam_ordinal": 0,
     }
 
 
@@ -356,6 +357,7 @@ def test_b_pathA_self_gameobject_shape_discharges_present_true() -> None:
     # Discharge is the read reroute, RHS-agnostic -> present=True.
     assert s.rig_binding == {
         "field": "weaponSlot", "child": "WeaponSlot", "present": True,
+        "cam_receiver": "cam", "cam_ordinal": 0,
     }
 
 
@@ -381,6 +383,7 @@ def test_b_neutralize_skipped_ambiguous_but_reads_rerouted_discharges() -> None:
     # The GetRifle read rerouted -> present=True regardless of how the writes resolved.
     assert s.rig_binding == {
         "field": "weaponSlot", "child": "WeaponSlot", "present": True,
+        "cam_receiver": "cam", "cam_ordinal": 0,
     }
     assert "return pivotOf(self:_resolveWeaponSlot())" in s.luau_source
 
@@ -400,6 +403,7 @@ def test_b_abstain_no_matchable_read_stamps_present_false() -> None:
     assert n == 0
     assert s.rig_binding == {
         "field": "weaponSlot", "child": "WeaponSlot", "present": False,
+        "cam_receiver": "cam", "cam_ordinal": 0,
     }
     # Abstained -> source unedited (the un-discharged binding reaches the verifier).
     assert "self.weaponSlot = self.cam:GetChildren()[1]" in s.luau_source
@@ -467,6 +471,7 @@ def test_h1_no_module_return_abstains() -> None:
     assert n == 0
     assert s.rig_binding == {
         "field": "weaponSlot", "child": "WeaponSlot", "present": False,
+        "cam_receiver": "cam", "cam_ordinal": 0,
     }
     assert "_resolveWeaponSlot" not in s.luau_source
 
@@ -508,6 +513,7 @@ def test_h3_neutralize_skips_on_ambiguity_two_same_field_writes() -> None:
     assert "return pivotOf(self:_resolveWeaponSlot())" in out
     assert s.rig_binding == {
         "field": "weaponSlot", "child": "WeaponSlot", "present": True,
+        "cam_receiver": "cam", "cam_ordinal": 0,
     }
 
 
@@ -601,6 +607,7 @@ def test_h3_no_consumer_read_means_no_silent_green() -> None:
     assert n == 0
     assert s.rig_binding == {
         "field": "weaponSlot", "child": "WeaponSlot", "present": False,
+        "cam_receiver": "cam", "cam_ordinal": 0,
     }
     # Abstained: the camera-child ordinal still survives in the source so the
     # binding-present check fail-closes LOUD (and check D would still see it) —
@@ -731,6 +738,7 @@ def test_i_carrier_anchors_are_deterministic_projections() -> None:
     lower_rifle_rig_retarget([s], crm)
     assert s.rig_binding == {
         "field": "weaponSlot", "child": "GunMount", "present": True,
+        "cam_receiver": "cam", "cam_ordinal": 0,
     }
     assert "function Player:_resolveGunMount()" in s.luau_source
     assert 'rig:FindFirstChild("GunMount", true)' in s.luau_source
@@ -775,6 +783,7 @@ def test_p1_single_line_if_neutralize_skips_whole_rhs_guard_still_discharges() -
     assert n == 1  # the read reroute discharged; the if-write neutralize SKIPPED
     assert s.rig_binding == {
         "field": "weaponSlot", "child": "WeaponSlot", "present": True,
+        "cam_receiver": "cam", "cam_ordinal": 0,
     }
     # The if-write is left intact + LOADABLE (the whole-RHS guard never swallowed ``end``).
     assert "self.cam:GetChildren()[1] end" in s.luau_source
@@ -970,9 +979,13 @@ def test_p5_multi_rig_fact_per_script_fails_closed() -> None:
     )}
     n = lower_rifle_rig_retarget([s], multi_map)
     assert n == 0  # abstained on all edits — never an unverifiable partial discharge
+    # REDESIGN r3: the multi-fact carrier is a FULL 5-key carrier (from the FIRST
+    # rig fact) + present=False + multi_fact=True, so it round-trips the 5-key
+    # rehydrate LOAD validator and fires LOUD on the resume path too.
     assert s.rig_binding == {
         "field": "weaponSlot", "child": "WeaponSlot",
         "present": False, "multi_fact": True,
+        "cam_receiver": "", "cam_ordinal": 0,
     }
     # No edits applied — both camera-child writes survive for the loud fail-close.
     assert "self.cam:GetChildren()[1]" in s.luau_source
@@ -1027,6 +1040,7 @@ def test_r3_fallback_validates_if_then_end_block_balance(monkeypatch) -> None:
     assert n == 1
     assert s.rig_binding == {
         "field": "weaponSlot", "child": "WeaponSlot", "present": True,
+        "cam_receiver": "cam", "cam_ordinal": 0,
     }
     assert "self.cam:GetChildren()[1] end" in s.luau_source  # if-write untouched
     assert "return pivotOf(self:_resolveWeaponSlot())" in s.luau_source
@@ -1064,6 +1078,7 @@ def test_r3_fallback_happy_path_still_loadable(monkeypatch) -> None:
     assert n == 1
     assert s.rig_binding == {
         "field": "weaponSlot", "child": "WeaponSlot", "present": True,
+        "cam_receiver": "cam", "cam_ordinal": 0,
     }
 
 
@@ -1411,6 +1426,7 @@ def test_r5_discharge_is_rhs_agnostic_across_write_shapes() -> None:
         assert n == 1, rhs
         assert s.rig_binding == {
             "field": "weaponSlot", "child": "WeaponSlot", "present": True,
+            "cam_receiver": "cam", "cam_ordinal": 0,
         }, rhs
         assert "return pivotOf(self:_resolveWeaponSlot())" in s.luau_source, rhs
 
@@ -1730,3 +1746,145 @@ def test_r6_typed_local_after_comment_still_abstains(tmp_path: Path) -> None:
     assert entry is not None
     assert entry.rig_facts == ()
     assert entry.resolved_total == 0
+
+
+# === REDESIGN r3 — carrier gains cam_receiver + cam_ordinal =================
+# S1 promotes the resolver fact's deterministic identity (cam_receiver +
+# a new RigRootedRetargetFact.ordinal) into the rig_binding carrier, threaded
+# through transpile/pipeline-copy/rehydrate so slice 1.2's check-D exemption
+# can anchor on it. These tests assert the new keys and the widened LOAD
+# validator (all FIVE keys, partial-row drop).
+
+
+def test_r3_fact_carries_ordinal_from_nonzero_getchild(tmp_path: Path) -> None:
+    # The credited GetChild(n) ordinal is captured on the fact (was implicit
+    # int(m.group(3)); r3 surfaces it as RigRootedRetargetFact.ordinal).
+    src = (
+        "public class Player : MonoBehaviour {\n"
+        "  public Transform weaponSlot;\n"
+        "  void Awake() { weaponSlot = Camera.main.transform.GetChild(1); }\n"
+        "}\n"
+    )
+    # child[1] must resolve uniquely -> give the MainCamera node a second child.
+    lib = _fps_library(child_name="Barrel", second_child="WeaponSlot")
+    entry = _build(tmp_path, src, lib)
+    assert entry is not None
+    assert entry.rig_facts == (
+        RigRootedRetargetFact(
+            field_name="weaponSlot", child_name="WeaponSlot",
+            cam_receiver="Camera.main.transform", ordinal=1),
+    )
+
+
+def test_r3_carrier_stamps_cam_receiver_and_ordinal_from_fact() -> None:
+    # The discharged carrier carries cam_receiver + cam_ordinal as fact
+    # projections (NON-default values prove they are threaded from the fact, not
+    # hardcoded): a direct-form receiver with ordinal=2.
+    s = _Script(_AI_PLAYER)
+    crm = {"/proj/Player.cs": ChildRefScript(
+        facts=(), getchild_total=1, resolved_total=1,
+        rig_facts=(RigRootedRetargetFact(
+            field_name="weaponSlot", child_name="WeaponSlot",
+            cam_receiver="Camera.main.transform", ordinal=2),),
+    )}
+    n = lower_rifle_rig_retarget([s], crm)
+    assert n == 1
+    assert s.rig_binding == {
+        "field": "weaponSlot", "child": "WeaponSlot", "present": True,
+        "cam_receiver": "Camera.main.transform", "cam_ordinal": 2,
+    }
+
+
+def test_r3_carrier_keys_are_rhs_agnostic_across_shapes() -> None:
+    # The cam_receiver/cam_ordinal keys are stamped from the fact regardless of
+    # the AI write shape (they are fact projections, not output fingerprints).
+    shapes = [
+        "self.cam:GetChildren()[1]",
+        "self.gameObject",
+        "self.cam and __unityChild(self.cam, 1)",
+    ]
+    for rhs in shapes:
+        src = (
+            "function Player:Awake()\n"
+            "    self.cam = workspace.CurrentCamera\n"
+            f"    self.weaponSlot = {rhs}\n"
+            "end\n\n"
+            "function Player:GetRifle()\n"
+            "    return pivotOf(self.weaponSlot)\n"
+            "end\n\n"
+            "return Player\n"
+        )
+        s = _Script(src)
+        lower_rifle_rig_retarget([s], _rig_map(cam_receiver="cam"))
+        assert s.rig_binding is not None
+        assert s.rig_binding["cam_receiver"] == "cam", rhs
+        assert s.rig_binding["cam_ordinal"] == 0, rhs
+
+
+def _pipeline_for_rehydrate(out_dir: Path):
+    from converter.pipeline import Pipeline
+    p = Pipeline.__new__(Pipeline)
+    p.output_dir = out_dir  # the only attr _load_rig_binding_for_rehydration reads
+    return p
+
+
+def _write_plan(out_dir: Path, rig_binding: dict) -> None:
+    import json as _json
+    (out_dir / "conversion_plan.json").write_text(
+        _json.dumps({"rig_binding": rig_binding}), encoding="utf-8")
+
+
+def test_r3_rehydrate_load_preserves_all_five_keys(tmp_path: Path) -> None:
+    # SAVE persists the full carrier; LOAD (widened) reads + validates ALL FIVE
+    # keys and round-trips them (the check-D exemption anchor survives resume).
+    carrier = {
+        "field": "weaponSlot", "child": "WeaponSlot", "present": True,
+        "cam_receiver": "cam", "cam_ordinal": 0,
+    }
+    _write_plan(tmp_path, {"Player": carrier})
+    p = _pipeline_for_rehydrate(tmp_path)
+    loaded = p._load_rig_binding_for_rehydration()
+    assert loaded == {"Player": carrier}
+
+
+def test_r3_rehydrate_present_false_5key_survives_to_fire_loud(tmp_path: Path) -> None:
+    # A present=False 5-key carrier (the abstained / multi-fact case) MUST survive
+    # rehydrate intact so the binding-present verifier fires loud on the resume
+    # path — NOT get dropped to None (which would silently abstain).
+    carrier = {
+        "field": "weaponSlot", "child": "WeaponSlot", "present": False,
+        "cam_receiver": "", "cam_ordinal": 0, "multi_fact": True,
+    }
+    _write_plan(tmp_path, {"Player": carrier})
+    p = _pipeline_for_rehydrate(tmp_path)
+    loaded = p._load_rig_binding_for_rehydration()
+    assert loaded == {"Player": carrier}  # incl. the optional multi_fact flag
+
+
+def test_r3_rehydrate_drops_partial_carrier_missing_new_keys(tmp_path: Path) -> None:
+    # The PRE-FIX 3-key carrier (no cam_receiver/cam_ordinal) is now a PARTIAL row
+    # -> dropped to None -> the verifier abstains (the safe default), NEVER a
+    # partial carrier that would exempt blind in check D.
+    _write_plan(tmp_path, {"Player": {
+        "field": "weaponSlot", "child": "WeaponSlot", "present": True}})
+    p = _pipeline_for_rehydrate(tmp_path)
+    assert p._load_rig_binding_for_rehydration() == {}
+
+
+def test_r3_rehydrate_drops_row_with_malformed_cam_ordinal(tmp_path: Path) -> None:
+    # cam_ordinal must be an int (and NOT a bool masquerading as int) — a malformed
+    # value drops the whole row.
+    for bad in ["0", True, None, 1.5]:
+        _write_plan(tmp_path, {"Player": {
+            "field": "weaponSlot", "child": "WeaponSlot", "present": True,
+            "cam_receiver": "cam", "cam_ordinal": bad}})
+        p = _pipeline_for_rehydrate(tmp_path)
+        assert p._load_rig_binding_for_rehydration() == {}, bad
+
+
+def test_r3_rehydrate_drops_row_with_nonstr_cam_receiver(tmp_path: Path) -> None:
+    _write_plan(tmp_path, {"Player": {
+        "field": "weaponSlot", "child": "WeaponSlot", "present": True,
+        "cam_receiver": 123, "cam_ordinal": 0}})
+    p = _pipeline_for_rehydrate(tmp_path)
+    assert p._load_rig_binding_for_rehydration() == {}

@@ -71,10 +71,18 @@ class RigRootedRetargetFact:
     uses it ONLY to opportunistically pick the camera-child init-write to clean
     (best-effort hygiene); it is NEVER required for the read-reroute discharge. Its
     absence (the AI collapsed the RHS) is a SKIP, not a failure. Defaults to "".
+
+    REDESIGN r3 RE-PROMOTION: ``cam_receiver`` AND the new ``ordinal`` (the n in the
+    credited ``GetChild(n)``) are PROMOTED to LOAD-BEARING as the deterministic
+    upstream anchor for check D's dead-write exemption (stamped into the carrier as
+    ``cam_receiver``/``cam_ordinal`` — slice 1.2 consumes them). They remain NOT a
+    discharge condition. ``ordinal`` is in hand at every construction site
+    (``int(m.group(...))``); for an admitted fact ``cam_receiver`` is NEVER "".
     """
     field_name: str  # the assignment LHS field ("weaponSlot"), from `<field> = cam.GetChild(n)`
     child_name: str  # resolved authored child name under the MainCamera node ("WeaponSlot"), E1-E3 guarded
     cam_receiver: str = ""  # the C# group-2 camera receiver text (the lowering's RECEIVER ANCHOR)
+    ordinal: int = 0  # REDESIGN r3: the n in the credited GetChild(n); -> carrier cam_ordinal
 
 
 # Per-script resolution outcome, keyed on the canonical .cs path key. Carries
@@ -847,7 +855,10 @@ def _resolve_rig_facts(
         name = getattr(child, "name", "") or ""
         rig_facts.append(
             RigRootedRetargetFact(
-                field_name=field, child_name=name, cam_receiver=m.group(2)
+                field_name=field,
+                child_name=name,
+                cam_receiver=m.group(2),
+                ordinal=ordinal,  # REDESIGN r3: credited GetChild(n) -> carrier cam_ordinal
             )
         )
     return rig_facts

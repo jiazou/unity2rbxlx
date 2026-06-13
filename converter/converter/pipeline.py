@@ -4587,13 +4587,17 @@ script.Disabled = true
         self,
     ) -> dict[str, dict[str, object]]:
         """Load the persisted per-script rig-retarget binding carrier from
-        ``conversion_plan.json`` into ``name -> {field, child, present}``.
+        ``conversion_plan.json`` into
+        ``name -> {field, child, present, cam_receiver, cam_ordinal}``.
 
         Mirrors the ``child_ref_resolution`` rehydration. Returns ``{}`` on a
         missing/malformed plan or a plan that pre-dates the field; a malformed row
         is dropped (absent -> ``None`` -> the binding-present check abstains, the
-        same safe pre-field default). Only well-formed rows (str field/child, bool
-        present) are forwarded."""
+        same safe pre-field default). REDESIGN r3: validates ALL FIVE keys
+        (str field/child, bool present, str cam_receiver, int cam_ordinal) — a row
+        missing/malformed on ANY of the five is DROPPED to ``None`` (NEVER rehydrate
+        a partial carrier that would exempt blind in check D). The optional
+        ``multi_fact`` flag, when present, is preserved."""
         plan_path = self.output_dir / "conversion_plan.json"
         if not plan_path.exists():
             return {}
@@ -4613,9 +4617,30 @@ script.Disabled = true
             field = rb.get("field")
             child = rb.get("child")
             present = rb.get("present")
-            if (isinstance(field, str) and isinstance(child, str)
-                    and isinstance(present, bool)):
-                out[name] = {"field": field, "child": child, "present": present}
+            cam_receiver = rb.get("cam_receiver")
+            cam_ordinal = rb.get("cam_ordinal")
+            # REDESIGN r3: ALL FIVE keys must be well-formed or the whole row is
+            # dropped (-> None -> abstain). A partial carrier would let check D's
+            # exemption anchor on a missing receiver/ordinal and exempt blind.
+            # ``bool`` is a subclass of ``int`` in Python, so reject a bool
+            # masquerading as cam_ordinal.
+            if not (isinstance(field, str) and isinstance(child, str)
+                    and isinstance(present, bool)
+                    and isinstance(cam_receiver, str)
+                    and isinstance(cam_ordinal, int)
+                    and not isinstance(cam_ordinal, bool)):
+                continue
+            row: dict[str, object] = {
+                "field": field,
+                "child": child,
+                "present": present,
+                "cam_receiver": cam_receiver,
+                "cam_ordinal": cam_ordinal,
+            }
+            multi_fact = rb.get("multi_fact")
+            if isinstance(multi_fact, bool):
+                row["multi_fact"] = multi_fact
+            out[name] = row
         return out
 
     def _classify_storage(self) -> None:
