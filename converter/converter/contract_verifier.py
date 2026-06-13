@@ -1643,13 +1643,73 @@ def _rig_has_surviving_dynamic_self_index_read(source: str) -> bool:
 
 
 def _rig_index_receiver_is_self(proj: str, open_idx: int) -> bool:
-    """True if the ``[`` at ``open_idx`` indexes a bare ``self`` receiver — i.e. the
-    immediately-preceding CODE token (modulo whitespace, on the code projection
-    ``proj``) is the keyword ``self`` at a word boundary. Excludes ``myself[k]`` /
-    ``a.self[k]`` (the char before ``self`` must not be an identifier/``.`` char)."""
+    """True if the ``[`` at ``open_idx`` indexes a ``self`` receiver after the receiver
+    expression is NORMALIZED — i.e. surrounding parentheses and whitespace (comments
+    are already blanked in the code projection ``proj``) are stripped and the receiver
+    reduces to the keyword ``self`` at a word boundary.
+
+    Round-3 BLOCKING fix (codex): the prior version matched only a BARE ``self`` token
+    immediately before ``[``, so a PARENTHESIZED receiver ``(self)[k]`` /
+    ``( self )["weapon"..suffix]`` / ``((self))[k]`` — semantically identical to
+    ``self[k]`` in Luau — slipped through as "not self" and discharged True, masking a
+    live dynamic read. Rather than enumerate one more literal form (per-form
+    whack-a-mole), normalize the receiver: peel balanced ``( ... )`` wrappers and
+    whitespace, then test the residual token. This closes ``self[k]``, ``(self)[k]``,
+    ``( self )[k]``, ``((self))[k]``, ``self [k]``, and ``self --c\\n[k]`` (the comment
+    is whitespace in ``proj``) in one robust check.
+
+    Stays gated to a self-receiver dynamic index: ``other[k]`` / ``t[k]`` / a member
+    access ``a.self[k]`` / a substring ``myself[k]`` / a parenthesized non-self
+    ``(notself)[k]`` all reduce to a residual that is NOT the bare keyword ``self`` and
+    are left alone (no over-broadening).
+
+    RESIDUAL (NOT detected — accepted, documented): this is a SYNTACTIC normalization,
+    not data-flow. A receiver ALIAS (``local s = self; s[k]``), ``rawget(self, k)``, and
+    metatable ``__index`` indirection are NOT reduced to ``self`` here and are an
+    accepted residual — see ``followups.md``. They are non-reachable from real
+    conversions (the deterministic C#->Luau transpiler emits dot-form ``self.<field>``
+    field access and never a computed/aliased field read, so the corpus is dot-form),
+    and proving "the field is never read" over arbitrary aliased Luau is beyond static
+    text analysis. Best-effort-conservative on the syntactic forms; the data-flow tail
+    is logged, not silently ignored."""
     j = open_idx - 1
-    while j >= 0 and proj[j] in " \t\r\n":
-        j -= 1
+    # Peel surrounding whitespace and balanced ``( ... )`` parenthesization that wraps
+    # the receiver. Each loop strips one layer: trailing whitespace, then if a ``)``
+    # closes the receiver, DESCEND INTO the parentheses (the wrapped inner expression
+    # is the real receiver) and re-strip — so ``(self)`` / ``( self )`` / ``((self))``
+    # all reduce to ``self``. A balanced wrapper that is NOT a sole-receiver wrap (e.g.
+    # ``getKey()`` — a call whose ``(`` is preceded by an identifier) has a non-``self``
+    # residual before its ``(`` and falls through to the word-boundary check below.
+    while True:
+        while j >= 0 and proj[j] in " \t\r\n":
+            j -= 1
+        if j >= 0 and proj[j] == ")":
+            depth = 0
+            k = j
+            while k >= 0:
+                c = proj[k]
+                if c == ")":
+                    depth += 1
+                elif c == "(":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                k -= 1
+            if depth != 0:
+                return False  # unbalanced -> cannot normalize to self
+            # If a non-whitespace token immediately precedes the matching ``(`` it is a
+            # CALL/index suffix (``f()``, ``t[i]()``), not a bare parenthesized
+            # receiver — its residual is that token, not ``self``: stop peeling and let
+            # the word-boundary check below reject it.
+            p = k - 1
+            while p >= 0 and proj[p] in " \t\r\n":
+                p -= 1
+            if p >= 0 and (proj[p].isalnum() or proj[p] in "_)]\"'"):
+                j = k - 1  # call/suffix form -> residual is the preceding token
+                break
+            j = j - 1  # descend into the parens; the inner expr is the receiver
+            continue
+        break
     # The 4 chars ending at j must be exactly ``self``.
     if j < 3 or proj[j - 3:j + 1] != "self":
         return False

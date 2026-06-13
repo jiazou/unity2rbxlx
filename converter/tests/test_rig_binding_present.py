@@ -1397,6 +1397,145 @@ def test_pathA_r2_non_self_dynamic_index_does_not_false_fail(
     ]) == []
 
 
+# ===========================================================================
+# Dual-voice REVIEW round 3 (D-S1b-PATHA-r3-paren) — the r2 dynamic-self-index
+# fail-closed matched only a BARE ``self`` token immediately before ``[``, so a
+# PARENTHESIZED receiver ``(self)[k]`` / ``( self )["weapon"..suffix]`` /
+# ``((self))[k]`` (semantically identical to ``self[k]`` in Luau) slipped through
+# as "not self" -> discharge True -> a live dynamic read masked. The fix
+# NORMALIZES the receiver (peel balanced parens + whitespace; comments are already
+# blanked in the code projection) so ALL syntactic self-index variants fail closed.
+# ===========================================================================
+
+@pytest.mark.parametrize(
+    "paren_dynamic_key",
+    [
+        "local x = (self)[k]",
+        'local x = ( self )["weapon"..suffix]',
+        "local x = ((self))[k]",
+        "local x = (  self  )[getKey()]",
+    ],
+)
+def test_pathA_r3_paren_self_dynamic_index_read_fails_closed(
+    paren_dynamic_key: str,
+) -> None:
+    """D-S1b-PATHA-r3-paren — a PARENTHESIZED dynamic ``self`` index
+    (``(self)[k]`` / ``( self )["weapon"..suffix]`` / ``((self))[k]``) is
+    semantically a ``self[k]`` read whose key the analyzer cannot decode, so it
+    COULD read ``<field>`` at runtime and was NOT rerouted. The receiver
+    normalization reduces every parenthesized/whitespace form to ``self`` ->
+    discharge FAILS CLOSED (a loud row). Pre-fix (5f36a38) the bare-self matcher
+    missed the parens -> false-passed (covered by
+    ``test_pathA_r3_paren_self_red_against_5f36a38``)."""
+    src = _green_plus_boundary_read(paren_dynamic_key)
+    assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is False
+    assert len(_rig_rows([
+        _rbx("Player", src, {"field": "weaponSlot", "child": "WeaponSlot", "present": True})
+    ])) == 1
+
+
+@pytest.mark.parametrize(
+    "non_self_paren_key",
+    [
+        "local x = (notself)[k]",
+        "local x = (a.self)[k]",
+        "local x = myself[k]",
+        "local x = other[k]",
+        "local x = t[k]",
+        "local x = getKey()[k]",
+    ],
+)
+def test_pathA_r3_paren_normalization_does_not_over_broaden(
+    non_self_paren_key: str,
+) -> None:
+    """D-S1b-PATHA-r3-paren SCOPE GUARD — the receiver normalization must NOT
+    over-broaden. A parenthesized NON-self receiver (``(notself)[k]`` /
+    ``(a.self)[k]``), a substring (``myself[k]``), an unrelated table
+    (``other[k]`` / ``t[k]``), and a call-suffix index (``getKey()[k]``) all
+    reduce to a residual that is NOT the bare keyword ``self`` -> they do NOT block
+    discharge (discharges True). Only a normalized ``self`` receiver trips."""
+    src = _green_plus_boundary_read(non_self_paren_key)
+    assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is True
+    assert _rig_rows([
+        _rbx("Player", src, {"field": "weaponSlot", "child": "WeaponSlot", "present": True})
+    ]) == []
+
+
+def test_pathA_r3_paren_self_red_against_5f36a38() -> None:
+    """D-S1b-PATHA-r3-paren pre-fix-RED proof (narrator-INDEPENDENT) — load the
+    ACTUAL 5f36a38 (bare-self matcher) verifier blob from git and run each
+    parenthesized dynamic self-index through ITS ``_rig_binding_discharged``. Every
+    parenthesized form false-PASSES there (discharged=True — the bare-self matcher
+    missed the parens) and fails closed under the normalized receiver check,
+    proving the fix is load-bearing. The bare ``self[k]`` stays fail-closed in
+    BOTH (no regression of the realistic case)."""
+    import importlib.util
+    import subprocess
+
+    repo_root = Path(__file__).resolve().parent.parent.parent  # the worktree root
+    blob = subprocess.run(
+        ["git", "show", "5f36a38:converter/converter/contract_verifier.py"],
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    old_path = Path(__file__).parent / "_old_contract_verifier_5f36a38.py"
+    old_path.write_text(blob, encoding="utf-8")
+    try:
+        spec = importlib.util.spec_from_file_location("_old_cv_5f36a38", str(old_path))
+        assert spec is not None and spec.loader is not None
+        old = importlib.util.module_from_spec(spec)
+        sys.modules["_old_cv_5f36a38"] = old
+        spec.loader.exec_module(old)
+    finally:
+        old_path.unlink(missing_ok=True)
+
+    paren_forms = [
+        "local x = (self)[k]",
+        'local x = ( self )["weapon"..suffix]',
+        "local x = ((self))[k]",
+    ]
+    for stmt in paren_forms:
+        src = _green_plus_boundary_read(stmt)
+        # PRE-FIX (real 5f36a38 bare-self matcher): the parens EVADED it -> false-pass.
+        assert old._rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is True, (
+            f"{stmt!r}: the real 5f36a38 bare-self matcher must false-PASS "
+            f"(proving the receiver normalization is load-bearing)"
+        )
+        # POST-FIX (normalized receiver): fails closed.
+        assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is False, (
+            f"{stmt!r}: the normalized receiver check must fail closed"
+        )
+
+    # The bare ``self[k]`` is fail-closed in BOTH (no regression of the realistic case).
+    bare = _green_plus_boundary_read("local x = self[k]")
+    assert old._rig_binding_discharged(bare, "weaponSlot", "WeaponSlot") is False
+    assert _rig_binding_discharged(bare, "weaponSlot", "WeaponSlot") is False
+
+
+@pytest.mark.xfail(
+    reason=(
+        "ACCEPTED RESIDUAL (documented in followups.md): a receiver ALIAS "
+        "(``local s = self; s[k]``) is a DATA-FLOW dynamic read the static "
+        "receiver normalization does NOT reduce to ``self``. Non-reachable from "
+        "real conversions (the deterministic C#->Luau transpiler emits dot-form "
+        "``self.<field>`` and never a computed/aliased field read), and proving "
+        "the field is never read over arbitrary aliased Luau is beyond static text "
+        "analysis. Logged, not silently ignored. This marker makes the boundary "
+        "explicit; it is NOT required to pass."
+    ),
+    strict=False,
+)
+def test_pathA_r3_aliased_self_dynamic_read_residual_is_documented() -> None:
+    """D-S1b-PATHA-r3-paren residual marker — a receiver ALIAS ``local s = self;
+    s[k]`` is the accepted data-flow residual: the static check does not track the
+    alias back to ``self``, so it does NOT fail closed. xfail documents the
+    boundary."""
+    src = _green_plus_boundary_read("local s = self\n    local x = s[k]")
+    assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is False
+
+
 def test_pathA_r3_false_fail_shapes_red_against_041e0ec() -> None:
     """D-S1b-PATHA-r3 pre-fix-RED proof (narrator-INDEPENDENT) — load the ACTUAL
     041e0ec (over-broad computed-key) verifier blob from git. The WRITE / substring /
