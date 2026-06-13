@@ -630,7 +630,9 @@ def _receiver_roots_at_engine_global(receiver: str) -> bool:
     return m is not None and m.group(1) in _ENGINE_GLOBAL_ROOTS
 
 
-def _count_surviving_child_ordinals(source: str) -> int:
+def _count_surviving_child_ordinals(
+    source: str, exempt_field: str | None = None
+) -> int:
     """Count POSITIONAL child-ordinal survivor SITES in ``source`` — the
     adjacent shape ``<recv>:GetChildren()[N]`` (simple OR method-call receiver)
     plus the across-lines factored shape (``local v = X:GetChildren()`` then a
@@ -638,13 +640,40 @@ def _count_surviving_child_ordinals(source: str) -> int:
     when survivors exceed the script's unresolved-site budget. Code-position
     aware; counts each factored ``local v`` chain ONCE. Survivors whose receiver
     roots at a known-safe ENGINE GLOBAL (``workspace``/``game``/...) are EXCLUDED
-    — they are engine-tree iterations, not unresolved child-ref ordinals."""
+    — they are engine-tree iterations, not unresolved child-ref ordinals.
+
+    RIG-AWARE exemption (SITE-ALIGNED): when ``exempt_field`` is set (the caller
+    has independently confirmed a DISCHARGED rig binding on that field), AT MOST
+    ONE adjacent ``self.<field> = <recv>:GetChildren()[n]`` dead init-write site
+    is skipped from the count — the dead write the Path-A read-reroute superseded.
+    The skip happens INSIDE this same walk, AFTER the identical
+    ``_luau_pos_is_code`` + engine-global filters that COUNT a site, and only on a
+    site whose match position lands inside a ``self.<field> =`` write-LHS RHS span.
+    So the exemption can only ever remove a site this function WOULD have counted
+    (``exempt ⊆ counted-survivors``, structurally — there is no separately-computed
+    number to subtract), it never spans the across-lines factored form (a write is
+    the adjacent form), and the ``< 1`` cap exempts only the SINGLE dead init-write
+    — a second same-field write, a READ survivor, a different field, or an
+    engine-global/bracket-receiver write that this function did NOT count all
+    REMAIN counted and still fail closed."""
+    exempt_spans: list[tuple[int, int]] = (
+        _rig_field_write_rhs_spans(source, exempt_field) if exempt_field else []
+    )
+    exempted = 0
     count = 0
     for m in _GETCHILDREN_INDEX_ANY_RE.finditer(source):
         if not _luau_pos_is_code(source, m.start()):
             continue
         if _receiver_roots_at_engine_global(m.group(1)):
             continue  # engine-global iteration — not a child-ref survivor
+        if (
+            exempted < 1
+            and _pos_in_any_span(m.start(), exempt_spans)
+        ):
+            # The dead init-write of the discharged rig field — superseded by the
+            # read reroute (Path A). Skip exactly this one counted site.
+            exempted += 1
+            continue
         count += 1
     for m in _GETCHILDREN_ASSIGN_RE.finditer(source):
         if not _luau_pos_is_code(source, m.start()):
@@ -658,6 +687,33 @@ def _count_surviving_child_ordinals(source: str) -> int:
                 count += 1
                 break  # one factored chain == one survivor site
     return count
+
+
+def _pos_in_any_span(pos: int, spans: list[tuple[int, int]]) -> bool:
+    """True if ``pos`` lies within any ``[lo, hi)`` span."""
+    return any(lo <= pos < hi for lo, hi in spans)
+
+
+def _rig_field_write_rhs_spans(source: str, field: str) -> list[tuple[int, int]]:
+    """The ``[rhs_start, rhs_end)`` char spans of every code-position
+    ``self.<field> = <RHS>`` write in ``source``, used to recognize a survivor SITE
+    that lands inside a write-LHS RHS (the dead init-write of a discharged rig
+    binding). Positions index ``source`` directly: the assignment is located over
+    the position-PRESERVING ``_rig_code_projection`` (so a ``self.<field> =`` inside
+    a comment/string never matches) but the spans map 1:1 back onto ``source`` for
+    the survivor-site position test. Returned in source order."""
+    spans: list[tuple[int, int]] = []
+    if not field:
+        return spans
+    projected = _rig_code_projection(source)
+    assign_re = re.compile(r"self\." + re.escape(field) + r"\s*=(?!=)")
+    for m in assign_re.finditer(projected):
+        rhs_start = m.end()
+        while rhs_start < len(projected) and projected[rhs_start] in " \t\r\n":
+            rhs_start += 1
+        rhs_end = _rig_statement_rhs_end(projected, rhs_start)
+        spans.append((rhs_start, rhs_end))
+    return spans
 
 
 def _check_surviving_child_ordinal(
@@ -688,17 +744,18 @@ def _check_surviving_child_ordinal(
         rt = r.get("resolved_total")
         if gt is None or rt is None or gt <= 0:
             continue
-        survivors = _count_surviving_child_ordinals(script.source)
         # RIG-AWARE exemption: a surviving positional ordinal that is the dead
         # init-WRITE of a DISCHARGED rig binding's field (``self.<field> =
         # <recv>:GetChildren()[n]``) is superseded by the read reroute (Path A) —
         # it is "resolved-but-left-behind", NOT an unresolved child-ref survivor,
-        # and the rig fact already bumped ``resolved_total``. Subtract EXACTLY that
-        # dead write from the count so it does not fire ``child_ordinal_survivor``.
-        # The exemption is gated on the binding being PRESENT (stamp) AND
-        # INDEPENDENTLY discharged in the real source; a READ survivor, a
-        # non-/un-discharged-binding script, or any survivor beyond the dead write
-        # is NOT exempted and still fails closed.
+        # and the rig fact already bumped ``resolved_total``. The exemption is
+        # applied SITE-ALIGNED INSIDE ``_count_surviving_child_ordinals`` (skip AT
+        # MOST the one counted dead-init-write site), so it can never subtract a
+        # site check D did not count. It is gated on the binding being PRESENT
+        # (stamp) AND INDEPENDENTLY discharged in the real source; a READ survivor,
+        # a non-/un-discharged-binding script, or any survivor beyond the single
+        # dead write is NOT exempted and still fails closed.
+        exempt_field: str | None = None
         rb = script.rig_binding
         if rb:
             field = str(rb.get("field") or "")
@@ -710,9 +767,8 @@ def _check_surviving_child_ordinal(
                 and stamp
                 and _rig_binding_discharged(script.source, field, child)
             ):
-                survivors -= _rig_discharged_ordinal_write_exempt_count(
-                    script.source, field
-                )
+                exempt_field = field
+        survivors = _count_surviving_child_ordinals(script.source, exempt_field)
         if survivors <= 0:
             continue
         unresolved_budget = gt - rt
@@ -1602,42 +1658,6 @@ def _rig_has_surviving_ordinal_write(source: str, field: str) -> bool:
         if _RIG_ORDINAL_WRITE_TAIL_RE.search(rhs):
             return True
     return False
-
-
-# The ``self.<field> = <recv>:GetChildren()[n]`` write-LHS tail in EXACTLY the
-# shape check D counts (``_GETCHILDREN_INDEX_ANY_RE`` — the adjacent
-# ``GetChildren()[n]`` form). The ``GetChild(n)`` form ``_RIG_ORDINAL_WRITE_TAIL_RE``
-# also tolerates is NOT counted by check D, so excluding it here keeps the check-D
-# exemption count EXACTLY aligned with what check D counted (never over-subtracting).
-_RIG_GETCHILDREN_WRITE_TAIL_RE = re.compile(r":GetChildren\(\)\[\d+\]")
-
-
-def _rig_discharged_ordinal_write_exempt_count(
-    source: str, field: str
-) -> int:
-    """Count of surviving ``self.<field> = <recv>:GetChildren()[n]`` write-LHS
-    ordinal SITES — the dead init-write the read-reroute (Path A) superseded.
-
-    Counts ONLY the ``GetChildren()[n]`` adjacent form that
-    ``_count_surviving_child_ordinals`` (check D) counts, so the returned value is
-    the EXACT number check D over-counted for this discharged rig field — the
-    caller subtracts it. A READ ordinal (a non-``self.<field>=`` consumption), a
-    factored chain, or a ``GetChild(n)`` write (uncounted by check D) is NOT
-    counted here, so the exemption never silences a real survivor. Caller MUST gate
-    on ``_rig_binding_discharged`` first — this helper presumes the binding is
-    discharged and exempts only the dead write that discharge leaves behind."""
-    projected = _rig_code_projection(source)
-    assign_re = re.compile(r"self\." + re.escape(field) + r"\s*=(?!=)")
-    count = 0
-    for m in assign_re.finditer(projected):
-        rhs_start = m.end()
-        while rhs_start < len(projected) and projected[rhs_start] in " \t\r\n":
-            rhs_start += 1
-        rhs_end = _rig_statement_rhs_end(projected, rhs_start)
-        rhs = _rig_collapse_code_ws(projected[rhs_start:rhs_end])
-        if _RIG_GETCHILDREN_WRITE_TAIL_RE.search(rhs):
-            count += 1
-    return count
 
 
 def _rig_method_body_end(source: str, decl_start: int) -> int:

@@ -1786,3 +1786,173 @@ def test_checkD_no_exemption_on_undischarged_rig() -> None:
     assert any(v.check == "child_ordinal_survivor" for v in cd), (
         "an UNDISCHARGED binding gets no exemption — the surviving ordinal fires"
     )
+
+
+# ---------------------------------------------------------------------------
+# ROUND-6 P1 — the rig exemption (round-5) was computed by a SEPARATE regex
+# (``_rig_discharged_ordinal_write_exempt_count``) that counted ``self.<field>=``
+# writes WITHOUT check D's engine-global filter and WITHOUT its receiver-shape
+# constraint, and matched EVERY same-field GetChildren()[n] write — so it could
+# subtract a number larger than what check D actually counted, silently swallowing
+# a SEPARATE real survivor on the same script. The fix makes the exemption
+# SITE-ALIGNED inside ``_count_surviving_child_ordinals`` (skip AT MOST the one
+# counted dead-init-write site, after the same code-position + engine-global
+# filters), guaranteeing ``exempt ⊆ counted-survivors``. These tests drive the
+# REAL helpers / lowering and would each have FAILED against 3a4231a.
+# ---------------------------------------------------------------------------
+
+
+def test_checkD_engine_global_dead_write_does_not_mask_separate_survivor() -> None:
+    """ROUND-6 BYPASS-1 GUARD — a discharged rig whose dead init-write uses an
+    ENGINE-GLOBAL receiver (``self.weaponSlot = workspace:GetChildren()[1]``) is
+    NOT a site check D counts (engine-global filtered), so it must NOT be exempted.
+    A SEPARATE genuine survivor on the same script (``foo:GetChildren()[2]``) STILL
+    fires. Against 3a4231a the separate-regex exempt count over-counted the
+    engine-global write (1) and the subtraction masked the real survivor."""
+    base = _lower(_SKIPPED_NEUTRALIZE_SINGLELINE_IF).luau_source
+    # Re-root the dead write at an engine global (check D does NOT count it), and
+    # add a SEPARATE genuine READ survivor that check D DOES count.
+    src = base.replace(
+        "self.weaponSlot = self.cam:GetChildren()[1]",
+        "self.weaponSlot = workspace:GetChildren()[1]",
+    ).replace(
+        "function Player:GetRifle()\n",
+        "function Player:GetRifle()\n    local extra = foo:GetChildren()[2]\n",
+    )
+    assert "self.weaponSlot = workspace:GetChildren()[1]" in src
+    assert "foo:GetChildren()[2]" in src
+    assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is True
+    script = _rbx_with_accounting(
+        "Player",
+        src,
+        {"field": "weaponSlot", "child": "WeaponSlot", "present": True},
+        getchild_total=1,
+        resolved_total=1,  # budget 0 -> the separate survivor must fire
+    )
+    cd = _check_surviving_child_ordinal(_TOPOLOGY, [script])
+    assert any(v.check == "child_ordinal_survivor" for v in cd), (
+        "an engine-global-rooted dead write is not a counted site, so it must not "
+        "be exempted — the SEPARATE real survivor must STILL fail closed"
+    )
+
+
+def test_checkD_bracket_receiver_dead_write_does_not_mask_separate_survivor() -> None:
+    """ROUND-6 BYPASS-1 GUARD (variant) — a discharged rig whose dead init-write has
+    a BRACKET-INDEXED receiver (``self.weaponSlot = arr[1]:GetChildren()[2]``) is NOT
+    spanned by check D's receiver pattern, so it is NOT a counted site and must NOT
+    be exempted. A SEPARATE genuine survivor STILL fires."""
+    base = _lower(_SKIPPED_NEUTRALIZE_SINGLELINE_IF).luau_source
+    src = base.replace(
+        "self.weaponSlot = self.cam:GetChildren()[1]",
+        "self.weaponSlot = arr[1]:GetChildren()[2]",
+    ).replace(
+        "function Player:GetRifle()\n",
+        "function Player:GetRifle()\n    local extra = foo:GetChildren()[3]\n",
+    )
+    assert "self.weaponSlot = arr[1]:GetChildren()[2]" in src
+    assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is True
+    script = _rbx_with_accounting(
+        "Player",
+        src,
+        {"field": "weaponSlot", "child": "WeaponSlot", "present": True},
+        getchild_total=1,
+        resolved_total=1,
+    )
+    cd = _check_surviving_child_ordinal(_TOPOLOGY, [script])
+    assert any(v.check == "child_ordinal_survivor" for v in cd), (
+        "a bracket-indexed-receiver dead write is not a counted site, so it must "
+        "not be exempted — the SEPARATE real survivor must STILL fail closed"
+    )
+
+
+def test_checkD_exempts_only_one_same_field_write() -> None:
+    """ROUND-6 BYPASS-2 GUARD — the exemption is bounded to AT MOST the SINGLE dead
+    rig init-write. A discharged rig with the legitimate dead write PLUS a SECOND
+    same-field ``GetChildren()[n]`` write on a different receiver
+    (``self.weaponSlot = self.muzzle:GetChildren()[2]``) leaves the extra write
+    counted (2 survivors, 1 exempt -> 1) so it STILL fires. Against 3a4231a the
+    unanchored same-field exempt regex matched BOTH writes (exempt 2) and masked it."""
+    base = _lower(_SKIPPED_NEUTRALIZE_SINGLELINE_IF).luau_source
+    src = base.replace(
+        "if self.cam then self.weaponSlot = self.cam:GetChildren()[1] end\n",
+        "if self.cam then self.weaponSlot = self.cam:GetChildren()[1] end\n"
+        "    self.weaponSlot = self.muzzle:GetChildren()[2]\n",
+    )
+    assert "self.weaponSlot = self.muzzle:GetChildren()[2]" in src
+    assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is True
+    script = _rbx_with_accounting(
+        "Player",
+        src,
+        {"field": "weaponSlot", "child": "WeaponSlot", "present": True},
+        getchild_total=1,
+        resolved_total=1,  # budget 0; 2 counted - 1 exempt = 1 > 0 -> fires
+    )
+    cd = _check_surviving_child_ordinal(_TOPOLOGY, [script])
+    assert any(v.check == "child_ordinal_survivor" for v in cd), (
+        "only the SINGLE dead rig init-write is exempt — a second same-field write "
+        "must STILL fail closed"
+    )
+
+
+def test_checkD_round6_pre_fix_red_proof() -> None:
+    """PRE-FIX RED proof for round 6: the 3a4231a (separate-regex) exempt logic
+    MASKED both bypasses — its check D did NOT fire on the engine-global-write and
+    second-same-field-write scenarios above. Proves the site-aligned refactor is
+    load-bearing, not a tautology."""
+    import importlib.util
+    import subprocess
+
+    blob = subprocess.run(
+        ["git", "show", "3a4231a:converter/converter/contract_verifier.py"],
+        cwd=str(Path(__file__).parent.parent),
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    old_path = Path(__file__).parent / "_old_cv_checkd_3a4231a.py"
+    old_path.write_text(blob, encoding="utf-8")
+    try:
+        spec = importlib.util.spec_from_file_location("_old_cv_3a4231a", str(old_path))
+        assert spec is not None and spec.loader is not None
+        old = importlib.util.module_from_spec(spec)
+        sys.modules["_old_cv_3a4231a"] = old
+        spec.loader.exec_module(old)
+    finally:
+        old_path.unlink(missing_ok=True)
+
+    base = _lower(_SKIPPED_NEUTRALIZE_SINGLELINE_IF).luau_source
+    rb = {"field": "weaponSlot", "child": "WeaponSlot", "present": True}
+
+    # BYPASS-1 scenario: engine-global dead write + separate genuine survivor.
+    b1 = base.replace(
+        "self.weaponSlot = self.cam:GetChildren()[1]",
+        "self.weaponSlot = workspace:GetChildren()[1]",
+    ).replace(
+        "function Player:GetRifle()\n",
+        "function Player:GetRifle()\n    local extra = foo:GetChildren()[2]\n",
+    )
+    s1 = _rbx_with_accounting("Player", b1, rb, getchild_total=1, resolved_total=1)
+    assert not any(
+        v.check == "child_ordinal_survivor"
+        for v in old._check_surviving_child_ordinal(_TOPOLOGY, [s1])
+    ), "the pre-fix check D must MASK bypass-1 — proving the round-6 fix is load-bearing"
+    assert any(
+        v.check == "child_ordinal_survivor"
+        for v in _check_surviving_child_ordinal(_TOPOLOGY, [s1])
+    )
+
+    # BYPASS-2 scenario: legit dead write + second same-field write.
+    b2 = base.replace(
+        "if self.cam then self.weaponSlot = self.cam:GetChildren()[1] end\n",
+        "if self.cam then self.weaponSlot = self.cam:GetChildren()[1] end\n"
+        "    self.weaponSlot = self.muzzle:GetChildren()[2]\n",
+    )
+    s2 = _rbx_with_accounting("Player", b2, rb, getchild_total=1, resolved_total=1)
+    assert not any(
+        v.check == "child_ordinal_survivor"
+        for v in old._check_surviving_child_ordinal(_TOPOLOGY, [s2])
+    ), "the pre-fix check D must MASK bypass-2 — proving the round-6 fix is load-bearing"
+    assert any(
+        v.check == "child_ordinal_survivor"
+        for v in _check_surviving_child_ordinal(_TOPOLOGY, [s2])
+    )
