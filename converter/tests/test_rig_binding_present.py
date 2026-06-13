@@ -1404,3 +1404,168 @@ def test_pathA_r3_false_fail_shapes_red_against_041e0ec() -> None:
     exact_read = _green_plus_boundary_read('local x = self["weapon".."Slot"]')
     assert old._rig_binding_discharged(exact_read, "weaponSlot", "WeaponSlot") is False
     assert _rig_binding_discharged(exact_read, "weaponSlot", "WeaponSlot") is False
+
+
+# ===========================================================================
+# Dual-voice REVIEW round 4 (D-S1b-PATHA-r4) — two findings:
+#
+#   FIX 1 [BLOCKING] — bracket-key detection was RAW-TEXT-ONLY, so ENCODED
+#   string-literal keys that resolve to the field bypassed the fail-closed gate
+#   (fail-OPEN): ``self[[weaponSlot]]`` / ``self[=[weaponSlot]=]`` (long-bracket
+#   string keys), ``self["wea\x70onSlot"]`` (hex escape), ``self["wea\x70on".."Slot"]``
+#   (escape + concat) all DISCHARGED True at d51ae90 despite being surviving READs.
+#   The fix DECODES the full finite Luau string-literal grammar
+#   (``_rig_decode_luau_string_key``) and compares to ``<field>`` exactly, closing the
+#   whole bracket-key class.
+#
+#   FIX 2 [MINOR] — the write-LHS exception missed MULTI-ASSIGNMENT: a target list
+#   ``self.weaponSlot, other = ...`` / ``self["weapon".."Slot"], other = ...`` has a
+#   ``,`` before the ``=``, so it false-FAILED as a READ. The fix recognizes a
+#   multi-target assignment list as an LHS WRITE.
+#
+# Each encoded-read form is RED against d51ae90 (fail-open) and each multi-assignment
+# write is RED against d51ae90 (false-fail), proven both directions below.
+# ===========================================================================
+
+# The encoded-key READ forms — each DECODES to exactly ``weaponSlot`` and is a
+# surviving raw field consumption the dot-form reroute cannot rewrite.
+_ENCODED_KEY_READS = {
+    "long_bracket": "local x = self[[weaponSlot]]",
+    "long_bracket_eq": "local x = self[=[weaponSlot]=]",
+    "hex_escape": r'local x = self["wea\x70onSlot"]',
+    "hex_escape_concat": r'local x = self["wea\x70on".."Slot"]',
+}
+
+
+@pytest.mark.parametrize("form", sorted(_ENCODED_KEY_READS))
+def test_pathA_r4_encoded_key_read_fails_closed(form: str) -> None:
+    """D-S1b-PATHA-r4 FIX 1 — each ENCODED string-literal bracket key that decodes to
+    exactly ``weaponSlot`` is a surviving READ -> discharge FAILS CLOSED and the
+    verifier fires a loud row. The resolver + rerouted reads stay intact, so the ONLY
+    thing blocking discharge is the encoded surviving READ — the decode-then-compare
+    gate must catch it regardless of encoding (raw-text-only bypass closed)."""
+    src = _green_plus_boundary_read(_ENCODED_KEY_READS[form])
+    assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is False
+    script = _rbx(
+        "Player", src, {"field": "weaponSlot", "child": "WeaponSlot", "present": True}
+    )
+    assert len(_rig_rows([script])) == 1
+
+
+def test_pathA_r4_encoded_key_write_lhs_still_discharges() -> None:
+    """D-S1b-PATHA-r4 FIX 1 — a long-bracket string-key WRITE ``self[[weaponSlot]] = x``
+    decodes to exactly ``weaponSlot`` but is an assignment LHS (a Tier-2-skipped write
+    may survive), so it does NOT block discharge — discharges True."""
+    src = _green_plus_boundary_read("self[[weaponSlot]] = somethingElse")
+    assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is True
+    assert _rig_rows([
+        _rbx("Player", src, {"field": "weaponSlot", "child": "WeaponSlot", "present": True})
+    ]) == []
+
+
+@pytest.mark.parametrize(
+    "unrelated_key",
+    [
+        'local x = self["someOther"]',
+        "local x = self[[preweaponSlotpost]]",
+    ],
+)
+def test_pathA_r4_unrelated_decoded_key_does_not_fail(unrelated_key: str) -> None:
+    """D-S1b-PATHA-r4 FIX 1 — a key that decodes to a value that is NOT exactly
+    ``weaponSlot`` (an unrelated short-string key, or a long-bracket key that merely
+    CONTAINS the field as a substring) must NOT block discharge — the compare is
+    EXACT, not substring. Discharges True."""
+    src = _green_plus_boundary_read(unrelated_key)
+    assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is True
+    assert _rig_rows([
+        _rbx("Player", src, {"field": "weaponSlot", "child": "WeaponSlot", "present": True})
+    ]) == []
+
+
+def test_pathA_r4_dynamic_bracket_key_does_not_false_fail() -> None:
+    """D-S1b-PATHA-r4 FIX 1 — a fully-dynamic key ``self[k]`` decodes to None (not a
+    static string), so it is NOT provably the field and must NOT block discharge."""
+    src = _green_plus_boundary_read("local x = self[k]")
+    assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is True
+    assert _rig_rows([
+        _rbx("Player", src, {"field": "weaponSlot", "child": "WeaponSlot", "present": True})
+    ]) == []
+
+
+@pytest.mark.parametrize(
+    "multi_write",
+    [
+        "self.weaponSlot, y = a, b",
+        'self["weapon".."Slot"], y = a, b',
+    ],
+)
+def test_pathA_r4_multi_assignment_write_lhs_discharges(multi_write: str) -> None:
+    """D-S1b-PATHA-r4 FIX 2 — a MULTI-TARGET assignment list
+    (``self.weaponSlot, y = a, b`` / ``self["weapon".."Slot"], y = a, b``) is a WRITE
+    LHS, not a READ, so it does NOT block discharge — discharges True. The pre-fix
+    LHS check only recognized a bare immediate ``=`` and false-FAILED these as reads."""
+    src = _green_plus_boundary_read(multi_write)
+    assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is True
+    assert _rig_rows([
+        _rbx("Player", src, {"field": "weaponSlot", "child": "WeaponSlot", "present": True})
+    ]) == []
+
+
+def test_pathA_r4_encoded_reads_and_multi_writes_red_against_d51ae90() -> None:
+    """D-S1b-PATHA-r4 pre-fix-RED proof (narrator-INDEPENDENT) — load the ACTUAL
+    d51ae90 verifier blob from git and run each round-4 shape through ITS
+    ``_rig_binding_discharged``:
+
+      * each ENCODED-KEY READ false-PASSES there (discharged=True — raw-text-only
+        bracket detection missed the encoding) and fails closed now (FIX 1);
+      * each MULTI-ASSIGNMENT WRITE false-FAILS there (discharged=False — the LHS
+        check missed the ``,``…``=`` list) and discharges True now (FIX 2).
+
+    Proves both fixes are load-bearing in BOTH directions against the real prior code."""
+    import importlib.util
+    import subprocess
+
+    repo_root = Path(__file__).resolve().parent.parent.parent  # the worktree root
+    blob = subprocess.run(
+        ["git", "show", "d51ae90:converter/converter/contract_verifier.py"],
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    old_path = Path(__file__).parent / "_old_contract_verifier_d51ae90.py"
+    old_path.write_text(blob, encoding="utf-8")
+    try:
+        spec = importlib.util.spec_from_file_location("_old_cv_d51ae90", str(old_path))
+        assert spec is not None and spec.loader is not None
+        old = importlib.util.module_from_spec(spec)
+        sys.modules["_old_cv_d51ae90"] = old
+        spec.loader.exec_module(old)
+    finally:
+        old_path.unlink(missing_ok=True)
+
+    # FIX 1 — encoded-key READs false-PASS at d51ae90 (fail-OPEN), fail closed now.
+    for form, stmt in _ENCODED_KEY_READS.items():
+        src = _green_plus_boundary_read(stmt)
+        assert old._rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is True, (
+            f"{form}: d51ae90 must false-PASS the encoded-key READ (fail-open) — "
+            f"proving FIX 1 is load-bearing"
+        )
+        assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is False, (
+            f"{form}: the decode-then-compare gate must fail closed"
+        )
+
+    # FIX 2 — multi-assignment WRITEs false-FAIL at d51ae90, discharge True now.
+    multi_writes = {
+        "dot_multi": "self.weaponSlot, y = a, b",
+        "concat_multi": 'self["weapon".."Slot"], y = a, b',
+    }
+    for name, stmt in multi_writes.items():
+        src = _green_plus_boundary_read(stmt)
+        assert old._rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is False, (
+            f"{name}: d51ae90 must false-FAIL the multi-assignment WRITE — proving "
+            f"FIX 2 is load-bearing"
+        )
+        assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is True, (
+            f"{name}: the multi-target LHS must be recognized as a WRITE"
+        )

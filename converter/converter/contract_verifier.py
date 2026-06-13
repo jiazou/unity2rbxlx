@@ -856,81 +856,398 @@ def _rig_field_token_re(field: str) -> "re.Pattern[str]":
     return re.compile(r"\b" + re.escape(field) + r"\b")
 
 
-# (2) STRING-KEY bracket access: ``[ "<field>" ]`` / ``[ '<field>' ]`` —
-#     receiver-agnostic (``(self)["<field>"]``, ``owner["<field>"]``, ...). The
-#     key must be a CLEAN single string literal equal to ``<field>``; a computed /
-#     concatenated key (``["weapon".."Slot"]``) does NOT match this clean form, and
-#     is independently caught by ``_rig_has_computed_field_key`` (fail closed).
-def _rig_string_key_read_re(field: str) -> "re.Pattern[str]":
-    return re.compile(r"\[\s*(['\"])" + re.escape(field) + r"\1\s*\]")
+# (2) STRING-KEY bracket access: ``self[<key>]`` where ``<key>`` is a STATIC Luau
+#     string expression that DECODES to exactly ``<field>`` — receiver-agnostic
+#     (``(self)[<key>]``, ``owner[<key>]``, ...). The whole finite Luau string-literal
+#     grammar is decoded by ``_rig_decode_luau_string_key`` (short strings with escape
+#     processing, long-bracket strings, and ``..`` concatenations of these), so an
+#     ENCODED key that resolves to the field (``[[weaponSlot]]``, ``["wea\\x70onSlot"]``,
+#     ``["wea\\x70on".."Slot"]``) is caught — closing the raw-text-only bypass (codex
+#     BLOCKING). A NON-static / dynamic key (``self[var]``, ``self[fn()]``,
+#     ``self["a"..var]``) decodes to None and is NEVER flagged (no false-fail).
 
 
 def _rig_pos_is_assignment_lhs(proj: str, end: int) -> bool:
-    """True if the field-access ending at ``end`` is the LHS of an ``=`` assignment
-    (a WRITE — a Tier-2-skipped init-write may legitimately survive; discharge is
-    decoupled from neutralize). The next non-ws/comment CODE char after the access
-    (read off the position-preserving code PROJECTION ``proj``) is a single ``=``
-    (not ``==``)."""
+    """True if the field-access ending at ``end`` is the LHS of an assignment (a
+    WRITE — a Tier-2-skipped init-write may legitimately survive; discharge is
+    decoupled from neutralize). Read off the position-preserving code PROJECTION
+    ``proj``.
+
+    Two LHS shapes are recognized:
+
+      * BARE single-target — the next non-ws CODE char after the access is a single
+        ``=`` (not ``==``): ``self.<field> = x``;
+      * MULTI-TARGET assignment list — the access is followed (modulo ws) by one or
+        more ``, <lvalue>`` targets and then a single ``=``:
+        ``self.<field>, other = a, b``. The access sits to the LEFT of the ``=`` in
+        an assignment-target list, so it is still a WRITE, not a READ (codex MINOR:
+        a multi-assignment write false-failed as a read before this).
+
+    The target-list scan walks ``, <balanced-lvalue>`` segments at bracket depth 0
+    up to a bare ``=``; a ``;`` / ``)`` / EOF / a binary ``==`` (not preceded by a
+    target separator) ends the search as NON-LHS."""
     a = end
     n = len(proj)
     while a < n and proj[a] in " \t\r\n":
         a += 1
-    return (
-        a < n
-        and proj[a] == "="
-        and not (a + 1 < n and proj[a + 1] == "=")
-    )
+    if a >= n:
+        return False
+    # Bare single-target ``= `` (not ``==``).
+    if proj[a] == "=" and not (a + 1 < n and proj[a + 1] == "="):
+        return True
+    # Multi-target list: the access must be immediately followed by a ``,`` that
+    # opens an assignment-target list ending in a bare ``=``.
+    if proj[a] != ",":
+        return False
+    depth = 0
+    while a < n:
+        ch = proj[a]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            if depth == 0:
+                return False  # closed past our expression — not an LHS list
+            depth -= 1
+        elif depth == 0:
+            if ch == "=":
+                # A bare ``=`` terminates the target list as an assignment (LHS);
+                # a ``==`` is a comparison, so this was NOT an assignment list.
+                return not (a + 1 < n and proj[a + 1] == "=")
+            if ch in ";\n":
+                return False  # statement ended before any ``=`` — not an LHS
+        a += 1
+    return False
 
 
-def _rig_constant_folds_to(interior: str, field: str) -> bool:
-    """True if ``interior`` (a bracket-key expression) is a concatenation of STRING
-    LITERALS ONLY that CONSTANT-FOLDS to EXACTLY ``<field>``.
+# Luau short-string single-char escapes (``\n`` etc.) -> the literal char they
+# denote. ``\xHH`` (hex), ``\ddd`` (1-3 decimal), ``\u{...}`` (unicode), ``\z`` (skip
+# following whitespace), and ``\<newline>`` (line continuation) are handled inline by
+# the decoder below.
+_RIG_LUAU_SIMPLE_ESCAPES = {
+    "n": "\n", "t": "\t", "r": "\r", "a": "\a", "b": "\b",
+    "f": "\f", "v": "\v", "\\": "\\", '"': '"', "'": "'", "0": "\0",
+}
 
-    SOUNDNESS: the whole interior must be ``"lit" .. "lit" .. ...`` — string literals
-    joined by ``..`` and nothing else. A single non-string-literal operand (a var, a
-    call, an arithmetic term) makes the value DYNAMIC and not provably ``<field>``, so
-    we abstain (do NOT fold). Only a fully constant-foldable key whose folded value
-    EQUALS ``<field>`` (not merely contains it as a substring) is a provable field
-    access."""
+
+def _rig_decode_short_string(expr: str) -> str | None:
+    """Decode a single Luau SHORT string literal (``"..."`` / ``'...'``) to its
+    constant value, processing the full finite escape grammar. ``None`` if ``expr``
+    (whitespace-trimmed) is not exactly one well-formed short string literal."""
+    s = expr.strip()
+    if len(s) < 2 or s[0] not in "\"'" or s[-1] != s[0]:
+        return None
+    quote = s[0]
+    body = s[1:-1]
+    out: list[str] = []
+    i = 0
+    n = len(body)
+    while i < n:
+        ch = body[i]
+        if ch == quote:
+            return None  # an unescaped closing quote mid-body -> not one literal
+        if ch != "\\":
+            out.append(ch)
+            i += 1
+            continue
+        i += 1
+        if i >= n:
+            return None  # trailing backslash
+        e = body[i]
+        if e in _RIG_LUAU_SIMPLE_ESCAPES:
+            out.append(_RIG_LUAU_SIMPLE_ESCAPES[e])
+            i += 1
+            continue
+        if e == "x":  # ``\xHH`` — exactly two hex digits
+            hexd = body[i + 1:i + 3]
+            if len(hexd) != 2 or any(c not in "0123456789abcdefABCDEF" for c in hexd):
+                return None
+            out.append(chr(int(hexd, 16)))
+            i += 3
+            continue
+        if e.isdigit():  # ``\ddd`` — 1-3 decimal digits
+            j = i
+            while j < n and j < i + 3 and body[j].isdigit():
+                j += 1
+            val = int(body[i:j])
+            if val > 255:
+                return None
+            out.append(chr(val))
+            i = j
+            continue
+        if e == "u":  # ``\u{...}`` — hex codepoint
+            if i + 1 >= n or body[i + 1] != "{":
+                return None
+            close = body.find("}", i + 2)
+            if close == -1:
+                return None
+            hexd = body[i + 2:close]
+            if not hexd or any(c not in "0123456789abcdefABCDEF" for c in hexd):
+                return None
+            cp = int(hexd, 16)
+            if cp > 0x10FFFF:
+                return None
+            out.append(chr(cp))
+            i = close + 1
+            continue
+        if e == "z":  # ``\z`` — skip following whitespace
+            i += 1
+            while i < n and body[i] in " \t\r\n\f\v":
+                i += 1
+            continue
+        if e == "\n":  # ``\<newline>`` line continuation -> a literal newline
+            out.append("\n")
+            i += 1
+            continue
+        if e == "\r":  # ``\<CR>`` / ``\<CRLF>`` line continuation
+            out.append("\n")
+            i += 1
+            if i < n and body[i] == "\n":
+                i += 1
+            continue
+        return None  # an unknown escape -> not a well-formed literal we decode
+    return "".join(out)
+
+
+def _rig_decode_long_bracket_string(expr: str) -> str | None:
+    """Decode a single Luau LONG-BRACKET string literal (``[[...]]`` / ``[=[...]=]``)
+    to its RAW content (NO escape processing inside long brackets). Per Luau, a first
+    newline immediately after the opener is stripped. ``None`` if ``expr`` (trimmed)
+    is not exactly one well-formed long-bracket string."""
+    s = expr.strip()
+    level = _long_bracket_open_level(s, 0)
+    if level is None:
+        return None
+    open_len = level + 2  # ``[`` + ``level`` ``=`` + ``[``
+    closer = "]" + "=" * level + "]"
+    if not s.endswith(closer):
+        return None
+    inner = s[open_len:len(s) - len(closer)]
+    # A long-bracket span must contain no earlier closer of the same level (else the
+    # literal ended before the trailing ``]...]`` and ``expr`` is not one literal).
+    if closer in inner:
+        return None
+    if inner.startswith("\r\n"):
+        inner = inner[2:]
+    elif inner.startswith("\n") or inner.startswith("\r"):
+        inner = inner[1:]
+    return inner
+
+
+def _rig_split_concat_operands(interior: str) -> list[str] | None:
+    """Split a bracket-key ``interior`` on the top-level ``..`` concatenation operator,
+    respecting string literals so a ``..`` INSIDE a string is not a split point.
+    ``None`` if a ``..`` appears at a structurally ambiguous spot (inside brackets /
+    parens — a dynamic expression we will not fold). Returns the list of operand
+    substrings (one element when there is no top-level ``..``)."""
+    operands: list[str] = []
+    start = 0
+    i = 0
+    n = len(interior)
+    while i < n:
+        ch = interior[i]
+        # Skip a short string literal wholesale (so its interior ``..`` is ignored).
+        if ch in ("'", '"'):
+            j = i + 1
+            while j < n:
+                if interior[j] == "\\":
+                    j += 2
+                    continue
+                if interior[j] == ch:
+                    break
+                j += 1
+            i = j + 1
+            continue
+        # Skip a long-bracket string wholesale.
+        level = _long_bracket_open_level(interior, i)
+        if level is not None:
+            close = interior.find("]" + "=" * level + "]", i + level + 2)
+            i = (n if close == -1 else close + level + 2)
+            continue
+        if ch == "." and i + 1 < n and interior[i + 1] == ".":
+            operands.append(interior[start:i])
+            i += 2
+            start = i
+            continue
+        i += 1
+    operands.append(interior[start:])
+    return operands
+
+
+def _rig_decode_luau_string_key(expr: str) -> str | None:
+    """Fully DECODE a static Luau bracket-key string expression ``expr`` to its
+    constant string value, or ``None`` if ``expr`` is NOT a provably-static string
+    (a variable, a call, an arithmetic term, or any operand that is not a string
+    literal -> dynamic, not provably the field).
+
+    Decodes the FINITE Luau string-literal grammar (codex BLOCKING FIX 1 — closes the
+    encoded-key class for good):
+
+      * SHORT strings (``"..."`` / ``'...'``) with full escape processing
+        (``\\xHH``, ``\\ddd``, ``\\u{...}``, ``\\n``/``\\t``/...; ``\\z``; line
+        continuations) — via ``_rig_decode_short_string``;
+      * LONG-BRACKET strings (``[[...]]`` / ``[=[...]=]``) — RAW content, first
+        newline stripped — via ``_rig_decode_long_bracket_string``;
+      * ``..`` CONCATENATIONS of the above — folded to the joined constant.
+
+    A single non-string-literal operand makes the whole key dynamic -> ``None``."""
+    operands = _rig_split_concat_operands(expr)
+    if operands is None:
+        return None
+    parts: list[str] = []
+    for operand in operands:
+        decoded = _rig_decode_short_string(operand)
+        if decoded is None:
+            decoded = _rig_decode_long_bracket_string(operand)
+        if decoded is None:
+            return None  # a non-string-literal operand -> dynamic key, abstain
+        parts.append(decoded)
+    return "".join(parts)
+
+
+def _rig_bracket_key_spans(source: str) -> list[tuple[int, int, str]]:
+    """Find every code-position ``[ ... ]`` bracket access in ``source`` and return
+    ``(open_index, close_index_exclusive, interior)`` for each. The matching ``]`` is
+    located by balancing ``[``/``]`` while skipping Luau string literals and
+    long-bracket spans, so a ``]`` inside a string never closes the access and a
+    ``[[...]]`` key is spanned as a whole. A ``[`` that opens a LONG-BRACKET string
+    (a string key like ``self[[weaponSlot]]``) yields the whole long string as the
+    interior. Only brackets whose ``[`` is at a real-code position are returned."""
+    spans: list[tuple[int, int, str]] = []
+    n = len(source)
+    i = 0
+    while i < n:
+        ch = source[i]
+        # Skip short strings wholesale.
+        if ch in ("'", '"'):
+            j = i + 1
+            while j < n:
+                if source[j] == "\\":
+                    j += 2
+                    continue
+                if source[j] == ch or source[j] == "\n":
+                    break
+                j += 1
+            i = j + 1
+            continue
+        # Skip ``--`` comments wholesale.
+        if ch == "-" and i + 1 < n and source[i + 1] == "-":
+            level = _long_bracket_open_level(source, i + 2)
+            if level is not None:
+                close = source.find("]" + "=" * level + "]", i + 2)
+                i = n if close == -1 else close + level + 2
+                continue
+            nl = source.find("\n", i)
+            i = n if nl == -1 else nl
+            continue
+        if ch == "[":
+            if not _rig_pos_is_real_code(source, i):
+                i += 1
+                continue
+            # ``self[[key]]`` / ``self[=[key]=]`` — the ``[`` at ``i`` ITSELF opens a
+            # LONG-BRACKET string (the ``t[[...]]`` call/index-with-long-string form).
+            # Span the whole long string as the bracket interior so the key decodes —
+            # the directive treats these long-bracket string keys as field reads.
+            level = _long_bracket_open_level(source, i)
+            if level is not None:
+                closer = "]" + "=" * level + "]"
+                lclose = source.find(closer, i + level + 2)
+                if lclose == -1:
+                    i += 1
+                    continue
+                interior_end = lclose + level + 2
+                spans.append((i, interior_end, source[i:interior_end]))
+                i = interior_end
+                continue
+            # Ordinary ``[ <key> ]`` — balance to the matching ``]``, skipping
+            # strings/long-brackets/comments inside.
+            close = _rig_find_bracket_close(source, i)
+            if close == -1:
+                i += 1
+                continue
+            spans.append((i, close + 1, source[i + 1:close]))
+            i = close + 1
+            continue
+        i += 1
+    return spans
+
+
+def _rig_find_bracket_close(source: str, open_idx: int) -> int:
+    """The index of the ``]`` matching the ``[`` at ``open_idx``, balancing nested
+    ``[``/``]`` and skipping string literals / long-bracket spans / comments. -1 if
+    unbalanced."""
+    n = len(source)
+    depth = 0
+    i = open_idx
+    while i < n:
+        ch = source[i]
+        if ch in ("'", '"'):
+            j = i + 1
+            while j < n:
+                if source[j] == "\\":
+                    j += 2
+                    continue
+                if source[j] == ch or source[j] == "\n":
+                    break
+                j += 1
+            i = j + 1
+            continue
+        if ch == "-" and i + 1 < n and source[i + 1] == "-":
+            level = _long_bracket_open_level(source, i + 2)
+            if level is not None:
+                cl = source.find("]" + "=" * level + "]", i + 2)
+                i = n if cl == -1 else cl + level + 2
+                continue
+            nl = source.find("\n", i)
+            i = n if nl == -1 else nl
+            continue
+        if ch == "[":
+            # A nested long-bracket string key is skipped wholesale (its inner ``]``
+            # must not be mistaken for the access closer).
+            level = _long_bracket_open_level(source, i)
+            if level is not None and i != open_idx:
+                cl = source.find("]" + "=" * level + "]", i + level + 2)
+                i = n if cl == -1 else cl + level + 2
+                continue
+            depth += 1
+            i += 1
+            continue
+        if ch == "]":
+            depth -= 1
+            if depth == 0:
+                return i
+            i += 1
+            continue
+        i += 1
+    return -1
+
+
+def _rig_has_decoded_field_bracket_read(source: str, field: str) -> bool:
+    """True if any code-position ``self[<key>]`` bracket access whose ``<key>`` is a
+    STATIC string expression that DECODES to EXACTLY ``<field>`` survives as a READ.
+
+    The unified bracket-key gate (codex BLOCKING FIX 1): every ``[ ... ]`` access is
+    found structurally, its key fully DECODED (``_rig_decode_luau_string_key`` — short
+    strings with escape processing, long-bracket strings, ``..`` concatenations), and
+    flagged iff the decoded value EXACTLY equals ``<field>``. This subsumes BOTH the
+    old clean-literal matcher and the old computed-key folder, closing the encoded-key
+    class (hex/decimal/unicode escapes, long-bracket keys, escape+concat).
+
+    Two known-good non-firings (mirroring the dot path):
+
+      * ASSIGNMENT LHS (``self[<key>] = x``, incl. multi-target) -> a WRITE may
+        legitimately survive (discharge decoupled from neutralize);
+      * a NON-static / dynamic key (``self[var]``, ``self[fn()]``, ``self["a"..var]``)
+        -> decodes to None, never flagged (flagging it false-fails unrelated accesses).
+
+    Compares to ``<field>`` exactly (not a substring) and is fully GENERIC."""
     if not field:
         return False
-    # Split on the ``..`` concatenation operator; every operand must be a clean,
-    # single string literal (``"..."`` / ``'...'``) for the key to constant-fold.
-    operand_re = re.compile(r"^\s*(['\"])([^'\"]*)\1\s*$")
-    fragments = []
-    for operand in interior.split(".."):
-        mo = operand_re.match(operand)
-        if mo is None:
-            return False  # a dynamic / non-string-literal operand -> not foldable
-        fragments.append(mo.group(2))
-    return "".join(fragments) == field
-
-
-def _rig_has_computed_field_key(source: str, field: str) -> bool:
-    """True if a bracket access carries a COMPUTED/CONCATENATED key that CONSTANT-
-    FOLDS to EXACTLY ``<field>`` (e.g. ``["weapon".."Slot"]`` -> ``"weaponSlot"``) and
-    is a READ. A computed-key READ is a raw consumption the reroute cannot rewrite, so
-    it fails closed. Detected structurally on the RAW source: a ``[ ... ]`` access
-    whose interior is a string-literal concatenation folding to exactly ``<field>``.
-
-    Two known-good non-firings (mirroring the dot/literal-bracket paths):
-
-      * ASSIGNMENT LHS (``self["weapon".."Slot"] = x``) -> a WRITE may legitimately
-        survive (discharge decoupled from neutralize);
-      * a NON-constant-foldable / fully-dynamic key (``self[someVar]``, ``self[fn()]``,
-        ``self["a"..var]``) -> not provably the field, never flagged (flagging it
-        false-fails unrelated table accesses).
-
-    Conservative — fires ONLY on a literal concatenation that PROVABLY reconstructs the
-    exact field token, never on a substring match or an unrelated dynamic index."""
     proj = _rig_code_projection(source)
-    bracket_re = re.compile(r"\[([^\[\]]*\.\.[^\[\]]*)\]")
-    for m in bracket_re.finditer(source):
-        if not _rig_pos_is_real_code(source, m.start()):
+    for open_idx, close_excl, interior in _rig_bracket_key_spans(source):
+        decoded = _rig_decode_luau_string_key(interior)
+        if decoded is None or decoded != field:
             continue
-        if not _rig_constant_folds_to(m.group(1), field):
-            continue
-        if _rig_pos_is_assignment_lhs(proj, m.end()):
+        if _rig_pos_is_assignment_lhs(proj, close_excl):
             continue  # WRITE LHS -> a Tier-2-skipped write may survive
         return True
     return False
@@ -978,8 +1295,9 @@ def _rig_has_surviving_field_consumption(source: str, field: str) -> bool:
     READ is any occurrence of the exact ``<field>`` token used as a FIELD ACCESS:
 
       * preceded (modulo whitespace/comments) by a ``.`` (dot member access), OR
-      * appearing as a string key inside ``[ "..." ]`` / ``[ '...' ]`` (bracket
-        access), OR a computed/concatenated bracket key that reconstructs ``<field>``.
+      * appearing as a bracket key ``[ <key> ]`` whose ``<key>`` is a STATIC Luau
+        string expression that DECODES to exactly ``<field>`` — short strings (escape
+        processing), long-bracket strings, and ``..`` concatenations of these.
 
     Each such access is a SURVIVING CONSUMPTION (→ fail closed) UNLESS it is one of
     the two known-good exceptions:
@@ -1019,17 +1337,14 @@ def _rig_has_surviving_field_consumption(source: str, field: str) -> bool:
             continue  # the injected resolver's own ``_<field>Cache`` memo
         return True
 
-    # (2) STRING-KEY bracket access: ``[ "<field>" ]`` / ``[ '<field>' ]``.
-    for m in _rig_string_key_read_re(field).finditer(source):
-        start = m.start()
-        if not _rig_pos_is_real_code(source, start):
-            continue
-        if _rig_pos_is_assignment_lhs(proj, m.end()):
-            continue  # WRITE LHS
-        return True
-
-    # (2b) COMPUTED/CONCATENATED bracket key reconstructing ``<field>``.
-    if _rig_has_computed_field_key(source, field):
+    # (2) STRING-KEY bracket access ``self[<key>]`` — UNIFIED decode-then-compare
+    # over the full finite Luau string-literal grammar (short strings with escape
+    # processing, long-bracket string keys, ``..`` concatenations). A key that
+    # DECODES to exactly ``<field>`` is a surviving READ (write-LHS exempt); a
+    # dynamic / non-static key decodes to None and is never flagged. This subsumes
+    # the old clean-literal matcher AND the old computed-key folder, closing the
+    # encoded-key bypass class (codex BLOCKING FIX 1).
+    if _rig_has_decoded_field_bracket_read(source, field):
         return True
 
     return False
