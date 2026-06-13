@@ -39,6 +39,7 @@ from converter.child_ref_resolver import (  # noqa: E402
 from converter.contract_verifier import (  # noqa: E402
     FAIL_CLOSED_CHECKS,
     _check_rig_binding_present,
+    _check_surviving_child_ordinal,
     _rig_binding_discharged,
     _rig_has_surviving_ordinal_write,
     fail_closed_errors,
@@ -1569,3 +1570,219 @@ def test_pathA_r4_encoded_reads_and_multi_writes_red_against_d51ae90() -> None:
         assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is True, (
             f"{name}: the multi-target LHS must be recognized as a WRITE"
         )
+
+
+# ---------------------------------------------------------------------------
+# PHASE-INTEGRATION P1 — check D (``_check_surviving_child_ordinal``) FALSE
+# POSITIVE on a DISCHARGED rig binding's dead init-write ordinal.
+#
+# Path A discharges the binding via the READ reroute; the Tier-2 init-write
+# neutralize is best-effort and SKIPS the single-line ``if self.cam then
+# self.weaponSlot = self.cam:GetChildren()[1] end`` shape. So a DEAD ordinal
+# write survives. The binding is fully discharged (present-check GREEN), but
+# pre-fix check D counted that dead write against a 0 unresolved-site budget
+# ({getchild_total:1, resolved_total:1}) and fired ``child_ordinal_survivor``,
+# blocking a correctly-converted game. The fix makes check D rig-aware: the
+# write-LHS ordinal of a discharged rig field is "resolved-but-left-behind",
+# exempt from the survivor count — but ONLY that dead write (a READ survivor or
+# an undischarged binding STILL fires). These tests run the FULL verifier
+# interaction the rig-binding-row-only test at module scope did not.
+# ---------------------------------------------------------------------------
+
+# The skipped-neutralize single-line-if ordinal-write shape (one of the 5 real
+# AI write shapes; blessed as a valid Path A outcome by
+# test_rifle_rig_retarget.py:766). The Tier-2 neutralize skips this, so the dead
+# ``self.cam:GetChildren()[1]`` write survives in the lowered output.
+_SKIPPED_NEUTRALIZE_SINGLELINE_IF = (
+    "function Player:Awake()\n"
+    "    self.cam = workspace.CurrentCamera\n"
+    "    if self.cam then self.weaponSlot = self.cam:GetChildren()[1] end\n"
+    "end\n\n"
+    "function Player:GetRifle()\n"
+    "    return pivotOf(self.weaponSlot)\n"
+    "end\n\n"
+    "return Player\n"
+)
+
+
+def _rbx_with_accounting(
+    name: str,
+    source: str,
+    rig_binding: dict[str, object] | None,
+    *,
+    getchild_total: int,
+    resolved_total: int,
+) -> RbxScript:
+    """An ``RbxScript`` carrying BOTH the rig_binding carrier AND the real
+    ``child_ref_resolution`` accounting check D reads (the row the rig-binding-
+    row-only test omitted)."""
+    return RbxScript(
+        name=name,
+        source=source,
+        rig_binding=rig_binding,
+        child_ref_resolution={
+            "getchild_total": getchild_total,
+            "resolved_total": resolved_total,
+        },
+    )
+
+
+def test_checkD_no_false_positive_on_discharged_rig_dead_write() -> None:
+    """P1 REGRESSION — the dead init-write ordinal of a DISCHARGED rig binding
+    must NOT fire ``child_ordinal_survivor``. Drives the REAL lowering on the
+    skipped-neutralize single-line-if shape, with the REAL {1,1} accounting, then
+    runs the FULL ``verify_contract`` and asserts: present=True (no
+    rig_binding_present violation) AND no child_ordinal_survivor violation."""
+    lowered = _lower(_SKIPPED_NEUTRALIZE_SINGLELINE_IF)
+    # The dead ordinal write survived (Tier-2 neutralize skipped this shape).
+    assert "self.cam:GetChildren()[1]" in lowered.luau_source
+    # The binding is fully discharged via the read reroute (Path A).
+    assert (
+        _rig_binding_discharged(lowered.luau_source, "weaponSlot", "WeaponSlot")
+        is True
+    )
+    assert lowered.rig_binding == {
+        "field": "weaponSlot",
+        "child": "WeaponSlot",
+        "present": True,
+    }
+    # The REAL pipeline accounting: getchild_total=1 (the one Camera.main
+    # GetChild), resolved_total=1 (the rig fact bumped it) -> 0 unresolved budget.
+    script = _rbx_with_accounting(
+        "Player",
+        lowered.luau_source,
+        lowered.rig_binding,
+        getchild_total=1,
+        resolved_total=1,
+    )
+    # FULL verifier interaction (the gap the row-only test missed).
+    res = verify_contract(_TOPOLOGY, [script])
+    checks = {v.check for v in res.violations}
+    assert "rig_binding_present" not in checks  # present-check GREEN
+    assert "child_ordinal_survivor" not in checks  # the P1 false positive is gone
+    assert not any("child_ordinal_survivor" in e for e in fail_closed_errors(res))
+    # And directly at the unit boundary the codex finding flagged.
+    cd = _check_surviving_child_ordinal(_TOPOLOGY, [script])
+    assert [v.check for v in cd if v.check == "child_ordinal_survivor"] == []
+
+
+def test_checkD_pre_fix_red_proof() -> None:
+    """PRE-FIX RED proof: the d51ae90 (pre-fix) check D fires
+    ``child_ordinal_survivor`` on this exact discharged-rig scenario — proving the
+    fix is load-bearing, not a tautology. Rebuilds the pre-fix verifier from git
+    and runs ITS check D on the same lowered script + accounting."""
+    import importlib.util
+    import subprocess
+
+    blob = subprocess.run(
+        ["git", "show", "d51ae90:converter/converter/contract_verifier.py"],
+        cwd=str(Path(__file__).parent.parent),
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    old_path = Path(__file__).parent / "_old_cv_checkd_d51ae90.py"
+    old_path.write_text(blob, encoding="utf-8")
+    try:
+        spec = importlib.util.spec_from_file_location("_old_cv_checkd", str(old_path))
+        assert spec is not None and spec.loader is not None
+        old = importlib.util.module_from_spec(spec)
+        sys.modules["_old_cv_checkd"] = old
+        spec.loader.exec_module(old)
+    finally:
+        old_path.unlink(missing_ok=True)
+
+    lowered = _lower(_SKIPPED_NEUTRALIZE_SINGLELINE_IF)
+    script = _rbx_with_accounting(
+        "Player",
+        lowered.luau_source,
+        lowered.rig_binding,
+        getchild_total=1,
+        resolved_total=1,
+    )
+    old_cd = old._check_surviving_child_ordinal(_TOPOLOGY, [script])
+    assert any(v.check == "child_ordinal_survivor" for v in old_cd), (
+        "the pre-fix check D must FIRE the false positive — proving the rig-aware "
+        "exemption is load-bearing"
+    )
+    # The fixed check D does NOT fire on the same input.
+    new_cd = _check_surviving_child_ordinal(_TOPOLOGY, [script])
+    assert not any(v.check == "child_ordinal_survivor" for v in new_cd)
+
+
+def test_checkD_still_fires_on_read_survivor_no_rig() -> None:
+    """PRECISION GUARD — the fix did NOT blanket-disable check D. A genuine
+    UNRESOLVED surviving READ ordinal on a script with NO rig binding STILL fires
+    ``child_ordinal_survivor`` (budget 0, survivor present, no exemption applies)."""
+    # A surviving READ ordinal (consumption, NOT a self.<field>= write), no rig.
+    read_survivor_source = (
+        "function Player:GetRifle()\n"
+        "    local slot = self.cam:GetChildren()[1]\n"
+        "    return pivotOf(slot)\n"
+        "end\n\n"
+        "return Player\n"
+    )
+    script = _rbx_with_accounting(
+        "Player",
+        read_survivor_source,
+        None,  # NO rig binding -> no exemption is even considered
+        getchild_total=1,
+        resolved_total=1,  # budget 0 -> any survivor fires
+    )
+    cd = _check_surviving_child_ordinal(_TOPOLOGY, [script])
+    assert any(v.check == "child_ordinal_survivor" for v in cd), (
+        "an unresolved READ survivor on a non-rig script must STILL fail closed"
+    )
+
+
+def test_checkD_still_fires_on_read_survivor_with_discharged_rig() -> None:
+    """PRECISION GUARD — even WITH a discharged rig binding, a survivor that is NOT
+    the dead rig write-LHS (a READ consumption of an unrelated ordinal, beyond what
+    the rig write accounts for) STILL fires. The exemption subtracts EXACTLY the
+    one dead rig write, not every survivor."""
+    lowered = _lower(_SKIPPED_NEUTRALIZE_SINGLELINE_IF)
+    # Inject an ADDITIONAL surviving READ ordinal (a non-field receiver READ) on
+    # top of the discharged rig's dead write. This survivor is NOT a
+    # ``self.weaponSlot =`` write, so it is NOT exempt.
+    extra_read_source = lowered.luau_source.replace(
+        "function Player:GetRifle()\n",
+        "function Player:GetRifle()\n"
+        "    local extra = self.muzzle:GetChildren()[2]\n",
+    )
+    assert "self.muzzle:GetChildren()[2]" in extra_read_source
+    script = _rbx_with_accounting(
+        "Player",
+        extra_read_source,
+        lowered.rig_binding,  # discharged rig binding present
+        getchild_total=1,
+        resolved_total=1,  # budget 0; 2 survivors - 1 exempt dead write = 1 > 0
+    )
+    cd = _check_surviving_child_ordinal(_TOPOLOGY, [script])
+    assert any(v.check == "child_ordinal_survivor" for v in cd), (
+        "a READ survivor beyond the exempt dead rig write must STILL fail closed — "
+        "the exemption subtracts only the one dead write, not every survivor"
+    )
+
+
+def test_checkD_no_exemption_on_undischarged_rig() -> None:
+    """PRECISION GUARD — the exemption is gated on the binding being DISCHARGED.
+    A rig field whose surviving ordinal write is present but whose binding is NOT
+    discharged (no resolver landed -> raw reads survive) does NOT get the
+    exemption, so check D STILL fires on the surviving ordinal."""
+    # The raw AI shape with NO lowering applied: the ``self.weaponSlot =
+    # ...GetChildren()[1]`` write survives, no resolver, raw reads survive ->
+    # _rig_binding_discharged is False.
+    raw = _AI_OUTPUT_SHAPE
+    assert _rig_binding_discharged(raw, "weaponSlot", "WeaponSlot") is False
+    assert "self.cam:GetChildren()[1]" in raw
+    script = _rbx_with_accounting(
+        "Player",
+        raw,
+        {"field": "weaponSlot", "child": "WeaponSlot", "present": False},
+        getchild_total=1,
+        resolved_total=1,  # budget 0
+    )
+    cd = _check_surviving_child_ordinal(_TOPOLOGY, [script])
+    assert any(v.check == "child_ordinal_survivor" for v in cd), (
+        "an UNDISCHARGED binding gets no exemption — the surviving ordinal fires"
+    )

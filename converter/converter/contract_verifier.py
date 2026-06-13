@@ -689,6 +689,30 @@ def _check_surviving_child_ordinal(
         if gt is None or rt is None or gt <= 0:
             continue
         survivors = _count_surviving_child_ordinals(script.source)
+        # RIG-AWARE exemption: a surviving positional ordinal that is the dead
+        # init-WRITE of a DISCHARGED rig binding's field (``self.<field> =
+        # <recv>:GetChildren()[n]``) is superseded by the read reroute (Path A) —
+        # it is "resolved-but-left-behind", NOT an unresolved child-ref survivor,
+        # and the rig fact already bumped ``resolved_total``. Subtract EXACTLY that
+        # dead write from the count so it does not fire ``child_ordinal_survivor``.
+        # The exemption is gated on the binding being PRESENT (stamp) AND
+        # INDEPENDENTLY discharged in the real source; a READ survivor, a
+        # non-/un-discharged-binding script, or any survivor beyond the dead write
+        # is NOT exempted and still fails closed.
+        rb = script.rig_binding
+        if rb:
+            field = str(rb.get("field") or "")
+            child = str(rb.get("child") or "")
+            stamp = rb.get("present") is True
+            if (
+                field
+                and child
+                and stamp
+                and _rig_binding_discharged(script.source, field, child)
+            ):
+                survivors -= _rig_discharged_ordinal_write_exempt_count(
+                    script.source, field
+                )
         if survivors <= 0:
             continue
         unresolved_budget = gt - rt
@@ -1578,6 +1602,42 @@ def _rig_has_surviving_ordinal_write(source: str, field: str) -> bool:
         if _RIG_ORDINAL_WRITE_TAIL_RE.search(rhs):
             return True
     return False
+
+
+# The ``self.<field> = <recv>:GetChildren()[n]`` write-LHS tail in EXACTLY the
+# shape check D counts (``_GETCHILDREN_INDEX_ANY_RE`` — the adjacent
+# ``GetChildren()[n]`` form). The ``GetChild(n)`` form ``_RIG_ORDINAL_WRITE_TAIL_RE``
+# also tolerates is NOT counted by check D, so excluding it here keeps the check-D
+# exemption count EXACTLY aligned with what check D counted (never over-subtracting).
+_RIG_GETCHILDREN_WRITE_TAIL_RE = re.compile(r":GetChildren\(\)\[\d+\]")
+
+
+def _rig_discharged_ordinal_write_exempt_count(
+    source: str, field: str
+) -> int:
+    """Count of surviving ``self.<field> = <recv>:GetChildren()[n]`` write-LHS
+    ordinal SITES — the dead init-write the read-reroute (Path A) superseded.
+
+    Counts ONLY the ``GetChildren()[n]`` adjacent form that
+    ``_count_surviving_child_ordinals`` (check D) counts, so the returned value is
+    the EXACT number check D over-counted for this discharged rig field — the
+    caller subtracts it. A READ ordinal (a non-``self.<field>=`` consumption), a
+    factored chain, or a ``GetChild(n)`` write (uncounted by check D) is NOT
+    counted here, so the exemption never silences a real survivor. Caller MUST gate
+    on ``_rig_binding_discharged`` first — this helper presumes the binding is
+    discharged and exempts only the dead write that discharge leaves behind."""
+    projected = _rig_code_projection(source)
+    assign_re = re.compile(r"self\." + re.escape(field) + r"\s*=(?!=)")
+    count = 0
+    for m in assign_re.finditer(projected):
+        rhs_start = m.end()
+        while rhs_start < len(projected) and projected[rhs_start] in " \t\r\n":
+            rhs_start += 1
+        rhs_end = _rig_statement_rhs_end(projected, rhs_start)
+        rhs = _rig_collapse_code_ws(projected[rhs_start:rhs_end])
+        if _RIG_GETCHILDREN_WRITE_TAIL_RE.search(rhs):
+            count += 1
+    return count
 
 
 def _rig_method_body_end(source: str, decl_start: int) -> int:
