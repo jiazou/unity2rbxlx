@@ -40,6 +40,7 @@ from converter.contract_verifier import (  # noqa: E402
     FAIL_CLOSED_CHECKS,
     _check_rig_binding_present,
     _check_surviving_child_ordinal,
+    _count_surviving_child_ordinals,
     _rig_binding_discharged,
     _rig_has_surviving_ordinal_write,
     fail_closed_errors,
@@ -1955,4 +1956,291 @@ def test_checkD_round6_pre_fix_red_proof() -> None:
     assert any(
         v.check == "child_ordinal_survivor"
         for v in _check_surviving_child_ordinal(_TOPOLOGY, [s2])
+    )
+
+
+# ---------------------------------------------------------------------------
+# ROUND-7 P1 — the SITE identification was still TEXT-FORWARD: the exempt skip
+# was driven by a forward RHS span from a loose ``self.<field> =`` SUBSTRING
+# (``_rig_field_write_rhs_spans``). Two NEW holes, same root:
+#   (a) ``;`` boundary (Claude): the RHS span ended at a depth-0 NEWLINE but not
+#       a Luau ``;`` separator, so ``self.weaponSlot = nil ; foo:GetChildren()[1]``
+#       swallowed the genuine survivor into the exempt span -> masked.
+#   (b) substring LHS (codex): ``self.<field> =`` matched as a SUBSTRING, so
+#       ``myself.weaponSlot = ...`` / ``other.self.weaponSlot = ...`` were taken
+#       as the exempt write -> a real survivor masked.
+# The fix INVERTS the logic: the exemption is now STATEMENT-ANCHORED on the
+# COUNTED site — ``_site_is_discharged_rig_dead_write`` parses the single Luau
+# statement physically containing the counted GetChildren site (bounded by its
+# own depth-0 ``;``/newline) and exempts ONLY when that statement is EXACTLY an
+# assignment whose LHS is the STANDALONE lvalue ``self.<field>`` with the site on
+# its RHS. An ambiguous statement is NOT exempted (counted, fail closed). These
+# tests drive the REAL helpers and would each have FAILED against de8e7f9.
+# ---------------------------------------------------------------------------
+
+
+def test_checkD_semicolon_separated_survivor_still_fires() -> None:
+    """ROUND-7 BYPASS-A GUARD (``;`` boundary) — a discharged rig with the dead
+    write and a GENUINE UNRELATED survivor on the SAME physical line separated by a
+    Luau ``;`` (``self.weaponSlot = nil ; local stray = foo:GetChildren()[1]``) must
+    STILL fire. The survivor is in a SEPARATE ``;``-bounded statement, so the
+    statement-anchored exemption never reaches it. Against de8e7f9 the forward RHS
+    span over-reached past the ``;`` and the single exempt skip masked the survivor."""
+    base = _lower(_SKIPPED_NEUTRALIZE_SINGLELINE_IF).luau_source
+    # Replace the surviving dead-write line with: a NIL write (still discharges —
+    # discharge keys on the read reroute, not the write shape) then a ``;`` and a
+    # genuine UNRELATED survivor on the same physical line.
+    src = base.replace(
+        "if self.cam then self.weaponSlot = self.cam:GetChildren()[1] end\n",
+        "self.weaponSlot = nil ; local stray = foo:GetChildren()[1]\n",
+    )
+    assert "self.weaponSlot = nil ; local stray = foo:GetChildren()[1]" in src
+    assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is True
+    # The genuine survivor must be counted (NOT swallowed by the exempt skip).
+    assert _count_surviving_child_ordinals(src, "weaponSlot") == 1
+    script = _rbx_with_accounting(
+        "Player",
+        src,
+        {"field": "weaponSlot", "child": "WeaponSlot", "present": True},
+        getchild_total=1,
+        resolved_total=1,  # budget 0 -> the unrelated survivor must fire
+    )
+    cd = _check_surviving_child_ordinal(_TOPOLOGY, [script])
+    assert any(v.check == "child_ordinal_survivor" for v in cd), (
+        "a genuine survivor sharing a ``;``-line with the dead rig write must STILL "
+        "fail closed — the exempt skip is statement-bounded, not line-bounded"
+    )
+
+
+def test_checkD_myself_substring_lhs_survivor_still_fires() -> None:
+    """ROUND-7 BYPASS-B GUARD (substring LHS, ``myself``) — a survivor written via a
+    NON-``self`` lvalue whose name merely ENDS in ``self`` (``myself.weaponSlot =
+    foo:GetChildren()[2]``) is NOT the exempt rig write: ``self`` must be a STANDALONE
+    identifier. The statement-anchored LHS match rejects it, so the survivor STILL
+    fires. Against de8e7f9 the loose ``self.<field> =`` substring matched it."""
+    base = _lower(_SKIPPED_NEUTRALIZE_SINGLELINE_IF).luau_source
+    src = base.replace(
+        "if self.cam then self.weaponSlot = self.cam:GetChildren()[1] end\n",
+        "myself.weaponSlot = foo:GetChildren()[2]\n",
+    )
+    assert "myself.weaponSlot = foo:GetChildren()[2]" in src
+    assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is True
+    assert _count_surviving_child_ordinals(src, "weaponSlot") == 1
+    script = _rbx_with_accounting(
+        "Player",
+        src,
+        {"field": "weaponSlot", "child": "WeaponSlot", "present": True},
+        getchild_total=1,
+        resolved_total=1,
+    )
+    cd = _check_surviving_child_ordinal(_TOPOLOGY, [script])
+    assert any(v.check == "child_ordinal_survivor" for v in cd), (
+        "a ``myself.<field> =`` write is NOT the exempt rig write (``self`` is not "
+        "standalone) — the survivor must STILL fail closed"
+    )
+
+
+def test_checkD_dotted_self_substring_lhs_survivor_still_fires() -> None:
+    """ROUND-7 BYPASS-B GUARD (substring LHS, ``other.self``) — a survivor written via
+    ``other.self.weaponSlot = foo:GetChildren()[2]`` is NOT the exempt rig write: the
+    char before ``self`` is a ``.`` (it is a FIELD access, not the standalone lvalue).
+    The statement-anchored LHS match rejects it, so the survivor STILL fires."""
+    base = _lower(_SKIPPED_NEUTRALIZE_SINGLELINE_IF).luau_source
+    src = base.replace(
+        "if self.cam then self.weaponSlot = self.cam:GetChildren()[1] end\n",
+        "other.self.weaponSlot = foo:GetChildren()[2]\n",
+    )
+    assert "other.self.weaponSlot = foo:GetChildren()[2]" in src
+    assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is True
+    assert _count_surviving_child_ordinals(src, "weaponSlot") == 1
+    script = _rbx_with_accounting(
+        "Player",
+        src,
+        {"field": "weaponSlot", "child": "WeaponSlot", "present": True},
+        getchild_total=1,
+        resolved_total=1,
+    )
+    cd = _check_surviving_child_ordinal(_TOPOLOGY, [script])
+    assert any(v.check == "child_ordinal_survivor" for v in cd), (
+        "an ``other.self.<field> =`` write is NOT the exempt rig write (``self`` is a "
+        "field access, not standalone) — the survivor must STILL fail closed"
+    )
+
+
+def test_checkD_field_prefix_collision_does_not_exempt() -> None:
+    """ROUND-7 NEIGHBOR GUARD (field word-boundary) — a rig field ``weaponSlot`` must
+    NOT exempt a write to ``self.weaponSlotBackup = foo:GetChildren()[1]`` (a longer
+    field whose name has ``weaponSlot`` as a prefix). The field match requires a word
+    boundary, so the survivor STILL fires."""
+    base = _lower(_SKIPPED_NEUTRALIZE_SINGLELINE_IF).luau_source
+    src = base.replace(
+        "if self.cam then self.weaponSlot = self.cam:GetChildren()[1] end\n",
+        "self.weaponSlotBackup = foo:GetChildren()[1]\n",
+    )
+    assert "self.weaponSlotBackup = foo:GetChildren()[1]" in src
+    assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is True
+    # exempt_field="weaponSlot" must NOT exempt the ``weaponSlotBackup`` write.
+    assert _count_surviving_child_ordinals(src, "weaponSlot") == 1
+    script = _rbx_with_accounting(
+        "Player",
+        src,
+        {"field": "weaponSlot", "child": "WeaponSlot", "present": True},
+        getchild_total=1,
+        resolved_total=1,
+    )
+    cd = _check_surviving_child_ordinal(_TOPOLOGY, [script])
+    assert any(v.check == "child_ordinal_survivor" for v in cd), (
+        "a ``weaponSlot`` rig must NOT exempt a ``weaponSlotBackup`` write — the "
+        "field match is word-bounded, so the survivor must STILL fail closed"
+    )
+
+
+def test_checkD_field_prefix_collision_reverse() -> None:
+    """ROUND-7 NEIGHBOR GUARD (field word-boundary, reverse) — the dead write is
+    ``self.weaponSlot = ...`` but the exempt field is the LONGER ``weaponSlotBackup``;
+    the shorter write must NOT be exempted (word boundary both directions)."""
+    # A standalone unit assertion is cleanest here: a single dead write on field
+    # ``weaponSlot`` is NOT exempted when the exempt_field is ``weaponSlotBackup``.
+    one_write = "self.weaponSlot = foo:GetChildren()[1]\n"
+    assert _count_surviving_child_ordinals(one_write, "weaponSlotBackup") == 1
+
+
+def test_checkD_comparison_on_lhs_line_not_exempted() -> None:
+    """ROUND-7 NEIGHBOR GUARD (real-assignment) — a COMPARISON (``==``), not an
+    assignment (``if self.weaponSlot == foo:GetChildren()[1] then end``), is NOT the
+    exempt rig write: the statement-anchored LHS match requires a REAL ``=``, not a
+    comparison operator. So even with the exempt field set, the survivor is COUNTED.
+    Asserted at the ``_count_surviving_child_ordinals`` boundary (a surviving
+    ``self.weaponSlot ==`` READ would itself fail discharge upstream, so this isolates
+    the assignment-vs-comparison discrimination in the site anchor)."""
+    src = "if self.weaponSlot == foo:GetChildren()[1] then end\n"
+    # exempt_field set, but the statement is a comparison -> NOT exempted -> counted.
+    assert _count_surviving_child_ordinals(src, "weaponSlot") == 1
+    # And every comparison operator on the LHS is rejected as a non-assignment.
+    for op in ("==", "<=", ">=", "~="):
+        cmp_src = f"if self.weaponSlot {op} foo:GetChildren()[1] then end\n"
+        assert _count_surviving_child_ordinals(cmp_src, "weaponSlot") == 1, op
+
+
+def test_checkD_rhs_with_leading_operand_not_exempted() -> None:
+    """ROUND-7 CODEX GUARD (RHS identity) — the exempt write must be the BARE dead-write
+    shape ``self.<field> = <recv>:GetChildren()[n]`` (the site is the WHOLE RHS). An
+    assignment whose RHS merely CONTAINS a GetChildren after a leading operand
+    (``self.weaponSlot = nil or foo:GetChildren()[1]``) is NOT the dead init-write — the
+    ``foo:GetChildren()[1]`` is a genuine survivor and must STILL be counted. Against the
+    statement-anchored draft (before the whole-RHS guard) this masked the survivor."""
+    src = "self.weaponSlot = nil or foo:GetChildren()[1]\n"
+    assert _count_surviving_child_ordinals(src, "weaponSlot") == 1
+
+
+def test_checkD_rhs_with_multiple_getchildren_operands_all_counted() -> None:
+    """ROUND-7 CODEX GUARD (RHS identity, multi-operand) — an assignment whose RHS is a
+    BINARY expression of two GetChildren sites (``self.weaponSlot = a:GetChildren()[1] +
+    b:GetChildren()[2]``) is not a dead init-write; NEITHER site is the whole RHS, so
+    BOTH are counted (no exemption spent)."""
+    src = "self.weaponSlot = foo:GetChildren()[1] + bar:GetChildren()[2]\n"
+    assert _count_surviving_child_ordinals(src, "weaponSlot") == 2
+
+
+def test_checkD_bare_dead_write_shapes_still_exempt() -> None:
+    """ROUND-7 CODEX GUARD (companion) — the whole-RHS constraint does NOT break the
+    legitimate bare dead-write shapes the exemption exists for: a simple receiver, a
+    method receiver, an ``if c then ... end`` single-line block, and a multiline
+    continuation all still exempt their single dead init-write site."""
+    for src in (
+        "self.weaponSlot = foo:GetChildren()[1]\n",
+        "self.weaponSlot = self.cam:GetChildren()[1]\n",
+        "if self.cam then self.weaponSlot = self.cam:GetChildren()[1] end\n",
+        "self.weaponSlot =\n    foo:GetChildren()[1]\n",
+    ):
+        assert _count_surviving_child_ordinals(src, "weaponSlot") == 0, src
+
+
+def test_checkD_two_dead_writes_only_one_exempt() -> None:
+    """ROUND-7 NEIGHBOR GUARD (cap) — two legitimate ``self.<rigfield> =
+    <recv>:GetChildren()[n]`` writes: only ONE is exempt, the second STILL fires.
+    Statement-anchored identity + the ``< 1`` cap together exempt at most the single
+    dead init-write."""
+    base = _lower(_SKIPPED_NEUTRALIZE_SINGLELINE_IF).luau_source
+    src = base.replace(
+        "if self.cam then self.weaponSlot = self.cam:GetChildren()[1] end\n",
+        "self.weaponSlot = self.cam:GetChildren()[1]\n"
+        "    self.weaponSlot = self.muzzle:GetChildren()[2]\n",
+    )
+    assert "self.weaponSlot = self.muzzle:GetChildren()[2]" in src
+    assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is True
+    # 2 counted writes - 1 exempt = 1 survivor.
+    assert _count_surviving_child_ordinals(src, "weaponSlot") == 1
+    script = _rbx_with_accounting(
+        "Player",
+        src,
+        {"field": "weaponSlot", "child": "WeaponSlot", "present": True},
+        getchild_total=1,
+        resolved_total=1,
+    )
+    cd = _check_surviving_child_ordinal(_TOPOLOGY, [script])
+    assert any(v.check == "child_ordinal_survivor" for v in cd), (
+        "only ONE dead rig write is exempt — a SECOND same-field write must STILL "
+        "fail closed"
+    )
+
+
+def test_checkD_round7_pre_fix_red_proof() -> None:
+    """PRE-FIX RED proof for round 7: the de8e7f9 (forward-RHS-span) exempt logic
+    MASKED both new bypasses — its check D did NOT fire on the ``;``-separated
+    survivor and the ``myself.``/``other.self.`` substring-LHS scenarios. Proves the
+    statement-anchored inversion is load-bearing, not a tautology. Rebuilds de8e7f9's
+    verifier from git and runs ITS check D on the same inputs."""
+    import importlib.util
+    import subprocess
+
+    blob = subprocess.run(
+        ["git", "show", "de8e7f9:converter/converter/contract_verifier.py"],
+        cwd=str(Path(__file__).parent.parent),
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    old_path = Path(__file__).parent / "_old_cv_checkd_de8e7f9.py"
+    old_path.write_text(blob, encoding="utf-8")
+    try:
+        spec = importlib.util.spec_from_file_location("_old_cv_de8e7f9", str(old_path))
+        assert spec is not None and spec.loader is not None
+        old = importlib.util.module_from_spec(spec)
+        sys.modules["_old_cv_de8e7f9"] = old
+        spec.loader.exec_module(old)
+    finally:
+        old_path.unlink(missing_ok=True)
+
+    base = _lower(_SKIPPED_NEUTRALIZE_SINGLELINE_IF).luau_source
+    rb = {"field": "weaponSlot", "child": "WeaponSlot", "present": True}
+
+    # BYPASS-A scenario: ``;``-separated unrelated survivor.
+    a = base.replace(
+        "if self.cam then self.weaponSlot = self.cam:GetChildren()[1] end\n",
+        "self.weaponSlot = nil ; local stray = foo:GetChildren()[1]\n",
+    )
+    sa = _rbx_with_accounting("Player", a, rb, getchild_total=1, resolved_total=1)
+    assert not any(
+        v.check == "child_ordinal_survivor"
+        for v in old._check_surviving_child_ordinal(_TOPOLOGY, [sa])
+    ), "the pre-fix check D must MASK the ``;`` bypass — proving the round-7 fix is load-bearing"
+    assert any(
+        v.check == "child_ordinal_survivor"
+        for v in _check_surviving_child_ordinal(_TOPOLOGY, [sa])
+    )
+
+    # BYPASS-B scenario: ``myself.`` substring-LHS survivor.
+    b = base.replace(
+        "if self.cam then self.weaponSlot = self.cam:GetChildren()[1] end\n",
+        "myself.weaponSlot = foo:GetChildren()[2]\n",
+    )
+    sb = _rbx_with_accounting("Player", b, rb, getchild_total=1, resolved_total=1)
+    assert not any(
+        v.check == "child_ordinal_survivor"
+        for v in old._check_surviving_child_ordinal(_TOPOLOGY, [sb])
+    ), "the pre-fix check D must MASK the substring-LHS bypass — proving the round-7 fix is load-bearing"
+    assert any(
+        v.check == "child_ordinal_survivor"
+        for v in _check_surviving_child_ordinal(_TOPOLOGY, [sb])
     )

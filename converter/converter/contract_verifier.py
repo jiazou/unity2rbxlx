@@ -642,23 +642,26 @@ def _count_surviving_child_ordinals(
     roots at a known-safe ENGINE GLOBAL (``workspace``/``game``/...) are EXCLUDED
     — they are engine-tree iterations, not unresolved child-ref ordinals.
 
-    RIG-AWARE exemption (SITE-ALIGNED): when ``exempt_field`` is set (the caller
+    RIG-AWARE exemption (SITE-ANCHORED): when ``exempt_field`` is set (the caller
     has independently confirmed a DISCHARGED rig binding on that field), AT MOST
-    ONE adjacent ``self.<field> = <recv>:GetChildren()[n]`` dead init-write site
-    is skipped from the count — the dead write the Path-A read-reroute superseded.
-    The skip happens INSIDE this same walk, AFTER the identical
-    ``_luau_pos_is_code`` + engine-global filters that COUNT a site, and only on a
-    site whose match position lands inside a ``self.<field> =`` write-LHS RHS span.
-    So the exemption can only ever remove a site this function WOULD have counted
-    (``exempt ⊆ counted-survivors``, structurally — there is no separately-computed
-    number to subtract), it never spans the across-lines factored form (a write is
-    the adjacent form), and the ``< 1`` cap exempts only the SINGLE dead init-write
-    — a second same-field write, a READ survivor, a different field, or an
-    engine-global/bracket-receiver write that this function did NOT count all
-    REMAIN counted and still fail closed."""
-    exempt_spans: list[tuple[int, int]] = (
-        _rig_field_write_rhs_spans(source, exempt_field) if exempt_field else []
-    )
+    ONE adjacent ``self.<field> = <recv>:GetChildren()[n]`` dead init-write site is
+    skipped from the count — the dead write the Path-A read-reroute superseded. The
+    decision is made INSIDE this same walk, AFTER the identical ``_luau_pos_is_code``
+    + engine-global filters that COUNT a site, and ONLY by parsing the single Luau
+    STATEMENT that physically CONTAINS that counted site
+    (``_site_is_discharged_rig_dead_write``): the enclosing statement is bounded by
+    its own depth-0 ``;`` / newline boundaries and must be EXACTLY an assignment whose
+    LHS is the standalone lvalue ``self.<field>`` (rejecting ``myself`` / ``a.self`` /
+    ``weaponSlotBackup`` look-alikes) with the GetChildren site on its RHS. So the
+    exemption can only ever remove a site this function WOULD have counted
+    (``exempt ⊆ counted-survivors``, structurally — there is no separate number to
+    subtract), it never spans the across-lines factored form (a write is the adjacent
+    form), and the ``< 1`` cap exempts only the SINGLE dead init-write — a second
+    same-field write, a READ survivor, an UNRELATED survivor sharing a ``;``-line, a
+    different field, or an engine-global/bracket-receiver write that this function did
+    NOT count all REMAIN counted and still fail closed. An AMBIGUOUS site
+    (statement can't be cleanly parsed as ``self.<field> = ...``) is NOT exempted —
+    it is counted (fail closed)."""
     exempted = 0
     count = 0
     for m in _GETCHILDREN_INDEX_ANY_RE.finditer(source):
@@ -668,7 +671,10 @@ def _count_surviving_child_ordinals(
             continue  # engine-global iteration — not a child-ref survivor
         if (
             exempted < 1
-            and _pos_in_any_span(m.start(), exempt_spans)
+            and exempt_field
+            and _site_is_discharged_rig_dead_write(
+                source, m.start(), m.end(), exempt_field
+            )
         ):
             # The dead init-write of the discharged rig field — superseded by the
             # read reroute (Path A). Skip exactly this one counted site.
@@ -689,31 +695,205 @@ def _count_surviving_child_ordinals(
     return count
 
 
-def _pos_in_any_span(pos: int, spans: list[tuple[int, int]]) -> bool:
-    """True if ``pos`` lies within any ``[lo, hi)`` span."""
-    return any(lo <= pos < hi for lo, hi in spans)
+# LHS of the exempt dead init-write: the STANDALONE lvalue ``self.<field>`` at the
+# START of a statement, then a REAL assignment ``=`` (not ``==``/``<=``/``>=``/``~=``).
+# Anchored at the statement start so ``other.self.weaponSlot =`` / ``myself.weaponSlot
+# =`` cannot match (their statement starts at ``other``/``myself``, not ``self``); the
+# field word-boundary ``(?!\w)`` rejects the ``weaponSlot`` vs ``weaponSlotBackup``
+# prefix collision; ``(?<![<>~])=`` + ``(?!=)`` rejects every comparison operator.
+_RIG_EXEMPT_LHS_RE_CACHE: dict[str, re.Pattern[str]] = {}
 
 
-def _rig_field_write_rhs_spans(source: str, field: str) -> list[tuple[int, int]]:
-    """The ``[rhs_start, rhs_end)`` char spans of every code-position
-    ``self.<field> = <RHS>`` write in ``source``, used to recognize a survivor SITE
-    that lands inside a write-LHS RHS (the dead init-write of a discharged rig
-    binding). Positions index ``source`` directly: the assignment is located over
-    the position-PRESERVING ``_rig_code_projection`` (so a ``self.<field> =`` inside
-    a comment/string never matches) but the spans map 1:1 back onto ``source`` for
-    the survivor-site position test. Returned in source order."""
-    spans: list[tuple[int, int]] = []
+def _rig_exempt_lhs_re(field: str) -> re.Pattern[str]:
+    """Compiled (cached) regex matching a statement that OPENS with the standalone
+    lvalue ``self.<field>`` followed by a real assignment ``=``. Match group spans the
+    LHS+``=``; ``match`` (anchored) is applied to a single statement's projected text."""
+    cached = _RIG_EXEMPT_LHS_RE_CACHE.get(field)
+    if cached is None:
+        cached = re.compile(
+            r"self\." + re.escape(field) + r"(?!\w)\s*(?<![<>~=])=(?!=)"
+        )
+        _RIG_EXEMPT_LHS_RE_CACHE[field] = cached
+    return cached
+
+
+# Block-opener KEYWORDS: each begins a nested statement region, so the statement that
+# physically contains a site AFTER one of them starts past the keyword, not at the
+# enclosing ``if``/``for``/``while`` head. (``)`` is handled positionally — a ``)``
+# closing a control header, e.g. ``for (...)``, is an un-matched closer at depth 0 in
+# the backward scan and already advances ``start``.)
+_RIG_BLOCK_OPENER_KEYWORDS = frozenset({"then", "do", "else", "repeat"})
+# Block CLOSER keywords: each ENDS an inner statement region, so the forward statement
+# scan stops there (``if c then <stmt> end`` -> ``<stmt>`` ends at ``end``).
+_RIG_BLOCK_CLOSER_KEYWORDS = frozenset({"end", "else", "elseif", "until"})
+_RIG_WORD_RE = re.compile(r"[A-Za-z_]\w*")
+
+
+def _advance_past_block_openers(projected: str, start: int, pos: int) -> int:
+    """Return the largest position ``<= pos`` that is the END of a depth-0 block-opener
+    keyword (``then``/``do``/``else``/``repeat``) lying in ``[start, pos)``, or ``start``
+    if none. Forward token scan over ``[start, pos)`` tracking bracket depth so a keyword
+    inside ``()``/``[]``/``{}`` (never a statement opener at this depth) is ignored."""
+    result = start
+    depth = 0
+    k = start
+    while k < pos:
+        ch = projected[k]
+        if ch in "([{":
+            depth += 1
+            k += 1
+            continue
+        if ch in ")]}":
+            if depth > 0:
+                depth -= 1
+            k += 1
+            continue
+        if depth == 0 and (ch.isalpha() or ch == "_"):
+            m = _RIG_WORD_RE.match(projected, k)
+            assert m is not None
+            if m.group(0) in _RIG_BLOCK_OPENER_KEYWORDS and m.end() <= pos:
+                result = m.end()
+            k = m.end()
+            continue
+        k += 1
+    return result
+
+
+def _rig_statement_bounds(projected: str, pos: int) -> tuple[int, int]:
+    """The ``[start, end)`` char bounds of the single Luau STATEMENT that physically
+    contains ``pos``, over the position-PRESERVING code projection ``projected``.
+
+    Backward from ``pos``: stop AFTER the nearest preceding depth-0 statement boundary
+    — a depth-0 ``;``, a code newline that is NOT an RHS continuation, an UN-matched
+    block opener (``)``/``{``/``then``/``do``/``else``/``repeat``), or start-of-source.
+    Forward from ``pos``: stop AT the next depth-0 ``;`` or non-continuation newline, or
+    EOF. Bracket depth is tracked so a ``;``/newline inside ``()``/``[]``/``{}`` does not
+    split. Both scans run over the projection so a delimiter inside a string/comment
+    (already blanked) can never bound the statement."""
+    n = len(projected)
+    # --- backward to statement start ---
+    start = 0
+    depth = 0
+    i = pos - 1
+    while i >= 0:
+        ch = projected[i]
+        if ch in ")]}":
+            depth += 1
+            i -= 1
+            continue
+        if ch in "([{":
+            if depth == 0:
+                start = i + 1  # an un-matched opener — statement begins after it
+                break
+            depth -= 1
+            i -= 1
+            continue
+        if depth == 0:
+            if ch == ";":
+                start = i + 1
+                break
+            if ch == "\n":
+                # A code newline ends the prior statement UNLESS the RHS continues
+                # across it (``_rig_line_continues`` mirrors the lowering's rule). The
+                # continuation test reads the line ENDING at this newline, so pass that
+                # line's start (the char after the preceding newline / source start).
+                line_start = projected.rfind("\n", 0, i) + 1
+                if not _rig_line_continues(projected, line_start, i):
+                    start = i + 1
+                    break
+        i -= 1
+    # A block opener KEYWORD (``then``/``do``/``else``/``repeat``) at depth 0 between
+    # ``start`` and ``pos`` begins a nested statement — advance ``start`` past the LAST
+    # such opener so ``if c then self.f = X[1] end`` anchors the inner statement at
+    # ``self.f`` (else the ``if`` head defeats the standalone-``self`` LHS match). Scan
+    # FORWARD from ``start`` over code positions, tracking bracket depth so an opener
+    # inside ``()``/``[]``/``{}`` is ignored.
+    start = _advance_past_block_openers(projected, start, pos)
+    # Skip leading blanks so the LHS anchor sits at the first token.
+    while start < pos and projected[start] in " \t\r\n":
+        start += 1
+    # --- forward to statement end ---
+    end = n
+    depth = 0
+    j = pos
+    while j < n:
+        ch = projected[j]
+        if ch in "([{":
+            depth += 1
+            j += 1
+            continue
+        if ch in ")]}":
+            if depth == 0:
+                end = j
+                break
+            depth -= 1
+            j += 1
+            continue
+        if depth == 0:
+            if ch == ";":
+                end = j
+                break
+            if ch == "\n":
+                if not _rig_line_continues(projected, start, j):
+                    end = j
+                    break
+            if ch.isalpha() or ch == "_":
+                wm = _RIG_WORD_RE.match(projected, j)
+                assert wm is not None
+                if wm.group(0) in _RIG_BLOCK_CLOSER_KEYWORDS:
+                    # A block CLOSER (``end``/``else``/``elseif``/``until``) ends the
+                    # inner statement: ``if c then self.f = X[1] end`` -> the write
+                    # statement ends at ``end``, so a trailing ``end`` does not look
+                    # like a trailing RHS operand.
+                    end = j
+                    break
+                j = wm.end()  # skip the whole identifier so its chars aren't re-scanned
+                continue
+        j += 1
+    return (start, end)
+
+
+def _site_is_discharged_rig_dead_write(
+    source: str, site_start: int, site_end: int, field: str
+) -> bool:
+    """True iff the GetChildren survivor SITE spanning ``[site_start, site_end)`` is the
+    dead init-write of a discharged rig binding's ``field`` — i.e. the single Luau
+    statement physically containing the site is EXACTLY the assignment
+    ``self.<field> = <recv>:GetChildren()[n]`` whose ENTIRE RHS is that one site.
+
+    The identity is STATEMENT-ANCHORED (not a forward span from a loose LHS substring):
+    we locate the site's enclosing statement bounds over the position-preserving
+    ``_rig_code_projection`` and require, in order:
+      (1) the statement OPENS with the standalone lvalue ``self.<field>`` then a real
+          assignment ``=`` (``_rig_exempt_lhs_re`` — rejects ``myself``/``a.self``
+          look-alikes, the ``weaponSlot``/``weaponSlotBackup`` prefix collision, and
+          every comparison operator); AND
+      (2) the GetChildren site is the WHOLE RHS — its receiver starts exactly at the
+          first RHS token (no leading ``nil or ...`` / other operand) and nothing but
+          whitespace follows the site to the statement end (no trailing ``+ bar:Get...``
+          operand). So an arbitrary RHS expression that merely CONTAINS a GetChildren
+          (``self.<field> = nil or foo:GetChildren()[1]``, ``... = a[1] + b[2]``) is NOT
+          the dead init-write and is NOT exempted.
+    Any statement that fails either gate (incl. an un-parseable / ambiguous one) returns
+    False — the site is counted, fail closed (a false-positive is safe; a mask is not)."""
     if not field:
-        return spans
+        return False
     projected = _rig_code_projection(source)
-    assign_re = re.compile(r"self\." + re.escape(field) + r"\s*=(?!=)")
-    for m in assign_re.finditer(projected):
-        rhs_start = m.end()
-        while rhs_start < len(projected) and projected[rhs_start] in " \t\r\n":
-            rhs_start += 1
-        rhs_end = _rig_statement_rhs_end(projected, rhs_start)
-        spans.append((rhs_start, rhs_end))
-    return spans
+    start, end = _rig_statement_bounds(projected, site_start)
+    if not (start <= site_start and site_end <= end):
+        return False
+    stmt = projected[start:end]
+    m = _rig_exempt_lhs_re(field).match(stmt)
+    if m is None:
+        return False  # statement does not OPEN with ``self.<field> =``
+    rhs_start = start + m.end()
+    # (2) the site must BE the whole RHS: receiver flush against the RHS start (only
+    # whitespace before it) and only whitespace after the site to the statement end.
+    if projected[rhs_start:site_start].strip() != "":
+        return False  # a leading operand precedes the site -> not the dead init-write
+    if projected[site_end:end].strip() != "":
+        return False  # a trailing operand follows the site -> not the dead init-write
+    return True
 
 
 def _check_surviving_child_ordinal(
