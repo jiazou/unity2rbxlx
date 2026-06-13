@@ -775,11 +775,14 @@ def _rig_method_suffix(child: str) -> str:
     return f"{sanitized}_{digest}"
 
 
-# The non-yielding lifecycle methods the rewrite ABSTAINS on (it cannot land a
-# ``task.wait``-bearing resolver call under the synchronous build loop). A bare
-# ``self.<field>`` READ inside one of these is NOT a surviving consumer — the
-# yield-guard intentionally leaves it (it reads the neutralized ``nil`` safely),
-# so it does not count against discharge. Mirrors the lowering's closed list.
+# The non-yielding lifecycle methods the LOWERING abstains on (it cannot land a
+# ``task.wait``-bearing resolver call under the synchronous build loop). The
+# lowering leaves a ``self.<field>`` read there un-rerouted. Path A re-anchor: the
+# VERIFIER does NOT inherit the lowering's lifecycle exemption — a raw read that
+# survives in ``Awake``/``Start`` can cache the stale wrong value (the init-write is
+# only Tier-2 best-effort-neutralized), so it is a FAIL-CLOSED boundary case (its
+# OWN loud row), NOT a silently-safe one. This set is used only to LABEL the read's
+# lifecycle context for the boundary scan, not to exempt it.
 _RIG_NON_YIELDING_LIFECYCLE: frozenset[str] = frozenset({"Awake", "Start"})
 
 # A code-level ``function <Class>:<method>(`` / ``function <Class>.<method>(``
@@ -835,15 +838,51 @@ def _rig_enclosing_method(source: str, pos: int) -> str | None:
     return method
 
 
-def _rig_has_surviving_field_read(source: str, field: str) -> bool:
-    """True if a bare ``self.<field>`` consumer READ survives at a code position
-    in a YIELD-SAFE method — meaning the lowering did NOT rewrite it through the
-    resolver. Excludes (a) a member-tail ``self`` (``x.self.<field>``), (b) the
-    assignment LHS (``self.<field> =``, not ``==``), and (c) a read inside a
-    non-yielding lifecycle method (``Awake``/``Start``) — the yield-guard leaves
-    those reading the neutralized ``nil``, which is safe and not a consumer."""
-    pattern = re.compile(r"self\." + re.escape(field) + r"\b")
-    for m in pattern.finditer(source):
+# A bracket-index read of the field on ``self``: ``self["<field>"]`` /
+# ``self['<field>']`` (whitespace-tolerant). The read-reroute covers the dot-form
+# ``self.<field>`` only, so this form is a FAIL-CLOSED boundary case (§4 e-boundary
+# (ii)) — the lowering cannot safely rewrite it, so a surviving bracket read must
+# fail loud, never silently pass.
+def _rig_bracket_read_re(field: str) -> "re.Pattern[str]":
+    return re.compile(
+        r"self\s*\[\s*['\"]" + re.escape(field) + r"['\"]\s*\]"
+    )
+
+
+# A NON-``self`` receiver READ of the field — a module-table ``<Class>.<field>``,
+# an ``owner.<field>``, or a receiver-alias ``local p = self; p.<field>``. Any
+# dotted-receiver ``<recv>.<field>`` where ``<recv>`` is NOT the bare ``self``
+# token is a raw consumption of the binding the dot-form read-reroute does NOT
+# rewrite, so it is a FAIL-CLOSED boundary case (§4 e-boundary (i)). The receiver
+# is captured (group 1) so the bare-``self`` form is excluded; the assignment LHS
+# is excluded by the caller's ``=`` lookahead.
+def _rig_nonself_read_re(field: str) -> "re.Pattern[str]":
+    return re.compile(r"([A-Za-z_]\w*)\." + re.escape(field) + r"\b")
+
+
+def _rig_has_surviving_field_consumption(source: str, field: str) -> bool:
+    """True if ANY raw consumption of the binding survives that the lowering's
+    dot-form READ reroute did NOT (and could not) safely rewrite — so the binding
+    is NOT discharged. Path A re-anchor: this is the load-bearing discharge gate
+    (replaces the old surviving-WRITE gate). It fires on:
+
+      (a) a bare ``self.<field>`` dot-form READ in ANY method (the read-reroute
+          should have rerouted it; a survivor means it did not land) — INCLUDING a
+          read in a non-yielding lifecycle method ``Awake``/``Start`` (§4 e-boundary
+          (iii): the verifier does NOT inherit the lowering's lifecycle exemption,
+          since the init-write is only best-effort-neutralized so the read can cache
+          stale state) and INCLUDING a shadowed-``self`` read (§4 e-boundary (iv));
+      (b) a bracket-index read ``self["<field>"]`` (§4 e-boundary (ii));
+      (c) a NON-``self`` receiver read ``<Class>.<field>`` / ``owner.<field>`` /
+          a receiver-alias ``p.<field>`` (§4 e-boundary (i)).
+
+    Excludes ONLY the assignment LHS (``self.<field> =`` / ``<recv>.<field> =``,
+    not ``==``) and a member-tail ``self`` (``x.self.<field>``, which is itself a
+    non-``self`` read caught by (c) on its own receiver). Each surviving form is a
+    FAIL-CLOSED boundary, never a silent pass."""
+    # (a) + shadow/lifecycle: a bare ``self.<field>`` dot-form READ.
+    dot_re = re.compile(r"self\." + re.escape(field) + r"\b")
+    for m in dot_re.finditer(source):
         start = m.start()
         if not _rig_pos_is_real_code(source, start):
             continue
@@ -851,7 +890,7 @@ def _rig_has_surviving_field_read(source: str, field: str) -> bool:
         while j >= 0 and source[j] in " \t":
             j -= 1
         if j >= 0 and source[j] == ".":
-            continue  # x.self.<field> -> not a bare read
+            continue  # x.self.<field> -> caught as a non-self read below, not here
         a = m.end()
         while a < len(source) and source[a] in " \t":
             a += 1
@@ -859,9 +898,51 @@ def _rig_has_surviving_field_read(source: str, field: str) -> bool:
             a + 1 < len(source) and source[a + 1] == "="
         ):
             continue  # assignment LHS -> not a read
-        if _rig_enclosing_method(source, start) in _RIG_NON_YIELDING_LIFECYCLE:
-            continue  # non-yielding lifecycle read -> abstained, not a consumer
+        # NOTE (Path A): a non-yielding lifecycle read and a shadowed-self read are
+        # NO LONGER exempted — they are surviving raw consumptions that fail closed.
         return True
+
+    # (b) a bracket-index read ``self["<field>"]`` (not an assignment LHS).
+    for m in _rig_bracket_read_re(field).finditer(source):
+        start = m.start()
+        if not _rig_pos_is_real_code(source, start):
+            continue
+        a = m.end()
+        while a < len(source) and source[a] in " \t":
+            a += 1
+        if a < len(source) and source[a] == "=" and not (
+            a + 1 < len(source) and source[a + 1] == "="
+        ):
+            continue  # assignment LHS -> not a read
+        return True
+
+    # (c) a NON-``self`` receiver dotted read ``<recv>.<field>`` (module-table,
+    # owner, or a receiver-alias). ``self`` itself is handled by (a); any other
+    # receiver is a boundary form the reroute cannot rewrite.
+    for m in _rig_nonself_read_re(field).finditer(source):
+        recv = m.group(1)
+        if recv == "self":
+            continue  # the bare ``self.<field>`` form -> handled by (a)
+        start = m.start()
+        if not _rig_pos_is_real_code(source, start):
+            continue
+        # exclude ``x.self.<field>`` (the receiver here is ``self`` preceded by a
+        # ``.``) — that read's true receiver is ``self`` but as a member tail it is
+        # foreign; treat it as a non-self consumption (fail closed) only if the
+        # captured receiver token is not ``self``. (recv != "self" already.)
+        a = m.end()
+        while a < len(source) and source[a] in " \t":
+            a += 1
+        if a < len(source) and source[a] == "=" and not (
+            a + 1 < len(source) and source[a + 1] == "="
+        ):
+            continue  # assignment LHS -> not a read
+        return True
+
+    # A shadowed-``self`` read (``function(self) ... self.<field> ...``) is still
+    # textually ``self.<field>``, so (a) already returned True for it — it fails
+    # closed without a separate shadow scan (§4 e-boundary (iv): a shadowed read is
+    # never silently counted as discharged; here it simply survives as a raw read).
     return False
 
 
@@ -1218,24 +1299,40 @@ def _rig_binding_discharged(source: str, field: str, child: str) -> bool:
     is ``field``'s binding discharged via the rig retarget in THIS final source?
     Derived from the SOURCE alone — anchored ONLY on the deterministic IR
     ``field``/``child`` (NOT the lowering's ``present`` self-stamp, NOT an
-    arbitrary AI-output token, and it never REPAIRS). True IFF, over code positions:
+    arbitrary AI-output token, and it never REPAIRS).
+
+    PATH A re-anchor — discharge keys on the consumer-READ reroute (the AI-STABLE
+    member access), NOT on the AI-VOLATILE write/ordinal shape. True IFF, over code
+    positions:
 
       (1) the injected per-instance resolver landed — the method
           ``function <Class>:_resolve<suffix>(`` exists WHOSE BODY is the rig
           resolver (the distinctive ``_MainCameraRig`` lookup as LIVE code) AND
-          >=1 ``self:_resolve<suffix>(`` CALL exists AND NO bare ``self.<field>``
-          consumer READ survives (the reads were rewritten through the resolver);
-          AND
-      (2) the original ordinal/camera-child WRITE is gone — no surviving
-          ``self.<field> = <... GetChild(n) | GetChildren()[n] ...>`` assignment.
+          >=1 ``self:_resolve<suffix>(`` CALL exists; AND
+      (2) **NO raw consumption of the binding survives** — no bare ``self.<field>``
+          dot-form READ (in ANY method, incl. ``Awake``/``Start`` and a shadowed
+          ``self``), no bracket-index ``self["<field>"]``, and no NON-``self``
+          receiver read (``<Class>.<field>`` / ``owner.<field>`` / a receiver-alias
+          ``p.<field>``). This is the discharge gate (``_rig_has_surviving_field_
+          consumption``); every surviving form FAILS CLOSED (the Path A generality
+          boundary — never silently passes).
+
+    The 'no surviving camera-child ordinal WRITE' clause is DROPPED from the
+    discharge gate (Path A re-anchor). On the 5 real RHS write shapes there may be
+    no positional ordinal to anchor, and the write is dead data once the reads are
+    rerouted, so a surviving init-write must NOT fail discharge — a script whose
+    init-write was Tier-2-SKIPPED but whose reads are all rerouted MUST discharge
+    True. The surviving-ordinal-WRITE scan is retained as a best-effort SECONDARY
+    DIAGNOSTIC only (``_rig_has_surviving_ordinal_write``), not a PASS/FAIL gate.
 
     ``suffix`` is reconstructed from ``child`` by the same deterministic
     sanitization the lowering uses, so the method name matches whatever the
     lowering emitted (verbatim for a plain child name; a sanitized+hashed suffix
     for a child with spaces/special chars). This is the §2 'loud-check-against-the-
-    fact' — it confirms the LOWERING's deterministic binding actually LANDED,
+    fact' — it confirms the LOWERING's deterministic READ reroute actually LANDED,
     independent of the lowering's belief, so a mis-stamp / reverted edit / stale
-    resume carrier (or a FOREIGN same-named stub) is caught."""
+    resume carrier (or a FOREIGN same-named stub) is caught, AND an unsupported
+    boundary form fails loud."""
     if not field or not child:
         return False
     suffix = _rig_method_suffix(child)
@@ -1249,12 +1346,11 @@ def _rig_binding_discharged(source: str, field: str, child: str) -> bool:
     # the declaration is ``function <Class>:_resolve<suffix>(``, not ``self:...``).
     if not _rig_code_contains(source, call):
         return False
-    # (1c) no surviving bare consumer READ of ``self.<field>``.
-    if _rig_has_surviving_field_read(source, field):
-        return False
-    # (2) the ordinal/camera-child WRITE was neutralized (no surviving positional
-    # ordinal write of the field).
-    if _rig_has_surviving_ordinal_write(source, field):
+    # (2) no surviving raw consumption of the binding (the LOAD-BEARING Path A gate):
+    # a dot-form ``self.<field>`` read (incl. lifecycle/shadowed), a bracket-index
+    # ``self["<field>"]``, or a NON-``self`` receiver read — each a fail-closed
+    # boundary the read-reroute cannot safely rewrite.
+    if _rig_has_surviving_field_consumption(source, field):
         return False
     return True
 

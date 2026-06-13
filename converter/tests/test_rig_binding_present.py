@@ -420,28 +420,33 @@ def test_review_f1_foreign_resolver_stub_does_not_discharge() -> None:
     assert len(_rig_rows([script])) == 1
 
 
-def test_review_f2_multiline_surviving_ordinal_write_is_detected() -> None:
-    """BLOCKING #2 (both voices) — the surviving-ordinal-write scan must be
-    continuation-aware. A multiline surviving camera-child write
-    (``self.weaponSlot =\\n  self.cam:GetChildren()[1]``) re-clobbers the field at
-    runtime, so it must be DETECTED -> NOT discharged -> the check fires."""
+def test_review_f2_multiline_surviving_ordinal_write_secondary_diagnostic() -> None:
+    """SECONDARY DIAGNOSTIC (Path A re-anchor) — the surviving-ordinal-write scan
+    stays continuation-aware (kept machinery), but under Path A a surviving
+    init-WRITE no longer fails DISCHARGE: with the reads rerouted, the leftover
+    write is dead data (nothing reads ``self.weaponSlot``). The scan still DETECTS
+    the multiline write (it is the demoted secondary diagnostic), but
+    ``_rig_binding_discharged`` is now True (the read reroute is the load-bearing
+    gate, not the write shape)."""
     green = _lower()
     # Inject a SURVIVING multiline camera-child ordinal write into the yielding
-    # GetRifle (a re-clobber the lowering's one-write neutralize missed).
+    # GetRifle (a leftover the lowering's one-write neutralize skipped). It is an
+    # LHS write of the field, so it does NOT survive as a raw READ.
     multiline_source = green.luau_source.replace(
         "return rifle\nend",
         "self.weaponSlot =\n        self.cam:GetChildren()[1]\n    return rifle\nend",
     )
     assert "self.cam:GetChildren()[1]" in multiline_source
-    # Scan-level: the multiline write IS detected (pre-fix missed it -> True = BUG).
+    # Secondary diagnostic still detects the surviving write (kept machinery).
     assert _rig_has_surviving_ordinal_write(multiline_source, "weaponSlot") is True
-    assert _rig_binding_discharged(multiline_source, "weaponSlot", "WeaponSlot") is False
+    # Path A: discharge keys on the READ reroute — a dead write does NOT block it.
+    assert _rig_binding_discharged(multiline_source, "weaponSlot", "WeaponSlot") is True
     script = _rbx(
         "Player",
         multiline_source,
         {"field": "weaponSlot", "child": "WeaponSlot", "present": True},
     )
-    assert len(_rig_rows([script])) == 1
+    assert _rig_rows([script]) == []
 
 
 def test_review_f3_resolver_only_in_long_bracket_does_not_discharge() -> None:
@@ -485,59 +490,61 @@ def test_review_f3_resolver_only_in_long_bracket_does_not_discharge() -> None:
 # span. The fix closes the whole postfix class (``[``/``(``/``.``/``:``). Each
 # split case is RED against 1ca1cbb (the round-1 verifier).
 # ---------------------------------------------------------------------------
-def test_review_r2_split_before_index_surviving_write_is_detected() -> None:
-    """ROUND-2 BLOCKING — a surviving camera-child write split BEFORE the ``[``
-    index (``self.weaponSlot = self.cam:GetChildren()\\n    [1]``) re-clobbers the
-    field at runtime, so the continuation-aware RHS span must reach the ``[1]`` ->
-    the write is DETECTED -> NOT discharged -> the check fires."""
+def test_review_r2_split_before_index_surviving_write_secondary_diagnostic() -> None:
+    """ROUND-2 (now SECONDARY DIAGNOSTIC under Path A) — the continuation-aware RHS
+    span still reaches a write split BEFORE the ``[`` index
+    (``self.weaponSlot = self.cam:GetChildren()\\n    [1]``), so the secondary
+    diagnostic DETECTS it (kept machinery). But Path A drops the write from the
+    discharge gate: with the reads rerouted, the leftover write is dead -> the
+    binding STILL discharges True."""
     green = _lower()
     split_source = green.luau_source.replace(
         "return rifle\nend",
         "self.weaponSlot = self.cam:GetChildren()\n        [1]\n    return rifle\nend",
     )
     assert "self.cam:GetChildren()\n        [1]" in split_source
-    # Scan-level: the split-before-index write IS detected (round-1 missed it).
+    # Secondary diagnostic still detects the split-before-index write.
     assert _rig_has_surviving_ordinal_write(split_source, "weaponSlot") is True
-    assert _rig_binding_discharged(split_source, "weaponSlot", "WeaponSlot") is False
+    # Path A: a dead leftover write does not block discharge.
+    assert _rig_binding_discharged(split_source, "weaponSlot", "WeaponSlot") is True
     script = _rbx(
         "Player",
         split_source,
         {"field": "weaponSlot", "child": "WeaponSlot", "present": True},
     )
-    assert len(_rig_rows([script])) == 1
+    assert _rig_rows([script]) == []
 
 
-def test_review_r2_split_before_getchild_call_is_detected() -> None:
-    """ROUND-2 — the call-continuation head (``(``): a write split BEFORE the
-    ``GetChild(`` call args (``self.weaponSlot = self.cam:GetChild\\n    (1)``)
-    must be spanned -> detected -> not discharged."""
+def test_review_r2_split_before_getchild_call_secondary_diagnostic() -> None:
+    """ROUND-2 (secondary diagnostic) — the call-continuation head (``(``): the scan
+    still spans a write split BEFORE the ``GetChild(`` call args; Path A keeps it as
+    the demoted diagnostic, discharge stays True (dead write)."""
     green = _lower()
     split_source = green.luau_source.replace(
         "return rifle\nend",
         "self.weaponSlot = self.cam:GetChild\n        (1)\n    return rifle\nend",
     )
     assert _rig_has_surviving_ordinal_write(split_source, "weaponSlot") is True
-    assert _rig_binding_discharged(split_source, "weaponSlot", "WeaponSlot") is False
+    assert _rig_binding_discharged(split_source, "weaponSlot", "WeaponSlot") is True
     script = _rbx(
         "Player",
         split_source,
         {"field": "weaponSlot", "child": "WeaponSlot", "present": True},
     )
-    assert len(_rig_rows([script])) == 1
+    assert _rig_rows([script]) == []
 
 
-def test_review_r2_split_before_member_getchildren_is_detected() -> None:
-    """ROUND-2 — the member-continuation head (``.``): a write split BEFORE the
-    member access (``self.weaponSlot = self.cam\\n    :GetChildren()[1]`` is the
-    ``:`` head already handled; the ``.`` head is exercised by splitting before a
-    ``.GetChild`` member form). Spanned -> detected -> not discharged."""
+def test_review_r2_split_before_member_getchildren_secondary_diagnostic() -> None:
+    """ROUND-2 (secondary diagnostic) — the member-continuation head (``.``): the
+    scan still spans a write split BEFORE a ``.GetChild`` member form. Path A keeps
+    the scan as the demoted diagnostic; discharge stays True (dead write)."""
     green = _lower()
     split_source = green.luau_source.replace(
         "return rifle\nend",
         "self.weaponSlot = self.cam\n        .GetChild(1)\n    return rifle\nend",
     )
     assert _rig_has_surviving_ordinal_write(split_source, "weaponSlot") is True
-    assert _rig_binding_discharged(split_source, "weaponSlot", "WeaponSlot") is False
+    assert _rig_binding_discharged(split_source, "weaponSlot", "WeaponSlot") is True
 
 
 def test_review_r2_over_reach_guard_does_not_swallow_following_statement() -> None:
@@ -581,23 +588,24 @@ def test_review_r3_whitespace_at_colon_method_junction_is_detected() -> None:
         "self.weaponSlot = self.cam : GetChildren ( ) [ 1 ]\n    return rifle\nend",
     )
     assert _rig_has_surviving_ordinal_write(spaced, "weaponSlot") is True
-    assert _rig_binding_discharged(spaced, "weaponSlot", "WeaponSlot") is False
+    # Path A: the surviving write is a dead leftover -> discharge stays True.
+    assert _rig_binding_discharged(spaced, "weaponSlot", "WeaponSlot") is True
     script = _rbx(
         "Player", spaced, {"field": "weaponSlot", "child": "WeaponSlot", "present": True}
     )
-    assert len(_rig_rows([script])) == 1
+    assert _rig_rows([script]) == []
 
 
 def test_review_r3_whitespace_before_method_getchild_is_detected() -> None:
     """ROUND-3 — the ``:`` -> ``GetChild`` junction whitespace variant
-    (``self.cam: GetChild(1)``) is also detected."""
+    (``self.cam: GetChild(1)``) is also detected (secondary diagnostic)."""
     green = _lower()
     spaced = green.luau_source.replace(
         "return rifle\nend",
         "self.weaponSlot = self.cam: GetChild(1)\n    return rifle\nend",
     )
     assert _rig_has_surviving_ordinal_write(spaced, "weaponSlot") is True
-    assert _rig_binding_discharged(spaced, "weaponSlot", "WeaponSlot") is False
+    assert _rig_binding_discharged(spaced, "weaponSlot", "WeaponSlot") is True
 
 
 def test_review_r3_comment_after_call_before_index_is_detected() -> None:
@@ -612,24 +620,26 @@ def test_review_r3_comment_after_call_before_index_is_detected() -> None:
     )
     assert "-- gap" in commented
     assert _rig_has_surviving_ordinal_write(commented, "weaponSlot") is True
-    assert _rig_binding_discharged(commented, "weaponSlot", "WeaponSlot") is False
+    # Path A: the surviving write is a dead leftover -> discharge stays True.
+    assert _rig_binding_discharged(commented, "weaponSlot", "WeaponSlot") is True
     script = _rbx(
         "Player", commented,
         {"field": "weaponSlot", "child": "WeaponSlot", "present": True},
     )
-    assert len(_rig_rows([script])) == 1
+    assert _rig_rows([script]) == []
 
 
 def test_review_r3_comment_before_method_is_detected() -> None:
     """ROUND-3 — a ``--`` comment between the receiver and its method
-    (``self.cam -- gap\\n  :GetChildren()[1]``) must not truncate the span either."""
+    (``self.cam -- gap\\n  :GetChildren()[1]``) must not truncate the span either
+    (secondary diagnostic)."""
     green = _lower()
     commented = green.luau_source.replace(
         "return rifle\nend",
         "self.weaponSlot = self.cam -- gap\n        :GetChildren()[1]\n    return rifle\nend",
     )
     assert _rig_has_surviving_ordinal_write(commented, "weaponSlot") is True
-    assert _rig_binding_discharged(commented, "weaponSlot", "WeaponSlot") is False
+    assert _rig_binding_discharged(commented, "weaponSlot", "WeaponSlot") is True
 
 
 def test_review_r3_crlf_line_ending_split_is_detected() -> None:
@@ -643,7 +653,8 @@ def test_review_r3_crlf_line_ending_split_is_detected() -> None:
     )
     assert "\r\n" in crlf
     assert _rig_has_surviving_ordinal_write(crlf, "weaponSlot") is True
-    assert _rig_binding_discharged(crlf, "weaponSlot", "WeaponSlot") is False
+    # Path A: the surviving write is a dead leftover -> discharge stays True.
+    assert _rig_binding_discharged(crlf, "weaponSlot", "WeaponSlot") is True
 
 
 def test_review_r3_ordinal_inside_string_does_not_false_detect() -> None:
@@ -829,3 +840,299 @@ def test_review_r4_corpus_with_real_resolver_body_still_discharges() -> None:
     assert _rig_binding_discharged(green.luau_source, "weaponSlot", "WeaponSlot") is True
     script = _rbx("Player", green.luau_source, green.rig_binding)
     assert _rig_rows([script]) == []
+
+
+# ===========================================================================
+# PATH A re-anchor (D-S1b-PATHA) — discharge keys on the READ reroute (RHS-agnostic),
+# NOT the write shape; + the FAIL-CLOSED BOUNDARY for forms the reroute cannot rewrite.
+# ===========================================================================
+
+# The 5 real AI write shapes for ``self.weaponSlot`` (design §3.4 / acceptance e.i):
+# the lowering reroutes the GetRifle READS identically on ALL of them because the
+# reroute keys on the AI-STABLE ``self.<field>`` member access, NOT the write RHS.
+_WRITE_SHAPES = {
+    "getchildren_ordinal": "self.weaponSlot = self.cam and self.cam:GetChildren()[1]",
+    "gameobject": "self.weaponSlot = self.gameObject",
+    "unitychild": "self.weaponSlot = self.cam and __unityChild(self.cam, 1)",
+    "multistep_local": (
+        "local children = self.cam:GetChildren()\n"
+        "    self.weaponSlot = children[1]"
+    ),
+    "findfirstchild_fallback": (
+        'self.weaponSlot = self.cam:FindFirstChild("WeaponSlot")'
+    ),
+}
+
+
+@pytest.mark.parametrize("shape_name", sorted(_WRITE_SHAPES))
+def test_pathA_discharges_on_all_five_real_write_shapes(shape_name: str) -> None:
+    """e.i (Path A) — discharge is RHS-AGNOSTIC: across all 5 real write shapes the
+    read reroute lands identically, ``_rig_binding_discharged`` is True, and the
+    verifier is GREEN. The OLD write-anchored discharge abstained on shapes 2-5
+    (the D-S2-REDESIGN failure); Path A discharges on all 5."""
+    write = _WRITE_SHAPES[shape_name]
+    src = _AI_OUTPUT_SHAPE.replace(
+        "self.weaponSlot = self.cam and self.cam:GetChildren()[1]", write
+    )
+    lowered = _lower(source=src)
+    # The reads were rerouted regardless of which write shape the AI emitted.
+    assert "self:_resolveWeaponSlot()" in lowered.luau_source
+    assert _rig_binding_discharged(
+        lowered.luau_source, "weaponSlot", "WeaponSlot"
+    ) is True
+    assert lowered.rig_binding == {
+        "field": "weaponSlot",
+        "child": "WeaponSlot",
+        "present": True,
+    }
+    script = _rbx("Player", lowered.luau_source, lowered.rig_binding)
+    assert _rig_rows([script]) == []
+
+
+def test_pathA_tier2_skipped_write_but_reads_rerouted_discharges_true() -> None:
+    """e.i / h.3 (Path A) — a script whose Tier-2 init-write neutralize was SKIPPED
+    (the collapsed ``self.gameObject`` shape the recognizer does not match) but whose
+    consumer READS are all rerouted MUST discharge True. The leftover write is dead
+    data; discharge keys on the read reroute, NOT the write. (This DROPS the old
+    'surviving ordinal write fails discharge' gate — the superseded clause.)"""
+    src = _AI_OUTPUT_SHAPE.replace(
+        "self.weaponSlot = self.cam and self.cam:GetChildren()[1]",
+        "self.weaponSlot = self.gameObject",
+    )
+    lowered = _lower(source=src)
+    # The init-write was NOT neutralized (no camera-child ordinal to recognize) ...
+    assert "self.weaponSlot = self.gameObject" in lowered.luau_source
+    # ... but discharge still holds because every consumer read was rerouted.
+    assert _rig_binding_discharged(
+        lowered.luau_source, "weaponSlot", "WeaponSlot"
+    ) is True
+    assert lowered.rig_binding["present"] is True
+    assert _rig_rows([_rbx("Player", lowered.luau_source, lowered.rig_binding)]) == []
+
+
+# ---------------------------------------------------------------------------
+# e-boundary (i)-(iv) — the FAIL-CLOSED BOUNDARY. Each is a source where the
+# resolver method + a call ARE present (clauses 1a/1b pass) but an UNSUPPORTED
+# consumption form survives -> discharge MUST be False -> a loud row -> success=False.
+# Each is RED against 5da0eab (the pre-boundary verifier, which exempted lifecycle/
+# shadowed reads and only gated on the dot-form read + the ordinal WRITE).
+# ---------------------------------------------------------------------------
+def _green_plus_boundary_read(injected_read_stmt: str) -> str:
+    """The real discharged Player output with an extra UNSUPPORTED boundary READ
+    of the field injected into the yielding GetRifle (after the rerouted reads).
+    The resolver + calls stay intact, so the ONLY thing blocking discharge is the
+    surviving boundary consumption."""
+    green = _lower()
+    return green.luau_source.replace(
+        "    return rifle\nend",
+        "    " + injected_read_stmt + "\n    return rifle\nend",
+        1,
+    )
+
+
+def test_e_boundary_i_nonself_receiver_owner_fails_closed() -> None:
+    """e-boundary (i) — a NON-``self`` receiver read ``owner.weaponSlot`` (the
+    reroute target ``self.weaponSlot`` is absent) FAILS CLOSED. A bare
+    'no self.<field> survives' check alone would FALSE-PASS this (the codex
+    fail-open hole)."""
+    src = _green_plus_boundary_read("local x = owner.weaponSlot")
+    assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is False
+    script = _rbx(
+        "Player", src, {"field": "weaponSlot", "child": "WeaponSlot", "present": True}
+    )
+    assert len(_rig_rows([script])) == 1
+
+
+def test_e_boundary_i_receiver_alias_fails_closed() -> None:
+    """e-boundary (i) — a receiver-alias ``local p = self; p.weaponSlot`` read FAILS
+    CLOSED (the alias ``p`` is a non-``self`` receiver the reroute does not cover)."""
+    src = _green_plus_boundary_read("local p = self\n    local x = p.weaponSlot")
+    assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is False
+    script = _rbx(
+        "Player", src, {"field": "weaponSlot", "child": "WeaponSlot", "present": True}
+    )
+    assert len(_rig_rows([script])) == 1
+
+
+def test_e_boundary_i_module_table_fails_closed() -> None:
+    """e-boundary (i) — a legacy module-table read ``Player.weaponSlot`` FAILS CLOSED
+    (dead-legacy form; a future module-table mode is a logged boundary, not a silent
+    miss)."""
+    src = _green_plus_boundary_read("local x = Player.weaponSlot")
+    assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is False
+    assert len(_rig_rows([
+        _rbx("Player", src, {"field": "weaponSlot", "child": "WeaponSlot", "present": True})
+    ])) == 1
+
+
+def test_e_boundary_ii_bracket_index_fails_closed() -> None:
+    """e-boundary (ii) — a bracket-index read ``self["weaponSlot"]`` FAILS CLOSED
+    (the reroute covers the dot-form only)."""
+    src = _green_plus_boundary_read('local x = self["weaponSlot"]')
+    assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is False
+    script = _rbx(
+        "Player", src, {"field": "weaponSlot", "child": "WeaponSlot", "present": True}
+    )
+    assert len(_rig_rows([script])) == 1
+
+
+def test_e_boundary_iii_lifecycle_read_fails_closed() -> None:
+    """e-boundary (iii) — a raw ``self.weaponSlot`` READ surviving in a NON-yielding
+    lifecycle method (``Awake``/``Start``) gets its OWN loud row (NOT a blanket
+    exempt). Under Path A the init-write is only best-effort-neutralized, so a
+    lifecycle read can cache the stale wrong value -> it must fail closed. The
+    pre-boundary verifier EXEMPTED lifecycle reads (false-pass) -> RED vs 5da0eab."""
+    green = _lower()
+    # Inject a surviving raw read into Awake (a non-yielding lifecycle method the
+    # lowering does not reroute). The resolver + GetRifle reroute stay intact.
+    src = green.luau_source.replace(
+        "    self.weaponSlot = nil",
+        "    self.weaponSlot = nil\n    local cached = self.weaponSlot",
+        1,
+    )
+    assert "local cached = self.weaponSlot" in src
+    assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is False
+    script = _rbx(
+        "Player", src, {"field": "weaponSlot", "child": "WeaponSlot", "present": True}
+    )
+    assert len(_rig_rows([script])) == 1
+
+
+def test_e_boundary_iv_shadowed_self_read_fails_closed() -> None:
+    """e-boundary (iv) — a ``self.weaponSlot`` read under an enclosing shadowing
+    ``self`` (a ``function(self)`` closure) FAILS CLOSED: it is still a surviving raw
+    ``self.<field>`` read (on a FOREIGN object), so the verifier never counts it as
+    discharged. The pre-boundary verifier exempted shadowed reads -> RED vs 5da0eab."""
+    src = _green_plus_boundary_read(
+        "local cb = function(self)\n"
+        "        return self.weaponSlot\n"
+        "    end\n"
+        "    cb(somethingElse)"
+    )
+    assert "function(self)" in src
+    assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is False
+    script = _rbx(
+        "Player", src, {"field": "weaponSlot", "child": "WeaponSlot", "present": True}
+    )
+    assert len(_rig_rows([script])) == 1
+
+
+# ---------------------------------------------------------------------------
+# Generic — a DIFFERENT game (field/child) discharges IDENTICALLY (g-generic).
+# ---------------------------------------------------------------------------
+def test_g_generic_different_game_torchmount_discharges_green() -> None:
+    """g-generic (Path A) — a class ``Hero`` with field ``torchMount`` and a
+    MainCamera child ``TorchAnchor`` discharges green via the same mechanism: NO
+    ``weaponSlot``/``WeaponSlot``/``rifle`` hardcode anywhere in the discharge path.
+    ``field``/``child`` are purely the carrier's projections."""
+    hero_src = (
+        _AI_OUTPUT_SHAPE.replace("Player", "Hero")
+        .replace("weaponSlot", "torchMount")
+        .replace("riflePrefab", "torchPrefab")
+        .replace("GetRifle", "GetTorch")
+        .replace("rifle", "torch")
+    )
+    lowered = _lower(
+        source=hero_src,
+        field="torchMount",
+        child="TorchAnchor",
+        source_path="/proj/Hero.cs",
+    )
+    assert "function Hero:_resolveTorchAnchor()" in lowered.luau_source
+    assert 'rig:FindFirstChild("TorchAnchor", true)' in lowered.luau_source
+    assert "self:_resolveTorchAnchor()" in lowered.luau_source
+    assert _rig_binding_discharged(
+        lowered.luau_source, "torchMount", "TorchAnchor"
+    ) is True
+    assert lowered.rig_binding == {
+        "field": "torchMount",
+        "child": "TorchAnchor",
+        "present": True,
+    }
+    # The verifier is GREEN, and keys on the carrier's field/child, not a hardcode.
+    assert _rig_rows([_rbx("Hero", lowered.luau_source, lowered.rig_binding)]) == []
+    # No rifle/weaponSlot leaked into the lowered output.
+    assert "weaponSlot" not in lowered.luau_source
+    assert "WeaponSlot" not in lowered.luau_source
+
+
+# ---------------------------------------------------------------------------
+# Pre-fix RED proof for the boundary (e-boundary) — narrator-INDEPENDENT: load the
+# ACTUAL 5da0eab verifier blob from git and run the boundary sources through ITS
+# ``_rig_binding_discharged``. The forms the pre-boundary verifier MISSED (non-self
+# receiver, bracket-index, lifecycle read) false-PASS there (discharged=True) and
+# fail closed under Path A — proving the boundary is a real, load-bearing addition.
+# (The shadowed-self form already failed closed at 5da0eab — it is a textual
+# ``self.<field>`` dot read the old read-scan caught — so it is a REGRESSION GUARD,
+# green both ways, asserted separately by test_e_boundary_iv above.)
+# ---------------------------------------------------------------------------
+def _load_old_verifier_module():
+    """Import the 5da0eab (pre-boundary) ``contract_verifier`` blob as a standalone
+    module, so the RED proof runs against the REAL prior code, not a reconstruction."""
+    import importlib.util
+    import subprocess
+
+    repo_root = Path(__file__).resolve().parent.parent.parent  # the worktree root
+    blob = subprocess.run(
+        ["git", "show", "5da0eab:converter/converter/contract_verifier.py"],
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    old_path = Path(__file__).parent / "_old_contract_verifier_5da0eab.py"
+    old_path.write_text(blob, encoding="utf-8")
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "_old_cv_5da0eab", str(old_path)
+        )
+        assert spec is not None and spec.loader is not None
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["_old_cv_5da0eab"] = mod
+        spec.loader.exec_module(mod)
+        return mod
+    finally:
+        old_path.unlink(missing_ok=True)
+
+
+def test_e_boundary_pre_fix_red_proof_against_real_5da0eab_blob() -> None:
+    """e-boundary pre-fix-RED proof — the non-self / bracket / lifecycle boundary
+    forms each FALSE-PASS the ACTUAL 5da0eab discharge gate (loaded from git), and
+    fail closed under Path A. Run against the real prior code (narrator-independent),
+    not a reconstruction."""
+    old = _load_old_verifier_module()
+    red_forms = {
+        "owner": _green_plus_boundary_read("local x = owner.weaponSlot"),
+        "alias": _green_plus_boundary_read("local p = self\n    local x = p.weaponSlot"),
+        "module": _green_plus_boundary_read("local x = Player.weaponSlot"),
+        "bracket": _green_plus_boundary_read('local x = self["weaponSlot"]'),
+        "lifecycle": _lower().luau_source.replace(
+            "    self.weaponSlot = nil",
+            "    self.weaponSlot = nil\n    local cached = self.weaponSlot",
+            1,
+        ),
+    }
+    for name, src in red_forms.items():
+        # PRE-FIX (real 5da0eab): false-passes (discharged True).
+        assert old._rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is True, (
+            f"{name}: the real 5da0eab gate must false-PASS (proving the Path A "
+            f"boundary is load-bearing)"
+        )
+        # POST-FIX (Path A): fails closed.
+        assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is False, (
+            f"{name}: Path A boundary must fail closed"
+        )
+
+
+def test_e_boundary_iv_shadowed_is_regression_guard_red_both_ways() -> None:
+    """The shadowed-``self`` form is a REGRESSION GUARD: it failed closed already at
+    5da0eab (the read is textually ``self.weaponSlot`` and the old read-scan caught
+    it) and still fails closed under Path A. Asserting it green-both-ways documents
+    that it is NOT a newly-caught false-pass (unlike the non-self/bracket/lifecycle
+    forms)."""
+    old = _load_old_verifier_module()
+    src = _green_plus_boundary_read(
+        "local cb = function(self)\n        return self.weaponSlot\n    end\n    cb(o)"
+    )
+    assert old._rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is False
+    assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is False
