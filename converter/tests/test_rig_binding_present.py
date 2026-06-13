@@ -1136,3 +1136,110 @@ def test_e_boundary_iv_shadowed_is_regression_guard_red_both_ways() -> None:
     )
     assert old._rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is False
     assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is False
+
+
+# ===========================================================================
+# Dual-voice REVIEW round 1 (D-S1b-PATHA-r1) — the boundary gate was a BLACKLIST
+# (``_rig_nonself_read_re`` = single-token ``<ident>.field``; ``_rig_bracket_read_re``
+# = bare ``self["field"]``), so EXOTIC receivers EVADED it and false-passed an
+# undischarged source. The fix is a RECEIVER-AGNOSTIC whitelist: ANY surviving
+# code-position field-access READ of ``<field>`` (dot member OR string-key bracket,
+# computed key included) fails closed REGARDLESS of receiver, except an assignment
+# LHS (a Tier-2-skipped write) and the injected resolver's own internals.
+#
+# Each exotic form below false-PASSES the REAL 7b59488 blacklist (proven by
+# ``test_pathA_r1_exotic_receivers_red_against_7b59488``) and fails closed now.
+# ===========================================================================
+
+# The exotic-receiver field READS codex listed + the whitespace/newline-dot + a
+# computed/concatenated bracket key. Each is a SURVIVING field-access READ of the
+# bound field that the ``self.<field>`` read-reroute does NOT cover.
+_EXOTIC_RECEIVER_READS = {
+    "paren_owner": "local x = (owner).weaponSlot",
+    "getter_call": "local x = getOwner().weaponSlot",
+    "indexed_owner": "local x = owners[1].weaponSlot",
+    "member_tail_self": "local x = other.self.weaponSlot",
+    "paren_self_bracket": 'local x = (self)["weaponSlot"]',
+    "whitespace_dot": "local x = self .weaponSlot",
+    "newline_dot": "local x = self.\n        weaponSlot",
+    "computed_bracket_key": 'local x = self["weapon".."Slot"]',
+}
+
+
+@pytest.mark.parametrize("form", sorted(_EXOTIC_RECEIVER_READS))
+def test_pathA_r1_exotic_receiver_read_fails_closed(form: str) -> None:
+    """D-S1b-PATHA-r1 — each exotic-receiver / whitespace-dot / computed-key field
+    READ is a surviving raw consumption the reroute cannot rewrite, so discharge
+    FAILS CLOSED and the verifier fires a loud row. The resolver + the rerouted
+    GetRifle reads stay intact, so the ONLY thing blocking discharge is the exotic
+    surviving READ — the receiver-agnostic gate must catch it regardless of shape."""
+    src = _green_plus_boundary_read(_EXOTIC_RECEIVER_READS[form])
+    assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is False
+    script = _rbx(
+        "Player", src, {"field": "weaponSlot", "child": "WeaponSlot", "present": True}
+    )
+    assert len(_rig_rows([script])) == 1
+
+
+def test_pathA_r1_exotic_receivers_red_against_7b59488() -> None:
+    """D-S1b-PATHA-r1 pre-fix-RED proof (narrator-INDEPENDENT) — load the ACTUAL
+    7b59488 (round-1 blacklist) verifier blob from git and run each exotic form
+    through ITS ``_rig_binding_discharged``. Every exotic form false-PASSES there
+    (discharged=True — the blacklist evaded it) and fails closed under the
+    receiver-agnostic whitelist, proving the fix is load-bearing."""
+    import importlib.util
+    import subprocess
+
+    repo_root = Path(__file__).resolve().parent.parent.parent  # the worktree root
+    blob = subprocess.run(
+        ["git", "show", "7b59488:converter/converter/contract_verifier.py"],
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    old_path = Path(__file__).parent / "_old_contract_verifier_7b59488.py"
+    old_path.write_text(blob, encoding="utf-8")
+    try:
+        spec = importlib.util.spec_from_file_location("_old_cv_7b59488", str(old_path))
+        assert spec is not None and spec.loader is not None
+        old = importlib.util.module_from_spec(spec)
+        sys.modules["_old_cv_7b59488"] = old
+        spec.loader.exec_module(old)
+    finally:
+        old_path.unlink(missing_ok=True)
+
+    for form, stmt in _EXOTIC_RECEIVER_READS.items():
+        src = _green_plus_boundary_read(stmt)
+        # PRE-FIX (real 7b59488 blacklist): the exotic receiver EVADED it -> false-pass.
+        assert old._rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is True, (
+            f"{form}: the real 7b59488 blacklist must false-PASS (proving the "
+            f"receiver-agnostic gate is load-bearing)"
+        )
+        # POST-FIX (receiver-agnostic whitelist): fails closed.
+        assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is False, (
+            f"{form}: the receiver-agnostic gate must fail closed"
+        )
+
+
+def test_pathA_r1_nonself_write_lhs_exception_still_discharges() -> None:
+    """D-S1b-PATHA-r1 write-LHS exception — a surviving NON-``self`` receiver field
+    WRITE (``owner.weaponSlot = 5``) is a Tier-2-skipped write, NOT a read, so it
+    does NOT block discharge (discharge is decoupled from neutralize). With the
+    reads rerouted, the binding STILL discharges True. (The corpus's own
+    ``self.weaponSlot = nil`` write-LHS exception is covered by the happy-path
+    tests; this proves the exception is RECEIVER-AGNOSTIC too — a write LHS on any
+    receiver survives.)"""
+    src = _green_plus_boundary_read("owner.weaponSlot = 5")
+    assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is True
+    assert _rig_rows([
+        _rbx("Player", src, {"field": "weaponSlot", "child": "WeaponSlot", "present": True})
+    ]) == []
+
+
+def test_pathA_r1_bracket_write_lhs_exception_still_discharges() -> None:
+    """D-S1b-PATHA-r1 write-LHS exception (bracket form) — a surviving bracket WRITE
+    ``self["weaponSlot"] = x`` is a write LHS, not a read, so it does not block
+    discharge."""
+    src = _green_plus_boundary_read('self["weaponSlot"] = somethingElse')
+    assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is True

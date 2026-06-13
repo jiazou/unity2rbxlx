@@ -838,111 +838,178 @@ def _rig_enclosing_method(source: str, pos: int) -> str | None:
     return method
 
 
-# A bracket-index read of the field on ``self``: ``self["<field>"]`` /
-# ``self['<field>']`` (whitespace-tolerant). The read-reroute covers the dot-form
-# ``self.<field>`` only, so this form is a FAIL-CLOSED boundary case (§4 e-boundary
-# (ii)) — the lowering cannot safely rewrite it, so a surviving bracket read must
-# fail loud, never silently pass.
-def _rig_bracket_read_re(field: str) -> "re.Pattern[str]":
-    return re.compile(
-        r"self\s*\[\s*['\"]" + re.escape(field) + r"['\"]\s*\]"
+# A field-access READ of the ``<field>`` token, RECEIVER-AGNOSTIC. The reroute
+# only rewrites the AI-STABLE ``self.<field>`` dot read; ANY OTHER field-access of
+# the same token that survives is a raw consumption the lowering could not rewrite,
+# so the binding is NOT discharged — fail closed. We do NOT enumerate receiver
+# shapes (the round-1 blacklist a long tail of exotic receivers evaded). Instead we
+# close the whole class: a SURVIVING field-access READ of ``<field>`` fails closed
+# REGARDLESS of receiver, with exactly two known-good exceptions (assignment LHS;
+# the injected resolver's own internals).
+#
+# (1) DOT member access: the ``<field>`` token immediately preceded (modulo
+#     whitespace/comments) by a ``.`` — ``self.<field>``, ``owner.<field>``,
+#     ``(owner).<field>``, ``getOwner().<field>``, ``owners[1].<field>``,
+#     ``other.self.<field>``, ``self .<field>``, ``self.\n<field>`` ALL match,
+#     because the discriminator is "a ``.`` precedes the token", not the receiver.
+def _rig_field_token_re(field: str) -> "re.Pattern[str]":
+    return re.compile(r"\b" + re.escape(field) + r"\b")
+
+
+# (2) STRING-KEY bracket access: ``[ "<field>" ]`` / ``[ '<field>' ]`` —
+#     receiver-agnostic (``(self)["<field>"]``, ``owner["<field>"]``, ...). The
+#     key must be a CLEAN single string literal equal to ``<field>``; a computed /
+#     concatenated key (``["weapon".."Slot"]``) does NOT match this clean form, and
+#     is independently caught by ``_rig_has_computed_field_key`` (fail closed).
+def _rig_string_key_read_re(field: str) -> "re.Pattern[str]":
+    return re.compile(r"\[\s*(['\"])" + re.escape(field) + r"\1\s*\]")
+
+
+def _rig_pos_is_assignment_lhs(proj: str, end: int) -> bool:
+    """True if the field-access ending at ``end`` is the LHS of an ``=`` assignment
+    (a WRITE — a Tier-2-skipped init-write may legitimately survive; discharge is
+    decoupled from neutralize). The next non-ws/comment CODE char after the access
+    (read off the position-preserving code PROJECTION ``proj``) is a single ``=``
+    (not ``==``)."""
+    a = end
+    n = len(proj)
+    while a < n and proj[a] in " \t\r\n":
+        a += 1
+    return (
+        a < n
+        and proj[a] == "="
+        and not (a + 1 < n and proj[a + 1] == "=")
     )
 
 
-# A NON-``self`` receiver READ of the field — a module-table ``<Class>.<field>``,
-# an ``owner.<field>``, or a receiver-alias ``local p = self; p.<field>``. Any
-# dotted-receiver ``<recv>.<field>`` where ``<recv>`` is NOT the bare ``self``
-# token is a raw consumption of the binding the dot-form read-reroute does NOT
-# rewrite, so it is a FAIL-CLOSED boundary case (§4 e-boundary (i)). The receiver
-# is captured (group 1) so the bare-``self`` form is excluded; the assignment LHS
-# is excluded by the caller's ``=`` lookahead.
-def _rig_nonself_read_re(field: str) -> "re.Pattern[str]":
-    return re.compile(r"([A-Za-z_]\w*)\." + re.escape(field) + r"\b")
+def _rig_has_computed_field_key(source: str, field: str) -> bool:
+    """True if a bracket access carries a COMPUTED/CONCATENATED key that produces
+    ``<field>`` (e.g. ``["weapon".."Slot"]``). A computed key is a raw consumption
+    the reroute cannot rewrite, so it fails closed. Detected structurally on the
+    RAW source: a ``[ ... ]`` access whose interior contains a string-concatenation
+    (``..``) AND whose concatenated string FRAGMENTS, joined, contain ``<field>``.
+    Conservative — only fires on a concatenation that reconstructs the field token,
+    never on an unrelated dynamic index."""
+    bracket_re = re.compile(r"\[([^\[\]]*\.\.[^\[\]]*)\]")
+    for m in bracket_re.finditer(source):
+        if not _rig_pos_is_real_code(source, m.start()):
+            continue
+        interior = m.group(1)
+        # Join the string-literal fragments inside the bracket; if the
+        # concatenation reconstructs the field token, it is a computed field read.
+        joined = "".join(re.findall(r"['\"]([^'\"]*)['\"]", interior))
+        if field and field in joined:
+            return True
+    return False
 
 
-def _rig_has_surviving_field_consumption(source: str, field: str) -> bool:
-    """True if ANY raw consumption of the binding survives that the lowering's
-    dot-form READ reroute did NOT (and could not) safely rewrite — so the binding
-    is NOT discharged. Path A re-anchor: this is the load-bearing discharge gate
-    (replaces the old surviving-WRITE gate). It fires on:
+# The resolver's own internal field of the form ``_<field>Cache`` (the memo). Its
+# token is ``_<field>Cache``, NOT a bare ``<field>`` field-access (the char before
+# ``<field>`` is ``_`` and after is ``C`` — no word boundary), so the
+# ``_rig_field_token_re`` word-boundary scan never matches it. Kept as an explicit
+# exception only for robustness against a future cache-field rename.
+def _rig_is_resolver_internal_access(
+    source: str, start: int, end: int, suffix: str
+) -> bool:
+    """True if the field-access at ``[start, end)`` is part of the INJECTED
+    resolver's own internals — the ``_<field>Cache`` memo field OR any position
+    inside the injected ``_resolve<suffix>`` method body — so it is NOT a foreign
+    surviving consumption. (A REROUTED read became ``self:_resolve<suffix>()`` and
+    carries NO ``.<field>`` field-access, so it correctly does not reach here.)
+    ``suffix`` is the CHILD-derived resolver-method suffix the lowering emitted."""
+    # The ``_<field>Cache`` memo: a ``_`` immediately precedes the token and
+    # ``Cache`` immediately follows it.
+    if (
+        start >= 1
+        and source[start - 1] == "_"
+        and source[end:end + 5] == "Cache"
+    ):
+        return True
+    # Inside the injected ``_resolve<suffix>`` method body.
+    decl_re = re.compile(
+        r"\bfunction\s+[A-Za-z_]\w*[:.]_resolve" + re.escape(suffix) + r"\s*\("
+    )
+    for m in decl_re.finditer(source):
+        if not _rig_pos_is_real_code(source, m.start()):
+            continue
+        body_end = _rig_method_body_end(source, m.start())
+        if m.start() <= start < body_end:
+            return True
+    return False
 
-      (a) a bare ``self.<field>`` dot-form READ in ANY method (the read-reroute
-          should have rerouted it; a survivor means it did not land) — INCLUDING a
-          read in a non-yielding lifecycle method ``Awake``/``Start`` (§4 e-boundary
-          (iii): the verifier does NOT inherit the lowering's lifecycle exemption,
-          since the init-write is only best-effort-neutralized so the read can cache
-          stale state) and INCLUDING a shadowed-``self`` read (§4 e-boundary (iv));
-      (b) a bracket-index read ``self["<field>"]`` (§4 e-boundary (ii));
-      (c) a NON-``self`` receiver read ``<Class>.<field>`` / ``owner.<field>`` /
-          a receiver-alias ``p.<field>`` (§4 e-boundary (i)).
 
-    Excludes ONLY the assignment LHS (``self.<field> =`` / ``<recv>.<field> =``,
-    not ``==``) and a member-tail ``self`` (``x.self.<field>``, which is itself a
-    non-``self`` read caught by (c) on its own receiver). Each surviving form is a
-    FAIL-CLOSED boundary, never a silent pass."""
-    # (a) + shadow/lifecycle: a bare ``self.<field>`` dot-form READ.
-    dot_re = re.compile(r"self\." + re.escape(field) + r"\b")
-    for m in dot_re.finditer(source):
+def _rig_has_surviving_field_consumption(
+    source: str, field: str, child: str
+) -> bool:
+    """True if ANY surviving code-position field-access READ of the ``<field>``
+    token survives that the lowering's dot-form READ reroute did NOT (and could not)
+    safely rewrite — so the binding is NOT discharged. Path A re-anchor: this is the
+    load-bearing discharge gate (replaces the old surviving-WRITE gate).
+
+    RECEIVER-AGNOSTIC (round-1 BLOCKING fix): the discriminator is "a raw
+    ``<field>`` field-access READ survived", NOT the receiver shape. We do NOT
+    enumerate receiver forms (the blacklist a long tail of exotic receivers —
+    ``(owner).<field>``, ``getOwner().<field>``, ``owners[1].<field>``,
+    ``other.self.<field>``, ``(self)["<field>"]`` — silently evaded). A field-access
+    READ is any occurrence of the exact ``<field>`` token used as a FIELD ACCESS:
+
+      * preceded (modulo whitespace/comments) by a ``.`` (dot member access), OR
+      * appearing as a string key inside ``[ "..." ]`` / ``[ '...' ]`` (bracket
+        access), OR a computed/concatenated bracket key that reconstructs ``<field>``.
+
+    Each such access is a SURVIVING CONSUMPTION (→ fail closed) UNLESS it is one of
+    the two known-good exceptions:
+
+      1. an ASSIGNMENT LHS (``<recv>.<field> =`` / ``<recv>["<field>"] =``, not
+         ``==``) — a WRITE; a Tier-2-skipped init-write may legitimately survive
+         (discharge is decoupled from neutralize);
+      2. the injected resolver's OWN internals — the ``_<field>Cache`` memo and any
+         occurrence inside the injected ``_resolve<suffix>`` method body. (A
+         rerouted read became ``self:_resolve<suffix>()`` and contains NO
+         ``.<field>`` field-access, so it correctly never matches.)
+
+    The RECEIVER is ignored entirely (``self``, ``owner``, ``(owner)``,
+    ``getOwner()``, ``owners[1]``, ``other.self``, parenthesized, aliased — ALL fail
+    closed identically), closing the whole receiver-form class with no enumeration."""
+    # The resolver method is named for the CHILD (``_resolve<child-suffix>``), so the
+    # resolver-body exception keys on the child-derived suffix the lowering emitted.
+    suffix = _rig_method_suffix(child)
+    # Position-preserving code projection (comment/string interiors blanked) so the
+    # preceding-``.`` and assignment-LHS checks see CODE, not formatting or strings.
+    proj = _rig_code_projection(source)
+
+    # (1) DOT member access: a ``.`` immediately precedes the ``<field>`` token.
+    for m in _rig_field_token_re(field).finditer(source):
         start = m.start()
+        end = m.end()
         if not _rig_pos_is_real_code(source, start):
             continue
+        # Walk back over whitespace AND blanked comment chars (projection) to the
+        # preceding CODE char; a ``.`` there makes this a dot field-access.
         j = start - 1
-        while j >= 0 and source[j] in " \t":
+        while j >= 0 and proj[j] in " \t\r\n":
             j -= 1
-        if j >= 0 and source[j] == ".":
-            continue  # x.self.<field> -> caught as a non-self read below, not here
-        a = m.end()
-        while a < len(source) and source[a] in " \t":
-            a += 1
-        if a < len(source) and source[a] == "=" and not (
-            a + 1 < len(source) and source[a + 1] == "="
-        ):
-            continue  # assignment LHS -> not a read
-        # NOTE (Path A): a non-yielding lifecycle read and a shadowed-self read are
-        # NO LONGER exempted — they are surviving raw consumptions that fail closed.
+        if j < 0 or proj[j] != ".":
+            continue  # not a dot member access (a bare identifier / write target name)
+        if _rig_pos_is_assignment_lhs(proj, end):
+            continue  # WRITE LHS -> a Tier-2-skipped write may survive
+        if _rig_is_resolver_internal_access(source, start, end, suffix):
+            continue  # the injected resolver's own internals
         return True
 
-    # (b) a bracket-index read ``self["<field>"]`` (not an assignment LHS).
-    for m in _rig_bracket_read_re(field).finditer(source):
+    # (2) STRING-KEY bracket access: ``[ "<field>" ]`` / ``[ '<field>' ]``.
+    for m in _rig_string_key_read_re(field).finditer(source):
         start = m.start()
         if not _rig_pos_is_real_code(source, start):
             continue
-        a = m.end()
-        while a < len(source) and source[a] in " \t":
-            a += 1
-        if a < len(source) and source[a] == "=" and not (
-            a + 1 < len(source) and source[a + 1] == "="
-        ):
-            continue  # assignment LHS -> not a read
+        if _rig_pos_is_assignment_lhs(proj, m.end()):
+            continue  # WRITE LHS
         return True
 
-    # (c) a NON-``self`` receiver dotted read ``<recv>.<field>`` (module-table,
-    # owner, or a receiver-alias). ``self`` itself is handled by (a); any other
-    # receiver is a boundary form the reroute cannot rewrite.
-    for m in _rig_nonself_read_re(field).finditer(source):
-        recv = m.group(1)
-        if recv == "self":
-            continue  # the bare ``self.<field>`` form -> handled by (a)
-        start = m.start()
-        if not _rig_pos_is_real_code(source, start):
-            continue
-        # exclude ``x.self.<field>`` (the receiver here is ``self`` preceded by a
-        # ``.``) — that read's true receiver is ``self`` but as a member tail it is
-        # foreign; treat it as a non-self consumption (fail closed) only if the
-        # captured receiver token is not ``self``. (recv != "self" already.)
-        a = m.end()
-        while a < len(source) and source[a] in " \t":
-            a += 1
-        if a < len(source) and source[a] == "=" and not (
-            a + 1 < len(source) and source[a + 1] == "="
-        ):
-            continue  # assignment LHS -> not a read
+    # (2b) COMPUTED/CONCATENATED bracket key reconstructing ``<field>``.
+    if _rig_has_computed_field_key(source, field):
         return True
 
-    # A shadowed-``self`` read (``function(self) ... self.<field> ...``) is still
-    # textually ``self.<field>``, so (a) already returned True for it — it fails
-    # closed without a separate shadow scan (§4 e-boundary (iv): a shadowed read is
-    # never silently counted as discharged; here it simply survives as a raw read).
     return False
 
 
@@ -1350,7 +1417,7 @@ def _rig_binding_discharged(source: str, field: str, child: str) -> bool:
     # a dot-form ``self.<field>`` read (incl. lifecycle/shadowed), a bracket-index
     # ``self["<field>"]``, or a NON-``self`` receiver read — each a fail-closed
     # boundary the read-reroute cannot safely rewrite.
-    if _rig_has_surviving_field_consumption(source, field):
+    if _rig_has_surviving_field_consumption(source, field, child):
         return False
     return True
 
