@@ -997,6 +997,223 @@ def test_r3_check_d_exemption_anchors_on_generic_receiver_and_ordinal(
     )
 
 
+# ---------------------------------------------------------------------------
+# REAL-CHAIN check-D witness — NO hand-built fact, NO hardcoded anchor (r3 fix).
+# The tests above use a HAND-BUILT RigRootedRetargetFact (acceptable to unit-
+# witness check-D logic in isolation), but 1.4 is the END-TO-END witness slice and
+# must witness the FULL fact->carrier PROMOTION: the real resolver computes
+# cam_receiver/ordinal, the real lowering STAMPS them into the carrier, and the
+# real verifier's check-D exemption matches on THOSE stamped keys. So if the
+# lowering's promotion regresses (drops/garbles cam_receiver/cam_ordinal), the
+# exemption silently reverts to a field-only mask and these tests RED.
+# ---------------------------------------------------------------------------
+def _real_chain_ai_output_with_survivor(*, class_name: str, field: str) -> str:
+    """An AI-output Player shape whose Awake carries a SURVIVING credited dead
+    ordinal write — the ambiguous single-line ``if self.cam then self.<field> =
+    self.cam:GetChildren()[1] end`` Tier-2 SKIPS — plus the yielding GetRifle
+    consumer reads the read-reroute discharges. ``cam`` matches the real
+    resolver's cam_receiver and ``[1]`` matches its credited ordinal+1 (the C# in
+    ``_resolve_real_rig_fact`` is ``cam = Camera.main.transform; <field> =
+    cam.GetChild(0)`` -> cam_receiver='cam', ordinal=0). The PROMOTION (not this
+    source) decides whether the survivor is exempt."""
+    return (
+        f"local {class_name} = {{}}\n"
+        f"{class_name}.__index = {class_name}\n"
+        f"function {class_name}.new()\n"
+        f"    local self = setmetatable({{}}, {class_name})\n"
+        "    return self\n"
+        "end\n"
+        f"function {class_name}:Awake()\n"
+        "    self.cam = workspace.CurrentCamera\n"
+        f"    if self.cam then self.{field} = self.cam:GetChildren()[1] end\n"
+        "end\n"
+        f"function {class_name}:GetRifle()\n"
+        f"    local rifle = self.host.instantiatePrefab(self.riflePrefab, self.{field}, pivotOf(self.{field}))\n"
+        f"    if self.{field} then rifle:PivotTo(pivotOf(self.{field})) end\n"
+        "    return rifle\n"
+        "end\n"
+        f"return {class_name}\n"
+    )
+
+
+def _lower_via_real_producer_with_survivor(
+    tmp_path: Path, *, field: str, child: str, class_name: str
+) -> tuple[_Script, RigRootedRetargetFact]:
+    """Drive the WHOLE r3 promotion chain with NO hand-built carrier: the REAL
+    resolver (``build_child_ref_map`` -> ``_resolve_rig_facts``) computes the
+    ``RigRootedRetargetFact`` (and thus its ``cam_receiver``/``ordinal``); the REAL
+    lowering then STAMPS those values FROM the fact INTO the ``rig_binding``
+    carrier. Returns ``(edited_script, real_fact)`` so the caller asserts the
+    carrier's anchor came from the fact, never a literal."""
+    entry, key = _resolve_real_rig_fact(
+        tmp_path, field=field, child=child, class_name=class_name
+    )
+    assert entry.rig_facts, "the real producer must admit the rig fact"
+    fact = entry.rig_facts[0]
+    s = _Script(
+        _real_chain_ai_output_with_survivor(class_name=class_name, field=field),
+        source_path=key,
+    )
+    # The lowering reads cam_receiver/ordinal OFF THE REAL FACT (not hand-built).
+    lower_rifle_rig_retarget([s], {key: entry})
+    return s, fact
+
+
+def _verify_budget0_for(script: RbxScript, topology: dict[str, object]) -> object:
+    """Check-D budget 0 (resolved Player) over an arbitrary-module ``script``."""
+    script.child_ref_resolution = {"getchild_total": 1, "resolved_total": 1}
+    return verify_contract(topology, [script])
+
+
+def test_r3_real_chain_check_d_exempts_promoted_anchor_end_to_end(
+    tmp_path: Path,
+) -> None:
+    """REAL-CHAIN END-TO-END WITNESS (acceptance f-r3.i, full promotion) — drives
+    the WHOLE r3 chain with NO hand-built fact and NO hardcoded anchor: the REAL
+    resolver computes ``cam_receiver``/``ordinal`` from the C# + hierarchy, the REAL
+    lowering STAMPS them into the carrier, and the REAL verifier's check-D exemption
+    matches the surviving credited dead write on THOSE stamped keys. The surviving
+    site really exists (Tier-2 skipped), check D at budget 0 EXEMPTS it (no
+    ``child_ordinal_survivor``, not blocked) — and because the matching keys came
+    from the REAL fact via the REAL lowering, a promotion regression (lowering drops
+    or garbles ``cam_receiver``/``cam_ordinal``) flips the exemption off and REDS
+    this test. Generic: every load-bearing value is read from the fact/carrier."""
+    field, child, class_name = "gunSlot", "GunMount", "Soldier"
+    s, fact = _lower_via_real_producer_with_survivor(
+        tmp_path, field=field, child=child, class_name=class_name
+    )
+    rb = s.rig_binding
+    assert isinstance(rb, dict)
+    # The carrier's anchor was PROMOTED from the real fact — assert equality against
+    # the FACT's values (no literals), so this is a true promotion witness.
+    assert rb["cam_receiver"] == fact.cam_receiver, (
+        "the lowering must PROMOTE the resolver fact's cam_receiver into the carrier"
+    )
+    assert rb["cam_ordinal"] == fact.ordinal, (
+        "the lowering must PROMOTE the resolver fact's ordinal into cam_ordinal"
+    )
+    assert rb["present"] is True, "the read reroute must discharge present=True"
+    # The credited dead ordinal write GENUINELY survives (the exemption's target).
+    # The surviving site is keyed on the REAL fact's receiver+ordinal, never a literal.
+    survivor_site = (
+        f"self.{field} = self.{fact.cam_receiver}:GetChildren()[{fact.ordinal + 1}]"
+    )
+    assert survivor_site in s.luau_source, (
+        f"the credited dead ordinal write must survive Tier-2 for this witness: "
+        f"{survivor_site!r}"
+    )
+
+    topology = {"modules": {class_name: {"stem": class_name}}}
+    script = RbxScript(name=class_name, source=s.luau_source, rig_binding=rb)
+    res = _verify_budget0_for(script, topology)
+    survivor = [v for v in res.violations if v.check == "child_ordinal_survivor"]
+    assert survivor == [], (
+        "check D must EXEMPT the credited dead write whose anchor was PROMOTED from "
+        f"the real fact (promotion intact): {[v.detail for v in survivor]}"
+    )
+    assert [v for v in res.violations if v.check == "rig_binding_present"] == []
+    assert fail_closed_errors(res) == [], (
+        f"a discharged rig with a promoted-anchor survivor must not fail closed: "
+        f"{fail_closed_errors(res)}"
+    )
+
+
+def test_r3_real_chain_check_d_fires_when_survivor_ordinal_diverges_from_promotion(
+    tmp_path: Path,
+) -> None:
+    """REAL-CHAIN ANCHOR-DISCRIMINATION WITNESS (acceptance f-r3.iii, full
+    promotion) — proves the exemption READ the PROMOTED ``cam_ordinal`` (not a
+    blanket field mask). Drive the SAME real producer->lowering promotion, then
+    MUTATE the SURVIVING SITE to a DIFFERENT ordinal (``[k+1]``) than the one the
+    real fact credited. The surviving site no longer matches the promoted anchor
+    (``k != cam_ordinal+1``) -> check D FIRES ``child_ordinal_survivor`` and the
+    conversion fails closed. If the promotion had dropped ``cam_ordinal`` the
+    exemption could not discriminate; that this REDS only after the mutation proves
+    the anchor came from the real fact and is load-bearing."""
+    field, child, class_name = "gunSlot", "GunMount", "Soldier"
+    s, fact = _lower_via_real_producer_with_survivor(
+        tmp_path, field=field, child=child, class_name=class_name
+    )
+    rb = s.rig_binding
+    assert isinstance(rb, dict) and rb["present"] is True
+    credited = f"self.{fact.cam_receiver}:GetChildren()[{fact.ordinal + 1}]"
+    diverged = f"self.{fact.cam_receiver}:GetChildren()[{fact.ordinal + 2}]"
+    mutated_source = s.luau_source.replace(credited, diverged, 1)
+    assert mutated_source != s.luau_source, "the surviving site must be present to mutate"
+    assert diverged in mutated_source
+
+    topology = {"modules": {class_name: {"stem": class_name}}}
+    script = RbxScript(name=class_name, source=mutated_source, rig_binding=rb)
+    res = _verify_budget0_for(script, topology)
+    survivor = [v for v in res.violations if v.check == "child_ordinal_survivor"]
+    assert survivor != [], (
+        "a survivor at a DIFFERENT ordinal than the promoted cam_ordinal must FIRE "
+        "check D — the exemption discriminates on the promoted anchor, not the field"
+    )
+    assert any("child_ordinal_survivor" in e for e in fail_closed_errors(res))
+
+
+def test_r3_real_chain_check_d_fires_when_survivor_receiver_diverges_from_promotion(
+    tmp_path: Path,
+) -> None:
+    """REAL-CHAIN ANCHOR-DISCRIMINATION WITNESS (acceptance f-r3.ii, full promotion)
+    — proves the exemption READ the PROMOTED ``cam_receiver``. Same real
+    producer->lowering promotion, but MUTATE the surviving site's RECEIVER to a
+    different symbol than the fact credited. The site no longer matches the promoted
+    receiver -> check D FIRES. A promotion that garbled ``cam_receiver`` (or a
+    receiver-blind exemption) would FALSE-PASS this genuine survivor."""
+    field, child, class_name = "gunSlot", "GunMount", "Soldier"
+    s, fact = _lower_via_real_producer_with_survivor(
+        tmp_path, field=field, child=child, class_name=class_name
+    )
+    rb = s.rig_binding
+    assert isinstance(rb, dict) and rb["present"] is True
+    assert fact.cam_receiver != "muzzle", "pick a receiver distinct from the credited one"
+    credited = f"self.{fact.cam_receiver}:GetChildren()[{fact.ordinal + 1}]"
+    diverged = f"self.muzzle:GetChildren()[{fact.ordinal + 1}]"
+    mutated_source = s.luau_source.replace(credited, diverged, 1)
+    assert mutated_source != s.luau_source and diverged in mutated_source
+
+    topology = {"modules": {class_name: {"stem": class_name}}}
+    script = RbxScript(name=class_name, source=mutated_source, rig_binding=rb)
+    res = _verify_budget0_for(script, topology)
+    survivor = [v for v in res.violations if v.check == "child_ordinal_survivor"]
+    assert survivor != [], (
+        "a survivor through a DIFFERENT receiver than the promoted cam_receiver must "
+        "FIRE check D — the exemption discriminates on the promoted receiver anchor"
+    )
+    assert any("child_ordinal_survivor" in e for e in fail_closed_errors(res))
+
+
+def test_r3_real_chain_exemption_dies_if_promotion_drops_anchor_keys(
+    tmp_path: Path,
+) -> None:
+    """REAL-CHAIN NON-TAUTOLOGY GUARD — confirms the exemption is LOAD-BEARING on the
+    promoted keys: if the lowering had NOT promoted ``cam_receiver``/``cam_ordinal``
+    into the carrier (a regression), the same surviving credited dead write would
+    NOT be exempted and check D would FIRE. Simulated by stripping the promoted keys
+    from the REAL carrier (mimicking a promotion that dropped them), holding source +
+    discharge fixed. This makes the exemption a genuine guard: the GREEN of the
+    end-to-end exemption test above depends on the promotion actually happening."""
+    field, child, class_name = "gunSlot", "GunMount", "Soldier"
+    s, fact = _lower_via_real_producer_with_survivor(
+        tmp_path, field=field, child=child, class_name=class_name
+    )
+    rb = s.rig_binding
+    assert isinstance(rb, dict)
+    # A carrier as it would be if the promotion DROPPED the anchor keys (regression).
+    no_anchor = {"field": rb["field"], "child": rb["child"], "present": rb["present"]}
+    topology = {"modules": {class_name: {"stem": class_name}}}
+    script = RbxScript(name=class_name, source=s.luau_source, rig_binding=no_anchor)
+    res = _verify_budget0_for(script, topology)
+    survivor = [v for v in res.violations if v.check == "child_ordinal_survivor"]
+    assert survivor != [], (
+        "WITHOUT the promoted cam_receiver/cam_ordinal anchor the credited dead "
+        "write must NOT be exempted -> check D FIRES. (Proves the end-to-end "
+        "exemption witness depends on the real promotion, not on the source alone.)"
+    )
+
+
 # ===========================================================================
 # 3. FRESH-CONVERSION E2E (acceptance g — conversion half).
 # Assert on the REAL captured pipeline OUTPUT (the corpus fixture S2 regenerated
