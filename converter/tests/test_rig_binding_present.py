@@ -145,6 +145,42 @@ def _rig_rows(scripts: list[RbxScript]) -> list:
     return [v for v in res.violations if v.check == "rig_binding_present"]
 
 
+def _load_old_contract_verifier(sha: str, mod_name: str) -> object:
+    """Load the ``contract_verifier.py`` blob at ``sha`` as a standalone module for a
+    pre-fix RED proof. SKIP (not fail) when ``sha`` is unreachable — these proofs are
+    point-in-time artifacts: an intermediate slice commit is orphaned by the run's
+    rebase/redesign and absent from a fresh clone (CI) or after merge. The forward
+    behavior (current code is correct) is covered by the many non-archaeology tests in
+    this file; these RED proofs only guard "the fix wasn't a tautology", which is
+    meaningful only against the real old blob."""
+    import importlib.util
+    import subprocess
+
+    repo_root = Path(__file__).resolve().parent.parent.parent  # the worktree root
+    proc = subprocess.run(
+        ["git", "show", f"{sha}:converter/converter/contract_verifier.py"],
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        pytest.skip(
+            f"historical contract_verifier blob {sha} unreachable "
+            f"(orphaned intermediate slice commit; RED proof is point-in-time)"
+        )
+    old_path = Path(__file__).parent / f"_old_cv_{mod_name}.py"
+    old_path.write_text(proc.stdout, encoding="utf-8")
+    try:
+        spec = importlib.util.spec_from_file_location(f"_old_cv_{mod_name}", str(old_path))
+        assert spec is not None and spec.loader is not None
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[f"_old_cv_{mod_name}"] = mod
+        spec.loader.exec_module(mod)
+        return mod
+    finally:
+        old_path.unlink(missing_ok=True)
+
+
 # Sanity: the real lowering discharges the on-corpus shape.
 def test_real_lowering_discharges_corpus_shape() -> None:
     s = _lower()
@@ -1059,33 +1095,11 @@ def test_g_generic_different_game_torchmount_discharges_green() -> None:
 # ``self.<field>`` dot read the old read-scan caught — so it is a REGRESSION GUARD,
 # green both ways, asserted separately by test_e_boundary_iv above.)
 # ---------------------------------------------------------------------------
-def _load_old_verifier_module():
+def _load_old_verifier_module() -> object:
     """Import the 5da0eab (pre-boundary) ``contract_verifier`` blob as a standalone
-    module, so the RED proof runs against the REAL prior code, not a reconstruction."""
-    import importlib.util
-    import subprocess
-
-    repo_root = Path(__file__).resolve().parent.parent.parent  # the worktree root
-    blob = subprocess.run(
-        ["git", "show", "5da0eab:converter/converter/contract_verifier.py"],
-        cwd=str(repo_root),
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
-    old_path = Path(__file__).parent / "_old_contract_verifier_5da0eab.py"
-    old_path.write_text(blob, encoding="utf-8")
-    try:
-        spec = importlib.util.spec_from_file_location(
-            "_old_cv_5da0eab", str(old_path)
-        )
-        assert spec is not None and spec.loader is not None
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules["_old_cv_5da0eab"] = mod
-        spec.loader.exec_module(mod)
-        return mod
-    finally:
-        old_path.unlink(missing_ok=True)
+    module, so the RED proof runs against the REAL prior code, not a reconstruction.
+    SKIPs when 5da0eab is unreachable (orphaned in a fresh clone / after merge)."""
+    return _load_old_contract_verifier("5da0eab", "5da0eab")
 
 
 def test_e_boundary_pre_fix_red_proof_against_real_5da0eab_blob() -> None:
@@ -1180,27 +1194,7 @@ def test_pathA_r1_exotic_receivers_red_against_7b59488() -> None:
     through ITS ``_rig_binding_discharged``. Every exotic form false-PASSES there
     (discharged=True — the blacklist evaded it) and fails closed under the
     receiver-agnostic whitelist, proving the fix is load-bearing."""
-    import importlib.util
-    import subprocess
-
-    repo_root = Path(__file__).resolve().parent.parent.parent  # the worktree root
-    blob = subprocess.run(
-        ["git", "show", "7b59488:converter/converter/contract_verifier.py"],
-        cwd=str(repo_root),
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
-    old_path = Path(__file__).parent / "_old_contract_verifier_7b59488.py"
-    old_path.write_text(blob, encoding="utf-8")
-    try:
-        spec = importlib.util.spec_from_file_location("_old_cv_7b59488", str(old_path))
-        assert spec is not None and spec.loader is not None
-        old = importlib.util.module_from_spec(spec)
-        sys.modules["_old_cv_7b59488"] = old
-        spec.loader.exec_module(old)
-    finally:
-        old_path.unlink(missing_ok=True)
+    old = _load_old_contract_verifier("7b59488", "7b59488")
 
     for form, stmt in _EXOTIC_RECEIVER_READS.items():
         src = _green_plus_boundary_read(stmt)
@@ -1442,27 +1436,7 @@ def test_pathA_r3_paren_self_red_against_5f36a38() -> None:
     missed the parens) and fails closed under the normalized receiver check,
     proving the fix is load-bearing. The bare ``self[k]`` stays fail-closed in
     BOTH (no regression of the realistic case)."""
-    import importlib.util
-    import subprocess
-
-    repo_root = Path(__file__).resolve().parent.parent.parent  # the worktree root
-    blob = subprocess.run(
-        ["git", "show", "5f36a38:converter/converter/contract_verifier.py"],
-        cwd=str(repo_root),
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
-    old_path = Path(__file__).parent / "_old_contract_verifier_5f36a38.py"
-    old_path.write_text(blob, encoding="utf-8")
-    try:
-        spec = importlib.util.spec_from_file_location("_old_cv_5f36a38", str(old_path))
-        assert spec is not None and spec.loader is not None
-        old = importlib.util.module_from_spec(spec)
-        sys.modules["_old_cv_5f36a38"] = old
-        spec.loader.exec_module(old)
-    finally:
-        old_path.unlink(missing_ok=True)
+    old = _load_old_contract_verifier("5f36a38", "5f36a38")
 
     paren_forms = [
         "local x = (self)[k]",
@@ -1515,27 +1489,7 @@ def test_pathA_r3_false_fail_shapes_red_against_041e0ec() -> None:
     dynamic shapes false-FAIL there (discharged=False — over-strict) and discharge
     True now, proving the tightening is load-bearing. The exact-fold READ stays
     fail-closed in BOTH (no regression of the realistic case)."""
-    import importlib.util
-    import subprocess
-
-    repo_root = Path(__file__).resolve().parent.parent.parent  # the worktree root
-    blob = subprocess.run(
-        ["git", "show", "041e0ec:converter/converter/contract_verifier.py"],
-        cwd=str(repo_root),
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
-    old_path = Path(__file__).parent / "_old_contract_verifier_041e0ec.py"
-    old_path.write_text(blob, encoding="utf-8")
-    try:
-        spec = importlib.util.spec_from_file_location("_old_cv_041e0ec", str(old_path))
-        assert spec is not None and spec.loader is not None
-        old = importlib.util.module_from_spec(spec)
-        sys.modules["_old_cv_041e0ec"] = old
-        spec.loader.exec_module(old)
-    finally:
-        old_path.unlink(missing_ok=True)
+    old = _load_old_contract_verifier("041e0ec", "041e0ec")
 
     # The shapes the over-broad gate false-FAILED (over-strict): each discharges True
     # now. (The fully-dynamic keys — ``self[someVar]`` / ``self[fn()]`` /
@@ -1683,27 +1637,7 @@ def test_pathA_r4_encoded_reads_and_multi_writes_red_against_d51ae90() -> None:
         check missed the ``,``…``=`` list) and discharges True now (FIX 2).
 
     Proves both fixes are load-bearing in BOTH directions against the real prior code."""
-    import importlib.util
-    import subprocess
-
-    repo_root = Path(__file__).resolve().parent.parent.parent  # the worktree root
-    blob = subprocess.run(
-        ["git", "show", "d51ae90:converter/converter/contract_verifier.py"],
-        cwd=str(repo_root),
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
-    old_path = Path(__file__).parent / "_old_contract_verifier_d51ae90.py"
-    old_path.write_text(blob, encoding="utf-8")
-    try:
-        spec = importlib.util.spec_from_file_location("_old_cv_d51ae90", str(old_path))
-        assert spec is not None and spec.loader is not None
-        old = importlib.util.module_from_spec(spec)
-        sys.modules["_old_cv_d51ae90"] = old
-        spec.loader.exec_module(old)
-    finally:
-        old_path.unlink(missing_ok=True)
+    old = _load_old_contract_verifier("d51ae90", "d51ae90")
 
     # FIX 1 — encoded-key READs false-PASS at d51ae90 (fail-OPEN), fail closed now.
     for form, stmt in _ENCODED_KEY_READS.items():
@@ -1827,26 +1761,7 @@ def test_checkD_pre_fix_red_proof() -> None:
     ``child_ordinal_survivor`` on this exact discharged-rig scenario — proving the
     fix is load-bearing, not a tautology. Rebuilds the pre-fix verifier from git
     and runs ITS check D on the same lowered script + accounting."""
-    import importlib.util
-    import subprocess
-
-    blob = subprocess.run(
-        ["git", "show", "d51ae90:converter/converter/contract_verifier.py"],
-        cwd=str(Path(__file__).parent.parent),
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
-    old_path = Path(__file__).parent / "_old_cv_checkd_d51ae90.py"
-    old_path.write_text(blob, encoding="utf-8")
-    try:
-        spec = importlib.util.spec_from_file_location("_old_cv_checkd", str(old_path))
-        assert spec is not None and spec.loader is not None
-        old = importlib.util.module_from_spec(spec)
-        sys.modules["_old_cv_checkd"] = old
-        spec.loader.exec_module(old)
-    finally:
-        old_path.unlink(missing_ok=True)
+    old = _load_old_contract_verifier("d51ae90", "checkd")
 
     lowered = _lower(_SKIPPED_NEUTRALIZE_SINGLELINE_IF)
     script = _rbx_with_accounting(
@@ -2055,26 +1970,7 @@ def test_checkD_round6_pre_fix_red_proof() -> None:
     MASKED both bypasses — its check D did NOT fire on the engine-global-write and
     second-same-field-write scenarios above. Proves the site-aligned refactor is
     load-bearing, not a tautology."""
-    import importlib.util
-    import subprocess
-
-    blob = subprocess.run(
-        ["git", "show", "3a4231a:converter/converter/contract_verifier.py"],
-        cwd=str(Path(__file__).parent.parent),
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
-    old_path = Path(__file__).parent / "_old_cv_checkd_3a4231a.py"
-    old_path.write_text(blob, encoding="utf-8")
-    try:
-        spec = importlib.util.spec_from_file_location("_old_cv_3a4231a", str(old_path))
-        assert spec is not None and spec.loader is not None
-        old = importlib.util.module_from_spec(spec)
-        sys.modules["_old_cv_3a4231a"] = old
-        spec.loader.exec_module(old)
-    finally:
-        old_path.unlink(missing_ok=True)
+    old = _load_old_contract_verifier("3a4231a", "3a4231a")
 
     base = _lower(_SKIPPED_NEUTRALIZE_SINGLELINE_IF).luau_source
     rb = _carrier()
@@ -2357,26 +2253,7 @@ def test_checkD_round7_pre_fix_red_proof() -> None:
     survivor and the ``myself.``/``other.self.`` substring-LHS scenarios. Proves the
     statement-anchored inversion is load-bearing, not a tautology. Rebuilds de8e7f9's
     verifier from git and runs ITS check D on the same inputs."""
-    import importlib.util
-    import subprocess
-
-    blob = subprocess.run(
-        ["git", "show", "de8e7f9:converter/converter/contract_verifier.py"],
-        cwd=str(Path(__file__).parent.parent),
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
-    old_path = Path(__file__).parent / "_old_cv_checkd_de8e7f9.py"
-    old_path.write_text(blob, encoding="utf-8")
-    try:
-        spec = importlib.util.spec_from_file_location("_old_cv_de8e7f9", str(old_path))
-        assert spec is not None and spec.loader is not None
-        old = importlib.util.module_from_spec(spec)
-        sys.modules["_old_cv_de8e7f9"] = old
-        spec.loader.exec_module(old)
-    finally:
-        old_path.unlink(missing_ok=True)
+    old = _load_old_contract_verifier("de8e7f9", "de8e7f9")
 
     base = _lower(_SKIPPED_NEUTRALIZE_SINGLELINE_IF).luau_source
     rb = _carrier()
@@ -2600,27 +2477,7 @@ def test_fr3_x_pre_fix_red_proof_receiver_blind_r8_masks() -> None:
     different-receiver (ii) and different-ordinal (iii) survivors; the r3 anchored
     exemption does not. Loads the ACTUAL 91a19d4 verifier blob from git and runs ITS
     check D on the same inputs."""
-    import importlib.util
-    import subprocess
-
-    repo_root = Path(__file__).resolve().parent.parent.parent  # worktree root
-    blob = subprocess.run(
-        ["git", "show", "91a19d4:converter/converter/contract_verifier.py"],
-        cwd=str(repo_root),
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
-    old_path = Path(__file__).parent / "_old_cv_r8_91a19d4.py"
-    old_path.write_text(blob, encoding="utf-8")
-    try:
-        spec = importlib.util.spec_from_file_location("_old_cv_r8", str(old_path))
-        assert spec is not None and spec.loader is not None
-        old = importlib.util.module_from_spec(spec)
-        sys.modules["_old_cv_r8"] = old
-        spec.loader.exec_module(old)
-    finally:
-        old_path.unlink(missing_ok=True)
+    old = _load_old_contract_verifier("91a19d4", "r8")
 
     carrier = _carrier()  # the old verifier reads only field/child/present
     # (ii) DIFFERENT-receiver survivor: the r8 field-only exemption MASKS it.
@@ -2816,27 +2673,7 @@ def test_r2_dynamic_self_index_red_against_a10c76a() -> None:
     missed) so the rig exemption masks the surviving write and ``verify_contract``
     returns NO ``rig_binding_present`` AND NO ``child_ordinal_survivor`` (the [] codex
     observed). The fixed verifier fires both. Proves the fix is load-bearing."""
-    import importlib.util
-    import subprocess
-
-    repo_root = Path(__file__).resolve().parent.parent.parent  # worktree root
-    blob = subprocess.run(
-        ["git", "show", "a10c76a:converter/converter/contract_verifier.py"],
-        cwd=str(repo_root),
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
-    old_path = Path(__file__).parent / "_old_cv_r2_a10c76a.py"
-    old_path.write_text(blob, encoding="utf-8")
-    try:
-        spec = importlib.util.spec_from_file_location("_old_cv_r2_a10c76a", str(old_path))
-        assert spec is not None and spec.loader is not None
-        old = importlib.util.module_from_spec(spec)
-        sys.modules["_old_cv_r2_a10c76a"] = old
-        spec.loader.exec_module(old)
-    finally:
-        old_path.unlink(missing_ok=True)
+    old = _load_old_contract_verifier("a10c76a", "r2_a10c76a")
 
     # The VARIABLE-BOUND key is the genuine gap: a10c76a's decode-then-compare path
     # statically folds the inline ``"weapon".."Slot"`` concat (so it already caught the
