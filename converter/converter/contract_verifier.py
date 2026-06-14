@@ -983,10 +983,10 @@ def _check_surviving_child_ordinal(
         rt = r.get("resolved_total")
         if gt is None or rt is None or gt <= 0:
             continue
-        # RIG-AWARE exemption (POSITIVELY anchored — REDESIGN r3): a surviving
-        # positional ordinal that is the EXACT credited dead init-WRITE of a
-        # DISCHARGED rig binding (``self.<field> = self.<cam_receiver>:GetChildren()[k]``,
-        # ``k == cam_ordinal + 1``) is superseded by the read reroute (Path A) — it is
+        # RIG-AWARE exemption (POSITIVELY anchored): a surviving positional ordinal
+        # that is the EXACT credited dead init-WRITE of a DISCHARGED rig binding
+        # (``self.<field> = self.<cam_receiver>:GetChildren()[k]``, ``k == cam_ordinal
+        # + 1``) is superseded by the read reroute (Path A) — it is
         # "resolved-but-left-behind", NOT an unresolved child-ref survivor, and the rig
         # fact already bumped ``resolved_total``. The exemption is applied SITE-ALIGNED
         # INSIDE ``_count_surviving_child_ordinals`` (skip AT MOST the one counted
@@ -994,18 +994,18 @@ def _check_surviving_child_ordinal(
         # gated on (a) the binding PRESENT stamp AND the INDEPENDENT
         # ``_rig_binding_discharged`` re-derivation, AND (b) the carrier's deterministic
         # ``cam_receiver``/``cam_ordinal`` anchors (the AI-stable upstream identity, NOT
-        # an output fingerprint). A DIFFERENT-receiver write (codex r8), a SAME-receiver
-        # DIFFERENT-ordinal write (codex r3), a bare-``cam`` receiver, the direct
-        # no-seed form, a READ survivor, a non-/un-discharged script, or any survivor
-        # beyond the single credited write is NOT exempted and still fails closed.
+        # an output fingerprint). A DIFFERENT-receiver write, a SAME-receiver
+        # DIFFERENT-ordinal write, a bare-``cam`` receiver, the direct no-seed form, a
+        # READ survivor, a non-/un-discharged script, or any survivor beyond the single
+        # credited write is NOT exempted and still fails closed.
         #
-        # TRUST BOUNDARY (codex r3 adjudication — User-Challenge/Taste). The exemption
-        # TRUSTS the carrier's ``cam_receiver``/``cam_ordinal`` as the deterministic
-        # resolver-fact's proxy; it CANNOT re-derive them from the source (the source
-        # can't self-identify which GetChild site the resolver credited), exactly as
-        # ``field``/``child`` are trusted anchors above. A well-formed FORGED carrier
-        # (receiver+ordinal chosen to match a genuine survivor) could therefore exempt
-        # that survivor. The SECURITY BOUND is that the skip is gated on
+        # TRUST BOUNDARY. The exemption TRUSTS the carrier's
+        # ``cam_receiver``/``cam_ordinal`` as the deterministic resolver-fact's proxy;
+        # it CANNOT re-derive them from the source (the source can't self-identify which
+        # GetChild site the resolver credited), exactly as ``field``/``child`` are
+        # trusted anchors above. A well-formed FORGED carrier (receiver+ordinal chosen
+        # to match a genuine survivor) could therefore exempt that survivor. The
+        # SECURITY BOUND is that the skip is gated on
         # ``_site_is_discharged_rig_dead_write`` (the site is the WHOLE RHS of a
         # ``self.<field> = ...`` WRITE) ANDed with independent discharge below
         # (``_rig_binding_discharged`` -> no raw ``self.<field>`` READ survives). So the
@@ -1141,27 +1141,6 @@ _RIG_NON_YIELDING_LIFECYCLE: frozenset[str] = frozenset({"Awake", "Start"})
 _RIG_FUNCTION_METHOD_RE = re.compile(
     r"\bfunction\s+([A-Za-z_]\w*)[:.]([A-Za-z_]\w*)\s*\("
 )
-
-# A surviving camera-child / positional-ordinal WRITE of the field: the RHS
-# textually carries a ``GetChild(n)`` / ``GetChildren()[n]`` positional access
-# (the camera-child ordinal shape the lowering should have neutralized to ``nil``).
-# Anchored on the deterministic ``field`` (the IR projection), code-position
-# guarded — NOT an arbitrary AI-output grep. Span-limited to the start of the RHS
-# (the assignment text up to the access) so it does not run across statements.
-#
-# Run over the CODE PROJECTION of the source (``_rig_code_projection``): comment
-# and string interiors are already blanked there, and the RHS is whitespace-
-# collapsed before the match (``_rig_collapse_code_ws``), so the whole formatting
-# tail collapses to one canonical form — ``self.<field> = <recv>:GetChildren()[n]``
-# — regardless of inter-token whitespace, ``--`` comments between tokens, or line
-# splits. This is the STRUCTURAL close of the surviving-write formatting class
-# (round 3): normalization over an ever-growing set of per-junction ``\s*``
-# tolerances. The pattern stays minimal (no per-junction ``\s*``) because the
-# projection has already removed the whitespace the regex used to chase.
-_RIG_ORDINAL_WRITE_TAIL_RE = re.compile(
-    r":GetChildren\(\)\[\d+\]|[:.]GetChild\(\d+\)"
-)
-
 
 def _rig_pos_is_real_code(source: str, pos: int) -> bool:
     """A position that is BOTH code (not in a short string / line-comment) AND NOT
@@ -1575,12 +1554,11 @@ def _rig_has_decoded_field_bracket_read(source: str, field: str) -> bool:
     """True if any code-position ``self[<key>]`` bracket access whose ``<key>`` is a
     STATIC string expression that DECODES to EXACTLY ``<field>`` survives as a READ.
 
-    The unified bracket-key gate (codex BLOCKING FIX 1): every ``[ ... ]`` access is
-    found structurally, its key fully DECODED (``_rig_decode_luau_string_key`` — short
-    strings with escape processing, long-bracket strings, ``..`` concatenations), and
-    flagged iff the decoded value EXACTLY equals ``<field>``. This subsumes BOTH the
-    old clean-literal matcher and the old computed-key folder, closing the encoded-key
-    class (hex/decimal/unicode escapes, long-bracket keys, escape+concat).
+    The unified bracket-key gate: every ``[ ... ]`` access is found structurally, its
+    key fully DECODED (``_rig_decode_luau_string_key`` — short strings with escape
+    processing, long-bracket strings, ``..`` concatenations), and flagged iff the
+    decoded value EXACTLY equals ``<field>``. This closes the encoded-key class
+    (hex/decimal/unicode escapes, long-bracket keys, escape+concat).
 
     Two known-good non-firings (mirroring the dot path):
 
@@ -1873,51 +1851,6 @@ def _rig_line_continues(source: str, start: int, nl_pos: int) -> bool:
     return _RIG_CONTINUATION_HEAD_RE.match(nxt) is not None
 
 
-def _rig_statement_rhs_end(source: str, start: int) -> int:
-    """The end char index of the RHS expression beginning at ``start``, balanced
-    across (), [], {} and short strings, terminating at the end of the logical
-    statement (a code-level newline at bracket depth 0, or EOF). Multiline-aware so
-    a multi-line camera-child RHS is fully spanned. Mirrors the lowering's
-    ``_statement_rhs_end``."""
-    i = start
-    n = len(source)
-    depth = 0
-    while i < n:
-        ch = source[i]
-        if ch in "([{":
-            depth += 1
-            i += 1
-            continue
-        if ch in ")]}":
-            if depth == 0:
-                break
-            depth -= 1
-            i += 1
-            continue
-        if ch in ("'", '"'):
-            quote = ch
-            i += 1
-            while i < n:
-                c = source[i]
-                if c == "\\":
-                    i += 2
-                    continue
-                if c == quote or c == "\n":
-                    break
-                i += 1
-            i += 1
-            continue
-        if ch == "\n" and depth == 0:
-            if _rig_line_continues(source, start, i):
-                i += 1
-                continue
-            break
-        if ch == "-" and i + 1 < n and source[i + 1] == "-" and depth == 0:
-            break  # a trailing comment -> RHS ends before it
-        i += 1
-    return i
-
-
 def _rig_code_projection(source: str) -> str:
     """A position-PRESERVING projection of ``source`` that keeps ONLY code and blanks
     every comment / string / long-bracket span — INCLUDING the ``--`` / quote / long-
@@ -1981,73 +1914,6 @@ def _rig_code_projection(source: str) -> str:
             continue
         i += 1
     return "".join(chars)
-
-
-def _rig_collapse_code_ws(rhs: str) -> str:
-    """Collapse inter-token whitespace in an already-projected RHS so the canonical
-    tail pattern matches regardless of the original formatting: runs of whitespace
-    (spaces/newlines — the projection left no comments) become empty where they sit
-    between two punctuation/identifier-boundary characters, and a single space only
-    where two identifier characters would otherwise fuse. The tail regex matches
-    ``:GetChildren()[n]`` / ``:GetChild(n)`` which is pure punctuation+name with no
-    internal identifier-identifier boundary, so collapsing to empty between
-    non-identifier neighbours suffices to canonicalize ``self.cam :  GetChildren ( )
-    [ 1 ]`` -> ``self.cam:GetChildren()[1]``."""
-    out: list[str] = []
-    i = 0
-    n = len(rhs)
-    while i < n:
-        ch = rhs[i]
-        if ch in " \t\r\n":
-            j = i
-            while j < n and rhs[j] in " \t\r\n":
-                j += 1
-            prev = out[-1] if out else ""
-            nxt = rhs[j] if j < n else ""
-            # Keep a single space only when removing it would fuse two identifier
-            # characters into one token (``a b`` -> ``ab``); drop it otherwise.
-            if prev and nxt and _rig_is_ident_char(prev) and _rig_is_ident_char(nxt):
-                out.append(" ")
-            i = j
-            continue
-        out.append(ch)
-        i += 1
-    return "".join(out)
-
-
-def _rig_is_ident_char(c: str) -> bool:
-    """True if ``c`` can be part of a Luau identifier (alphanumeric or ``_``)."""
-    return c.isalnum() or c == "_"
-
-
-def _rig_has_surviving_ordinal_write(source: str, field: str) -> bool:
-    """True if a code-position ``self.<field> = <... GetChild(n) | GetChildren()[n] ...>``
-    positional-ordinal WRITE survives — the camera-child shape the lowering should
-    have neutralized to ``nil``. Anchored on the deterministic ``field``; the RHS
-    is balanced to the END of the logical statement (multiline-aware), so a
-    multi-line camera-child RHS (``self.<field> =\\n  self.cam:GetChildren()[1]``)
-    is fully spanned and a later unrelated statement's ordinal does not leak in.
-
-    The scan runs over the CODE PROJECTION of ``source`` (comment/string interiors
-    blanked, position-preserving) and the spanned RHS is whitespace-collapsed before
-    the tail match, so the whole whitespace/comment/line-split formatting class
-    collapses to the one canonical access form — closing it structurally rather than
-    per-junction (round-3 directive)."""
-    projected = _rig_code_projection(source)
-    assign_re = re.compile(r"self\." + re.escape(field) + r"\s*=(?!=)")
-    for m in assign_re.finditer(projected):
-        # The ``=`` established we are mid-statement, so the value may begin on the
-        # NEXT line (``self.<field> =\n  self.cam:GetChildren()[1]``). Advance past
-        # leading whitespace/newlines to the first real RHS token before spanning,
-        # so a value-on-next-line write is not truncated at the leading newline.
-        rhs_start = m.end()
-        while rhs_start < len(projected) and projected[rhs_start] in " \t\r\n":
-            rhs_start += 1
-        rhs_end = _rig_statement_rhs_end(projected, rhs_start)
-        rhs = _rig_collapse_code_ws(projected[rhs_start:rhs_end])
-        if _RIG_ORDINAL_WRITE_TAIL_RE.search(rhs):
-            return True
-    return False
 
 
 def _rig_method_body_end(source: str, decl_start: int) -> int:
@@ -2224,13 +2090,11 @@ def _rig_binding_discharged(source: str, field: str, child: str) -> bool:
           read``) -> fail closed. (A static ``self["<field>"]`` is already covered by
           (2)'s decoded-bracket path.)
 
-    The 'no surviving camera-child ordinal WRITE' clause is DROPPED from the
-    discharge gate (Path A re-anchor). On the 5 real RHS write shapes there may be
-    no positional ordinal to anchor, and the write is dead data once the reads are
-    rerouted, so a surviving init-write must NOT fail discharge — a script whose
-    init-write was Tier-2-SKIPPED but whose reads are all rerouted MUST discharge
-    True. The surviving-ordinal-WRITE scan is retained as a best-effort SECONDARY
-    DIAGNOSTIC only (``_rig_has_surviving_ordinal_write``), not a PASS/FAIL gate.
+    A surviving camera-child ordinal WRITE is NOT a discharge condition. On the real
+    RHS write shapes there may be no positional ordinal to anchor, and the write is
+    dead data once the reads are rerouted, so a surviving init-write must NOT fail
+    discharge — a script whose init-write was Tier-2-SKIPPED but whose reads are all
+    rerouted MUST discharge True.
 
     ``suffix`` is reconstructed from ``child`` by the same deterministic
     sanitization the lowering uses, so the method name matches whatever the

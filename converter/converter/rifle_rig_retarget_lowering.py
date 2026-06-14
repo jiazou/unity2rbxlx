@@ -25,9 +25,8 @@ editing the AI's emitted Luau (the AI is NOT trusted to preserve the binding):
 
 DISCHARGE (``present=True``) := the resolver method present + >=1 call + NO raw
 ``self.<field>`` dot-form READ survives (outside ``Awake``/``Start``). The init-WRITE
-neutralize is NOT a discharge condition (Path A re-anchor — supersedes the round-5
-write-shape coupling; the ``cam_receiver`` camera-RHS shape-matching is now an
-OPTIONAL Tier-2 refinement, no longer load-bearing).
+neutralize is NOT a discharge condition; the ``cam_receiver`` camera-RHS
+shape-matching is an OPTIONAL Tier-2 refinement, not load-bearing.
 
 The lowering STAMPS the ``rig_binding`` carrier for EVERY script with >=1 rig fact
 (default ``present=False``); it flips ``present=True`` only after RE-DERIVING
@@ -826,28 +825,24 @@ def _binding_discharged(
     authority (S1b owns the verifier copy; this is the lowering's own re-derive so
     it never stamps ``present=True`` off a reverted edit).
 
-    BEST-EFFORT HINT, NOT THE AUTHORITY (phase-integration FINDING 2): this
-    predicate (and its ``_has_unrewritable_boundary_read`` helper) is a BEST-EFFORT
-    discharge HINT. The slice-1.2 verifier's ``_rig_binding_discharged`` — run on the
-    FINAL output — is the SOLE discharge authority (design §1.6 / FIX 1). The two are
-    independent text-scanners and can DESYNC on a few boundary forms (``self[<int>]``,
-    a shadowed-``self`` dot-read, a concatenated bracket key ``self["weaponSlot".."" ]``)
-    where this predicate is LENIENT (returns discharged) but the verifier FIRES. That
-    desync is FAIL-CLOSED-SAFE BY DESIGN: a lowering-lenient / verifier-strict
-    disagreement means the verifier fires and the binding fails closed (never silent-
-    wrong). The UNSAFE direction — both discharged while a real read survives
-    (mutual-mask) — does NOT occur: see ``test_f2_no_mutual_mask_lowering_at_least_as_
-    lenient`` for the no-mutual-mask safety property. The residual desync forms are all
-    NON-REACHABLE from the deterministic dot-form transpiler, so per-form parity
-    between the two scanners is INTENTIONALLY NOT pursued (it would be brittle two-
-    scanner mirroring); ``_has_unrewritable_boundary_read`` stays as the best-effort
-    hint that reduces cosmetic edited+loud cases on common forms.
+    BEST-EFFORT HINT, NOT THE AUTHORITY: this predicate (and its
+    ``_has_unrewritable_boundary_read`` helper) is a best-effort discharge hint. The
+    verifier's ``_rig_binding_discharged`` — run on the FINAL output — is the SOLE
+    discharge authority. The two are independent text-scanners and can DESYNC on a few
+    boundary forms (``self[<int>]``, a shadowed-``self`` dot-read, a concatenated
+    bracket key ``self["weaponSlot".."" ]``) where this predicate is LENIENT (returns
+    discharged) but the verifier FIRES. That desync is FAIL-CLOSED-SAFE: the verifier
+    fires and the binding fails closed (never silent-wrong). The UNSAFE direction —
+    both discharged while a real read survives (mutual-mask) — does NOT occur: see
+    ``test_f2_no_mutual_mask_against_verifier_or_conservatism``. The residual desync
+    forms are all NON-REACHABLE from the deterministic dot-form transpiler, so per-form
+    parity between the two scanners is INTENTIONALLY NOT pursued.
 
     ``child`` is the REAL rig-child name (for reconstructing the canonical emit);
     ``suffix`` is the VALID-LUAU-IDENTIFIER method-name suffix (``_resolve<suffix>``).
 
-    PATH A re-anchor — discharge keys on the consumer-READ reroute (the AI-STABLE
-    member access), NOT on the AI-VOLATILE write/ordinal shape. True IFF:
+    Discharge keys on the consumer-READ reroute (the AI-STABLE member access), NOT on
+    the AI-VOLATILE write/ordinal shape. True IFF:
       (1a) the LOWERING'S OWN resolver method ``function <Class>:_resolve<suffix>(``
            (STRUCTURALLY equal to the canonical emit, NOT a preexisting foreign
            same-named method) exists; AND
@@ -855,17 +850,13 @@ def _binding_discharged(
       (1c) NO bare ``self.<field>`` dot-form READ survives at a consumer (outside
            the non-yielding lifecycle methods Awake/Start).
 
-    The init-WRITE neutralize is NO LONGER a discharge condition (Path A re-anchor,
-    supersedes the round-5 coupling): it is Tier-2 best-effort hygiene
-    (SKIP-on-ambiguity), harmless because (1c) leaves no raw read to read the stale
-    write. So a script whose neutralize was SKIPPED (the AI collapsed the RHS to
-    ``self.gameObject`` / ``__unityChild(...)`` etc.) still discharges True once the
-    reads are rerouted — fixing the D-S2-REDESIGN abstain on the real 5 write shapes.
-
-    Condition (1a) still requires STRUCTURAL equality to the lowering's OWN canonical
-    emit, so a preexisting foreign ``_resolve<suffix>`` method that merely uses the
-    ``_MainCameraRig`` marker cannot false-discharge on a source the lowering never
-    wrote this run."""
+    The init-WRITE neutralize is NOT a discharge condition: it is Tier-2 best-effort
+    hygiene (SKIP-on-ambiguity), harmless because (1c) leaves no raw read to read the
+    stale write. So a script whose neutralize was SKIPPED still discharges True once
+    the reads are rerouted. The (1a) structural-equality requirement keeps a
+    preexisting foreign ``_resolve<suffix>`` method that merely uses the
+    ``_MainCameraRig`` marker from false-discharging a source the lowering never wrote
+    this run."""
     method_call = f"self:_resolve{suffix}("
     # (1a) the lowering's OWN resolver method is present at a code position
     # (structural equality to the canonical emit). The class name is read from the

@@ -4593,11 +4593,11 @@ script.Disabled = true
         Mirrors the ``child_ref_resolution`` rehydration. Returns ``{}`` on a
         missing/malformed plan or a plan that pre-dates the field; a malformed row
         is dropped (absent -> ``None`` -> the binding-present check abstains, the
-        same safe pre-field default). REDESIGN r3: validates ALL FIVE keys
-        (str field/child, bool present, str cam_receiver, int cam_ordinal) — a row
-        missing/malformed on ANY of the five is DROPPED to ``None`` (NEVER rehydrate
-        a partial carrier that would exempt blind in check D). The optional
-        ``multi_fact`` flag, when present, is preserved."""
+        same safe pre-field default). Validates ALL FIVE keys (str field/child, bool
+        present, str cam_receiver, int cam_ordinal) — a row missing/malformed on ANY
+        of the five is DROPPED to ``None`` (NEVER rehydrate a partial carrier that
+        would exempt blind in check D). The optional ``multi_fact`` flag, when
+        present, is preserved."""
         plan_path = self.output_dir / "conversion_plan.json"
         if not plan_path.exists():
             return {}

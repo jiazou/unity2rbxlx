@@ -43,7 +43,6 @@ from converter.contract_verifier import (  # noqa: E402
     _check_surviving_child_ordinal,
     _count_surviving_child_ordinals,
     _rig_binding_discharged,
-    _rig_has_surviving_ordinal_write,
     fail_closed_errors,
     verify_contract,
 )
@@ -463,8 +462,6 @@ def test_review_f2_multiline_surviving_ordinal_write_secondary_diagnostic() -> N
         "self.weaponSlot =\n        self.cam:GetChildren()[1]\n    return rifle\nend",
     )
     assert "self.cam:GetChildren()[1]" in multiline_source
-    # Secondary diagnostic still detects the surviving write (kept machinery).
-    assert _rig_has_surviving_ordinal_write(multiline_source, "weaponSlot") is True
     # Path A: discharge keys on the READ reroute — a dead write does NOT block it.
     assert _rig_binding_discharged(multiline_source, "weaponSlot", "WeaponSlot") is True
     script = _rbx(
@@ -529,8 +526,6 @@ def test_review_r2_split_before_index_surviving_write_secondary_diagnostic() -> 
         "self.weaponSlot = self.cam:GetChildren()\n        [1]\n    return rifle\nend",
     )
     assert "self.cam:GetChildren()\n        [1]" in split_source
-    # Secondary diagnostic still detects the split-before-index write.
-    assert _rig_has_surviving_ordinal_write(split_source, "weaponSlot") is True
     # Path A: a dead leftover write does not block discharge.
     assert _rig_binding_discharged(split_source, "weaponSlot", "WeaponSlot") is True
     script = _rbx(
@@ -550,7 +545,6 @@ def test_review_r2_split_before_getchild_call_secondary_diagnostic() -> None:
         "return rifle\nend",
         "self.weaponSlot = self.cam:GetChild\n        (1)\n    return rifle\nend",
     )
-    assert _rig_has_surviving_ordinal_write(split_source, "weaponSlot") is True
     assert _rig_binding_discharged(split_source, "weaponSlot", "WeaponSlot") is True
     script = _rbx(
         "Player",
@@ -569,7 +563,6 @@ def test_review_r2_split_before_member_getchildren_secondary_diagnostic() -> Non
         "return rifle\nend",
         "self.weaponSlot = self.cam\n        .GetChild(1)\n    return rifle\nend",
     )
-    assert _rig_has_surviving_ordinal_write(split_source, "weaponSlot") is True
     assert _rig_binding_discharged(split_source, "weaponSlot", "WeaponSlot") is True
 
 
@@ -589,7 +582,6 @@ def test_review_r2_over_reach_guard_does_not_swallow_following_statement() -> No
     )
     # The neutralized write does NOT pick up the following ``local`` ordinal -> the
     # binding STILL discharges (the over-reach guard held).
-    assert _rig_has_surviving_ordinal_write(over_reach_source, "weaponSlot") is False
     assert _rig_binding_discharged(over_reach_source, "weaponSlot", "WeaponSlot") is True
 
 
@@ -613,7 +605,6 @@ def test_review_r3_whitespace_at_colon_method_junction_is_detected() -> None:
         "return rifle\nend",
         "self.weaponSlot = self.cam : GetChildren ( ) [ 1 ]\n    return rifle\nend",
     )
-    assert _rig_has_surviving_ordinal_write(spaced, "weaponSlot") is True
     # Path A: the surviving write is a dead leftover -> discharge stays True.
     assert _rig_binding_discharged(spaced, "weaponSlot", "WeaponSlot") is True
     script = _rbx(
@@ -630,7 +621,6 @@ def test_review_r3_whitespace_before_method_getchild_is_detected() -> None:
         "return rifle\nend",
         "self.weaponSlot = self.cam: GetChild(1)\n    return rifle\nend",
     )
-    assert _rig_has_surviving_ordinal_write(spaced, "weaponSlot") is True
     assert _rig_binding_discharged(spaced, "weaponSlot", "WeaponSlot") is True
 
 
@@ -645,7 +635,6 @@ def test_review_r3_comment_after_call_before_index_is_detected() -> None:
         "self.weaponSlot = self.cam:GetChildren() -- gap\n        [1]\n    return rifle\nend",
     )
     assert "-- gap" in commented
-    assert _rig_has_surviving_ordinal_write(commented, "weaponSlot") is True
     # Path A: the surviving write is a dead leftover -> discharge stays True.
     assert _rig_binding_discharged(commented, "weaponSlot", "WeaponSlot") is True
     script = _rbx(
@@ -664,7 +653,6 @@ def test_review_r3_comment_before_method_is_detected() -> None:
         "return rifle\nend",
         "self.weaponSlot = self.cam -- gap\n        :GetChildren()[1]\n    return rifle\nend",
     )
-    assert _rig_has_surviving_ordinal_write(commented, "weaponSlot") is True
     assert _rig_binding_discharged(commented, "weaponSlot", "WeaponSlot") is True
 
 
@@ -678,33 +666,18 @@ def test_review_r3_crlf_line_ending_split_is_detected() -> None:
         "self.weaponSlot = self.cam:GetChildren()\r\n        [1]\r\n    return rifle\nend",
     )
     assert "\r\n" in crlf
-    assert _rig_has_surviving_ordinal_write(crlf, "weaponSlot") is True
     # Path A: the surviving write is a dead leftover -> discharge stays True.
     assert _rig_binding_discharged(crlf, "weaponSlot", "WeaponSlot") is True
-
-
-def test_review_r3_ordinal_inside_string_does_not_false_detect() -> None:
-    """ROUND-3 — the projection blanks STRING interiors, so an ordinal-shaped token
-    inside a string literal assigned to the field
-    (``self.weaponSlot = "self.cam:GetChildren()[1]"``) is NOT a surviving ordinal
-    write (it is a harmless string) -> must NOT be detected."""
-    green = _lower()
-    stringy = green.luau_source.replace(
-        "self.weaponSlot = nil",
-        'self.weaponSlot = "self.cam:GetChildren()[1]"',
-    )
-    assert _rig_has_surviving_ordinal_write(stringy, "weaponSlot") is False
 
 
 def test_review_r3_corpus_happy_path_still_discharges() -> None:
     """ROUND-3 REGRESSION GUARD — the structural projection must NOT make the legit
     resolver body (its internal ``:GetChildren()`` / ``FindFirstChild`` /
     ``:GetAttribute("_MainCameraRig")``) or the neutralized ``self.weaponSlot = nil``
-    write look like a surviving ordinal write. The corpus happy-path discharges."""
+    write look like a surviving binding. The corpus happy-path discharges."""
     green = _lower()
     assert "self.weaponSlot = nil" in green.luau_source
     assert "function Player:_resolveWeaponSlot()" in green.luau_source
-    assert _rig_has_surviving_ordinal_write(green.luau_source, "weaponSlot") is False
     assert _rig_binding_discharged(green.luau_source, "weaponSlot", "WeaponSlot") is True
 
 
