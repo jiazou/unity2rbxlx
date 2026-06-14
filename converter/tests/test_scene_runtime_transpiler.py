@@ -340,7 +340,7 @@ class TestPerScriptGating:
 
         def fake_ai(csharp_source, api_key, model, class_name="",
                     script_type="Script", project_context="",
-                    runtime_mode="legacy"):
+                    runtime_mode="legacy", is_player_controller=False):
             # Key by class_name (stem-ish); enough for the 2-script
             # synthetic project.
             captured[class_name] = runtime_mode

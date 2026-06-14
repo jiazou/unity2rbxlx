@@ -112,23 +112,29 @@ cache. The items below are where code or docs are stale or wrong.
     authority, then `REQUIRE_PLAYER_BIND` 0→1 in `test.yml`);
   - (b) contract verifier flipped fail-closed (Architecture section above);
   - (c) deterministic-lowering homes for the known pack-covered gaps (Turret child-index,
-    HudControl binding) verified on a generic conversion.
+    HudControl binding) verified on a generic conversion — tracked concretely by the
+    canary-failures item below.
   Then delete: `script_coherence_packs.py` + its test file, `--scaffolding=fps` +
   `converter/scaffolding/` + `_fps_artifacts_*` back-compat in `pipeline.py`, the
   `detect_fps_game` autogen heuristic, and the legacy `scene_runtime_mode` branch.
   `docs/refactor_plan.md` updated 2026-06-11: pack-split lane (PR-E0/E/F) dropped.
 
-- [ ] **P1 — Gate (c) execution: generic fidelity homes for the pack-covered gaps.** Status:
-  Turret child-index lowering is LANDED and wired (`child_index_lowering.lower_child_index`
-  called from `contract_pipeline`; reuses the `__unityChild` pack helper) — needs Studio
-  verification on a fresh generic conversion. HudControl now classifies
-  client/ModuleScript/ReplicatedStorage correctly (Slice H was stale per
-  `.harness/followups.md`); residual risk is runtime boot/binding (SceneRuntimeClient not
-  constructing the requireable client module, or `self.gameObject` not binding to the
-  ScreenGui) — if the canary shows a dead HUD, capture the real root cause, don't fix blind.
-  KNOWN_ISSUES § "Scene-runtime generic mode" is the running queue for further pack-covered
-  gaps found on generic conversions; new entries get deterministic-lowering or host-runtime
-  homes, never per-game packs.
+- [ ] **P1 — Generic-mode SimpleFPS canary failures (dual-voice investigation 2026-06-11; NOT
+  Step-1b regressions).** This IS gate (a)/(c) above made concrete — the PR5 canary gate
+  (SimpleFPS plays under generic). See `docs/design/scene-runtime-pr5-8-recut-plan.md` §"The
+  canary failures". Slices: **T** turret child-index lowering from a stronger signal than
+  AI-output text (turret won't spin/fire — note `contract_pipeline` retired the post-transpile
+  `lower_child_index` pass in favor of `child_ref_resolver.build_child_ref_map` +
+  `prerewrite_child_index`, so Slice T lands in the resolver, not the old lowering pass);
+  **T-bullet** nil-parent→workspace default in the `instantiatePrefab` clone service (bullets
+  never enter the DataModel); **R** generic `weaponSlot` rebind (rifle not held); **D** door
+  dynamic-Animator-driver narrowing (`pr148-followups`); **H** HudControl client-domain rule
+  (classification already correct — residual risk is runtime boot/binding: SceneRuntimeClient
+  not constructing the requireable client module, or `self.gameObject` not binding to the
+  ScreenGui; if the canary shows a dead HUD, capture the real root cause, don't fix blind).
+  Highest leverage: Slice T (+ T-bullet) clears the turret. KNOWN_ISSUES § "Scene-runtime
+  generic mode" is the running queue for further pack-covered gaps; new entries get
+  deterministic-lowering or host-runtime homes, never per-game packs.
 
 ## Materials & meshes
 

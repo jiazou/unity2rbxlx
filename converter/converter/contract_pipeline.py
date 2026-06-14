@@ -38,12 +38,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TypedDict
 
+from converter.child_ref_resolver import build_child_ref_map
 from converter.code_transpiler import (
     TranspilationResult,
     TranspiledScript,
     _is_visual_only_script,
     transpile_scripts,
 )
+from core.unity_types import GuidIndex, ParsedScene, PrefabLibrary
 from unity.script_analyzer import ScriptInfo
 
 
@@ -197,8 +199,18 @@ class ContractPipelineResult:
 
 
 def _is_contract_warning(w: str) -> bool:
-    """A warning emitted by ``_verify_and_reprompt`` (pre OR post tag)."""
-    return w.startswith("contract-verifier")
+    """A contract-rule (a)-(h) warning from ``_verify_and_reprompt`` (pre OR
+    post tag).
+
+    EXCLUDES ``contract-verifier-player`` (paradigm B, rules ``p1``/``p2``):
+    player rejects are NON-load-bearing cosmetic notes outside the a-h
+    contract the compliance spike measures, so they must not perturb
+    ``first_attempt_pass_count`` (which drops any script carrying a contract
+    warning)."""
+    return (
+        w.startswith("contract-verifier")
+        and not w.startswith("contract-verifier-player")
+    )
 
 
 def _is_post_reprompt_warning(w: str) -> bool:
@@ -366,6 +378,9 @@ def transpile_with_contract(
     use_ai: bool = True,
     max_concurrent: int = 10,
     serialized_field_refs: dict[str, dict[str, str]] | None = None,
+    parsed_scenes: list[ParsedScene] | None = None,
+    prefab_library: PrefabLibrary | None = None,
+    guid_index: GuidIndex | None = None,
 ) -> ContractPipelineResult:
     """Run the generic-runtime contract pipeline on ``script_infos``.
 
@@ -379,6 +394,10 @@ def transpile_with_contract(
         api_key: Anthropic API key (optional -- CLI backend works without).
         use_ai / max_concurrent / serialized_field_refs: forwarded to
             ``transpile_scripts``.
+        parsed_scenes / prefab_library / guid_index: the parsed Unity hierarchy
+            inputs the child-ref resolver consumes to build the per-script
+            ``ChildRefMap`` (resolving ``transform.GetChild(n)`` to named lookups
+            before transpile). ``None``/empty leaves the map empty (no pre-rewrite).
 
     Returns:
         ``ContractPipelineResult`` carrying the transpile output plus
@@ -403,6 +422,25 @@ def transpile_with_contract(
         len(component_class_paths), len(runtime_bearing_paths),
     )
 
+    # Paradigm B (NON-load-bearing): the identified player controller's path,
+    # keyed on the deterministic upstream ``has_character_controller`` signal
+    # (NOT a transpiled-output fingerprint, §3). Threaded into transpilation so
+    # the player script's prompt gets ``_PLAYER_CONTROLLER_DIRECTIVE``. Abstains
+    # (empty) on 0/>1 CC-modules or any stem collision, mirroring
+    # ``find_player_controllers``.
+    player_controller_paths = _player_controller_paths(modules, script_infos)
+
+    # Single producer of the #2 child-ref facts: resolve transform-rooted
+    # GetChild(n) sites against the parsed hierarchy so the pre-rewrite emits
+    # named lookups before transpile (and stamps the resolved/total tally for the
+    # backstop). Empty when the parse inputs are absent -> no pre-rewrite.
+    child_ref_map = build_child_ref_map(
+        script_infos=script_infos,
+        parsed_scenes=parsed_scenes,
+        prefab_library=prefab_library,
+        guid_index=guid_index,
+    )
+
     transpilation = transpile_scripts(
         unity_project_path=unity_project_path,
         script_infos=script_infos,
@@ -413,6 +451,8 @@ def transpile_with_contract(
         runtime_mode="generic",
         runtime_bearing_paths=runtime_bearing_paths,
         component_class_paths=component_class_paths,
+        player_controller_paths=player_controller_paths,
+        child_ref_map=child_ref_map,
     )
 
     # Build the stem-keyed require graph from the planner's modules table.
@@ -429,21 +469,19 @@ def transpile_with_contract(
     _apply_require_resolutions(transpilation.scripts, require_resolutions)
 
     # Camera-facet lowering (allowlisted deterministic lowering pass, PR5):
-    # route a flattened first-person controller's look math onto the
-    # SceneCameraInput runtime service so generic-mode FPS games yaw, not just
-    # pitch. Structure-gated, never per-game; see camera_facet_lowering.py and
-    # docs/design/camera-input-fidelity-plan.md.
+    # route a flattened first-person DRONE/TURRET controller's look math onto
+    # the SceneCameraInput runtime service so generic-mode FPS games yaw, not
+    # just pitch. Structure-gated, never per-game; see camera_facet_lowering.py
+    # and docs/design/camera-input-fidelity-plan.md. The PLAYER is owned by
+    # paradigm C (the deterministic host authority in scene_runtime.luau, keyed
+    # on the upstream ``has_character_controller`` signal), so the player script
+    # is EXCLUDED from this pass (§3) -- it is never the camera/move writer here.
     # Player identity comes from the DETERMINISTIC UPSTREAM Unity signal (the
     # planner's per-module ``has_character_controller``), NOT a fingerprint of
     # the transpiled output -- the latter abstained silently on AI shape
     # variance, decoupling camera/movement/character (the systemic bug this
-    # closes). ``find_player_controllers`` fail-closes (``[]``) on 0 or >1
+    # closes). ``_player_controller_paths`` fail-closes (``∅``) on 0 or >1
     # distinct CC-scripts.
-    from converter.movement_facet_lowering import (
-        find_player_controllers,
-        lower_movement_facet,
-    )
-    players = find_player_controllers(transpilation.scripts, modules)
     # Surface upstream player identity that did NOT cleanly bind, rather than
     # abstaining silently. ``cc_module_count`` is the number of distinct
     # CC-bearing scripts the planner saw on placed GameObjects.
@@ -476,6 +514,16 @@ def transpile_with_contract(
                 "runtime (re-convert) so the signal is stamped."
             ),
         ))
+    # Re-source the player_unresolved fail-close on the POST-transpile
+    # intersection (P1-c): ``player_controller_paths`` is keyed off the
+    # PRE-transpile ``script_infos``; a player ``.cs`` that fails to read is
+    # dropped from ``transpilation.scripts`` but stays in ``script_infos``.
+    # Intersecting with the emitted paths restores the deleted
+    # ``find_player_controllers`` POST-transpile fail-close: a transpile-dropped
+    # player script => empty intersection => player_unresolved.
+    emitted_player_paths = player_controller_paths & {
+        Path(s.source_path) for s in transpilation.scripts
+    }
     if cc_module_count > 1:
         player_fail_closed.append(FailClosed(
             kind="player_ambiguous",
@@ -486,7 +534,7 @@ def transpile_with_contract(
                 f"no controller was bound."
             ),
         ))
-    elif cc_module_count == 1 and not players:
+    elif cc_module_count == 1 and not emitted_player_paths:
         player_fail_closed.append(FailClosed(
             kind="player_unresolved",
             detail=(
@@ -497,55 +545,46 @@ def transpile_with_contract(
         ))
 
     from converter.camera_facet_lowering import lower_camera_facet
+    # Exclude the player (keyed on the deterministic upstream identity) from
+    # camera-facet lowering -- paradigm C owns the player camera; this pass is
+    # drone/turret-only (P1-a). Filtering by ``player_controller_paths`` (not an
+    # AI fingerprint) means a strict-match player look method is never spliced.
+    #
+    # FAIL-CLOSE GATE makes a stray player lowering moot: when the player signal
+    # is absent / ambiguous / unresolved, ``player_controller_paths`` is ∅ so
+    # this filter excludes nothing -- a strict-look player-shaped script COULD
+    # get ``self._cam:step`` spliced. But each of those cases appended a
+    # ``player_signal_absent`` / ``player_ambiguous`` / ``player_unresolved``
+    # row to ``player_fail_closed`` above, which the orchestrator turns into a
+    # project-level fail-closed reason: the conversion is REJECTED and nothing
+    # ships. So a lowering on the ∅ path can never reach a shipped build -- the
+    # fail-close is the decisive gate, not this exclusion. (A 2nd exclusion path
+    # is intentionally NOT added: it would risk the drone/turret path for no
+    # shipped-output benefit.)
     lowered = lower_camera_facet(
-        transpilation.scripts, follow_character_paths=players,
+        [s for s in transpilation.scripts
+         if Path(s.source_path) not in player_controller_paths]
     )
     if lowered:
         log.info("[contract] camera-facet lowering routed %d controller(s) "
                  "to SceneCameraInput", lowered)
 
-    # Movement-facet lowering: retarget the identified player controller's WASD
-    # method from the vestigial scene rig onto the character's Humanoid:Move.
-    moved = lower_movement_facet(players)
-    if moved:
-        log.info("[contract] movement-facet lowering retargeted %d player "
-                 "controller(s) to the character Humanoid", moved)
-    # A player was identified upstream but a binding locator missed its rewrite
-    # site -- surface it loudly (the controller would run un-bound, the failure
-    # mode this fix exists to eliminate) instead of shipping a silent regression.
-    if players:
-        player = players[0]
-        if moved == 0:
-            player_fail_closed.append(FailClosed(
-                kind="player_move_unbound",
-                detail=(
-                    f"{Path(player.source_path).name}: player identified "
-                    f"upstream but no WASD movement method was located to "
-                    f"retarget onto the character Humanoid."
-                ),
-            ))
-        if "self._cam:step(" not in (player.luau_source or ""):
-            player_fail_closed.append(FailClosed(
-                kind="player_look_unbound",
-                detail=(
-                    f"{Path(player.source_path).name}: player identified "
-                    f"upstream but no look method was located to route onto "
-                    f"SceneCameraInput (camera will not follow the character)."
-                ),
-            ))
+    # NOTE: paradigm C (the deterministic host authority in scene_runtime.luau,
+    # keyed on the upstream ``has_character_controller`` signal) owns the
+    # player's look + move; paradigm A is deleted, so there is no A-locator
+    # abstention concept any more. The signal-based fail-closeds
+    # (player_signal_absent / player_ambiguous / player_unresolved) key on C's
+    # own identity and remain above.
 
-    # Child-index lowering (allowlisted deterministic lowering pass): the
-    # transpiler flattens Unity ``transform.GetChild(n)`` to
-    # ``<recv>:GetChildren()[n+1]``, which returns the injected non-spatial
-    # child (e.g. the AudioSource->Sound stamped at child index 0 of a Part),
-    # so a following ``:GetPivot()`` crashes. Resolve each such site to the
-    # N-th SPATIAL child instead. Structure-gated (the GetChildren()[literal]
-    # emission shape), never per-game; see child_index_lowering.py.
-    from converter.child_index_lowering import lower_child_index
-    lowered_children = lower_child_index(transpilation.scripts)
-    if lowered_children:
-        log.info("[contract] child-index lowering resolved GetChild sites "
-                 "in %d script(s) to the N-th spatial child", lowered_children)
+    # Child-index handling is now done by the pre-transpile child-ref resolver
+    # (``child_ref_resolver.build_child_ref_map`` + ``prerewrite_child_index``,
+    # threaded into ``transpile_scripts`` above): transform-rooted
+    # ``transform.GetChild(n)`` sites are resolved to named ``Find("<name>")``
+    # lookups in the C# BEFORE the AI sees them, so no positional ordinal reaches
+    # the output. The post-transpile ``lower_child_index`` pass is retired here;
+    # the contract verifier's child-ordinal backstop fail-closes on any survivor
+    # for a fully-resolved script. (``child_index_lowering.py`` stays — the
+    # legacy packs still use it, and the backstop reuses ``source_has_child_index``.)
 
     # OnTriggerStay lowering (allowlisted deterministic lowering pass): the
     # transpiler collapses Unity OnTriggerStay onto the same ``.Touched`` EDGE
@@ -604,13 +643,24 @@ def transpile_with_contract(
         # contract on stub output; ``auto`` mode must treat this as a
         # fail-closed signal to fall back to legacy.
         #
-        # EXCEPTION: a visual-only script (water shader, particle visual)
-        # has no Roblox equivalent and is INTENTIONALLY stubbed -- in
-        # generic mode that stub is a contract-valid inert ModuleScript
-        # (see ``_inert_component_stub``), so it is a legitimate terminal
-        # state, not an AI failure. Only genuine fallthrough fails closed.
-        if script.strategy != "ai" and not _is_visual_only_script(
-            Path(script.source_path), script.csharp_source,
+        # EXCEPTION: an INTENTIONALLY inert-stubbed component (a visual-only
+        # water-shader / particle helper, OR an empty subclass of a dead base)
+        # is a contract-valid inert ModuleScript (see ``_inert_component_stub``),
+        # so it is a legitimate terminal state, not an AI failure. The
+        # transpiler stamps ``intentional_inert_stub`` for those -- trust the
+        # stamp (the empty-subclass verdict needs project context this site
+        # lacks; recomputing ``_is_visual_only_script`` here would miss it and
+        # turn a clean stub into a spurious stub_strategy fail-close). The
+        # ``_is_visual_only_script`` recompute is retained as a backstop for any
+        # stub path that predates the stamp. Only genuine fallthrough fails
+        # closed.
+        intentional_stub = getattr(script, "intentional_inert_stub", False)
+        if (
+            script.strategy != "ai"
+            and not intentional_stub
+            and not _is_visual_only_script(
+                Path(script.source_path), script.csharp_source,
+            )
         ):
             fail_closed.append(FailClosed(
                 kind="stub_strategy",
@@ -746,6 +796,48 @@ def _component_class_paths(
         by_stem,
         lambda m: bool(m.get("is_component_class") or m.get("runtime_bearing")),
     )
+
+
+def _player_controller_paths(
+    modules: dict[str, _SceneRuntimeModule],
+    script_infos: list[ScriptInfo],
+) -> frozenset[Path]:
+    """Return the UNIQUE player-controller ``info.path`` (or ``frozenset()``),
+    keyed on the deterministic UPSTREAM Unity signal ``has_character_controller``
+    (paradigm B directive targeting, §3). Mirrors ``find_player_controllers``'
+    fail-closed abstention (``movement_facet_lowering.py:144-160``) so B targets
+    EXACTLY the script paradigm C binds — no divergence.
+
+    ``_join_module_paths`` does the stem->path JOIN but does NOT provide the
+    unique-exactly-one abstention on its own (it only flags per-stem collisions
+    and would add EVERY selected module's path). So the guard is added EXPLICITLY:
+    1. count distinct CC-modules via the same predicate as the orchestrator's
+       ``cc_module_count``; abstain (``frozenset()``) on count != 1 (0 -> non-FPS,
+       >1 -> ambiguous);
+    2. unpack the 2-tuple and abstain on any stem collision OR ``len(paths) != 1``
+       (a join that did not resolve to exactly one path is an abstain, not a
+       partial set);
+    3. else return the single player path.
+
+    Keyed on ``modules`` alone (no transpiled output): NO AI-output fingerprint.
+    """
+    cc_module_count = sum(
+        1 for m in modules.values()
+        if isinstance(m, dict) and m.get("has_character_controller")
+    )
+    if cc_module_count != 1:
+        return frozenset()
+    by_stem: dict[str, list[Path]] = {}
+    for info in script_infos:
+        by_stem.setdefault(info.path.stem, []).append(info.path)
+    paths, collisions = _join_module_paths(
+        modules,
+        by_stem,
+        lambda m: bool(m.get("has_character_controller")),
+    )
+    if collisions or len(paths) != 1:
+        return frozenset()
+    return paths
 
 
 def _join_module_paths(

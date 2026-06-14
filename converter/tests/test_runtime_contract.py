@@ -1205,3 +1205,187 @@ class TestIfExpressionDepthTracking:
             # no top-level ``return Class``
         )
         _assert_rule(src, "d")
+
+
+# ---------------------------------------------------------------------------
+# Player rejects (rules p1 / p2) -- paradigm B, NON-load-bearing.
+#
+# These run ONLY under ``verify_module(..., is_player_controller=True)``, so
+# they need a flag-aware variant of the helpers above. They are gated on the
+# deterministic upstream player identity, never the Luau text -- the same
+# bytes verify clean as a non-player and dirty as the player.
+# ---------------------------------------------------------------------------
+
+def _player_rules(source: str) -> list[str]:
+    return [
+        v.rule
+        for v in verify_module(source, is_player_controller=True).violations
+    ]
+
+
+class TestPlayerRejects:
+
+    def test_p1_camera_cframe_write_rejected_for_player(self):
+        src = (
+            'local Class = {}\n'
+            'function Class.new() return setmetatable({}, Class) end\n'
+            'function Class:Update()\n'
+            '    workspace.CurrentCamera.CFrame = self.aim\n'
+            'end\n'
+            'return Class\n'
+        )
+        assert "p1" in _player_rules(src)
+
+    def test_p1_camera_type_write_rejected_for_player(self):
+        src = (
+            'local Class = {}\n'
+            'function Class.new() return setmetatable({}, Class) end\n'
+            'function Class:Start()\n'
+            '    workspace.CurrentCamera.CameraType = Enum.CameraType.Scriptable\n'
+            'end\n'
+            'return Class\n'
+        )
+        assert "p1" in _player_rules(src)
+
+    def test_p1_whitespace_tolerant(self):
+        # The regex tolerates whitespace around the dots and the ``=``.
+        src = (
+            'local Class = {}\n'
+            'function Class.new() return setmetatable({}, Class) end\n'
+            'function Class:Update()\n'
+            '    workspace . CurrentCamera . CFrame  =  self.aim\n'
+            'end\n'
+            'return Class\n'
+        )
+        assert "p1" in _player_rules(src)
+
+    def test_p1_message_is_actionable(self):
+        src = (
+            'local Class = {}\n'
+            'function Class.new() return setmetatable({}, Class) end\n'
+            'function Class:Update()\n'
+            '    workspace.CurrentCamera.CFrame = self.aim\n'
+            'end\n'
+            'return Class\n'
+        )
+        v = next(
+            v
+            for v in verify_module(src, is_player_controller=True).violations
+            if v.rule == "p1"
+        )
+        assert "self.host.player" in v.message
+        assert "CurrentCamera" in v.message
+
+    def test_p1_equality_test_not_a_write(self):
+        # ``==`` is a comparison; the ``(?!=)`` lookahead must not flag it.
+        src = (
+            'local Class = {}\n'
+            'function Class.new() return setmetatable({}, Class) end\n'
+            'function Class:Update()\n'
+            '    if workspace.CurrentCamera.CFrame == self.last then return end\n'
+            'end\n'
+            'return Class\n'
+        )
+        assert "p1" not in _player_rules(src)
+
+    def test_p2_humanoid_move_rejected_for_player(self):
+        src = (
+            'local Class = {}\n'
+            'function Class.new() return setmetatable({}, Class) end\n'
+            'function Class:Update()\n'
+            '    Humanoid:Move(self.dir)\n'
+            'end\n'
+            'return Class\n'
+        )
+        assert "p2" in _player_rules(src)
+
+    def test_p2_message_is_actionable(self):
+        src = (
+            'local Class = {}\n'
+            'function Class.new() return setmetatable({}, Class) end\n'
+            'function Class:Update()\n'
+            '    Humanoid:Move(self.dir)\n'
+            'end\n'
+            'return Class\n'
+        )
+        v = next(
+            v
+            for v in verify_module(src, is_player_controller=True).violations
+            if v.rule == "p2"
+        )
+        assert "Humanoid:Move" in v.message
+        assert "self.host.player" in v.message
+
+    def test_lowercase_hum_move_alias_not_rejected(self):
+        # The literal is ``Humanoid:Move(``; a ``hum:Move(`` local alias is
+        # an accepted scope-limitation (B is non-load-bearing; C dominates).
+        src = (
+            'local Class = {}\n'
+            'function Class.new() return setmetatable({}, Class) end\n'
+            'function Class:Update()\n'
+            '    local hum = self.rig.Humanoid\n'
+            '    hum:Move(self.dir)\n'
+            'end\n'
+            'return Class\n'
+        )
+        assert "p2" not in _player_rules(src)
+
+    def test_pivotto_not_rejected(self):
+        # PivotTo serves yaw / translate / respawn -- not lexically
+        # separable; the design drops the clause.
+        src = (
+            'local Class = {}\n'
+            'function Class.new() return setmetatable({}, Class) end\n'
+            'function Class:Update()\n'
+            '    self.rig:PivotTo(self.targetCFrame)\n'
+            'end\n'
+            'return Class\n'
+        )
+        assert _player_rules(src) == []
+
+    def test_camera_write_inside_string_not_rejected(self):
+        # Scans ``stripped`` -- a match inside a string literal is blanked.
+        src = (
+            'local Class = {}\n'
+            'function Class.new() return setmetatable({}, Class) end\n'
+            'function Class:Log()\n'
+            '    print("set workspace.CurrentCamera.CFrame = x")\n'
+            'end\n'
+            'return Class\n'
+        )
+        assert verify_module(src, is_player_controller=True).ok
+
+    def test_humanoid_move_inside_comment_not_rejected(self):
+        src = (
+            'local Class = {}\n'
+            'function Class.new() return setmetatable({}, Class) end\n'
+            'function Class:Update()\n'
+            '    -- used to call Humanoid:Move(dir); host owns it now\n'
+            '    return\n'
+            'end\n'
+            'return Class\n'
+        )
+        assert verify_module(src, is_player_controller=True).ok
+
+    def test_non_player_does_not_run_player_rejects(self):
+        # The DEFAULT (is_player_controller=False) runs only rules a-h, so a
+        # camera-writing non-player script (e.g. a turret) verifies clean.
+        src = (
+            'local Class = {}\n'
+            'function Class.new() return setmetatable({}, Class) end\n'
+            'function Class:Update()\n'
+            '    workspace.CurrentCamera.CFrame = self.aim\n'
+            '    Humanoid:Move(self.dir)\n'
+            'end\n'
+            'return Class\n'
+        )
+        assert verify_module(src).ok
+        assert verify_module(src, is_player_controller=False).ok
+        # But the SAME source, as the player, trips both rejects.
+        rules = _player_rules(src)
+        assert "p1" in rules and "p2" in rules
+
+    def test_player_flag_does_not_suppress_contract_rules(self):
+        # The flag ADDS the player rejects; it must not disable rules a-h.
+        src = 'print("loaded")\n' + COMPLIANT
+        assert "a" in _player_rules(src)

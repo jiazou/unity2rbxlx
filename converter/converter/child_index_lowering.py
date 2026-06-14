@@ -78,31 +78,72 @@ end
 """
 
 
-def _luau_pos_is_code(source: str, pos: int) -> bool:
-    """True if char index ``pos`` is real code, not inside a string or a
-    ``--`` comment.
+def _long_bracket_level(source: str, i: int) -> int | None:
+    """If ``source[i]`` opens a Luau long bracket ``[=*[``, return its level
+    (number of ``=``); else ``None``. ``i`` must point at the opening ``[``."""
+    if source[i] != "[":
+        return None
+    j = i + 1
+    while j < len(source) and source[j] == "=":
+        j += 1
+    if j < len(source) and source[j] == "[":
+        return j - (i + 1)
+    return None
 
-    Scans from the start of ``pos``'s line, tracking single/double-quoted
-    strings (with backslash escapes) and ``--`` line comments -- the only forms
-    the transpiler emits. Multi-line ``[[ ]]`` strings/comments and backtick
-    interpolation strings aren't modeled (parity with the legacy pack).
-    """
-    i = source.rfind("\n", 0, pos) + 1
-    quote: str | None = None
+
+def _luau_pos_is_code(source: str, pos: int) -> bool:
+    """True if char index ``pos`` is real code, not inside a string or a comment.
+
+    Scans from the START of the file (block comments / long strings can open on
+    a prior line, so a per-line scan would miss them), tracking: ``--`` line
+    comments, ``--[[ ]]`` / ``--[=[ ]=]`` block comments, ``[[ ]]`` / ``[=[ ]=]``
+    long strings, and single/double-quoted short strings (``\\`` escapes).
+    Backtick interpolation strings aren't modeled (the transpiler doesn't emit
+    them here)."""
+    i = 0
+    n = len(source)
     while i < pos:
         ch = source[i]
-        if quote is not None:
-            if ch == "\\":
-                i += 2
+        # Comment — line or block (``--`` then optional long bracket).
+        if ch == "-" and i + 1 < n and source[i + 1] == "-":
+            level = _long_bracket_level(source, i + 2)
+            if level is not None:
+                close = "]" + "=" * level + "]"
+                end = source.find(close, i + 2)
+                if end == -1 or end + len(close) > pos:
+                    return False  # block comment encloses pos
+                i = end + len(close)
                 continue
-            if ch == quote:
-                quote = None
-        elif ch in ("'", '"'):
-            quote = ch
-        elif ch == "-" and i + 1 < pos and source[i + 1] == "-":
-            return False  # rest of the line (incl. pos) is a comment
+            nl = source.find("\n", i)
+            if nl == -1 or nl >= pos:
+                return False  # line comment runs through pos
+            i = nl + 1
+            continue
+        # Long string ``[[ ]]`` / ``[=[ ]=]`` (not a comment).
+        level = _long_bracket_level(source, i)
+        if level is not None:
+            close = "]" + "=" * level + "]"
+            end = source.find(close, i + level + 2)
+            if end == -1 or end + len(close) > pos:
+                return False  # long string encloses pos
+            i = end + len(close)
+            continue
+        # Short string ``"..."`` / ``'...'`` (``\`` escapes).
+        if ch in ("'", '"'):
+            j = i + 1
+            while j < n:
+                if source[j] == "\\":
+                    j += 2
+                    continue
+                if source[j] == ch:
+                    break
+                j += 1
+            if j >= pos:
+                return False
+            i = j + 1
+            continue
         i += 1
-    return quote is None
+    return True
 
 
 def source_has_child_index(source: str) -> bool:

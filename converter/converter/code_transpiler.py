@@ -27,6 +27,11 @@ from config import (
     LLM_CACHE_TTL_SECONDS,
     TRANSPILATION_CONFIDENCE_THRESHOLD,
 )
+from converter.child_ref_resolver import (
+    ChildRefMap,
+    ChildRefScript,
+    prerewrite_child_index,
+)
 
 log = logging.getLogger(__name__)
 
@@ -47,6 +52,18 @@ class TranspiledScript:
     warnings: list[str] = field(default_factory=list)
     flagged_for_review: bool = False
     script_type: str = "Script"  # Script, LocalScript, ModuleScript
+    # True when the transpiler INTENTIONALLY emitted an inert component stub
+    # (a Roblox-dead visual helper or an empty subclass of a dead base). The
+    # generic contract's stub_strategy fail-close trusts this stamp instead of
+    # recomputing the visual-only verdict (which lacks the project context the
+    # empty-subclass-of-dead-base decision needs). See contract_pipeline.
+    intentional_inert_stub: bool = False
+    # Per-script child-ref resolution tally from the generic-mode pre-rewrite
+    # (``child_ref_resolver``): a JSON-native dict ``{"getchild_total": int,
+    # "resolved_total": int}`` or ``None``. Copied onto the produced
+    # ``RbxScript.child_ref_resolution`` so the contract verifier's child-ordinal
+    # backstop can assert against the fact. ``None`` outside generic mode.
+    child_ref_resolution: dict[str, int] | None = None
 
 
 @dataclass
@@ -81,6 +98,22 @@ class TranspilationResult:
 RuntimeMode = Literal["legacy", "generic"]
 
 
+# Per-script prompt directive for the identified player controller (paradigm B,
+# NON-load-bearing — a conflict-reducer + cleaner-output nicety; paradigm C holds
+# the binding even if the AI ignores this entirely). Appended to ``project_context``
+# (a ``_ai_cache_key`` field), NEVER to the byte-frozen ``_AI_SYSTEM_PROMPT``.
+_PLAYER_CONTROLLER_DIRECTIVE = (
+    "## Player controller directive\n"
+    "This script is the player controller. The host owns camera, movement, aim, "
+    "and respawn via `self.host.player`. Do NOT write `workspace.CurrentCamera`, "
+    "do NOT call `Humanoid:Move`. For aim use `self.host.player:getLookCFrame()`; "
+    "for recoil `self.host.player:applyRecoil(degrees)` (pitch kick in DEGREES, "
+    "e.g. Unity `camRotation.x -= 2` -> `applyRecoil(2)`); to teleport use "
+    "`self.host.player:teleport(cf)`. "
+    "Keep your game logic (shoot decision, ammo, pickups, pause)."
+)
+
+
 def transpile_scripts(
     unity_project_path: str | Path,
     script_infos: list[Any],
@@ -92,6 +125,8 @@ def transpile_scripts(
     runtime_mode: RuntimeMode = "legacy",
     runtime_bearing_paths: frozenset[Path] | None = None,
     component_class_paths: frozenset[Path] | None = None,
+    player_controller_paths: frozenset[Path] | None = None,
+    child_ref_map: ChildRefMap | None = None,
 ) -> TranspilationResult:
     """Transpile a list of C# scripts to Luau.
 
@@ -125,11 +160,30 @@ def transpile_scripts(
             because a component runs host-bound whether authored or
             ``Instantiate()``-spawned. Defaults to ``runtime_bearing_paths``
             when not supplied (legacy callers / direct unit tests).
+        player_controller_paths: Under ``runtime_mode="generic"`` the set of
+            ``info.path`` values for the identified player controller (the
+            unique ``has_character_controller`` module, keyed on the
+            deterministic upstream Unity signal — see
+            ``_player_controller_paths`` in ``contract_pipeline.py``). Each such
+            script gets ``_PLAYER_CONTROLLER_DIRECTIVE`` appended to its prompt
+            ``project_context`` (paradigm B, NON-load-bearing). Defaults to an
+            empty set (legacy callers / direct unit tests unaffected — the
+            byte-identical no-directive context is preserved).
+        child_ref_map: Under ``runtime_mode="generic"`` the per-script
+            ``ChildRefScript`` map built by
+            ``child_ref_resolver.build_child_ref_map``. Each script's
+            ``transform``-rooted ``<recv>.GetChild(n)`` sites are PRE-REWRITTEN to
+            ``<recv>.Find("<name>")`` in ``csharp_source`` BEFORE it enters the
+            cache key / AI, and the per-script ``{getchild_total, resolved_total}``
+            tally is stamped onto each produced ``RbxScript.child_ref_resolution``.
+            ``None`` (default) for legacy callers / direct unit tests — no
+            pre-rewrite, no stamp.
 
     Returns:
         TranspilationResult with all transpiled scripts and summary counts.
     """
     runtime_bearing_paths = runtime_bearing_paths or frozenset()
+    player_controller_paths = player_controller_paths or frozenset()
     # The generic mode/target gate keys off component-ness, not placement.
     # Fall back to runtime_bearing_paths so callers that predate the split
     # (and direct unit tests) keep their existing behaviour.
@@ -144,8 +198,37 @@ def transpile_scripts(
     project_context = _build_project_context(script_infos)
     serialized_field_refs = serialized_field_refs or {}
 
+    from converter.roblox_dead_modules import is_empty_subclass_of_dead_base
+
+    # Project class-name -> source resolver for the empty-subclass-of-dead-base
+    # check. Maps a class to its UNIQUE source; a name that is unknown or
+    # collides (multiple files declare it) resolves to None so the check
+    # abstains. Sources are read lazily + cached (only base classes are looked
+    # up, not every script).
+    _class_paths: dict[str, list[Path]] = {}
+    for _info in script_infos:
+        if getattr(_info, "class_name", ""):
+            _class_paths.setdefault(_info.class_name, []).append(_info.path)
+    _base_source_cache: dict[str, str | None] = {}
+
+    def _resolve_class_source(class_name: str) -> str | None:
+        if class_name in _base_source_cache:
+            return _base_source_cache[class_name]
+        paths = _class_paths.get(class_name, [])
+        src: str | None = None
+        if len(paths) == 1:
+            try:
+                src = paths[0].read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                src = None
+        _base_source_cache[class_name] = src
+        return src
+
     # Phase 1: Classify scripts and read source
     pending_scripts: list[tuple[Any, str, str]] = []  # (info, csharp_source, script_type)
+    # Per-script child-ref resolution entry (generic-only), keyed on str(info.path),
+    # carried to the TranspiledScript stamp below.
+    child_ref_by_path: dict[str, ChildRefScript] = {}
     for info in script_infos:
         script_path = info.path
         try:
@@ -155,30 +238,76 @@ def transpile_scripts(
             result.total_failed += 1
             continue
 
-        # Auto-stub visual/rendering scripts that can't work in Roblox.
-        if _is_visual_only_script(script_path, csharp_source):
-            # A visual-only component class (e.g. a water-shader
-            # MonoBehaviour) is still routed through the generic contract,
+        # Generic-mode child-ref PRE-REWRITE: resolve transform-rooted
+        # GetChild(n) sites to named lookups in the C# BEFORE it enters the cache
+        # key / AI. Canonical-key lookup (resolved-first, raw fallback) mirrors
+        # ``_build_serialized_field_context``. Mutating ``csharp_source`` here is
+        # what the AI sees and what the cache keys on.
+        if runtime_mode == "generic" and child_ref_map:
+            try:
+                _canon_key = str(script_path.resolve())
+            except OSError:
+                _canon_key = str(script_path)
+            _child_ref_entry = (
+                child_ref_map.get(_canon_key)
+                or child_ref_map.get(str(script_path))
+            )
+            if _child_ref_entry is not None:
+                csharp_source, _ = prerewrite_child_index(
+                    csharp_source, _child_ref_entry,
+                )
+                child_ref_by_path[str(script_path)] = _child_ref_entry
+
+        # Auto-stub scripts that can't work in Roblox: a visual/rendering
+        # helper, OR an empty subclass of a Roblox-dead base.
+        is_generic_component = (
+            runtime_mode == "generic" and script_path in generic_paths
+        )
+        visual_only = _is_visual_only_script(script_path, csharp_source)
+        # An empty subclass of a dead base (e.g. ``GerstnerDisplace : Displace
+        # {}`` where Displace is a dead water-shader) has no rendering API of
+        # its own, so it misses the visual-only gate -- but it is just as dead.
+        # AI-transpiling it emits inheritance wiring (a module-scope ``require``
+        # of the now-stubbed base + ``setmetatable``) that intermittently trips
+        # the generic runtime contract (rules a/b) and fail-closes the build.
+        # Inert-stub it deterministically instead. Generic component only: the
+        # inert stub preserves the component identity the verdict needs, and
+        # legacy mode has no contract to satisfy (so its output is unchanged).
+        empty_subclass_dead = (
+            is_generic_component
+            and not visual_only
+            and is_empty_subclass_of_dead_base(
+                csharp_source, _resolve_class_source,
+            )
+        )
+        if visual_only or empty_subclass_dead:
+            # A component class is still routed through the generic contract,
             # so its stub must be a VALID inert ModuleScript: an empty class
             # table the host can ``require`` + instantiate harmlessly. The
             # legacy ``print(...)`` form returns nil, which (a) fails the
-            # contract's return rule and (b) throws when the host requires
-            # it. Non-generic / non-component visual scripts keep the plain
-            # legacy stub.
-            is_generic_component = (
-                runtime_mode == "generic" and script_path in generic_paths
-            )
+            # contract's return rule and (b) throws when the host requires it.
+            # Non-generic / non-component visual scripts keep the plain legacy
+            # stub. ``intentional_inert_stub`` tells contract_pipeline this
+            # ModuleScript stub is deliberate (so it is not fail-closed as an
+            # AI-fallthrough stub).
             if is_generic_component:
-                luau_source = _inert_component_stub(
-                    script_path.stem, "Unity visual/rendering effect (no Roblox equivalent)",
+                reason = (
+                    "Unity visual/rendering effect (no Roblox equivalent)"
+                    if visual_only
+                    else "empty subclass of a Roblox-dead base "
+                    "(no Roblox equivalent)"
                 )
+                luau_source = _inert_component_stub(script_path.stem, reason)
                 stub_script_type = "ModuleScript"
+                intentional_inert = True
             else:
                 luau_source = (
                     f'-- {script_path.stem}: Unity visual/rendering effect '
                     f'(no Roblox equivalent)\nprint("{script_path.stem} loaded")'
                 )
                 stub_script_type = "Script"
+                intentional_inert = False
+            _stub_child_ref = child_ref_by_path.get(str(script_path))
             result.scripts.append(TranspiledScript(
                 source_path=str(script_path),
                 output_filename=script_path.stem + ".luau",
@@ -187,10 +316,23 @@ def transpile_scripts(
                 strategy="stub",
                 confidence=1.0,
                 script_type=stub_script_type,
+                intentional_inert_stub=intentional_inert,
+                child_ref_resolution=(
+                    {
+                        "getchild_total": _stub_child_ref.getchild_total,
+                        "resolved_total": _stub_child_ref.resolved_total,
+                    }
+                    if _stub_child_ref is not None
+                    else None
+                ),
             ))
             result.total_transpiled += 1
             result.total_rule_based += 1
-            log.info("  %s: auto-stubbed (visual/rendering only)", script_path.name)
+            log.info(
+                "  %s: auto-stubbed (%s)", script_path.name,
+                "visual/rendering only" if visual_only
+                else "empty subclass of dead base",
+            )
             continue
 
         script_type = _classify_script_type(csharp_source, info)
@@ -275,7 +417,17 @@ def transpile_scripts(
             field_ctx = _build_serialized_field_context(
                 info.path, unity_project_path, serialized_field_refs,
             )
-            context_parts = [project_context, scoped, field_ctx]
+            # Paradigm B (NON-load-bearing): append the player-controller
+            # directive to the identified player script's prompt context ONLY,
+            # gated on generic-mode AND the deterministic upstream player
+            # identity. It lands in ``project_context`` (a ``_ai_cache_key``
+            # field), never the byte-frozen ``_AI_SYSTEM_PROMPT``.
+            is_player = (
+                runtime_mode == "generic"
+                and info.path in player_controller_paths
+            )
+            player_directive = _PLAYER_CONTROLLER_DIRECTIVE if is_player else ""
+            context_parts = [project_context, scoped, field_ctx, player_directive]
             context = "\n\n".join(p for p in context_parts if p)
             try:
                 if backend == "claude_cli":
@@ -285,6 +437,7 @@ def transpile_scripts(
                         script_type=script_type,
                         project_context=context,
                         runtime_mode=effective_runtime_mode,
+                        is_player_controller=is_player,
                     )
                 elif backend == "anthropic_api" and api_key:
                     luau, confidence, warnings = _ai_transpile(
@@ -293,6 +446,7 @@ def transpile_scripts(
                         script_type=script_type,
                         project_context=context,
                         runtime_mode=effective_runtime_mode,
+                        is_player_controller=is_player,
                     )
                 else:
                     return stem, None
@@ -398,6 +552,7 @@ def transpile_scripts(
 
         output_filename = info.path.stem + ".luau"
 
+        _child_ref_entry = child_ref_by_path.get(str(info.path))
         ts = TranspiledScript(
             source_path=str(info.path),
             output_filename=output_filename,
@@ -408,6 +563,14 @@ def transpile_scripts(
             warnings=warnings,
             flagged_for_review=flagged,
             script_type=script_type,
+            child_ref_resolution=(
+                {
+                    "getchild_total": _child_ref_entry.getchild_total,
+                    "resolved_total": _child_ref_entry.resolved_total,
+                }
+                if _child_ref_entry is not None
+                else None
+            ),
         )
         result.scripts.append(ts)
         result.total_transpiled += 1
@@ -1500,8 +1663,36 @@ def _contract_reprompt_user_message(
     )
 
 
+_PLAYER_RULES: frozenset[str] = frozenset({"p1", "p2"})
+
+
+def _format_contract_survivor_warning(violation) -> str:
+    """Tag a SURVIVING verifier violation for the ``TranspiledScript``.
+
+    Player rejects (``p1``/``p2``, paradigm B) get the distinct
+    ``contract-verifier-player`` tag -- it starts with ``contract-verifier-``
+    so it NEVER matches ``_is_post_reprompt_warning`` (which keys on the
+    ``contract-verifier `` space / ``contract-verifier:`` colon forms) -->
+    never promotes to a fail-closed --> B stays NON-load-bearing. Contract
+    rules (a)-(h) keep the ``contract-verifier `` (space) tag and stay
+    fail-closed. Shared between the cold ``_verify_and_reprompt`` path and
+    the ``_refresh_contract_warnings`` cache-replay path so both fail open
+    on a surviving player reject identically.
+    """
+    if violation.rule in _PLAYER_RULES:
+        return (
+            f"contract-verifier-player (rule {violation.rule}, "
+            f"line {violation.line}): {violation.message}"
+        )
+    return (
+        f"contract-verifier (rule {violation.rule}, "
+        f"line {violation.line}): {violation.message}"
+    )
+
+
 def _refresh_contract_warnings(
     luau_source: str, cached_warnings: list[str],
+    is_player_controller: bool = False,
 ) -> list[str]:
     """Replace cached contract-verifier warnings with a fresh re-verify.
 
@@ -1520,18 +1711,30 @@ def _refresh_contract_warnings(
     reprompt-rescued modules; on cache replay that distinction is
     unrecoverable, so we treat the cached output as "first attempt
     clean" if the current verifier passes.
+
+    ``is_player_controller`` (paradigm B, NON-load-bearing): when ``True``
+    the verifier also runs the two player rejects (``p1``/``p2``). This is
+    the LOAD-BEARING fail-open-on-cache-hit path: a cached player reject
+    (``p1``/``p2``) MUST be re-emitted under the ``contract-verifier-player``
+    tag, NOT the default ``contract-verifier `` (space) tag -- the space tag
+    matches ``_is_post_reprompt_warning`` and would promote to a hard
+    fail-closed on replay, making B load-bearing. The ``-player`` tag never
+    matches that promotion, so a surviving player reject fails OPEN on the
+    cache-replay path exactly as on the cold path. Contract rules (a)-(h)
+    keep the space tag and stay fail-closed.
     """
     from converter.runtime_contract import verify_module
     non_contract = [
         w for w in cached_warnings
         if not w.startswith("contract-verifier")
     ]
-    result = verify_module(luau_source)
+    result = verify_module(
+        luau_source, is_player_controller=is_player_controller,
+    )
     if result.ok:
         return non_contract
     return non_contract + [
-        f"contract-verifier (rule {v.rule}, line {v.line}): {v.message}"
-        for v in result.violations
+        _format_contract_survivor_warning(v) for v in result.violations
     ]
 
 
@@ -1540,6 +1743,7 @@ def _verify_and_reprompt(
     csharp_source: str,
     runtime_mode: RuntimeMode,
     reprompt_call,
+    is_player_controller: bool = False,
 ) -> tuple[str, list[str]]:
     """Run the contract verifier; on violations call ``reprompt_call`` ONCE.
 
@@ -1555,13 +1759,18 @@ def _verify_and_reprompt(
     only by design (the bottom of the design doc's "What already exists"
     section explicitly preserves legacy's repair passes).
 
-    Warnings carry two distinct tags so the compliance spike can compute
+    Warnings carry distinct tags so the compliance spike can compute
     pre/post-reprompt pass rates from the returned list alone:
 
-      * ``contract-verifier-pre`` -- a violation the FIRST AI output had.
-        Emitted only when reprompt was actually called.
-      * ``contract-verifier`` -- a violation that survived the reprompt
-        (and therefore routes to project-level fail-closed).
+      * ``contract-verifier-pre`` -- a contract-rule (a)-(h) violation the
+        FIRST AI output had. Emitted only when reprompt was actually called.
+      * ``contract-verifier`` -- a contract-rule (a)-(h) violation that
+        survived the reprompt (routes to project-level fail-closed).
+      * ``contract-verifier-player`` -- a SURVIVING paradigm-B player reject
+        (``p1``/``p2``). NON-load-bearing: fails OPEN (the ``-player`` tag
+        never matches ``_is_post_reprompt_warning``). Player rules emit NO
+        ``-pre`` tag, so a FIXED ``p1``/``p2`` leaves NO surviving player
+        warning, and the counter taxonomy never false-counts it as rescued.
 
     A module with only ``-pre`` warnings means the reprompt fixed
     everything; a module with both means partial fix; a module with no
@@ -1572,16 +1781,22 @@ def _verify_and_reprompt(
 
     from converter.runtime_contract import verify_module
 
-    initial = verify_module(luau_source)
+    initial = verify_module(
+        luau_source, is_player_controller=is_player_controller,
+    )
     if initial.ok:
         return luau_source, []
 
     # Record the pre-reprompt violations as ``-pre`` warnings before the
     # reprompt has a chance to fix them. They survive even on a
-    # successful reprompt so the spike can measure delta.
+    # successful reprompt so the spike can measure delta. Player rules
+    # (``p1``/``p2``) are EXCLUDED -- they are non-load-bearing and emit a
+    # ``-player`` survivor tag ONLY if they survive the reprompt (a fixed
+    # player reject leaves no warning), keeping the spike counters clean.
     pre_warnings = [
         f"contract-verifier-pre (rule {v.rule}, line {v.line}): {v.message}"
         for v in initial.violations
+        if v.rule not in _PLAYER_RULES
     ]
 
     violations_text = _format_contract_violations(initial.violations)
@@ -1595,29 +1810,28 @@ def _verify_and_reprompt(
         # warning too -- backend failure is operationally equivalent to
         # "reprompt didn't fix anything".
         return luau_source, pre_warnings + [
-            f"contract-verifier (rule {v.rule}, line {v.line}): {v.message}"
-            for v in initial.violations
+            _format_contract_survivor_warning(v) for v in initial.violations
         ]
 
     new_luau = _strip_code_fences(new_text)
     if not new_luau:
         return luau_source, pre_warnings + [
-            f"contract-verifier (rule {v.rule}, line {v.line}): {v.message}"
-            for v in initial.violations
+            _format_contract_survivor_warning(v) for v in initial.violations
         ]
 
-    second = verify_module(new_luau)
+    second = verify_module(
+        new_luau, is_player_controller=is_player_controller,
+    )
     if second.ok:
         # Reprompt fixed everything. Pre-warnings are still surfaced so
         # the spike can count "reprompt-rescued" modules separately from
         # "first-attempt clean" modules.
         return new_luau, pre_warnings
     # Still failing after one reprompt -- per design doc this routes to
-    # project-wide legacy fallback. Carry the remaining violations as
-    # ``contract-verifier`` warnings; the orchestrator decides.
+    # project-wide legacy fallback for contract rules (a)-(h); a surviving
+    # player reject (``p1``/``p2``) carries the fail-OPEN ``-player`` tag.
     return new_luau, pre_warnings + [
-        f"contract-verifier (rule {v.rule}, line {v.line}): {v.message}"
-        for v in second.violations
+        _format_contract_survivor_warning(v) for v in second.violations
     ]
 
 
@@ -1629,6 +1843,7 @@ def _ai_transpile(
     script_type: str = "Script",
     project_context: str = "",
     runtime_mode: RuntimeMode = "legacy",
+    is_player_controller: bool = False,
 ) -> tuple[str, float, list[str]]:
     """Transpile C# source to Luau using the Claude API.
 
@@ -1677,6 +1892,7 @@ def _ai_transpile(
             if runtime_mode == "generic":
                 cached_warnings = _refresh_contract_warnings(
                     luau_cached, cached_warnings,
+                    is_player_controller=is_player_controller,
                 )
             return luau_cached, cached["confidence"], cached_warnings
         else:
@@ -1761,6 +1977,7 @@ def _ai_transpile(
 
     luau_source, contract_warnings = _verify_and_reprompt(
         luau_source, csharp_source, runtime_mode, _api_reprompt,
+        is_player_controller=is_player_controller,
     )
     warnings.extend(contract_warnings)
 
@@ -1835,6 +2052,7 @@ def _claude_cli_transpile(
     script_type: str = "Script",
     project_context: str = "",
     runtime_mode: RuntimeMode = "legacy",
+    is_player_controller: bool = False,
 ) -> tuple[str, float, list[str]]:
     """Transpile C# to Luau by invoking Claude Code CLI.
 
@@ -1872,6 +2090,7 @@ def _claude_cli_transpile(
             if runtime_mode == "generic":
                 cached_warnings = _refresh_contract_warnings(
                     luau_cached, cached_warnings,
+                    is_player_controller=is_player_controller,
                 )
             return luau_cached, cached["confidence"], cached_warnings
         else:
@@ -1946,6 +2165,7 @@ def _claude_cli_transpile(
 
     luau_source, contract_warnings = _verify_and_reprompt(
         luau_source, csharp_source, runtime_mode, _cli_reprompt,
+        is_player_controller=is_player_controller,
     )
     warnings.extend(contract_warnings)
 

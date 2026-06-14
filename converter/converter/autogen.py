@@ -259,6 +259,28 @@ getItemRemote.OnServerEvent:Connect(function(player, pickupPart)
     pickupPart.Parent = nil
 end)
 
+-- Player teleport (paradigm C ``host.player:teleport(cf)``, NON-load-bearing,
+-- D7): the client REQUESTS a mid-game teleport; the server OWNS the character
+-- move. Declared + handled here in the tail (no shared-flag-funnel dependency,
+-- unlike PlayerShoot/PlayerGetItem). If the AI never calls it the remote simply
+-- never fires -- respawn (above) is unaffected (server-owned).
+local teleportRemote = Instance.new("RemoteEvent")
+teleportRemote.Name = "PlayerTeleport"
+teleportRemote.Parent = ReplicatedStorage
+
+-- The server applies the teleport ONLY to the REQUESTING player's own character
+-- (``player`` is the authenticated sender) -- a client can never move another
+-- player. Mirrors the server-owned spawn teleport (hrp.CFrame = ...).
+teleportRemote.OnServerEvent:Connect(function(player, cf)
+    if typeof(cf) ~= "CFrame" then return end
+    local char = player.Character
+    if not char then return end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if hrp then
+        hrp.CFrame = cf
+    end
+end)
+
 print("[GameServer] Initialized. Spawn point at", spawnCFrame.Position)
 '''
 
@@ -673,6 +695,14 @@ local PlayerGui = LocalPlayer and LocalPlayer:WaitForChild("PlayerGui", 10)
 local SceneRuntime = require(RS:WaitForChild("SceneRuntime"))
 local Plan = require(RS:WaitForChild("SceneRuntimePlan"))
 
+-- The host-owned player embodiment authority (paradigm C) reuses the camera
+-- service's vetted pure pose math via injected helpers — it never requires
+-- SceneCameraInput at the host's top-of-file (the host loads with no ``game``
+-- global). SceneCameraInput is emitted UNCONDITIONALLY alongside SceneRuntime
+-- (pipeline.py), so this require always resolves on the client.
+local SceneCameraInput = require(RS:WaitForChild("SceneCameraInput"))
+local UserInputService = game:GetService("UserInputService")
+
 local function workspaceFind(sceneRuntimeId)
     -- Linear scan; production builds may cache as needed. Hosts are
     -- stamped on the logical GameObject only (PR2), so this is
@@ -808,6 +838,24 @@ end
 local services = {
     task = task,
     warn = warn,
+    -- Player-embodiment authority (paradigm C) — CLIENT ONLY. ``isClient``
+    -- is the deterministic client/server discriminator the authority gates
+    -- on (NOT a RunService presence sniff); ``userInputService`` + the two
+    -- pure camera helpers reach the in-runtime authority via this table. The
+    -- SERVER table stamps ``isClient = false`` and omits these.
+    isClient = true,
+    userInputService = UserInputService,
+    cameraAdvance = SceneCameraInput._advance,
+    cameraComposeLook = SceneCameraInput._composeLook,
+    cameraYawOf = SceneCameraInput._yawOf,
+    -- Client teleport-request remote (paradigm C ``host.player:teleport(cf)``,
+    -- NON-load-bearing, D7) — CLIENT ONLY; the server never requests, so the
+    -- server services table omits it. The GameServer creates this remote, so a
+    -- bounded WaitForChild resolves it on the client.
+    playerTeleportRemote = RS:WaitForChild("PlayerTeleport", 10),
+    -- CFrame type-guard for the teleport request (the host injects this rather
+    -- than calling the ``typeof`` builtin directly so the predicate is testable).
+    isCFrame = function(v) return typeof(v) == "CFrame" end,
     resolveModule = resolveModule,
     workspaceFind = workspaceFind,
     awaitUiHost = awaitUiHost,
@@ -834,7 +882,7 @@ local services = {
         local tpl = _resolveTemplate(prefabId)
         if not tpl then return nil end
         local clone = tpl:Clone()
-        if parent then clone.Parent = parent end
+        clone.Parent = parent or workspace
         if cframe and clone:IsA("Model") then
             clone:PivotTo(cframe)
         end
@@ -958,6 +1006,11 @@ end
 local services = {
     task = task,
     warn = warn,
+    -- The server NEVER builds/drives the player-embodiment authority: the
+    -- explicit ``isClient = false`` flag makes ``_initPlayerAuthority`` leave
+    -- ``self._player = nil`` so the ``_tick`` brackets no-op. No UIS / camera
+    -- helpers are injected here (the client table carries them).
+    isClient = false,
     resolveModule = resolveModule,
     workspaceFind = workspaceFind,
     findFirstChildWhichIsA = function(inst, class)
@@ -983,7 +1036,7 @@ local services = {
         local tpl = _resolveTemplate(prefabId)
         if not tpl then return nil end
         local clone = tpl:Clone()
-        if parent then clone.Parent = parent end
+        clone.Parent = parent or workspace
         if cframe and clone:IsA("Model") then
             clone:PivotTo(cframe)
         end
