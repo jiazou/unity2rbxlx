@@ -792,6 +792,14 @@ def _binding_discharged(
     # a leftover/neutralized ``self.<field> = ...`` write keeps the field a member).
     if _has_surviving_field_read(source, field):
         return False
+    # (1d) ABSTAIN on any BOUNDARY-FORM read the reroute cannot rewrite and the
+    # slice-1.2 verifier fails closed on (bracket/dynamic ``self[expr]`` / non-``self``
+    # receiver / shadowed-``self`` / non-yielding-lifecycle raw read). Mirroring the
+    # verifier's reject set here keeps the lowering's discharge in lock-step with the
+    # verifier (phase-integration MAJOR #2): a boundary-form script abstains False on
+    # BOTH, instead of the lowering stamping present=True on a verifier-fire case.
+    if _has_unrewritable_boundary_read(source, field):
+        return False
     return True
 
 
@@ -888,6 +896,149 @@ def _has_surviving_field_read(source: str, field: str) -> bool:
             continue  # non-yielding lifecycle read -> abstained, not a consumer
         return True
     return False
+
+
+def _has_unrewritable_boundary_read(source: str, field: str) -> bool:
+    """True iff a BOUNDARY-FORM read of ``field`` survives — a form the consumer-read
+    reroute CANNOT safely rewrite and which the slice-1.2 verifier's
+    ``_rig_binding_discharged`` FAILS CLOSED on. The lowering MUST mirror these so it
+    ABSTAINS (``present=False``, source unedited for the reroute) on exactly the
+    scripts the verifier will reject — never stamp ``present=True`` on a verifier-fire
+    case (the desync this guards, phase-integration MAJOR #2). The forms (design §1.6,
+    lines 403-412):
+      (a) a bracket-index read ``self["<field>"]`` (the string-key member access);
+      (b) a DYNAMIC bracket read ``self[<expr>]`` (incl. a parenthesized ``self[(...)]``)
+          whose key is not a pure integer array index — the key cannot be statically
+          tied to (or ruled out as) the field, so it is a boundary form;
+      (c) a NON-``self`` receiver read of the field — module-table ``<Class>.<field>``,
+          ``owner.<field>``, a receiver-alias ``local p = self; p.<field>`` — any
+          ``<ident>.<field>`` whose receiver is not the bare ``self`` token;
+      (d) a raw ``self.<field>`` dot-form read inside a NON-yielding lifecycle method
+          (``Awake``/``Start``) — a stale-derived-state hazard the verifier flags
+          (design §1.6, supersedes the old "Awake read sees a safe nil" premise).
+
+    A SHADOWED-``self`` read (``function(self) ... self.<field>`` / ``local self = ...;
+    self.<field>``) is NOT a boundary form: ``self`` there is a FOREIGN object, so the
+    read is not a read of THIS script's field — the verifier mirrors the lowering's
+    shadow guard and treats it as neutral (does not block discharge), matching
+    ``_has_surviving_field_read``. The bare ``self.<field>`` dot-form read in a
+    YIELD-SAFE method is likewise NOT a boundary form: the reroute rewrites it (and
+    ``_has_surviving_field_read`` already counts a leftover one). This detector covers
+    ONLY the forms the reroute leaves un-rewritten AND the verifier rejects, so the
+    two AGREE on discharge: a clean dot-form script discharges True on both; a
+    boundary-form script abstains False on both."""
+    # (a)/(b) bracket-index reads ``self[ ... ]`` (string key or dynamic expr).
+    for m in re.finditer(r"self\s*\[", source):
+        start = m.start()
+        if not _luau_pos_is_code(source, start):
+            continue
+        if _luau_pos_in_long_bracket(source, start):
+            continue
+        # ``self`` must be a bare token (not ``x.self[...]``).
+        j = start - 1
+        while j >= 0 and source[j] in " \t":
+            j -= 1
+        if j >= 0 and source[j] == ".":
+            continue
+        if _self_is_shadowed_at(source, start):
+            continue  # a shadowed self[...] is a different object -> not this field
+        key = _bracket_key_text(source, m.end() - 1)
+        if key is None:
+            continue  # unbalanced/uncertain -> leave to syntax/other gates
+        stripped = key.strip()
+        # A string-literal key: boundary iff it is THIS field (``self["weaponSlot"]``).
+        sm = re.fullmatch(r"""(['"])(.*)\1""", stripped, re.DOTALL)
+        if sm is not None:
+            if sm.group(2) == field:
+                return True  # (a) bracket-index read of the field
+            continue  # a different string key -> unrelated member
+        # A pure integer key (``self[1]``) is array indexing, not a field read.
+        if re.fullmatch(r"\d+", stripped):
+            continue
+        # Anything else is a DYNAMIC key (a symbol / call / parenthesized expr) the
+        # reroute cannot tie to or rule out as the field -> boundary form (b).
+        return True
+    # (c) a NON-``self`` receiver read ``<ident>.<field>`` (module-table / owner /
+    # alias). Excludes ``self.<field>`` (handled by the dot-form reroute) and a
+    # member-tail ``x.<recv>.<field>`` recv that is itself ``self`` (``x.self.field``
+    # is already not a self read).
+    for m in re.finditer(r"([A-Za-z_]\w*)\s*\.\s*" + re.escape(field) + r"\b", source):
+        start = m.start()
+        if not _luau_pos_is_code(source, start):
+            continue
+        if _luau_pos_in_long_bracket(source, start):
+            continue
+        recv = m.group(1)
+        if recv == "self":
+            continue  # bare self.<field> -> the reroute's domain, handled elsewhere
+        # Not an assignment LHS (a write to a foreign field is not a READ we must
+        # reroute; the verifier's discharge gate is about surviving READS).
+        a = m.end()
+        while a < len(source) and source[a] in " \t":
+            a += 1
+        if a < len(source) and source[a] == "=" and not (
+            a + 1 < len(source) and source[a + 1] == "="
+        ):
+            continue
+        return True  # (c) non-self receiver read of the field
+    # (d) a raw ``self.<field>`` dot-form read inside a non-yielding lifecycle method
+    # (``Awake``/``Start``). A SHADOWED-self read is skipped (foreign object, neutral).
+    for m in re.finditer(r"self\." + re.escape(field) + r"\b", source):
+        start = m.start()
+        if not _luau_pos_is_code(source, start):
+            continue
+        if _luau_pos_in_long_bracket(source, start):
+            continue
+        j = start - 1
+        while j >= 0 and source[j] in " \t":
+            j -= 1
+        if j >= 0 and source[j] == ".":
+            continue  # x.self.<field> -> not a bare self read
+        a = m.end()
+        while a < len(source) and source[a] in " \t":
+            a += 1
+        if a < len(source) and source[a] == "=" and not (
+            a + 1 < len(source) and source[a + 1] == "="
+        ):
+            continue  # assignment LHS -> not a read
+        if _self_is_shadowed_at(source, start):
+            continue  # shadowed self -> foreign object, neutral (mirror the guard)
+        if _enclosing_method(source, start) in _NON_YIELDING_LIFECYCLE_METHODS:
+            return True  # (d) raw read in a non-yielding lifecycle method
+    return False
+
+
+def _bracket_key_text(source: str, open_idx: int) -> str | None:
+    """The text between a balanced ``[`` at ``open_idx`` and its matching ``]``,
+    bracket/string-aware at code positions. None if unbalanced/uncertain."""
+    depth = 0
+    i = open_idx
+    n = len(source)
+    while i < n:
+        ch = source[i]
+        if ch in ("'", '"') and _luau_pos_is_code(source, i):
+            quote = ch
+            i += 1
+            while i < n:
+                if source[i] == "\\":
+                    i += 2
+                    continue
+                if source[i] == quote:
+                    i += 1
+                    break
+                i += 1
+            continue
+        if _luau_pos_is_code(source, i):
+            if ch in "([{":
+                depth += 1
+            elif ch in ")]}":
+                depth -= 1
+                if depth == 0 and ch == "]":
+                    return source[open_idx + 1:i]
+                if depth < 0:
+                    return None
+        i += 1
+    return None
 
 
 def _luau_syntax_ok(source: str) -> bool:

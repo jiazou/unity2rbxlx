@@ -673,6 +673,45 @@ def _main_camera_node(
     return found[0]
 
 
+_THIS_TOKEN_RE = re.compile(r"this\Z")
+
+
+def _seed_lhs_is_bare_or_this(source: str, sym_start: int) -> bool:
+    """True iff the symbol matched at ``sym_start`` is the LHS of a BARE write
+    (``cam = ...``) or a ``this.``-qualified write (``this.cam = ...``), and NOT a
+    FOREIGN member access (``other.cam = ...`` / ``a.b.cam = ...``).
+
+    Mirrors the ``_lhs_is_bare_field`` "bare or ``this.`` only" discipline applied
+    to the GetChild LHS (round-1 BLOCKING #1): a seed assignment to a member field
+    of a foreign object is NOT a binding of the bare symbol used at the GetChild, so
+    it must not be admitted as a camera seed."""
+    # The char immediately before the symbol (skip only inline spaces/tabs — a
+    # member access ``obj . cam`` keeps the ``.`` as the preceding code token).
+    j = sym_start - 1
+    while j >= 0 and source[j] in " \t":
+        j -= 1
+    if j < 0 or source[j] != ".":
+        return True  # no leading ``.`` -> bare symbol write
+    # A dotted LHS: admit ONLY ``this.<sym>``. Walk back over the ``.`` to the
+    # preceding identifier and require it to be EXACTLY ``this``.
+    k = j - 1
+    while k >= 0 and source[k] in " \t":
+        k -= 1
+    ident_end = k + 1
+    while k >= 0 and (source[k].isalnum() or source[k] == "_"):
+        k -= 1
+    qualifier = source[k + 1:ident_end]
+    if _THIS_TOKEN_RE.match(qualifier) is None:
+        return False  # ``other.cam`` / ``a.b.cam`` -> foreign member access
+    # ``this`` itself must not be a member tail (``foo.this.cam`` -> foreign).
+    p = k
+    while p >= 0 and source[p] in " \t":
+        p -= 1
+    if p >= 0 and source[p] == ".":
+        return False
+    return True
+
+
 def _canonical_receiver(source: str, recv: str, use_pos: int) -> str | None:
     """Resolve the receiver-expression text ``recv`` (group 2 of
     ``_CS_CAM_GETCHILD_RE``) to its canonical receiver chain for the rig path,
@@ -703,6 +742,15 @@ def _canonical_receiver(source: str, recv: str, use_pos: int) -> str | None:
     # Find the NEAREST PRECEDING binding of ``recv`` before the use site — any
     # ``<recv> = <rhs>`` (not ``==``) at a code position with start < use_pos.
     # Whichever is last wins (it is the binding live at the GetChild line).
+    #
+    # SEED-LHS DISCIPLINE (round-1 BLOCKING #1 — mirror ``_lhs_is_bare_field``):
+    # the binding's LHS symbol must be a BARE symbol or a ``this.<recv>`` write —
+    # NOT a FOREIGN member access ``<other>.<recv>``. The ``\b`` after the ``.`` of
+    # ``other.cam`` lets ``any_assign_re`` (``\bcam\s*=``) match the ``cam`` token
+    # INSIDE ``other.cam``, so without this guard ``other.cam = Camera.main.transform``
+    # is mis-read as a bare-``cam`` seed and false-admits a foreign field as the
+    # camera receiver. A binding of a DIFFERENT lvalue (``other.cam``) is NOT a
+    # binding of the bare ``cam`` symbol used at the GetChild — skip it.
     any_assign_re = re.compile(r"\b" + re.escape(recv) + r"\s*=(?!=)")
     nearest_start = -1
     for m in any_assign_re.finditer(source):
@@ -710,6 +758,8 @@ def _canonical_receiver(source: str, recv: str, use_pos: int) -> str | None:
             break  # past the use site -> later bindings cannot be live here
         if not _cs_pos_is_code(source, m.start()):
             continue
+        if not _seed_lhs_is_bare_or_this(source, m.start()):
+            continue  # foreign member-access LHS (``other.cam =``) -> not this symbol
         nearest_start = m.start()
     if nearest_start == -1:
         return None  # no binding before the use site -> not seed-resolvable

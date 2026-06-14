@@ -636,30 +636,37 @@ def test_h4_member_tail_self_not_rewritten() -> None:
 
 
 def test_h5_yield_guard_abstains_in_awake_rewrites_in_getrifle() -> None:
-    # h.5 YIELD-GUARD: a read in non-yielding Awake is LEFT; a read in yielding
-    # GetRifle is rewritten.
+    # h.5 YIELD-GUARD + phase-integration MAJOR #2 (lowering↔verifier discharge
+    # parity): a RAW ``self.<field>`` READ surviving in non-yielding ``Awake`` is a
+    # BOUNDARY form the slice-1.2 verifier fails closed on. The lowering MUST mirror
+    # it and ABSTAIN (present=False, source unedited for the reroute) — NOT stamp
+    # present=True while leaving the Awake read (the desync). Supersedes the old
+    # "Awake read sees a safe nil, still discharge" premise (design §1.6 / lines 194).
     src = (
         "function Player:Awake()\n"
         "    self.cam = workspace.CurrentCamera\n"
-        "    local cached = self.weaponSlot\n"  # non-yielding -> abstain
+        "    local cached = self.weaponSlot\n"  # non-yielding raw read -> boundary form
         "    self.weaponSlot = self.cam:GetChildren()[1]\n"
         "end\n\n"
         "function Player:GetRifle()\n"
-        "    return pivotOf(self.weaponSlot)\n"  # yielding -> rewrite
+        "    return pivotOf(self.weaponSlot)\n"
         "end\n\n"
         "return Player\n"
     )
     s = _Script(src)
-    lower_rifle_rig_retarget([s], _rig_map())
+    n = lower_rifle_rig_retarget([s], _rig_map())
     out = s.luau_source
-    # The Awake READ is left as self.weaponSlot (only the camera-child write is nil).
-    awake_body = out.split("function Player:Awake()")[1].split("end")[0]
-    assert "local cached = self.weaponSlot" in awake_body
-    # The GetRifle read is rewritten.
-    assert "return pivotOf(self:_resolveWeaponSlot())" in out
+    assert n == 0  # abstained — never an unverifiable partial discharge
+    assert (s.rig_binding or {}).get("present") is False
+    # Source unedited for the reroute: no resolver injected, the reads stay raw.
+    assert "_resolveWeaponSlot" not in out
+    assert "local cached = self.weaponSlot" in out
+    assert "return pivotOf(self.weaponSlot)" in out
 
 
 def test_h5_start_is_non_yielding() -> None:
+    # Same boundary-form abstain as Awake, for the other non-yielding lifecycle
+    # method ``Start`` — the lowering abstains to stay in lock-step with the verifier.
     src = (
         "function Player:Start()\n"
         "    self.cam = workspace.CurrentCamera\n"
@@ -672,11 +679,138 @@ def test_h5_start_is_non_yielding() -> None:
         "return Player\n"
     )
     s = _Script(src)
-    lower_rifle_rig_retarget([s], _rig_map())
+    n = lower_rifle_rig_retarget([s], _rig_map())
     out = s.luau_source
-    start_body = out.split("function Player:Start()")[1].split("end")[0]
-    assert "local cached = self.weaponSlot" in start_body
-    assert "return pivotOf(self:_resolveWeaponSlot())" in out
+    assert n == 0
+    assert (s.rig_binding or {}).get("present") is False
+    assert "_resolveWeaponSlot" not in out
+    assert "local cached = self.weaponSlot" in out
+    assert "return pivotOf(self.weaponSlot)" in out
+
+
+# === FINDING 2: lowering↔verifier discharge parity on BOUNDARY forms ==========
+# A read of the field the consumer-read reroute CANNOT safely rewrite is a form the
+# slice-1.2 verifier fails closed on. The lowering MUST mirror it and ABSTAIN
+# (present=False, source unedited for the reroute) so the two AGREE — never stamp
+# present=True on a verifier-fire case. A CLEAN dot-form script still discharges True.
+
+
+def _assert_boundary_abstain(src: str) -> _Script:
+    s = _Script(src)
+    n = lower_rifle_rig_retarget([s], _rig_map())
+    assert n == 0  # abstained on the reroute
+    assert (s.rig_binding or {}).get("present") is False
+    assert "_resolveWeaponSlot" not in s.luau_source  # no resolver injected
+    return s
+
+
+def test_f2_bracket_string_key_read_abstains() -> None:
+    # A bracket-index read ``self["weaponSlot"]`` is the boundary form the reroute
+    # cannot rewrite -> abstain (verifier rejects it).
+    src = (
+        "function Player:Awake()\n"
+        "    self.cam = workspace.CurrentCamera\n"
+        "    self.weaponSlot = self.cam:GetChildren()[1]\n"
+        "end\n\n"
+        'function Player:GetRifle()\n'
+        '    return pivotOf(self["weaponSlot"])\n'
+        "end\n\n"
+        "return Player\n"
+    )
+    s = _assert_boundary_abstain(src)
+    assert 'self["weaponSlot"]' in s.luau_source  # left unedited
+
+
+def test_f2_dynamic_bracket_read_abstains() -> None:
+    # A DYNAMIC bracket read ``self[k]`` (incl. parenthesized ``self[(k)]``) cannot be
+    # tied to (or ruled out as) the field -> abstain.
+    src = (
+        "function Player:Awake()\n"
+        "    self.cam = workspace.CurrentCamera\n"
+        "    self.weaponSlot = self.cam:GetChildren()[1]\n"
+        "end\n\n"
+        "function Player:GetRifle()\n"
+        '    local k = "weaponSlot"\n'
+        "    return pivotOf(self[(k)])\n"
+        "end\n\n"
+        "return Player\n"
+    )
+    _assert_boundary_abstain(src)
+
+
+def test_f2_non_self_receiver_read_abstains() -> None:
+    # A NON-``self`` receiver read of the field (module-table / alias) -> abstain.
+    src = (
+        "function Player:Awake()\n"
+        "    self.cam = workspace.CurrentCamera\n"
+        "    self.weaponSlot = self.cam:GetChildren()[1]\n"
+        "end\n\n"
+        "function Player:GetRifle()\n"
+        "    local p = self\n"
+        "    return pivotOf(p.weaponSlot)\n"
+        "end\n\n"
+        "return Player\n"
+    )
+    s = _assert_boundary_abstain(src)
+    assert "p.weaponSlot" in s.luau_source  # left unedited
+
+
+def test_f2_module_table_receiver_read_abstains() -> None:
+    # ``Player.weaponSlot`` (module-table receiver) is a non-self form -> abstain.
+    src = (
+        "function Player:Awake()\n"
+        "    self.cam = workspace.CurrentCamera\n"
+        "    self.weaponSlot = self.cam:GetChildren()[1]\n"
+        "end\n\n"
+        "function Player:GetRifle()\n"
+        "    return pivotOf(Player.weaponSlot)\n"
+        "end\n\n"
+        "return Player\n"
+    )
+    _assert_boundary_abstain(src)
+
+
+def test_f2_clean_dot_form_still_discharges() -> None:
+    # CONTROL: a clean ``self.<field>`` dot-form consumer in a yield-safe method has
+    # NO boundary form -> discharges present=True (the change must not over-abstain).
+    src = (
+        "function Player:Awake()\n"
+        "    self.cam = workspace.CurrentCamera\n"
+        "    self.weaponSlot = self.cam:GetChildren()[1]\n"
+        "end\n\n"
+        "function Player:GetRifle()\n"
+        "    return pivotOf(self.weaponSlot)\n"
+        "end\n\n"
+        "return Player\n"
+    )
+    s = _Script(src)
+    n = lower_rifle_rig_retarget([s], _rig_map())
+    assert n == 1
+    assert (s.rig_binding or {}).get("present") is True
+    assert "return pivotOf(self:_resolveWeaponSlot())" in s.luau_source
+
+
+def test_f2_unrelated_bracket_index_does_not_block_discharge() -> None:
+    # A pure-integer ``self[1]`` (array index, NOT a field read) and a DIFFERENT
+    # string key ``self["other"]`` are NOT boundary forms -> a clean dot-form read
+    # still discharges True (no over-abstain on unrelated bracket access).
+    src = (
+        "function Player:Awake()\n"
+        "    self.cam = workspace.CurrentCamera\n"
+        "    self.weaponSlot = self.cam:GetChildren()[1]\n"
+        "end\n\n"
+        "function Player:GetRifle()\n"
+        "    local a = self[1]\n"
+        '    local b = self["other"]\n'
+        "    return pivotOf(self.weaponSlot)\n"
+        "end\n\n"
+        "return Player\n"
+    )
+    s = _Script(src)
+    n = lower_rifle_rig_retarget([s], _rig_map())
+    assert n == 1
+    assert (s.rig_binding or {}).get("present") is True
+    assert "return pivotOf(self:_resolveWeaponSlot())" in s.luau_source
 
 
 def test_h6_idempotency_twice_call_byte_identical() -> None:
@@ -1623,13 +1757,9 @@ def test_r5_structural_balance_skips_block_comment_brackets(monkeypatch) -> None
     assert _structural_balance_ok(unbalanced) is False
 
 
-@pytest.mark.xfail(
-    reason="accepted residual (user 2026-06-12): foreign-member seed false-admit; "
-    "netted by S1b independent verifier; not fixed via C# regex",
-    strict=False,
-)
 def test_r6_member_write_does_not_seed_bare_cam(tmp_path: Path) -> None:
-    # R6 BLOCKING (resolver:_canonical_receiver): ``other.cam = Camera.main.transform``
+    # R6 BLOCKING (resolver:_canonical_receiver) — phase-integration FINDING 1
+    # (was an accepted xfail residual; now FIXED): ``other.cam = Camera.main.transform``
     # is a member write on ANOTHER object — it must NOT seed the bare local ``cam``
     # read at ``weaponSlot = cam.GetChild(0)`` (the GetChild's ``cam`` is a distinct
     # local with no Camera.main binding live at the use site -> abstain).
@@ -1687,6 +1817,42 @@ def test_r7_this_dot_cam_field_seed_admits(tmp_path: Path) -> None:
             field_name="weaponSlot", child_name="WeaponSlot", cam_receiver="cam"),
     )
     assert entry.resolved_total == 1
+
+
+def test_f1_deep_member_seed_does_not_seed_bare_cam(tmp_path: Path) -> None:
+    # FINDING 1 extension: a DEEPER member-chain seed ``a.b.cam = Camera.main.transform``
+    # is still a FOREIGN member write (``cam`` preceded by ``.``, prefix != ``this``) —
+    # it must NOT seed the bare local ``cam`` at the GetChild. Guards the multi-dot
+    # case beyond the single-dot ``other.cam`` above.
+    src = (
+        "public class Player : MonoBehaviour {\n"
+        "  Transform cam; public Transform weaponSlot; Holder a;\n"
+        "  void Awake() {\n"
+        "    a.b.cam = Camera.main.transform;\n"
+        "    weaponSlot = cam.GetChild(0);\n"
+        "  }\n}\n"
+    )
+    entry = _build(tmp_path, src, _fps_library())
+    assert entry is not None
+    assert entry.rig_facts == ()
+    assert entry.resolved_total == 0
+
+
+def test_f1_foreign_this_tail_member_seed_rejected(tmp_path: Path) -> None:
+    # FINDING 1 edge: ``foo.this.cam = ...`` is NOT a legitimate ``this.``-qualified
+    # seed (``this`` is itself a member tail of ``foo``) — it must NOT seed bare ``cam``.
+    src = (
+        "public class Player : MonoBehaviour {\n"
+        "  Transform cam; public Transform weaponSlot; Wrap foo;\n"
+        "  void Awake() {\n"
+        "    foo.this.cam = Camera.main.transform;\n"
+        "    weaponSlot = cam.GetChild(0);\n"
+        "  }\n}\n"
+    )
+    entry = _build(tmp_path, src, _fps_library())
+    assert entry is not None
+    assert entry.rig_facts == ()
+    assert entry.resolved_total == 0
 
 
 def test_r6_line_comment_before_field_write_still_admits(tmp_path: Path) -> None:
