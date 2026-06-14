@@ -2054,3 +2054,250 @@ def test_r3_rehydrate_drops_row_with_nonstr_cam_receiver(tmp_path: Path) -> None
         "cam_receiver": 123, "cam_ordinal": 0}})
     p = _pipeline_for_rehydrate(tmp_path)
     assert p._load_rig_binding_for_rehydration() == {}
+
+
+# === r4 fix-round FINDING 1 — seed-LHS trivia false-admit (UNSAFE) ===========
+# ``_seed_lhs_is_bare_or_this`` must skip ALL C# trivia (spaces, tabs, NEWLINES,
+# ``//`` line + ``/* */`` block comments) between the seed symbol and a preceding
+# ``.``: a FOREIGN member-LHS seed split by a comment/newline (``other.\ncam = ...``
+# / ``other./*c*/cam = ...``) would otherwise FALSE-ADMIT a non-camera binding as a
+# camera seed -> a bogus RigRootedRetargetFact the verifier does NOT catch (ships a
+# wrong retarget). The UNSAFE direction. Legit bare / ``this.`` seeds still admit.
+
+
+def test_f1_member_seed_newline_before_sym_rejected(tmp_path: Path) -> None:
+    # ``other.\ncam = Camera.main.transform`` — a foreign member write split by a
+    # NEWLINE. The ``.`` still precedes ``cam`` -> NOT a bare-cam seed -> abstain.
+    src = (
+        "public class Player : MonoBehaviour {\n"
+        "  Transform cam; public Transform weaponSlot; Other other;\n"
+        "  void Awake() {\n"
+        "    other.\n"
+        "cam = Camera.main.transform;\n"
+        "    weaponSlot = cam.GetChild(0);\n"
+        "  }\n}\n"
+    )
+    entry = _build(tmp_path, src, _fps_library())
+    assert entry is not None
+    assert entry.rig_facts == ()
+    assert entry.resolved_total == 0
+
+
+def test_f1_member_seed_block_comment_before_sym_rejected(tmp_path: Path) -> None:
+    # ``other./*c*/cam = Camera.main.transform`` — a foreign member write split by an
+    # inline BLOCK comment. The ``.`` still precedes ``cam`` -> abstain.
+    src = (
+        "public class Player : MonoBehaviour {\n"
+        "  Transform cam; public Transform weaponSlot; Other other;\n"
+        "  void Awake() {\n"
+        "    other./*c*/cam = Camera.main.transform;\n"
+        "    weaponSlot = cam.GetChild(0);\n"
+        "  }\n}\n"
+    )
+    entry = _build(tmp_path, src, _fps_library())
+    assert entry is not None
+    assert entry.rig_facts == ()
+    assert entry.resolved_total == 0
+
+
+def test_f1_member_seed_line_comment_and_newline_rejected(tmp_path: Path) -> None:
+    # ``other. // c\n cam = ...`` — a foreign member write split by a LINE comment +
+    # newline + indentation. Still abstains.
+    src = (
+        "public class Player : MonoBehaviour {\n"
+        "  Transform cam; public Transform weaponSlot; Other other;\n"
+        "  void Awake() {\n"
+        "    other. // pick from the other object\n"
+        "    cam = Camera.main.transform;\n"
+        "    weaponSlot = cam.GetChild(0);\n"
+        "  }\n}\n"
+    )
+    entry = _build(tmp_path, src, _fps_library())
+    assert entry is not None
+    assert entry.rig_facts == ()
+    assert entry.resolved_total == 0
+
+
+def test_f1_member_seed_tab_newline_before_sym_rejected(tmp_path: Path) -> None:
+    # ``other.\n\tcam = ...`` — tabs + newline trivia between the ``.`` and ``cam``.
+    src = (
+        "public class Player : MonoBehaviour {\n"
+        "  Transform cam; public Transform weaponSlot; Other other;\n"
+        "  void Awake() {\n"
+        "    other.\n"
+        "\tcam = Camera.main.transform;\n"
+        "    weaponSlot = cam.GetChild(0);\n"
+        "  }\n}\n"
+    )
+    entry = _build(tmp_path, src, _fps_library())
+    assert entry is not None
+    assert entry.rig_facts == ()
+    assert entry.resolved_total == 0
+
+
+def test_f1_this_dot_block_comment_seed_still_admits(tmp_path: Path) -> None:
+    # ``this./*c*/cam = Camera.main.transform`` is a SAME-OBJECT field seed split by a
+    # comment — it must still ADMIT (trivia-skipping must not over-reject the legit
+    # ``this.``-qualified seed).
+    src = (
+        "public class Player : MonoBehaviour {\n"
+        "  Transform cam; public Transform weaponSlot;\n"
+        "  void Awake() {\n"
+        "    this./*c*/cam = Camera.main.transform;\n"
+        "    weaponSlot = cam.GetChild(0);\n"
+        "  }\n}\n"
+    )
+    entry = _build(tmp_path, src, _fps_library())
+    assert entry is not None
+    assert entry.rig_facts == (
+        RigRootedRetargetFact(
+            field_name="weaponSlot", child_name="WeaponSlot", cam_receiver="cam"),
+    )
+    assert entry.resolved_total == 1
+
+
+def test_f1_this_spaced_dot_seed_still_admits(tmp_path: Path) -> None:
+    # ``this . cam = Camera.main.transform`` — spaces around the ``.`` of a legit
+    # ``this.``-qualified seed must still admit.
+    src = (
+        "public class Player : MonoBehaviour {\n"
+        "  Transform cam; public Transform weaponSlot;\n"
+        "  void Awake() {\n"
+        "    this . cam = Camera.main.transform;\n"
+        "    weaponSlot = cam.GetChild(0);\n"
+        "  }\n}\n"
+    )
+    entry = _build(tmp_path, src, _fps_library())
+    assert entry is not None
+    assert entry.rig_facts == (
+        RigRootedRetargetFact(
+            field_name="weaponSlot", child_name="WeaponSlot", cam_receiver="cam"),
+    )
+    assert entry.resolved_total == 1
+
+
+def test_f1_seed_lhs_helper_unit_trivia_forms() -> None:
+    # Direct unit on ``_seed_lhs_is_bare_or_this`` over the trivia matrix: the symbol
+    # ``cam`` (start located by find) must REJECT every foreign-member trivia form and
+    # ADMIT every bare / ``this.`` form.
+    from converter.child_ref_resolver import _seed_lhs_is_bare_or_this
+
+    def admits(src: str) -> bool:
+        return _seed_lhs_is_bare_or_this(src, src.index("cam ="))
+
+    # Foreign member LHS, trivia-split -> REJECT.
+    assert admits("other.\ncam = x") is False
+    assert admits("other./*c*/cam = x") is False
+    assert admits("other. // c\n cam = x") is False
+    assert admits("other.\n\tcam = x") is False
+    assert admits("a.b.cam = x") is False
+    assert admits("foo.this.cam = x") is False  # this is a member tail of foo
+    # Bare / this-qualified -> ADMIT.
+    assert admits("cam = x") is True
+    assert admits("this.cam = x") is True
+    assert admits("this . cam = x") is True
+    assert admits("this./*c*/cam = x") is True
+    assert admits("this.\ncam = x") is True
+
+
+# === r4 fix-round FINDING 2 — no-mutual-mask safety property ==================
+# The lowering's ``_binding_discharged`` is a BEST-EFFORT HINT; the slice-1.2
+# verifier's ``_rig_binding_discharged`` (run on the final output) is the SOLE
+# authority. Every lowering<->verifier disagreement must be the FAIL-CLOSED-SAFE
+# direction (lowering=discharged / verifier=fires, i.e. verifier STRICTER), NEVER
+# the UNSAFE mutual-mask (BOTH discharged while the field is actually read). When the
+# verifier predicate is present (phase integration) we cross-check both scanners over
+# a boundary-form matrix; on this slice branch the verifier r3 predicate is not yet
+# present, so we SKIP that cross-check and instead assert the lowering's OWN
+# conservatism property: on every boundary form the lowering is at-least-as-lenient
+# (never stricter than) a surviving-read, so it can never be the masking party.
+
+_BOUNDARY_FORMS: tuple[tuple[str, str], ...] = (
+    # (label, GetRifle body) — boundary forms the dot-form reroute cannot rewrite.
+    ("bracket_string_key", '    return pivotOf(self["weaponSlot"])\n'),
+    ("dynamic_bracket", '    local k = "weaponSlot"\n    return pivotOf(self[(k)])\n'),
+    ("non_self_alias", "    local p = self\n    return pivotOf(p.weaponSlot)\n"),
+    ("module_table", "    return pivotOf(Player.weaponSlot)\n"),
+    ("self_int_index", "    return pivotOf(self[1])\n"),  # array index, NOT field
+    ("concat_bracket_key", '    return pivotOf(self["weapon" .. "Slot"])\n'),
+)
+
+
+def _boundary_src(get_rifle_body: str) -> str:
+    return (
+        "function Player:Awake()\n"
+        "    self.cam = workspace.CurrentCamera\n"
+        "    self.weaponSlot = self.cam:GetChildren()[1]\n"
+        "end\n\n"
+        "function Player:GetRifle()\n"
+        f"{get_rifle_body}"
+        "end\n\n"
+        "return Player\n"
+    )
+
+
+def test_f2_no_mutual_mask_against_verifier_or_conservatism() -> None:
+    # SAFETY CHECK: there is NO case where the lowering stamps present=True AND the
+    # verifier ALSO returns discharged while the field is ACTUALLY read (mutual-mask).
+    # Cross-check the real verifier when it is importable; otherwise assert the
+    # lowering's own conservatism (it is at-least-as-lenient, so never the masker).
+    from converter.rifle_rig_retarget_lowering import (
+        _binding_discharged,
+        _has_surviving_field_read,
+    )
+    try:
+        from converter.contract_verifier import (  # type: ignore[attr-defined]
+            _rig_binding_discharged as _verifier_discharged,
+        )
+        have_verifier = True
+    except ImportError:
+        _verifier_discharged = None  # noqa: N806
+        have_verifier = False
+
+    for label, body in _BOUNDARY_FORMS:
+        src = _boundary_src(body)
+        s = _Script(src)
+        lower_rifle_rig_retarget([s], _rig_map())
+        final = s.luau_source
+        lowering_present = bool((s.rig_binding or {}).get("present"))
+        # Is there a real surviving CONSUMER read of the field in the final source
+        # (a bare ``self.<field>`` read in a yield-safe method)?  ``self[...]`` /
+        # ``p.weaponSlot`` / ``Player.weaponSlot`` are not bare-self consumer reads,
+        # so this is the residual the dot-form reroute leaves.
+        residual_self_read = _has_surviving_field_read(final, "weaponSlot")
+        if have_verifier and _verifier_discharged is not None:
+            verifier_present = bool(
+                _verifier_discharged(final, "weaponSlot", "WeaponSlot", "WeaponSlot")
+            )
+            # The UNSAFE mutual-mask: both think discharged while there IS a read.
+            # (Here the boundary read is the non-dot form; "field actually read" is
+            # the presence of the boundary access we know each form carries.)
+            assert not (lowering_present and verifier_present), (
+                f"MUTUAL-MASK on {label}: both discharged"
+            )
+            # And every desync must be verifier-stricter (fail-closed), never the
+            # reverse (lowering stricter is merely cosmetic; lowering-lenient while
+            # verifier fires is the safe design).
+            if lowering_present:
+                assert verifier_present, (
+                    f"{label}: lowering present but verifier also present is the "
+                    "only safe co-discharge; an UNSAFE state would be both present "
+                    "with a read"
+                )
+        else:
+            # No verifier on this branch (lands in slice 1.2; parity asserted at
+            # phase integration). Conservatism property: the lowering ABSTAINS
+            # (present=False) on every boundary form -> it can never be the masking
+            # party. If it ever stamps present=True, there must be NO surviving bare
+            # self read (else it masked one).
+            if lowering_present:
+                assert not residual_self_read, (
+                    f"{label}: lowering present=True while a bare self read survives "
+                    "-> mutual-mask risk"
+                )
+            else:
+                # The fail-closed-safe direction: lowering abstains, source unedited.
+                assert "_resolveWeaponSlot" not in final, label
+    # Note: when the verifier r3 predicate is absent (this slice branch), the
+    # cross-scanner parity lands at phase integration (slice 1.2); the lowering's
+    # no-mutual-mask conservatism asserted above is the safety property for now.

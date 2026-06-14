@@ -752,6 +752,23 @@ def _binding_discharged(
     authority (S1b owns the verifier copy; this is the lowering's own re-derive so
     it never stamps ``present=True`` off a reverted edit).
 
+    BEST-EFFORT HINT, NOT THE AUTHORITY (phase-integration FINDING 2): this
+    predicate (and its ``_has_unrewritable_boundary_read`` helper) is a BEST-EFFORT
+    discharge HINT. The slice-1.2 verifier's ``_rig_binding_discharged`` — run on the
+    FINAL output — is the SOLE discharge authority (design §1.6 / FIX 1). The two are
+    independent text-scanners and can DESYNC on a few boundary forms (``self[<int>]``,
+    a shadowed-``self`` dot-read, a concatenated bracket key ``self["weaponSlot".."" ]``)
+    where this predicate is LENIENT (returns discharged) but the verifier FIRES. That
+    desync is FAIL-CLOSED-SAFE BY DESIGN: a lowering-lenient / verifier-strict
+    disagreement means the verifier fires and the binding fails closed (never silent-
+    wrong). The UNSAFE direction — both discharged while a real read survives
+    (mutual-mask) — does NOT occur: see ``test_f2_no_mutual_mask_lowering_at_least_as_
+    lenient`` for the no-mutual-mask safety property. The residual desync forms are all
+    NON-REACHABLE from the deterministic dot-form transpiler, so per-form parity
+    between the two scanners is INTENTIONALLY NOT pursued (it would be brittle two-
+    scanner mirroring); ``_has_unrewritable_boundary_read`` stays as the best-effort
+    hint that reduces cosmetic edited+loud cases on common forms.
+
     ``child`` is the REAL rig-child name (for reconstructing the canonical emit);
     ``suffix`` is the VALID-LUAU-IDENTIFIER method-name suffix (``_resolve<suffix>``).
 

@@ -684,30 +684,35 @@ def _seed_lhs_is_bare_or_this(source: str, sym_start: int) -> bool:
     Mirrors the ``_lhs_is_bare_field`` "bare or ``this.`` only" discipline applied
     to the GetChild LHS (round-1 BLOCKING #1): a seed assignment to a member field
     of a foreign object is NOT a binding of the bare symbol used at the GetChild, so
-    it must not be admitted as a camera seed."""
-    # The char immediately before the symbol (skip only inline spaces/tabs — a
-    # member access ``obj . cam`` keeps the ``.`` as the preceding code token).
-    j = sym_start - 1
-    while j >= 0 and source[j] in " \t":
-        j -= 1
-    if j < 0 or source[j] != ".":
+    it must not be admitted as a camera seed.
+
+    TRIVIA-ROBUST (phase-integration FINDING 1, UNSAFE direction): the "preceded by
+    ``.``" member-access check skips ALL C# trivia — spaces, tabs, NEWLINES, and
+    ``//``/``/* */`` comments — between the symbol and the preceding token, via
+    ``_skip_ws_and_comments_back``. Without it a foreign member-LHS seed split by a
+    comment or newline (``other.\ncam = ...`` / ``other./*c*/cam = ...``) false-admits
+    a non-camera binding as a camera seed (a bogus fact the verifier does NOT catch —
+    it ships a wrong retarget). Legit ``cam =`` / ``this.cam =`` / ``this . cam =`` /
+    ``this./*c*/cam =`` still ADMIT."""
+    # The nearest preceding CODE char before the symbol, skipping ALL trivia
+    # (whitespace incl. newlines + ``//``/``/* */`` comments). A member access
+    # ``obj./*c*/cam`` / ``obj.\ncam`` keeps the ``.`` as that preceding code token.
+    k = _skip_ws_and_comments_back(source, sym_start)
+    if k <= 0 or source[k - 1] != ".":
         return True  # no leading ``.`` -> bare symbol write
-    # A dotted LHS: admit ONLY ``this.<sym>``. Walk back over the ``.`` to the
-    # preceding identifier and require it to be EXACTLY ``this``.
-    k = j - 1
-    while k >= 0 and source[k] in " \t":
+    # A dotted LHS: admit ONLY ``this.<sym>``. Walk back over the ``.`` (and any
+    # trivia before it) to the preceding identifier and require it EXACTLY ``this``.
+    k = _skip_ws_and_comments_back(source, k - 1)  # past the ``.`` to its code char
+    ident_end = k
+    while k >= 1 and (source[k - 1].isalnum() or source[k - 1] == "_"):
         k -= 1
-    ident_end = k + 1
-    while k >= 0 and (source[k].isalnum() or source[k] == "_"):
-        k -= 1
-    qualifier = source[k + 1:ident_end]
+    qualifier = source[k:ident_end]
     if _THIS_TOKEN_RE.match(qualifier) is None:
         return False  # ``other.cam`` / ``a.b.cam`` -> foreign member access
-    # ``this`` itself must not be a member tail (``foo.this.cam`` -> foreign).
-    p = k
-    while p >= 0 and source[p] in " \t":
-        p -= 1
-    if p >= 0 and source[p] == ".":
+    # ``this`` itself must not be a member tail (``foo.this.cam`` -> foreign): skip
+    # trivia before ``this`` and reject if a ``.`` precedes it.
+    p = _skip_ws_and_comments_back(source, k)
+    if p > 0 and source[p - 1] == ".":
         return False
     return True
 
