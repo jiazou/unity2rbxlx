@@ -115,6 +115,11 @@ def verify_module(
     violations.extend(_check_unity_message_callbacks(statements, stripped, source))
     violations.extend(_check_gameobject_touch(stripped, source))
     violations.extend(_check_script_parent(stripped, source))
+    # Phase 1 (relation #8): runs for EVERY generic module (not gated on player), but is
+    # NON-load-bearing -- a surviving ``im`` reject fails OPEN (tagged ``contract-verifier-impulse``).
+    violations.extend(_check_raw_apply_impulse(stripped, source))
+    # Phase 2 (relation #8): nonexistent FindFirstChildOfType -> fail-closed (an invalid API crashes).
+    violations.extend(_check_invalid_findfirstchildoftype(stripped, source))
     if is_player_controller:
         violations.extend(_check_player_camera_write(stripped, source))
         violations.extend(_check_player_humanoid_move(stripped, source))
@@ -1109,6 +1114,95 @@ def _check_script_parent(stripped: str, source: str) -> list[Violation]:
                 scopes.pop()
             # The following ``then`` pushes the new branch scope.
 
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 (relation #8) -- raw linear impulse (rule ``im``) -- NON-load-bearing.
+#
+# A raw ``part:ApplyImpulse(...)`` applies the AI's Unity force against the
+# STUDS_PER_METER³-inflated Roblox mass, so a force-launched body barely moves.
+# The faithful launch routes through ``self.host.applyImpulse(part, force)`` (the
+# host applies ``Δv = (force / _UnityMass) * STUDS_PER_METER``). An unrouted
+# impulse only DEGRADES launch faithfulness (it does not crash), so a surviving
+# reject warns + fails OPEN (caller tags ``contract-verifier-impulse``) -- it
+# reprompts but never knocks a module out of generic mode.
+#
+# Scope is LINEAR ApplyImpulse only: ``ApplyImpulseAtPosition`` /
+# ``ApplyAngularImpulse`` have other chars after ``ApplyImpulse`` so the regex
+# never matches them, and the host call ``self.host.applyImpulse`` is a dot /
+# lowercase-``a`` form so it is never matched either.
+# ---------------------------------------------------------------------------
+
+# Whitespace-tolerant: Luau allows spaces around the ``:`` and before ``(``
+# (``rb:ApplyImpulse(``, ``rb : ApplyImpulse (``). ``ApplyImpulseAtPosition`` /
+# ``ApplyAngularImpulse`` have other chars after ``ApplyImpulse`` so ``\s*\(`` never matches them.
+_RE_RAW_APPLY_IMPULSE = re.compile(r":\s*ApplyImpulse\s*\(")
+# A method DEFINITION ``function X:ApplyImpulse(...)`` is not a call — don't flag it. The trailing
+# ``\s*`` tolerates the whitespace-legal ``function C : ApplyImpulse`` form (prefix ends ``function C ``).
+_RE_FUNC_DEF_PREFIX = re.compile(r"function\s+[\w.]*\s*$")
+
+
+def _is_method_def_call(stripped: str, pos: int) -> bool:
+    """True when the colon-call match at ``pos`` is actually a method DEFINITION
+    (``function <receiver>:Name(...)``). Scans the WHOLE current line before the colon (not a fixed
+    lookback) so a long receiver chain — e.g. ``function A.B.C:Name(...)`` — is still recognized."""
+    line_start = stripped.rfind("\n", 0, pos) + 1
+    return _RE_FUNC_DEF_PREFIX.search(stripped[line_start:pos]) is not None
+
+
+def _check_raw_apply_impulse(stripped: str, source: str) -> list[Violation]:
+    out: list[Violation] = []
+    for m in _RE_RAW_APPLY_IMPULSE.finditer(stripped):
+        if _is_method_def_call(stripped, m.start()):
+            continue  # ``function Class:ApplyImpulse(...)`` definition, not a call
+        line = source.count("\n", 0, m.start()) + 1
+        out.append(Violation(
+            rule="im",
+            line=line,
+            message=(
+                "raw ``:ApplyImpulse(`` does not apply the Unity->Roblox launch-velocity "
+                "scaling: a force-launched body barely moves against the inflated Roblox mass. "
+                "Route the linear impulse through ``self.host.applyImpulse(part, force)`` (the host "
+                "applies the faithful stud-scaled velocity); never call ``:ApplyImpulse(`` directly."
+            ),
+        ))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 (relation #8) -- nonexistent ``FindFirstChildOfType`` (rule ``fc``) -- LOAD-BEARING.
+#
+# ``FindFirstChildOfType`` is not a Roblox Instance method (an AI hallucination of Unity's type
+# lookup); the valid API is ``FindFirstChildOfClass("Humanoid")``. Calling it ERRORS at runtime, so a
+# converted hit-handler (bullet / explosion) that looks up the victim's Humanoid silently deals no
+# damage. Unlike the impulse rule (which only degrades), an invalid API CRASHES, so ``fc`` is NOT in
+# ``_FAIL_OPEN_RULE_TAGS`` -> a surviving ``fc`` gets the default ``contract-verifier `` tag and
+# promotes to a project FAIL-CLOSED (shipping a crash is worse than failing the conversion).
+#
+# Whitespace-tolerant; does NOT match the valid ``FindFirstChildOfClass``; the ``_RE_FUNC_DEF_PREFIX``
+# guard skips a ``function X:FindFirstChildOfType(...)`` definition (same as the impulse rule).
+# ---------------------------------------------------------------------------
+
+_RE_FINDFIRSTCHILDOFTYPE = re.compile(r":\s*FindFirstChildOfType\s*\(")
+
+
+def _check_invalid_findfirstchildoftype(stripped: str, source: str) -> list[Violation]:
+    out: list[Violation] = []
+    for m in _RE_FINDFIRSTCHILDOFTYPE.finditer(stripped):
+        if _is_method_def_call(stripped, m.start()):
+            continue  # ``function Class:FindFirstChildOfType(...)`` definition, not a call
+        line = source.count("\n", 0, m.start()) + 1
+        out.append(Violation(
+            rule="fc",
+            line=line,
+            message=(
+                "``FindFirstChildOfType`` is not a Roblox method — it errors at runtime, so a "
+                "hit-handler that looks up the victim's Humanoid deals no damage. Use "
+                "``FindFirstChildOfClass(\"Humanoid\")`` (or ``FindFirstChildWhichIsA`` for an "
+                "abstract base)."
+            ),
+        ))
     return out
 
 
