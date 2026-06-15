@@ -46,6 +46,11 @@
 local SceneRuntime = {}
 SceneRuntime.__index = SceneRuntime
 
+-- Phase 1 (relation #8): the pipeline length scale (Unity metres -> Roblox studs). The transpiler
+-- emits this same constant inline in per-script Luau (code_transpiler.py); the host needs its own
+-- module-scope copy to apply the faithful launch velocity in ``applyImpulse``.
+local STUDS_PER_METER = 3.571
+
 -- ---------------------------------------------------------------------
 -- R4-P1.3: Unity -> Roblox class-name translation for the GetComponent
 -- built-in fallback.
@@ -667,6 +672,16 @@ function SceneRuntime:_makeHostSurface(owner)
 				return engine:setActive(arg2, arg3)
 			end
 			return engine:setActive(arg1, arg2)
+		end,
+		-- Phase 1 (relation #8): faithful launch for a force-launched body. The AI lowers
+		-- ``Rigidbody.AddForce(f)`` to ``self.host.applyImpulse(part, f)``; the host applies the
+		-- stud-scaled velocity change so the bullet flies despite the inflated Roblox mass.
+		applyImpulse = function(arg1, arg2, arg3)
+			-- Dotted: host.applyImpulse(part, force); colon: host:applyImpulse(part, force)
+			if arg1 == host then
+				return engine:applyImpulse(arg2, arg3)
+			end
+			return engine:applyImpulse(arg1, arg2)
 		end,
 		findObjectOfType = function(arg1, arg2)
 			if arg1 == host then return engine:findObjectOfType(arg2) end
@@ -1482,6 +1497,41 @@ function SceneRuntime:_applyActiveToComponent(comp, inHierarchy, pendingStarts)
 		if not m.startCalled and pendingStarts ~= nil then
 			table.insert(pendingStarts, comp)
 		end
+	end
+end
+
+function SceneRuntime:applyImpulse(part, force)
+	-- Phase 1 (relation #8): apply the faithful stud-scaled launch velocity for a force-launched
+	-- body, independent of the STUDS_PER_METER³-inflated Roblox mass:
+	--     Δv = (force / m_unity) * STUDS_PER_METER     (mass-agnostic: the wrong m_rbx cancels)
+	-- where m_unity is the convert-time ``_UnityMass`` stamp, resolved at the ASSEMBLY level so a
+	-- wrapped Model (outer Model + inner ``*_Mesh``) or a ``TriggerZone`` sibling still launches the
+	-- right body with the right mass.
+	if not part or not part:IsA("BasePart") then
+		return
+	end
+	local target, mUnity = part, part:GetAttribute("_UnityMass")
+	if mUnity == nil and part.AssemblyRootPart then
+		target = part.AssemblyRootPart
+		mUnity = target:GetAttribute("_UnityMass")
+	end
+	if mUnity == nil then
+		local owner = part:FindFirstAncestorWhichIsA("Model")
+		if owner then
+			for _, d in ipairs(owner:GetDescendants()) do
+				if d:IsA("BasePart") and d:GetAttribute("_UnityMass") ~= nil then
+					target, mUnity = d, d:GetAttribute("_UnityMass")
+					break
+				end
+			end
+		end
+	end
+	if mUnity ~= nil and mUnity > 0 then
+		target.AssemblyLinearVelocity = target.AssemblyLinearVelocity
+			+ (force / mUnity) * STUDS_PER_METER
+	else
+		-- Unstamped (non-dynamic / missing): fall back to the raw impulse — never worse than today.
+		part:ApplyImpulse(force)
 	end
 end
 
