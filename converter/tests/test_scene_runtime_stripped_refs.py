@@ -182,17 +182,15 @@ class TestStrippedRefBindsAfterPlacementDrain:
 class TestCrossDomainStrippedRefHoldsThroughDrain:
 
     def _scenario(self, *, queue_policy_nils: bool) -> str:
-        # ``queue_policy_nils`` simulates the PRE-FIX design where a policy
-        # nil'd ref WAS queued: we set the crossDomainNil gate to a no-op by
-        # NOT gating the pending record. We can't toggle the production gate
-        # from Lua, so the RED variant manually injects the cross-domain rec
-        # into _pendingPlacementRefs after start() to prove that IF such a rec
-        # existed, the drain WOULD rebind it -- which is exactly what the gate
-        # prevents.
+        # ``queue_policy_nils`` models the pre-fix design where a policy-nil'd
+        # ref WAS queued. The production gate can't be toggled from Lua, so the
+        # RED variant manually injects the cross-domain rec into
+        # _pendingPlacementRefs after start() to prove that if such a rec
+        # existed the drain WOULD rebind it -- which the gate prevents.
         red_inject = textwrap.dedent("""\
-            -- RED variant: pre-fix design would have queued the policy-nil'd
-            -- ref. Inject it manually, then re-drain: the drain rebinds it
-            -- (which is exactly what the NOT-cross-domain queue gate prevents).
+            -- RED variant: inject the policy-nil'd ref the pre-fix design would
+            -- have queued, then re-drain -- the drain rebinds it (which the
+            -- NOT-cross-domain queue gate prevents).
             engine._pendingPlacementRefs = {
                 {source = srcComp, field = "peer", index = nil,
                  target_ref = "Srv:9:pfbS:222"},
@@ -483,34 +481,25 @@ class TestFailSoftWarnWhenTargetNeverRegisters:
 
 
 # ---------------------------------------------------------------------------
-# Round-1 P1 (codex) -- the UI-DEFERRED placed target variant of AC7.
+# The UI-DEFERRED placed-target variant of AC7.
 #
-# AC7 above covers a cross-domain scene->placed-prefab ref whose placed target
-# is NON-deferred (it routes through the gated ``_pendingPlacementRefs`` queue).
-# The OPEN question codex raised: the OLDER ``_inboundRefsToDeferred`` branch in
-# ``_wireReferences`` (~:1299) is UNCONDITIONAL (no ``not crossDomainNil`` gate)
-# and ``_completeDeferredBatch`` Pass-3b (~:2664) rebinds it with NO domain
-# recheck. Could a cross-domain (client->server) scene->placed-prefab stripped
-# ref whose placed target is UI-DEFERRED leak into ``_inboundRefsToDeferred`` and
-# get REBOUND, defeating the cross-domain policy?
+# AC7 covers a cross-domain scene->placed-prefab ref whose placed target is
+# NON-deferred (routed through the gated ``_pendingPlacementRefs`` queue). The
+# ``_inboundRefsToDeferred`` branch in ``_wireReferences`` is UNGATED and
+# ``_completeDeferredBatch`` Pass-3b rebinds it with no domain recheck — could a
+# cross-domain ref to a UI-DEFERRED placed target leak into it and get rebound?
 #
-# EMPIRICAL ANSWER (this test): NO. The ``_inboundRefsToDeferred`` branch only
-# fires when ``self._deferredInstanceIds[scopedTarget]`` is set at scene-ref wire
-# time. But ``start()`` wires ALL scene refs FIRST (the scene loop, :2759-2849)
-# and only THEN boots placements (:2925-2980), where a placed UI miss calls
-# ``_deferUiInstance`` -> sets the deferred marker. So at the moment the scene
-# cross-domain ref is wired, the placed target's marker is NOT yet set -> the
-# ``_inboundRefsToDeferred`` branch CANNOT fire for this ref class. It instead
-# hits the ``elseif not crossDomainNil ...`` branch, which is gated, so the
-# policy-nil'd ref enters NEITHER queue. When the deferred batch later completes
-# and drains, the ref is queued nowhere -> nothing to rebind -> the field stays
-# nil. The bypass is refuted-at-integration; no production change is warranted.
+# No: that branch only fires when ``_deferredInstanceIds[scopedTarget]`` is set
+# at scene-ref wire time, but ``start()`` wires ALL scene refs BEFORE booting
+# placements (which is where a placed UI miss sets the deferred marker). So at
+# wire time the marker is not yet set; the ref hits the gated
+# ``elseif not crossDomainNil`` branch instead and enters NEITHER queue, so the
+# drain has nothing to rebind and the field stays nil.
 #
-# This test drives the REAL host (no stubbing of _wireReferences /
-# _drainPendingPlacementRefs / _completeDeferredBatch): a UI-deferred placed
-# SERVER prefab + a scene CLIENT source holding a cross-domain ref to it, plus a
-# same-domain (client->client) UI-deferred placed ref on the same source to prove
-# the deferred binding path itself still works (regression guard).
+# This test drives the REAL host (nothing stubbed): a UI-deferred placed SERVER
+# prefab + a scene CLIENT source with a cross-domain ref to it, plus a
+# same-domain (client->client) UI-deferred placed ref proving the deferred
+# binding path still works (regression guard).
 # ---------------------------------------------------------------------------
 
 class TestCrossDomainUiDeferredPlacedTargetHoldsThroughDeferredDrain:
@@ -623,8 +612,7 @@ class TestCrossDomainUiDeferredPlacedTargetHoldsThroughDeferredDrain:
             local engine = SceneRuntime.new(services, plan)
             -- Run BOTH domains so the placed SERVER component IS constructed +
             -- registered locally -- the deferred drain therefore COULD rebind the
-            -- cross-domain ref if it had been queued. This is the strong form of
-            -- the gate test.
+            -- cross-domain ref if it had been queued.
             local edges = engine:start(nil)
             runDeferred()  -- flush deferred Starts + late UI batch
 

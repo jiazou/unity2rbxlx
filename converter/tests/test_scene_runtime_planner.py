@@ -1482,9 +1482,10 @@ class TestHasCharacterController:
 
 class TestPrefabStableIdThreeWayParity:
     """The planner ``_prefab_stable_id``, the emitter
-    ``scene_converter._prefab_stable_id``, and the resolver's ``prefab_id_for``
-    produce a byte-identical id for the same prefab, pinning the join key
-    directly rather than only catching skew at integration."""
+    ``scene_converter._prefab_stable_id``, and the resolver's
+    ``prefab_id_for_guid`` produce a byte-identical id for the same prefab,
+    pinning the join key directly rather than only catching skew at
+    integration."""
 
     def _build(self, tmp_path: Path, rel: str, name: str, guid: str):
         from core.unity_types import PrefabLibrary
@@ -1525,7 +1526,7 @@ class TestPrefabStableIdThreeWayParity:
 
     def _resolver_id(self, guid: str, guid_index: object) -> str | None:
         """Drive the REAL resolver path (``resolve_prefab_addressables`` ->
-        ``prefab_id_for``) for ``guid`` and return the id it derives, or
+        ``prefab_id_for_guid``) for ``guid`` and return the id it derives, or
         ``None`` when the resolver drops it. Computes the id the production way
         (via ``canonical_prefab_id`` against ``guid_index.project_root``), not a
         hand-built string."""

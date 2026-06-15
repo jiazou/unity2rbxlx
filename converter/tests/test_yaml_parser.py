@@ -308,11 +308,11 @@ class TestStrippedOut:
         assert "137514649" not in fids
 
 
-# Synthetic scene with an INTERIOR malformed (non-dict) document positioned
-# BEFORE a stripped MonoBehaviour. The malformed doc fails to parse, so under
-# a per-dict header counter every later doc shifts onto the wrong header — the
-# stripped MB would leak into ``result`` with a wrong (cid, fid) and never reach
-# ``stripped_out``. Position-stable pairing must keep each doc on its own header.
+# Synthetic scene with an interior malformed (non-dict) document BEFORE a
+# stripped MonoBehaviour. Under a per-dict header counter the malformed doc
+# would shift every later doc onto the wrong header (the stripped MB leaks into
+# ``result`` with a wrong (cid, fid) and never reaches ``stripped_out``).
+# Position-stable pairing must keep each doc on its own header.
 MALFORMED_BEFORE_STRIPPED_YAML = """%YAML 1.1
 %TAG !u! tag:unity3d.com,2011:
 --- !u!1 &1

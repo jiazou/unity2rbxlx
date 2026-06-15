@@ -1,9 +1,8 @@
 """Tests for unity.prefab_ref — the shared guid/object-ref -> canonical
-prefab-id resolution primitive extracted from addressables_resolver.
+prefab-id resolution primitive.
 
-Builds a REAL ``GuidIndex``/``GuidEntry`` (mirroring test_addressables_resolver's
-``_guid_index`` helper) so the prefab-id math runs through the production
-``canonical_prefab_id`` core rather than a mock."""
+Builds a real ``GuidIndex``/``GuidEntry`` so the prefab-id math runs through the
+production ``canonical_prefab_id`` core rather than a mock."""
 
 from __future__ import annotations
 
@@ -72,12 +71,11 @@ def test_canonical_empty_outside_root_returns_none(tmp_path):
 
 
 def test_rootless_index_known_guid_yields_bare_guid():
-    """The rootless ``SimpleNamespace(project_root=None, ...)`` shape (which the
-    existing three-way-identity test relies on, and which a nominal ``GuidIndex``
-    cannot represent) is accepted by ``GuidIndexLike``. With project_root None +
-    a known .prefab guid, ``canonical_prefab_id`` returns the bare guid (truthy,
-    not ""), so the primitive yields it rather than None — documenting the
-    None-collapse fires only on the empty-id path."""
+    """A rootless ``SimpleNamespace(project_root=None, ...)`` index is accepted by
+    ``GuidIndexLike``. With project_root None + a known .prefab guid,
+    ``canonical_prefab_id`` returns the bare guid (truthy), so the primitive
+    yields it rather than None — the None-collapse fires only on the empty-id
+    path."""
     from types import SimpleNamespace
 
     entry = GuidEntry(
@@ -90,9 +88,9 @@ def test_rootless_index_known_guid_yields_bare_guid():
     assert prefab_id_for_guid("catguid", gi) == "catguid"
 
 
-# --- Regression: byte-identical getattr fail-soft on partial duck-typed shapes
-# The OLD nested closure read via getattr(...), so a malformed/partial guid_index
-# (or an entry missing asset_path) dropped to None rather than raising. Pin that.
+# --- Regression: getattr fail-soft on partial duck-typed shapes -------------
+# A malformed/partial guid_index (or an entry missing asset_path) must drop to
+# None rather than raise. Pin that.
 
 def test_partial_index_missing_project_root_resolves_not_crash():
     """A duck-typed index missing ``project_root`` must not raise; getattr falls

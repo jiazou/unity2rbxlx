@@ -1230,7 +1230,7 @@ function SceneRuntime:_wireReferences(refs, componentByInstanceId,
 			-- the cross-domain POLICY (as opposed to a load-order miss). A
 			-- policy-nil'd ref must NOT enter ``_pendingPlacementRefs`` -- the
 			-- drain would otherwise rebind it once the placed component lands
-			-- and silently defeat the cross-domain gate (codex round-1 P1).
+			-- and silently defeat the cross-domain gate.
 			local crossDomainNil = false
 			if ref.target_kind == "component" then
 				local srcMeta = self._meta[sourceComp]
@@ -1308,17 +1308,14 @@ function SceneRuntime:_wireReferences(refs, componentByInstanceId,
 				elseif not crossDomainNil
 				       and (placement_id == nil or placement_id == "")
 				       and self:_isPlacementScopedRef(ref.target_ref) then
-					-- Phase 3 (slice 3.3): a SCENE-BOOT (placement_id nil/empty)
-					-- component ref that resolved to nil and whose ``target_ref``
-					-- is a placement-scoped engine-union key
-					-- (``<placement>:<prefab>:<src_fid>``) is a LOAD-ORDER miss:
+					-- A scene-boot (placement_id nil/empty) component ref that
+					-- resolved to nil and whose ``target_ref`` is a full
+					-- engine-union key (``<placement>:<prefab>:<src_fid>``, as
+					-- the planner emits for stripped refs) is a LOAD-ORDER miss:
 					-- the placed-prefab clone hasn't booted yet (the scene loop
-					-- wires every scene ref BEFORE any placement boots). Queue it
-					-- for ``_drainPendingPlacementRefs``. Gated on NOT-cross-domain
-					-- so a policy-nil'd ref is never rebound (D-P3-6 / round-1 P1).
-					-- ``target_ref`` is already the full engine-union key (the
-					-- planner emits the resolved ``<placement>:<prefab>:<src_fid>``
-					-- for stripped refs), so it is NOT placement-scoped here.
+					-- wires every scene ref before any placement boots). Queue it
+					-- for ``_drainPendingPlacementRefs``, gated on NOT-cross-domain
+					-- so a policy-nil'd ref is never rebound (D-P3-6).
 					self._pendingPlacementRefs = self._pendingPlacementRefs or {}
 					table.insert(self._pendingPlacementRefs, {
 						source = sourceComp,

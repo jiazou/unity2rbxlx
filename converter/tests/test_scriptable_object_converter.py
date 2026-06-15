@@ -296,6 +296,9 @@ PICKUP_GUID = "16cac8b68c4ca6448baecd0680e025f6"
 PICKUP_REL = "Assets/Prefabs/Pickup.prefab"
 PICKUP_ID = f"{PICKUP_GUID}:{PICKUP_REL}"
 
+# Real Trash-Dash project (path-guarded — CI without the source skips).
+_TRASH_DASH = Path("/Users/jiazou/workspace/trash-dash")
+
 
 class TestPrefabRefResolution:
     """SO object-ref fields that point at a ``.prefab`` resolve to the Unit-1
@@ -303,11 +306,10 @@ class TestPrefabRefResolution:
     non-prefab / unresolvable / no-index refs stay ``nil`` (fail-soft)."""
 
     def _real_index(self, project_root: Path, *entries):
-        """Build a real ``GuidIndex`` (non-optional ``Path`` project_root) with
-        the given ``(guid, relative_path, kind)`` entries. A real project_root
-        under which ``asset_path`` lives is REQUIRED for the full
-        ``<guid>:<path>`` id (else canonical_prefab_id returns a bare guid —
-        edge case 9b — and the byte-match would pass for the wrong reason)."""
+        """Build a real ``GuidIndex`` with the given ``(guid, relative_path,
+        kind)`` entries. A real project_root under which ``asset_path`` lives is
+        required for the full ``<guid>:<path>`` id (else canonical_prefab_id
+        returns only a bare guid)."""
         from core.unity_types import GuidEntry, GuidIndex
 
         idx = GuidIndex(project_root=project_root)
@@ -445,11 +447,9 @@ class TestPrefabRefResolution:
         assert f'"{PICKUP_ID}"' in src
 
     def test_nested_list_ref_counts(self, tmp_path):
-        # Drive a ``cloudPrefabs``-style list of refs (one prefab + one
-        # non-prefab) directly through ``_value_to_lua`` and assert the counter
-        # reflects the NESTED refs — proves ``counts`` survives the list
-        # recursion arm (:93). If that arm dropped ``counts``, resolved/skipped
-        # would stay 0.
+        # A ``cloudPrefabs``-style list of refs (one prefab + one non-prefab):
+        # the counter must reflect the nested refs, proving ``counts`` survives
+        # the list-recursion arm.
         proj = tmp_path / "proj"
         proj.mkdir()
         idx = self._real_index(
@@ -483,11 +483,9 @@ class TestPrefabRefResolution:
         assert f'"{PICKUP_ID}"' in src
 
     def test_nested_dict_ref_counts(self, tmp_path):
-        # Drive a ``prefabList[].m_CachedAsset``-style nested dict ref directly
-        # through ``_value_to_lua`` and assert the counter reflects the nested
-        # ref — proves ``counts`` survives the dict-value recursion arms
-        # (:118 identifier-key, :120 bracketed-key). If those arms dropped
-        # ``counts``, resolved would stay 0.
+        # A ``prefabList[].m_CachedAsset``-style nested dict ref: the counter
+        # must reflect the nested ref, proving ``counts`` survives the dict-value
+        # recursion arms (identifier-key and bracketed-key).
         proj = tmp_path / "proj"
         proj.mkdir()
         idx = self._real_index(proj, (PICKUP_GUID, PICKUP_REL, "prefab"))
@@ -503,9 +501,9 @@ class TestPrefabRefResolution:
         assert counts.skipped == 0
 
     def test_non_identifier_key_dict_ref_resolves(self, tmp_path):
-        # A nested dict whose key is NOT a valid Python identifier (hyphen, no
-        # m_ prefix to strip) → emit takes the ``["<key>"] = ...`` arm (:120).
-        # Proves prefab-ref resolution threads through that recursion arm too.
+        # A nested dict whose key is not a valid Python identifier (hyphen) →
+        # emit takes the ``["<key>"] = ...`` arm. Proves prefab-ref resolution
+        # threads through that recursion arm too.
         proj = tmp_path / "proj"
         proj.mkdir()
         idx = self._real_index(proj, (PICKUP_GUID, PICKUP_REL, "prefab"))
@@ -516,7 +514,7 @@ class TestPrefabRefResolution:
             f"{{fileID: 184264, guid: {PICKUP_GUID}, type: 3}}\n",
         )
         src = convert_asset_file(f, idx).luau_source
-        # Genuinely the non-identifier-key arm: bracketed-string key form.
+        # The non-identifier-key arm emits the bracketed-string key form.
         assert f'["bad-key"] = "{PICKUP_ID}"' in src
 
     # --- Acceptance #6: counters -----------------------------------------
@@ -565,18 +563,17 @@ class TestPrefabRefResolution:
             in caplog.text
         )
 
-    # --- belt-and-suspenders: real project parse, path-skipped -----------
+    # --- real project parse (path-guarded, skips without the source) -----
 
     def test_real_project_byte_match(self):
         import pytest
 
-        real_root = Path("/Users/jiazou/workspace/trash-dash")
-        if not (real_root / "Assets" / "Prefabs" / "Pickup.prefab").exists():
+        if not (_TRASH_DASH / "Assets" / "Prefabs" / "Pickup.prefab").exists():
             pytest.skip("trash-dash source project not on disk")
         from unity.guid_resolver import build_guid_index
         from unity.prefab_ref import prefab_id_for_ref
 
-        idx = build_guid_index(real_root)
+        idx = build_guid_index(_TRASH_DASH)
         pid = prefab_id_for_ref(
             {"guid": PICKUP_GUID, "fileID": 184264, "type": 3}, idx
         )
