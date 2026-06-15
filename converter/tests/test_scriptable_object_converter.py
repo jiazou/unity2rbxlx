@@ -440,6 +440,23 @@ class TestPrefabRefResolution:
         src = convert_asset_file(f, idx).luau_source
         assert f'"{PICKUP_ID}"' in src
 
+    def test_non_identifier_key_dict_ref_resolves(self, tmp_path):
+        # A nested dict whose key is NOT a valid Python identifier (hyphen, no
+        # m_ prefix to strip) → emit takes the ``["<key>"] = ...`` arm (:120).
+        # Proves prefab-ref resolution threads through that recursion arm too.
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        idx = self._real_index(proj, (PICKUP_GUID, PICKUP_REL, "prefab"))
+        f = self._write_asset(
+            tmp_path,
+            "  prefabMap:\n"
+            "    bad-key: "
+            f"{{fileID: 184264, guid: {PICKUP_GUID}, type: 3}}\n",
+        )
+        src = convert_asset_file(f, idx).luau_source
+        # Genuinely the non-identifier-key arm: bracketed-string key form.
+        assert f'["bad-key"] = "{PICKUP_ID}"' in src
+
     # --- Acceptance #6: counters -----------------------------------------
 
     def test_counts_tally_resolved_and_skipped(self, tmp_path):
