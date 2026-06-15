@@ -41,7 +41,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from converter.pipeline import Pipeline
 from converter.scene_converter import _wrap_geometry_with_children_into_model
-from core.roblox_types import RbxPart, RbxPlace
+from core.roblox_types import RbxConstraint, RbxPart, RbxPlace
 
 
 _GRAVITY_SCRIPT = "SceneGravityCorrection"
@@ -83,14 +83,29 @@ def _s2_mesh_wrapped(node_name: str, **outer_attrs: object) -> RbxPart:
 
 def _s4_welded_assembly(name: str) -> RbxPart:
     """S4: a welded multi-part assembly -- two dynamic ``_UnityMass`` BaseParts
-    (each carries its own ``_UnityMass``, scene_converter.py:2797 per part)."""
+    joined by the REAL post-conversion weld representation.
+
+    Each member carries its own ``_UnityMass`` (unanchored, scene_converter.py:2797
+    per part). The Unity ``FixedJoint`` on member ``_A`` lowers (via
+    ``component_converter.convert_joint``) to a
+    ``RbxConstraint(constraint_type="WeldConstraint", connected_body_file_id=...)``
+    appended to ``_A.constraints``, where ``connected_body_file_id`` resolves to the
+    connected body ``_B`` by its Unity ``unity_file_id`` (Part0=owner, Part1=
+    connected; resolved at rbxlx-write time)."""
+    member_a = _s1_basepart(f"{name}_A")
+    member_a.unity_file_id = f"{name}:1"
+    member_b = _s1_basepart(f"{name}_B")
+    member_b.unity_file_id = f"{name}:2"
+    member_a.constraints.append(
+        RbxConstraint(
+            constraint_type="WeldConstraint",
+            connected_body_file_id=member_b.unity_file_id,
+        )
+    )
     return RbxPart(
         name=name,
         class_name="Model",
-        children=[
-            _s1_basepart(f"{name}_A"),
-            _s1_basepart(f"{name}_B"),
-        ],
+        children=[member_a, member_b],
     )
 
 
@@ -217,13 +232,30 @@ class TestPMixedAntiVacuity:
         assert isinstance(inner.attributes.get("_UnityMass"), float)
         assert "_UnityMass" not in outer.attributes  # moved to inner by the producer
 
-        # S4: a welded assembly -- >=2 dynamic _UnityMass BaseParts.
+        # S4: a welded assembly -- >=2 dynamic _UnityMass BaseParts JOINED by a
+        # real WeldConstraint. Assert the weld RELATION exists (a WeldConstraint
+        # linking the members by the connected body's unity_file_id), not merely
+        # that the member names are present -- so a regression in the welded-
+        # assembly representation (dropped/mis-typed constraint) REDs this canary.
         welded_members = [
             x for x in parts
             if x.name.startswith("WeldedCrate_")
             and isinstance(x.attributes.get("_UnityMass"), float)
         ]
         assert len(welded_members) >= 2
+        member_ids = {
+            x.unity_file_id for x in welded_members if x.unity_file_id is not None
+        }
+        welds = [
+            c
+            for x in welded_members
+            for c in x.constraints
+            if c.constraint_type == "WeldConstraint"
+        ]
+        assert welds, "S4 must carry a WeldConstraint joining its members"
+        assert any(
+            w.connected_body_file_id in member_ids for w in welds
+        ), "the WeldConstraint must reference a sibling member as its connected body"
 
         # S5: a dynamic BasePart nested under a factless container Model.
         container = by_name["ContainerModel"]
