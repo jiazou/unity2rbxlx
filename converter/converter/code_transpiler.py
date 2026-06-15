@@ -1512,6 +1512,7 @@ ALWAYS put a `-- OnTrigger<Phase>(other)` / `-- OnCollision<Phase>(...)` origin 
 ### Component access
 - `GetComponent<T>()` / `GetComponent("Name")` → `self:GetComponent("T")`.
 - `GetComponentInChildren / Parent` → walk `self.gameObject:GetDescendants()` / `:GetAncestors()` and filter; the host registry doesn't index across hierarchy.
+- A type-based child lookup (e.g. find the player's Humanoid on a hit) uses Roblox `:FindFirstChildOfClass("Humanoid")` or `:FindFirstChildWhichIsA("BasePart")`. **`FindFirstChildOfType` does NOT exist in Roblox** — never emit `:FindFirstChildOfType(...)`; it errors at runtime (e.g. a bullet/explosion that looks up the victim's Humanoid would silently deal no damage). Use `:FindFirstChildOfClass("Humanoid")`.
 - `gameObject.AddComponent<T>()` → `self.host.addComponent(self.gameObject, "T", configTable)`.
 - `gameObject.SetActive(b)` → `self.host.setActive(self.gameObject, b)`.
 - `Instantiate(prefab)` / `Instantiate(prefab, pos, rot)` → `self.host.instantiatePrefab(self.<prefabField>, parent, cframe)`. `self.<prefabField>` is injected from the serialized prefab reference — never `prefab:Clone()`.
