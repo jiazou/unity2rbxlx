@@ -1776,6 +1776,85 @@ class TestPlanSceneRuntimeIsEssential:
         from converter.pipeline import Pipeline
         assert "plan_scene_runtime" in Pipeline.ESSENTIAL_PHASES
 
+    def test_resume_recomputes_addressables_over_stale_persisted_block(
+        self, tmp_path: Path,
+    ):
+        """AC8 (behavioral half). A ``--phase write_output`` resume re-runs
+        ``plan_scene_runtime`` (it is ESSENTIAL), so a STALE persisted
+        ``ctx.scene_runtime`` (a resolved-name/addressables block from a prior
+        run) is RECOMPUTED fresh — never paired stale with a fresh
+        ``prefab_library`` (codex-R2 hazard, D8). Then the real emitter, reading
+        the recomputed ``ctx.scene_runtime``, still emits the addressable
+        templates under the FRESH resolved names.
+
+        Drives the REAL ``Pipeline.plan_scene_runtime`` recompute + the REAL
+        ``generate_prefab_packages`` reading from ctx — proving recompute, not
+        stale reuse. If ``plan_scene_runtime`` reused the persisted block (or
+        were dropped from ESSENTIAL_PHASES so a resume never re-ran it), the
+        stale poison values would survive and these assertions would fail."""
+        from converter.prefab_packages import generate_prefab_packages
+
+        p = TestPlanSceneRuntimePipelineBridge()._make_pipeline(tmp_path)
+
+        cat_id = f"{TestPlanSceneRuntimePipelineBridge.CAT_GUID}:Assets/Bundles/Characters/Cat/character.prefab"
+        raccoon_id = f"{TestPlanSceneRuntimePipelineBridge.RACCOON_GUID}:Assets/Bundles/Characters/Raccoon/character.prefab"
+
+        # Persisted state from a PRIOR run, deliberately STALE/poisoned: a wrong
+        # resolved name + a wrong addressables block + a phantom prefab id.
+        p.ctx.scene_runtime = {
+            "prefabs": {
+                cat_id: {"name": "character", "template_name": "STALE_WRONG"},
+                "PHANTOM:Assets/Gone.prefab": {
+                    "name": "ghost", "template_name": "ghost",
+                },
+            },
+            "addressables": {
+                "by_address": {"Trash Cat": ["PHANTOM:Assets/Gone.prefab"]},
+                "by_label": {},
+            },
+        }
+
+        # The resume re-runs the essential planner → recompute.
+        p.plan_scene_runtime()
+        sr = p.ctx.scene_runtime
+
+        # Stale poison is GONE — recomputed fresh, not reused.
+        assert sr["prefabs"][cat_id]["template_name"] == "character__473ffa"
+        assert "PHANTOM:Assets/Gone.prefab" not in sr["prefabs"]
+        assert sr["addressables"]["by_address"]["Trash Cat"] == [cat_id]
+        assert sr["addressables"]["by_address"]["Trash Cat"] != [
+            "PHANTOM:Assets/Gone.prefab"
+        ]
+
+        # The emitter, reading the recomputed ctx (mirrors
+        # Pipeline._generate_prefab_packages), emits the addressable templates
+        # under the FRESH resolved names.
+        resolved_template_names = {
+            pid: sub["template_name"]
+            for pid, sub in sr["prefabs"].items()
+            if isinstance(sub, dict) and isinstance(sub.get("template_name"), str)
+        }
+        addressable_prefab_ids: set[str] = set()
+        for axis in ("by_address", "by_label"):
+            for ids in (sr["addressables"].get(axis) or {}).values():
+                addressable_prefab_ids.update(
+                    pid for pid in ids if isinstance(pid, str)
+                )
+
+        result = generate_prefab_packages(
+            prefab_library=p.state.prefab_library,
+            serialized_field_refs=p.ctx.serialized_field_refs or None,
+            guid_index=p.state.guid_index,
+            resolved_template_names=resolved_template_names,
+            addressable_prefab_ids=addressable_prefab_ids,
+        )
+        emitted_names = {t.name for t in result.templates}
+        # The addressable Cat/Raccoon templates are emitted under the FRESH
+        # (recomputed) resolved names, and the stale name never appears.
+        assert "character__473ffa" in emitted_names
+        assert "character__2ae64d" in emitted_names
+        assert "STALE_WRONG" not in emitted_names
+
 
 class TestAddressablesReachesEmbeddedPlan:
     """AC5 — ``addressables`` is in the host allowlist and renders into the

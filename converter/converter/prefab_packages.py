@@ -147,12 +147,20 @@ def _guid6_of(prefab_id: str) -> str | None:
     the bare name (cannot disambiguate).
     """
     head, sep, _rest = prefab_id.partition(":")
-    if not sep or not head:
-        return None
-    # A Unity guid is a hex token; a path head (e.g. ``Assets``) is not.
-    if not all(c in "0123456789abcdefABCDEF" for c in head):
-        return None
-    return head[:6]
+    if sep:
+        if not head:
+            return None
+        # A Unity guid is a hex token; a path head (e.g. ``Assets``) is not.
+        if not all(c in "0123456789abcdefABCDEF" for c in head):
+            return None
+        return head[:6]
+    # Colon-free id: a bare guid (canonical_prefab_id with project_root None,
+    # design fact 2) is itself the guid — a 32-hex-char Unity guid. A colon-free
+    # PATH (e.g. ``Assets/Foo.prefab``) is NOT a guid: gate on the canonical
+    # 32-hex shape so a real path segment is never misread as a guid.
+    if len(head) == 32 and all(c in "0123456789abcdefABCDEF" for c in head):
+        return head[:6]
+    return None
 
 
 def resolve_template_child_names(

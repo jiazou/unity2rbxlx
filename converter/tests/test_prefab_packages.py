@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from converter.prefab_packages import (
     _collect_referenced_prefab_names,
+    _guid6_of,
     _SPAWNER_LUAU,
     generate_prefab_packages,
     resolve_template_child_names,
@@ -1546,6 +1547,54 @@ _CAT_ID = "473ffa01abcd:Assets/Bundles/Characters/Cat/character.prefab"
 _RACCOON_ID = "2ae64d0eefab:Assets/Bundles/Characters/Raccoon/character.prefab"
 
 
+class TestGuid6Of:
+    """``_guid6_of`` must recognize ALL THREE prefab_id shapes — including the
+    colon-free BARE guid that ``canonical_prefab_id`` returns when
+    ``project_root is None`` (P2 logic bug: a colon-only check left two
+    colliding rootless ids both bare instead of ``base__guid6``)."""
+
+    def test_colon_guid_id(self):
+        assert _guid6_of(_CAT_ID) == "473ffa"
+
+    def test_colon_free_bare_guid(self):
+        """A 32-hex-char colon-free id (a bare Unity guid from
+        ``canonical_prefab_id(project_root=None)``) yields its first 6 hex."""
+        assert _guid6_of("473ffa01abcd0000000000000000aaaa") == "473ffa"
+
+    def test_colon_free_bare_guid_drives_collision_disambiguation(self):
+        """End-to-end: two colliding-base prefabs whose ids are colon-free
+        bare guids (the ``project_root is None`` shape from
+        ``canonical_prefab_id``) MUST disambiguate, not both stay bare."""
+        from unity.prefab_id import canonical_prefab_id
+        cat_id = canonical_prefab_id(
+            "473ffa01abcd0000000000000000aaaa", None, None,
+        )
+        rac_id = canonical_prefab_id(
+            "2ae64d0eefab0000000000000000bbbb", None, None,
+        )
+        # canonical_prefab_id returns a BARE colon-free guid here.
+        assert ":" not in cat_id and ":" not in rac_id
+        resolved = resolve_template_child_names({
+            cat_id: "character",
+            rac_id: "character",
+        })
+        assert resolved[cat_id] == "character__473ffa"
+        assert resolved[rac_id] == "character__2ae64d"
+        assert resolved[cat_id] != resolved[rac_id]
+
+    def test_colon_free_path_is_not_a_guid(self):
+        """A colon-free PATH (not 32 hex chars) must NOT be misread as a guid."""
+        assert _guid6_of("Assets/Bundles/Characters/Cat/character.prefab") is None
+
+    def test_empty_string_id(self):
+        assert _guid6_of("") is None
+
+    def test_colon_with_path_head_is_not_a_guid(self):
+        """The existing colon-path safety: a real path segment before ``:``
+        (non-hex) is not a guid."""
+        assert _guid6_of("Assets:Bundles/character.prefab") is None
+
+
 class TestResolveTemplateChildNames:
     def test_ac1_colliding_base_distinct_guid_suffixes(self):
         """AC1: two prefab_ids with base ``character`` + distinct guids
@@ -1673,6 +1722,21 @@ class TestSelectEmittedPrefabIds:
         assert select_emitted_prefab_ids(None, None, None) == set()
         # None library but addressable ids → still returns them.
         assert select_emitted_prefab_ids(None, None, {"x"}) == {"x"}
+
+    def test_duplicate_base_via_referenced_leg(self, tmp_path):
+        """A bare reference to a name shared by TWO prefabs pulls BOTH their
+        prefab_ids in through the ``referenced`` (serialized_field_refs) leg —
+        with NO ``addressable_prefab_ids``. This is the realistic collision
+        path (a script field referencing the shared base ``character``); the
+        prior tests only forced the colliding pair in via the explicit
+        ``addressable_prefab_ids`` arg, leaving the referenced leg unguarded
+        against a regression that deduped one of the two ids."""
+        lib, gi, cat_id, raccoon_id, icon_id = self._setup(tmp_path)
+        # A script field references the shared base name ``character``.
+        refs = {"Assets/Spawner.cs": {"characterPrefab": "character"}}
+        emitted = select_emitted_prefab_ids(lib, refs, None, guid_index=gi)
+        # BOTH colliding ids enter via the referenced leg — not just one.
+        assert emitted == {cat_id, raccoon_id}
 
     def test_matches_emitter_real_selection(self, tmp_path):
         """The predicate's ``referenced`` selection matches the emitter's
