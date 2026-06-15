@@ -187,6 +187,11 @@ API_CALL_MAP: dict[str, str] = {
     "rigidbody.velocity": ".AssemblyLinearVelocity",
     "rigidbody.angularVelocity": ".AssemblyAngularVelocity",
     "rigidbody.mass": ":GetMass()",
+    # Phase 1 (relation #8): the LIVE lowering of a linear AddForce routes through
+    # ``self.host.applyImpulse(part, f)`` (generic prompt + contract-verifier), so the host applies
+    # the faithful stud-scaled launch velocity. This raw ``:ApplyImpulse`` entry is the
+    # coverage/reference mapping only (it does not drive transpile output) — do NOT use it as a
+    # repair-path lowering for AddForce.
     "rigidbody.AddForce": ":ApplyImpulse",
     "rigidbody.AddTorque": ":ApplyAngularImpulse",
     "rigidbody.isKinematic": ".Anchored",
