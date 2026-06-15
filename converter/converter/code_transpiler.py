@@ -1543,7 +1543,7 @@ ALWAYS put a `-- OnTrigger<Phase>(other)` / `-- OnCollision<Phase>(...)` origin 
 ### Physics primitives
 - `Physics.Raycast(o, d, dist)` → `workspace:Raycast(o, d.Unit * (dist * 3.571), RaycastParams.new())`.
 - `Rigidbody.velocity` → `part.AssemblyLinearVelocity`.
-- `Rigidbody.AddForce(f)` → `part:ApplyImpulse(f)`.
+- `Rigidbody.AddForce(f)` (linear impulse / `AddForce(f, ForceMode.Impulse)`) → `self.host.applyImpulse(part, f)`. Do NOT pre-scale `f`: the host applies the faithful stud-scaled launch velocity despite the inflated Roblox mass. Never emit a raw `part:ApplyImpulse(...)`.
 - `Rigidbody.isKinematic = b` → `part.Anchored = b`.
 
 ### Input
