@@ -1047,6 +1047,21 @@ class Pipeline:
         # the planner module (avoids a core→converter dependency).
         self.ctx.scene_runtime = dict(artifact)
 
+        # Phase 1 (relation #8): parse the REAL project gravity ONCE, EARLY, and
+        # stash the scale-faithful base target accel (studs/s²). This MUST run
+        # here, before the SceneRuntimePlan ModuleScript is emitted in
+        # ``_subphase_inject_scene_runtime`` -- that emit serializes only keys
+        # already present in ``scene_runtime`` AND in ``_PLAN_KEYS_FOR_HOST``, so
+        # parsing later would never reach the plan (the client hook would fall
+        # back to a frozen 9.81). One parse, two consumers: the client reads it
+        # from the emitted plan field; the standalone server script reads the same
+        # stash to bake its literal.
+        from converter.project_gravity import parse_project_gravity_y
+        self.ctx.scene_runtime["gravityDesiredBaseStuds"] = (
+            parse_project_gravity_y(self.unity_project_path)
+            * _config.STUDS_PER_METER
+        )
+
         modules = artifact["modules"]
         runtime_bearing = sum(
             1 for m in modules.values() if m.get("runtime_bearing")
