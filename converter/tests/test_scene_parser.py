@@ -311,6 +311,38 @@ class TestStrippedComponents:
         scene = parse_scene(FIXTURES_DIR / "simple_scene.yaml")
         assert scene.stripped_components == {}
 
+    def test_non_monobehaviour_stripped_doc_not_recorded(self, tmp_path):
+        # Pass-6b filters on ``cid != CID_MONO_BEHAVIOUR`` (114): only stripped
+        # MonoBehaviours are reference targets the planner resolves. A stripped
+        # RectTransform (224) — even one carrying a valid
+        # m_CorrespondingSourceObject — must NOT enter stripped_components, so it
+        # can never be bridged as a component ref target.
+        text = (
+            "%YAML 1.1\n"
+            "%TAG !u! tag:unity3d.com,2011:\n"
+            "--- !u!224 &137514650 stripped\n"
+            "RectTransform:\n"
+            "  m_CorrespondingSourceObject: {fileID: 224000011972273751, "
+            "guid: a53fe2875371488408daf0df7d69a981, type: 3}\n"
+            "  m_PrefabInstance: {fileID: 1822972501}\n"
+            "  m_GameObject: {fileID: 0}\n"
+            "--- !u!114 &137514649 stripped\n"
+            "MonoBehaviour:\n"
+            "  m_CorrespondingSourceObject: {fileID: 114000011972273750, "
+            "guid: a53fe2875371488408daf0df7d69a981, type: 3}\n"
+            "  m_PrefabInstance: {fileID: 1822972501}\n"
+            "  m_GameObject: {fileID: 0}\n"
+            "  m_Script: {fileID: 11500000, "
+            "guid: fff2f071f7335eb43a712a702b990041, type: 3}\n"
+        )
+        scene = self._parse(tmp_path, text)
+        # The stripped Transform (224) is filtered out...
+        assert "137514650" not in scene.stripped_components
+        # ...while the sibling stripped MonoBehaviour (114) IS recorded, proving
+        # the filter discriminates on class id, not on doc presence.
+        assert "137514649" in scene.stripped_components
+        assert scene.stripped_components["137514649"].class_id == 114
+
 
 class TestStrippedComponentsRealScene:
     def test_real_scene_bridge_fields(self):

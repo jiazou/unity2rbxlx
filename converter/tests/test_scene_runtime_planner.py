@@ -1906,6 +1906,7 @@ class TestStrippedRefResolution:
         subplan_has_instance: bool = True,
         script_guid_matches: bool = True,
         source_prefab_guid_matches: bool = True,
+        subplan_in_block: bool = True,
     ) -> tuple[list[ParsedScene], PrefabLibrary, GuidIndex]:
         """Assemble parsed inputs reproducing the real stripped-ref shape.
 
@@ -1969,7 +1970,14 @@ class TestStrippedRefResolution:
         idx = _make_guid_index(tmp_path, guid_entries)
 
         lib = PrefabLibrary()
-        lib.prefabs.append(template)
+        # ``by_guid`` is what ``_walk_scene_prefab_placements`` consults to EMIT
+        # the placement; ``prefabs`` is the list ``plan_scene_runtime`` iterates
+        # to BUILD ``prefabs_block``. With ``subplan_in_block=False`` the template
+        # stays in ``by_guid`` (so the placement IS emitted) but is dropped from
+        # ``prefabs`` (so ``prefabs_block`` lacks that prefab_id) -> the post-pass
+        # hits the ``subplan is None`` fail-closed branch.
+        if subplan_in_block:
+            lib.prefabs.append(template)
         lib.by_guid[self._PREFAB_GUID] = template
 
         # Scene: a LoadoutState MB whose missionPopup -> the stripped fileID.
@@ -2107,6 +2115,38 @@ class TestStrippedRefResolution:
         artifact = plan_scene_runtime(
             parsed_scenes=scenes, prefab_library=lib, guid_index=idx,
             unity_project_root=tmp_path,
+        )
+        row = self._missionpopup_row(artifact)
+        assert row["target_ref"] == (
+            f"Assets/Scenes/Main.unity:{self._STRIPPED_FID}"
+        )
+        assert "target_script_id" not in row
+
+    def test_fail_closed_when_subplan_absent_from_prefabs_block(
+        self, tmp_path: Path,
+    ):
+        """The placement EXISTS (its prefab guid is in ``by_guid`` so
+        ``_walk_scene_prefab_placements`` emits it) but the prefab subplan is NOT
+        in ``prefabs_block`` (the template was filtered out of
+        ``prefab_library.prefabs``). The post-pass hits ``subplan is None`` and
+        keeps the unresolvable scene-local fallback (distinct from the
+        no-placement and subplan-lacks-instance branches)."""
+        scenes, lib, idx = self._build(tmp_path, subplan_in_block=False)
+        # Guard the fixture: a placement IS emitted (the branch under test is
+        # only reachable once the placement + prefab-guid gates have passed).
+        artifact = plan_scene_runtime(
+            parsed_scenes=scenes, prefab_library=lib, guid_index=idx,
+            unity_project_root=tmp_path,
+        )
+        prefab_id = f"{self._PREFAB_GUID}:Assets/Prefabs/UI/MissionPopup.prefab"
+        placements = artifact["scene_prefab_placements"]
+        assert any(p["prefab_id"] == prefab_id for p in placements), (
+            "fixture invariant: the placement must be emitted so the post-pass "
+            "reaches the subplan lookup"
+        )
+        assert prefab_id not in artifact["prefabs"], (
+            "fixture invariant: the prefab subplan must be ABSENT from "
+            "prefabs_block (the branch under test)"
         )
         row = self._missionpopup_row(artifact)
         assert row["target_ref"] == (

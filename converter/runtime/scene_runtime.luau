@@ -261,6 +261,16 @@ function SceneRuntime.new(services, plan)
 	-- the full engine-union key (``<placement>:<prefab>:<src_fid>``).
 	self._pendingPlacementRefs = nil
 
+	-- Phase 3 (slice 3.3, harden): count of deferred-UI host GROUPS still
+	-- awaiting completion. ``_resolveDeferredUiInstances`` clears
+	-- ``_deferredUiInstances`` ONCE up front then completes one group per
+	-- ``_completeDeferredBatch``, so ``_deferredUiInstances == nil`` is NOT a
+	-- reliable "all deferred work done" signal for the residual WARN gate (a
+	-- group that hosts a still-pending placement target may not have run yet).
+	-- This counter is the true in-flight signal: set to the group count, each
+	-- batch decrements it, and the residual WARN only fires once it reaches 0.
+	self._deferredGroupsPending = nil
+
 	return self
 end
 
@@ -1170,12 +1180,21 @@ function SceneRuntime:_drainPendingPlacementRefs()
 
 	-- After the FINAL drain (no UI-deferred work still in flight), any still-
 	-- unresolved record is a genuinely-absent target (no placement / never
-	-- registered). Emit a WARN so the residual nil is observable. Gate on no
-	-- pending UI-deferred batches so the WARN does not fire prematurely while
-	-- a placed target is still waiting on its PlayerGui host clone.
+	-- registered). Emit a WARN so the residual nil is observable. Suppress the
+	-- WARN while ANY deferred work can still register the target:
+	--   * ``_deferredUiInstances`` not yet dispatched (drained at the
+	--     post-placement-boot call site, before the UI batches run), OR
+	--   * ``_deferredGroupsPending`` > 0 -- groups dispatched but not all
+	--     completed (``_deferredUiInstances`` is cleared up front, so it is NOT
+	--     a sufficient signal; a later group may still host the target), OR
+	--   * ``_inboundRefsToDeferred`` -- UI-deferred back-patch still pending.
+	-- Only when no further deferred batch can register the target is a residual
+	-- nil genuine. Diagnostic-only -- binding behaviour is unchanged.
 	if self._pendingPlacementRefs ~= nil
 	   and (self._deferredUiInstances == nil
 	        or #self._deferredUiInstances == 0)
+	   and (self._deferredGroupsPending == nil
+	        or self._deferredGroupsPending <= 0)
 	   and self._inboundRefsToDeferred == nil then
 		for _, rec in ipairs(self._pendingPlacementRefs) do
 			local srcMeta = self._meta[rec.source]
@@ -2336,6 +2355,12 @@ function SceneRuntime:_resolveDeferredUiInstances()
 		table.insert(group, entry)
 	end
 
+	-- Phase 3 (harden): track how many host groups are still in flight so the
+	-- residual placement-ref WARN (in ``_drainPendingPlacementRefs``) does not
+	-- fire prematurely when an early group drains while a LATER group still
+	-- hosts the placement target. Each ``_completeDeferredBatch`` decrements it.
+	self._deferredGroupsPending = #groupOrder
+
 	-- MAJOR (codex r3): dependency-aware ordering. With pure per-host grouping
 	-- a group that holds an OUTBOUND ``component``-ref to a deferred component
 	-- on ANOTHER host could Awake/Start with that ref nil (it only got
@@ -2537,6 +2562,14 @@ function SceneRuntime:_completeDeferredBatch(pending)
 	-- set through ``_runAwakeEnableStart`` once. ``pending`` entries each
 	-- carry their resolved ``entry.goInst`` (nil = host clone never landed).
 	local engine = self
+	-- Phase 3 (harden): this group is now being completed -- decrement the
+	-- in-flight group count up front so EVERY exit (incl. the empty-batch early
+	-- return below) accounts for it. Once it reaches 0 the residual
+	-- placement-ref WARN in ``_drainPendingPlacementRefs`` may fire (no further
+	-- deferred group can register a still-pending target).
+	if engine._deferredGroupsPending ~= nil then
+		engine._deferredGroupsPending = engine._deferredGroupsPending - 1
+	end
 	-- Order the batch by the planner's ``lifecycle_order`` so deferred peers
 	-- Awake in the authored order (and same-GO peers can see each other via
 	-- GetComponent in Awake). ``lifecycle_order`` is per-scene; deferred
@@ -3006,6 +3039,19 @@ function SceneRuntime:start(domainFilter)
 	-- deferred components run their own complete late lifecycle batch once
 	-- their PlayerGui clone resolves event-driven.
 	self:_resolveDeferredUiInstances()
+
+	-- Phase 3 (harden): a final drain after the deferred resolution. When a
+	-- group completes with an EMPTY batch (its host clone never landed, so no
+	-- component was built/registered) ``_completeDeferredBatch`` returns before
+	-- its own end-of-batch drain, so a pending ref to that never-landing target
+	-- would otherwise never reach the residual-WARN gate. This last drain runs
+	-- once every group has been dispatched; in the synchronous-spawn path all
+	-- groups have completed (``_deferredGroupsPending == 0``) so the residual
+	-- WARN fires for genuinely-absent targets. In the async path groups may
+	-- still be in flight (counter > 0) -> the WARN stays suppressed here and
+	-- fires from the last group's own drain. Binding behaviour is unchanged
+	-- (the drain is idempotent).
+	self:_drainPendingPlacementRefs()
 
 	-- Build the host-owned per-player embodiment authority (paradigm C).
 	-- Client-only + keyed on the upstream has_character_controller MODULE
