@@ -37,6 +37,14 @@ def test_method_definition_not_flagged():
     assert not _fc(src), "a method definition must not be flagged"
 
 
+def test_long_receiver_method_definition_not_flagged():
+    # Regression (codex phase-2 BLOCKING): a definition with a receiver chain longer than the old
+    # 40-char lookback must still be recognized (a fail-closed false-positive would block conversion).
+    src = ("function ExtremelyLongNamespaceNameForTesting.ComponentClass:FindFirstChildOfType(t) "
+           "return nil end\nreturn C\n")
+    assert not _fc(src), "long-receiver definition must not be flagged"
+
+
 def test_fc_is_fail_closed():
     src = 'function C:OnHit(c) local h = c:FindFirstChildOfType("Humanoid") end\nreturn C\n'
     v = _fc(src)[0]

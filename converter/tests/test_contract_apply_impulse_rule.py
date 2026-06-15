@@ -36,7 +36,9 @@ def test_whitespace_tolerant_forms_are_flagged():
 def test_method_definition_is_not_flagged():
     # A definition named ApplyImpulse is not a raw call — must not be flagged (incl. spaced form).
     for defn in ("function C:ApplyImpulse(v) self.x = v end",
-                 "function C : ApplyImpulse(v) self.x = v end"):
+                 "function C : ApplyImpulse(v) self.x = v end",
+                 # long receiver chain (> the old 40-char lookback) — propagated phase-2 guard fix
+                 "function ExtremelyLongNamespaceNameForTesting.ComponentClass:ApplyImpulse(v) self.x = v end"):
         src = f"{defn}\nreturn C\n"
         assert not _im_rules(src), f"definition must not be flagged: {defn!r}"
 

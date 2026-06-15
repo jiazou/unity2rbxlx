@@ -1143,10 +1143,18 @@ _RE_RAW_APPLY_IMPULSE = re.compile(r":\s*ApplyImpulse\s*\(")
 _RE_FUNC_DEF_PREFIX = re.compile(r"function\s+[\w.]*\s*$")
 
 
+def _is_method_def_call(stripped: str, pos: int) -> bool:
+    """True when the colon-call match at ``pos`` is actually a method DEFINITION
+    (``function <receiver>:Name(...)``). Scans the WHOLE current line before the colon (not a fixed
+    lookback) so a long receiver chain — e.g. ``function A.B.C:Name(...)`` — is still recognized."""
+    line_start = stripped.rfind("\n", 0, pos) + 1
+    return _RE_FUNC_DEF_PREFIX.search(stripped[line_start:pos]) is not None
+
+
 def _check_raw_apply_impulse(stripped: str, source: str) -> list[Violation]:
     out: list[Violation] = []
     for m in _RE_RAW_APPLY_IMPULSE.finditer(stripped):
-        if _RE_FUNC_DEF_PREFIX.search(stripped[max(0, m.start() - 40):m.start()]):
+        if _is_method_def_call(stripped, m.start()):
             continue  # ``function Class:ApplyImpulse(...)`` definition, not a call
         line = source.count("\n", 0, m.start()) + 1
         out.append(Violation(
@@ -1182,7 +1190,7 @@ _RE_FINDFIRSTCHILDOFTYPE = re.compile(r":\s*FindFirstChildOfType\s*\(")
 def _check_invalid_findfirstchildoftype(stripped: str, source: str) -> list[Violation]:
     out: list[Violation] = []
     for m in _RE_FINDFIRSTCHILDOFTYPE.finditer(stripped):
-        if _RE_FUNC_DEF_PREFIX.search(stripped[max(0, m.start() - 40):m.start()]):
+        if _is_method_def_call(stripped, m.start()):
             continue  # ``function Class:FindFirstChildOfType(...)`` definition, not a call
         line = source.count("\n", 0, m.start()) + 1
         out.append(Violation(
