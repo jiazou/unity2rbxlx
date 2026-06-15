@@ -3,9 +3,9 @@ resolving addresses/labels to scene-runtime prefab ids."""
 
 from __future__ import annotations
 
-from pathlib import Path, PureWindowsPath
-from types import SimpleNamespace
+from pathlib import Path
 
+from core.unity_types import GuidEntry, GuidIndex
 from unity.addressables_resolver import (
     parse_addressables,
     resolve_prefab_addressables,
@@ -44,12 +44,25 @@ def _project(tmp_path: Path, *group_texts: str) -> Path:
     return tmp_path
 
 
-def _guid_index(mapping: dict[str, str]):
-    # guid -> relative path; build entries with asset_path/relative_path.
-    entries = {}
+def _classify(rel: str) -> str:
+    return "prefab" if rel.endswith(".prefab") else "texture"
+
+
+def _guid_index(mapping: dict[str, str], project_root: Path = Path("/proj")) -> GuidIndex:
+    """Build a REAL ``GuidIndex`` (project-relative ``asset_path`` under
+    ``project_root``) so the resolver computes prefab ids the production way —
+    via ``unity.prefab_id.canonical_prefab_id`` against a real ``project_root``,
+    not a hand-built ``guid:rel`` string."""
+    index = GuidIndex(project_root=project_root)
     for guid, rel in mapping.items():
-        entries[guid] = SimpleNamespace(asset_path=Path("/proj") / rel, relative_path=Path(rel))
-    return SimpleNamespace(guid_to_entry=entries)
+        asset_path = (project_root / rel)
+        index.guid_to_entry[guid] = GuidEntry(
+            guid=guid,
+            asset_path=asset_path,
+            relative_path=Path(rel),
+            kind=_classify(rel),
+        )
+    return index
 
 
 class TestParse:
@@ -98,24 +111,17 @@ class TestResolve:
         assert res.prefab_ids == set()
 
     def test_prefab_id_rel_is_posix_normalized(self, tmp_path):
-        """Slice 1.2 / D11: ``prefab_id_for`` normalizes the rel via
-        ``.as_posix()`` so a Windows-native ``relative_path`` (backslashes)
-        does NOT skew the prefab_id away from the byte-identical id the
-        planner / scene_converter ``_prefab_stable_id`` produce (which are
-        always forward-slashed)."""
-        from types import SimpleNamespace
-
+        """Slice 1.2 / D11: the resolver routes through the shared
+        ``canonical_prefab_id`` core, whose project-relative segment is always
+        ``.as_posix()`` forward-slashed — so the resolver prefab_id is
+        byte-identical with the planner / scene_converter ``_prefab_stable_id``
+        ids regardless of the host OS path separator. Driven via a REAL
+        ``GuidIndex`` + concrete ``asset_path`` (the production shape)."""
         idx = parse_addressables(_project(tmp_path, GROUP))
-        # ``relative_path`` carries OS-native backslashes (PureWindowsPath
-        # round-trips to a backslashed str); the resolver must forward-slash it.
-        gi = SimpleNamespace(guid_to_entry={
-            "catguid": SimpleNamespace(
-                asset_path=PureWindowsPath(
-                    r"C:\proj\Assets\Bundles\Characters\Cat\character.prefab"),
-                relative_path=PureWindowsPath(
-                    r"Assets\Bundles\Characters\Cat\character.prefab"),
-            ),
-        })
+        gi = _guid_index(
+            {"catguid": "Assets/Bundles/Characters/Cat/character.prefab"},
+            project_root=tmp_path,
+        )
         res = resolve_prefab_addressables(idx, gi)
         assert res.by_address["Trash Cat"] == [
             "catguid:Assets/Bundles/Characters/Cat/character.prefab",

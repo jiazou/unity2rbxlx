@@ -40,6 +40,7 @@ from core.unity_types import (
     PrefabTemplate,
     SceneNode,
 )
+from unity.prefab_id import canonical_prefab_id
 from unity.yaml_parser import ref_file_id, ref_guid
 
 
@@ -438,13 +439,11 @@ def _prefab_stable_id(
     this id shape); the GUID disambiguates while the path keeps the id
     legible in dumps.
 
-    BYTE-IDENTICAL with ``scene_converter._prefab_stable_id`` and the
-    resolver's ``prefab_id_for`` (Slice 1.2 / D11) so the planner-side
-    resolved-name map and the emitter-side ``prefab_namespace`` join on
-    the same key. The outside-root / no-root fallback mirrors
-    ``scene_converter`` exactly (returns the guid-or-empty form, never a
-    path-based divergent id) — uses the project-relative ``rel`` only,
-    never the absolute-path fallback of ``_relative_path_string``.
+    Delegates to ``unity.prefab_id.canonical_prefab_id`` (Slice 1.2 / D11) so
+    the planner-side resolved-name map, the emitter-side ``prefab_namespace``,
+    and the resolver's ``prefab_id_for`` all join on the SAME key. The
+    outside-root / no-root fallback (guid-or-empty form, never the absolute-path
+    fallback of ``_relative_path_string``) lives in that shared core.
     """
     guid = ""
     if guid_index is not None:
@@ -456,19 +455,7 @@ def _prefab_stable_id(
             if t is template:
                 guid = g
                 break
-    if unity_project_root is None:
-        return guid if guid else ""
-    try:
-        rel = (
-            template.prefab_path.resolve()
-            .relative_to(unity_project_root.resolve())
-            .as_posix()
-        )
-    except ValueError:
-        # Prefab outside the project root — same posture as
-        # ``scene_converter._prefab_stable_id`` (skip stamping).
-        return ""
-    return f"{guid}:{rel}" if guid else rel
+    return canonical_prefab_id(guid, template.prefab_path, unity_project_root)
 
 
 def _script_id_for(

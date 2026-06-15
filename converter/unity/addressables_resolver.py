@@ -28,6 +28,8 @@ from pathlib import Path
 
 import yaml
 
+from unity.prefab_id import canonical_prefab_id
+
 logger = logging.getLogger(__name__)
 
 # Unity YAML preamble + per-document tag lines (same shapes as the .asset/SO path).
@@ -142,23 +144,21 @@ def resolve_prefab_addressables(
     """
     out = PrefabAddressables()
     guid_to_entry = getattr(guid_index, "guid_to_entry", {})
+    project_root = getattr(guid_index, "project_root", None)
 
     def prefab_id_for(guid: str) -> str | None:
         entry = guid_to_entry.get(guid)
         path = getattr(entry, "asset_path", None) if entry is not None else None
         if path is None or path.suffix != ".prefab":
             return None
-        rel = getattr(entry, "relative_path", None)
-        # ``.as_posix()`` keeps this byte-identical with the planner /
-        # scene_converter ``_prefab_stable_id`` ids (Slice 1.2 / D11);
-        # a Windows-native ``str(rel)`` would inject backslashes and skew
-        # the addressable prefab_id join. ``relative_path`` may already be
-        # a ``str`` (forward-slashed) or a ``Path``.
-        if rel is None:
-            rel_str = path.name
-        else:
-            rel_str = Path(rel).as_posix()
-        return f"{guid}:{rel_str}"
+        # Delegate to the shared canonical-id core (Slice 1.2 / D11) so the
+        # addressable prefab_id is byte-identical with the planner /
+        # scene_converter ``_prefab_stable_id`` join key — INCLUDING the
+        # outside-root / no-project-root fallbacks. ``asset_path`` is the
+        # absolute, ``.resolve()``d prefab path; the core forward-slashes the
+        # project-relative segment, so a Windows-native skew can't occur.
+        pid = canonical_prefab_id(guid, path, project_root)
+        return pid if pid else None
 
     for address, guids in index.by_address.items():
         ids = [pid for pid in (prefab_id_for(g) for g in guids) if pid is not None]

@@ -1522,10 +1522,27 @@ class TestPrefabStableIdThreeWayParity:
 
         assert plan == conv == res == f"{guid}:{rel}"
 
+    def _resolver_id(self, guid: str, guid_index: object) -> str | None:
+        """Drive the REAL resolver path (``resolve_prefab_addressables`` ->
+        ``prefab_id_for``) for ``guid`` and return the id it derives, or
+        ``None`` when the resolver drops it. Computes the id the production way
+        (via ``canonical_prefab_id`` against ``guid_index.project_root``), not a
+        hand-built string."""
+        from unity.addressables_resolver import (
+            AddressablesIndex,
+            resolve_prefab_addressables,
+        )
+        index = AddressablesIndex()
+        index.by_address["addr"] = [guid]
+        resolved = resolve_prefab_addressables(index, guid_index)
+        ids = resolved.by_address.get("addr")
+        return ids[0] if ids else None
+
     def test_outside_root_three_way_empty_string(self, tmp_path: Path):
-        """A prefab outside the project root: planner and emitter both
-        return ``""`` (skip-stamping), byte-identical — the previously
-        divergent path-based planner fallback is gone (D6c)."""
+        """A prefab outside the project root: planner, emitter, AND the
+        resolver all skip it byte-identically — planner/emitter return ``""``
+        (skip-stamping) and the resolver drops the address (``None``). The
+        previously divergent path-based planner fallback is gone (D6c)."""
         from converter.scene_converter import _prefab_stable_id as conv_id
         from converter.scene_runtime_planner import _prefab_stable_id as plan_id
 
@@ -1548,11 +1565,20 @@ class TestPrefabStableIdThreeWayParity:
 
         plan = plan_id(template, idx, lib.by_guid, project_root)
         conv = conv_id(template, idx, lib.by_guid, project_root)
+        res = self._resolver_id(guid, idx)
+        # planner/emitter emit "" (skip), resolver drops to None — all three
+        # agree the outside-root prefab produces no usable join key.
         assert plan == conv == ""
+        assert res is None
 
     def test_project_root_none_three_way_guid_only(self, tmp_path: Path):
-        """project_root=None: planner and emitter both short-circuit to the
-        bare guid (no path segment), byte-identical (D6c)."""
+        """project_root=None: planner, emitter, AND the resolver all
+        short-circuit to the bare guid (no path segment), byte-identical (D6c).
+        The resolver reaches the project_root=None branch via a guid_index
+        whose ``project_root`` is None — the same input ``canonical_prefab_id``
+        treats as root-less."""
+        from types import SimpleNamespace
+
         from converter.scene_converter import _prefab_stable_id as conv_id
         from converter.scene_runtime_planner import _prefab_stable_id as plan_id
 
@@ -1562,7 +1588,41 @@ class TestPrefabStableIdThreeWayParity:
 
         plan = plan_id(template, idx, lib.by_guid, None)
         conv = conv_id(template, idx, lib.by_guid, None)
-        assert plan == conv == guid
+        # Resolver with a None project_root (root-less index) -> bare guid.
+        rootless = SimpleNamespace(
+            project_root=None,
+            guid_to_entry=dict(idx.guid_to_entry),
+        )
+        res = self._resolver_id(guid, rootless)
+        assert plan == conv == res == guid
+
+    def test_no_guid_three_way_rel_only(self, tmp_path: Path):
+        """No GUID resolvable but a project-relative path: planner and emitter
+        both return the bare project-relative path (no ``guid:`` prefix),
+        byte-identical. (The resolver always keys on a known guid, so its
+        no-guid leg is the inside-root path covered above.)"""
+        from converter.scene_converter import _prefab_stable_id as conv_id
+        from converter.scene_runtime_planner import _prefab_stable_id as plan_id
+        from unity.prefab_id import canonical_prefab_id
+
+        rel = "Assets/Prefabs/Anon.prefab"
+        prefab_abs = tmp_path / rel
+        prefab_abs.parent.mkdir(parents=True, exist_ok=True)
+        prefab_abs.touch()
+        template = PrefabTemplate(
+            prefab_path=prefab_abs, name="Anon",
+            root=PrefabNode(name="Anon", file_id="1", active=True, tag="Untagged"),
+            all_nodes={},
+        )
+        from core.unity_types import PrefabLibrary
+        lib = PrefabLibrary()
+        # No by_guid entry and an empty guid_index -> guid unresolvable.
+        idx = _make_guid_index(tmp_path, {})
+
+        plan = plan_id(template, idx, lib.by_guid, tmp_path)
+        conv = conv_id(template, idx, lib.by_guid, tmp_path)
+        # Shared core with no guid -> bare project-relative path.
+        assert plan == conv == canonical_prefab_id("", prefab_abs, tmp_path) == rel
 
 
 # ---------------------------------------------------------------------------
