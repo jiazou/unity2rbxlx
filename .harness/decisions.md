@@ -378,3 +378,128 @@ The §7 generic-converter Step-1 player-embodiment effort: paradigm C (`self.hos
 - **Phase 5** deleted `movement_facet_lowering.py` + the camera_facet PLAYER path (drone/turret strict path kept byte-identical) + the #182 locator residue; re-sourced the kept `player_unresolved` fail-close on the post-transpile `player_controller_paths ∩ emitted` intersection (D-P5-1); adapted the C-dominance corpus tests to drive the NATIVE un-lowered fixture per-fixture (cold3a59=camera, dde248=camera+move+jump) (D-P5-5); excluded the player from camera_facet lowering at the call site (D-P5-2 revised); FLIPPED `REQUIRE_PLAYER_BIND` 0→1 as the LAST act (slice 5.4) after a fresh cold-Studio conversion proved camera+WASD+jump+shoot+respawn all C-owned with A deleted.
 - **Cold-Studio verify caught 2 real player bugs** the build-time suite couldn't: `host.player:applyRecoil` advertised by the directive but never implemented (missing-method throw); then radians-vs-degrees (the AI's `applyRecoil(2)` slammed the camera to the 80° clamp). Both fixed (applyRecoil takes DEGREES; SceneCameraInput stays radians as its caller is the deterministic lowering pass).
 - Full effort dual-reviewed throughout (design 2 rounds caught 4 codex P1s; phase review caught a vacuous-camera-proof P1; the adversarial codex voice was load-bearing repeatedly). Full fast suite green at the flipped value (2868).
+
+## Run addressables-unit1-20260615T133903 (Addressables Unit 1) — 2026-06-15T10:05:21Z
+
+## Plan stage (2026-06-15)
+
+- **D1: Unique prefab key = deterministic upstream prefab_id (`<guid>:<path>`)**, not a
+  fingerprint of generated output. Classification: Taste (architecture). Rationale:
+  anchors load-bearing identity on the stable input; resolver already keys
+  scene_runtime.prefabs by it. On-disk Templates child name = sanitized `name__<guid6>`
+  (mirrors existing duplicate class/SO `__<hash>` scheme).
+- **D2: One drive phase, not three.** Classification: Mechanical (run structure). Unit 1
+  is one coupled unit, not testable piecewise; integrate/review/harden as a unit. Slices
+  (identity -> emission -> host resolve) defined by /drive-design phase 1.
+- **D3: Scope = Unit 1 only.** Classification: User-Challenge (premise-stated). Units 2-4
+  out of scope; Unit 1 is the validating spike.
+- **D4: baseRef = feat/addressables-prefab-conversion @ a8add0b.** Run diff excludes the
+  already-committed Phase-1 discovery parser. Classification: Mechanical.
+- **D5: Right-sized the Plan stage — ran dual-voice design review (the P1 convergence
+  gate), skipped the full gstack autoplan CEO/Design/Eng/DX ceremony.** Classification:
+  Taste (process). Rationale: the source full-feature design was already CEO/Design/Eng-
+  reviewed (2026-06-15); this run is a tight Unit-1 narrowing. Dual-voice review converged
+  in 2 rounds (codex caught 2 P1s round 1: resolver->plan bridge missing from scope +
+  by_address list semantics; both closed round 2). Surfaced at Gate A.
+
+## Detailed-design stage — Phase 1 (2026-06-15) — ⚠️ SUPERSEDED by the REVISION section below
+
+> D6 (unconditional) and D8 (self.state) below were OVERTURNED by dual-voice review
+> rounds 1–2. The authoritative decisions are in the "Phase 1 REVISION" section. D7, D9,
+> D10 carry forward unchanged. Kept here for the audit trail only.
+
+- **D6: Unique Templates child-name = `f"{base}__{guid6}"`, unconditional, derived from the
+  prefab_id's leading guid** (bare name only when guid empty). NOT the existing
+  collision-conditional `resolve_unique_asset_names`/`_disambiguate_by_source` schemes.
+  Classification: Taste (architecture). Rationale: two independent producers (prefab_packages
+  emitter + planner `template_name`) must compute the IDENTICAL child name without sharing
+  collision state; keying the suffix on the prefab's own guid makes the name a pure function
+  of the single prefab. Mirrors the established `name__<hash6>` shape.
+- **D7: Plan `addressables` block carries `by_address` + `by_label` only; NO `by_guid`.**
+  Classification: User-Challenge (corrects design.md). Rationale: `PrefabAddressables`
+  (resolver return) has no `by_guid`; the raw `AddressablesIndex.by_guid` is guid-keyed (not
+  prefab_id) and the host never reads it. design.md's repeated `by_guid` mention is dropped.
+- **D8: Resolver invoked in `pipeline.plan_scene_runtime`, parsed ONCE, `prefab_ids` stashed
+  on `self.state` for the emitter.** Classification: Taste (architecture). Rationale: it's
+  where guid_index + project path + artifact assembly already live; one parse feeds both the
+  plan block and the emission target set.
+- **D9: Multi-candidate address resolves to `ids[1]` (deterministic, resolver-ordered) +
+  warn; empty/missing fails soft (nil + warn, never crash).** Classification: Taste.
+  Rationale: the spike's `"Trash Cat"` is a singleton so the pick rule doesn't affect
+  acceptance, but the ambiguous/absent contract must be defined.
+- **D10: `by_label` is emitted into the plan but NOT consumed by `instantiatePrefab` in
+  Unit 1** (labels = `LoadAssetsAsync`, a Unit-2 concern). Classification: Mechanical (scope).
+
+## Detailed-design stage — Phase 1 REVISION (post dual-voice FINDINGS, 2026-06-15)
+
+Review (Claude P1 + codex MAJOR) showed the UNCONDITIONAL rename of every Templates child to
+`name__guid6` regresses currently-working paths: `template_name` / the bare prefab name is an
+OVERLOADED shared join key (PrefabSpawner.spawn/variantChain, AI-emitted
+`Templates:WaitForChild(name)`, the prefab-scoped animation attach, the `referenced_but_missing`
+manifest, variant chains). Switched to collision-conditional disambiguation with a single source
+of truth. Changed/new decisions:
+
+- **D6 [REVISED → collision-conditional]: resolved Templates child name = the BARE base when that
+  base is unique across the full prefab set; `base__guid6` ONLY when 2+ prefabs share a base.**
+  Classification: User-Challenge (review-driven; corrects the prior unconditional rename).
+  Rationale: keeps bare names (and every bare-name-keyed consumer) working for the non-colliding
+  majority → ZERO regression; suffixes only colliding bases (character→character__473ffa /
+  character__2ae64d) → fixes Cat/Raccoon. Mirrors `resolve_unique_asset_names` /
+  `_disambiguate_by_source`.
+- **D6b [NEW, refined R3]: SINGLE SOURCE OF TRUTH — `plan_scene_runtime` computes the resolved map
+  over the EMITTED set (D14) and stores it in `prefabs[id].template_name`; the emitter sets
+  `part.name` from that SAME stored value (read via `ctx.scene_runtime`), not an independent
+  recompute. `_resolveTemplate` already reads `template_name` → no Luau change.** Classification:
+  Taste (architecture). Rationale: kills the two-`_prefab_stable_id` divergence as a name-skew risk;
+  resume-safe. Object-identity (`id(template)`) alignment REJECTED (in-memory ids don't survive
+  resume).
+- **D6c [NEW, refined R3]: reconcile ALL THREE `_prefab_stable_id` producers (planner +
+  scene_converter + resolver) to ONE byte-identical form — `.as_posix()` rel + skip-on-outside-root/
+  no-root (guid-less ids are always colon-free relative paths) + a coupled root arg. Emitter
+  lookup-miss policy = WARN + SKIP for a colliding base, bare fallback for a unique base (NOT RAISE
+  — see D15).** Classification: Taste (architecture) + fail-soft. Rationale: full 3-way unification
+  makes a miss a defensive can't-happen path; the normalization also makes `partition(":")`
+  guid-detection safe (no absolute `C:/…`). Flips AND removes the long-deferred xfail parity tests
+  (`tests/test_prefab_packages.py:1364-1387`, pr2-followups §7).
+- **D14 [NEW R3]: collision domain = the EMITTED set (referenced ∪ addressable), NOT the full
+  library; selection factored into ONE shared `select_emitted_prefab_ids` predicate used by the
+  planner (collision scope) AND the emitter (what to emit).** Classification: User-Challenge
+  (codex R3). Rationale: full-library collision would suffix an emitted prefab over a non-emitted
+  same-base sibling, breaking its working bare-name spawn. Computable at planner time
+  (serialized_field_refs is set in `extract_assets` (phase 2), before `plan_scene_runtime`).
+- **D15 [NEW R3]: emitter resolved-name MISS policy = WARN + skip (colliding base) / bare fallback
+  (unique base), superseding D6c's RAISE.** Classification: fail-soft. Rationale: RAISE would crash
+  a whole conversion on a defensive can't-happen miss; WARN+skip surfaces it without crashing and
+  without cloning the wrong template. Also reframes AC8: with `plan_scene_runtime` essential, resume
+  RECOMPUTES (not persistence read-back) — AC8 tests the recompute path.
+- **D8 [REVISED]: resolver invoked in `pipeline.plan_scene_runtime`, parsed once; addressable
+  `prefab_ids` + resolved map persisted in the artifact (`ctx.scene_runtime`), NOT transient
+  `self.state`; `prefab_ids` kept OUTSIDE the Luau `_PLAN_KEYS_FOR_HOST` allowlist; AND
+  `plan_scene_runtime` added to `ESSENTIAL_PHASES`.** Classification: Taste (architecture) +
+  resume-correctness. Rationale: persistence alone is insufficient — a `--phase write_output`
+  resume can pair a fresh `prefab_library` with a STALE persisted map (codex R2); making the
+  planner essential forces a recompute ("save raw facts, recompute conclusions"). **The
+  schema-version bump is DROPPED** — review rounds 1–2 confirmed there is NO scene_runtime
+  schema/version field to bump (conversion_context.py); essential-recompute already prevents
+  stale reuse, so no invalidation lever is needed.
+- **D11 [NEW]: variant chains / `VariantParentTemplate` rekeying scoped OUT of Unit 1 with a
+  documented limitation + a runtime uniqueness assertion (WARN if a variant-parent base collides).**
+  Classification: Mechanical (scope). Rationale: variant metadata never carried prefab identity
+  (codex Medium-4); fixtures + Trash Dash have no duplicate-base variant parents; Cat/Raccoon are
+  not variants. Full fix (dual base+resolved fields) is a follow-up.
+- **D12 [NEW → revised]: animation attach for a colliding base is UNSUPPORTED (skip + WARN), NOT
+  over-attached.** Classification: User-Challenge (corrects an interim over-attach idea). Rationale:
+  identity is lost upstream — `animation_converter` first-wins-collapses duplicate prefab names
+  (`animation_converter.py:1734`) and `script_scopes` keeps only the bare scope, so no prefab_id
+  survives by attach time (codex High-2). Attaching one prefab's driver to all colliding templates
+  would mis-drive them. Non-colliding attach maps bare→resolved unchanged. Real fix (rekey animation
+  scope on prefab_id upstream) is a follow-up.
+
+## Execute stage — slice stacking (2026-06-15)
+- **D16: Unit-1 slices are a LINEAR code-dependent chain (1.1→1.2→1.3→1.4), stacked — each
+  slice branches from its dependency's converged tip, not phaseBaseSha; its review diff is the
+  INCREMENTAL `<dep-tip>..slice/<id>`.** Classification: Mechanical (run structure). Rationale:
+  1.2 imports 1.1's `resolve_template_child_names`/`select_emitted_prefab_ids`; 1.3 builds on
+  1.2's planner block; 1.4 needs 1.3's emitted templates. Drive's "fresh-from-base" model
+  assumes DISJOINT parallel slices; these share files + code deps, so stacking is correct.
+  Assembly: phaseInt fast-forwards through the linear stack (1.4 contains 1.1-1.3).
