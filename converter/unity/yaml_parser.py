@@ -282,15 +282,23 @@ def parse_documents(
             continue
         docs.append(parsed)
 
-    # Step 4: pair documents with headers, skip stripped docs
+    # Step 4: pair documents with headers, skip stripped docs.
+    #
+    # Pairing is POSITION-STABLE: ``docs`` is in the same order as ``chunks``,
+    # and ``_split_yaml_documents`` always emits one leading pre-separator
+    # chunk (with no header) followed by one chunk per ``---`` separator. So
+    # ``len(docs) == len(doc_headers) + 1`` and document slot ``i`` (for
+    # ``i >= 1``) pairs with ``doc_headers[i - 1]``. Each document slot
+    # consumes its own header slot regardless of whether it parsed to a dict,
+    # so an interior malformed/non-dict doc burns ITS OWN header and every
+    # later doc (including stripped ones) keeps the correct (cid, fid).
     result: list[tuple[int, str, dict]] = []
-    header_idx = 0
-    for doc in docs:
+    for i, doc in enumerate(docs):
         if not isinstance(doc, dict):
             continue
-        if header_idx < len(doc_headers):
+        header_idx = i - 1
+        if 0 <= header_idx < len(doc_headers):
             cid, fid, stripped = doc_headers[header_idx]
-            header_idx += 1
         else:
             cid, fid, stripped = 0, "0", False
         if stripped:

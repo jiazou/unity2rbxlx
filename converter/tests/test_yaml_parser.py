@@ -308,6 +308,46 @@ class TestStrippedOut:
         assert "137514649" not in fids
 
 
+# Synthetic scene with an INTERIOR malformed (non-dict) document positioned
+# BEFORE a stripped MonoBehaviour. The malformed doc fails to parse, so under
+# a per-dict header counter every later doc shifts onto the wrong header — the
+# stripped MB would leak into ``result`` with a wrong (cid, fid) and never reach
+# ``stripped_out``. Position-stable pairing must keep each doc on its own header.
+MALFORMED_BEFORE_STRIPPED_YAML = """%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1 &1
+: : : not valid yaml mapping : :
+--- !u!114 &2
+MonoBehaviour:
+  m_Name: Real
+--- !u!114 &3 stripped
+MonoBehaviour:
+  m_PrefabInstance: {fileID: 9999}
+"""
+
+
+class TestPositionStablePairing:
+    def test_stripped_after_malformed_doc_captured_with_right_fileid(self):
+        # (a) the stripped MB is captured in stripped_out with the RIGHT fileID.
+        stripped: list = []
+        result = parse_documents(
+            MALFORMED_BEFORE_STRIPPED_YAML, stripped_out=stripped
+        )
+        assert len(stripped) == 1
+        cid, fid, body = stripped[0]
+        assert cid == 114
+        assert fid == "3"
+        assert body["MonoBehaviour"]["m_PrefabInstance"]["fileID"] == 9999
+
+        # (b) the stripped MB is NOT in result (under any fileID).
+        result_fids = {fid for _, fid, _ in result}
+        assert "3" not in result_fids
+
+        # (c) the non-stripped doc carries its CORRECT (cid, fid) despite the
+        # earlier malformed doc consuming its own header slot.
+        assert result == [(114, "2", {"MonoBehaviour": {"m_Name": "Real"}})]
+
+
 REAL_SCENE = Path("/Users/jiazou/workspace/trash-dash/Assets/Scenes/Main.unity")
 
 
