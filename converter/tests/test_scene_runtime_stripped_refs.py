@@ -480,3 +480,213 @@ class TestFailSoftWarnWhenTargetNeverRegisters:
         rc, out, err = _run_scenario(scenario)
         assert rc == 0, f"luau failed: {err}\n{out}"
         assert "OK" in out, out
+
+
+# ---------------------------------------------------------------------------
+# Round-1 P1 (codex) -- the UI-DEFERRED placed target variant of AC7.
+#
+# AC7 above covers a cross-domain scene->placed-prefab ref whose placed target
+# is NON-deferred (it routes through the gated ``_pendingPlacementRefs`` queue).
+# The OPEN question codex raised: the OLDER ``_inboundRefsToDeferred`` branch in
+# ``_wireReferences`` (~:1299) is UNCONDITIONAL (no ``not crossDomainNil`` gate)
+# and ``_completeDeferredBatch`` Pass-3b (~:2664) rebinds it with NO domain
+# recheck. Could a cross-domain (client->server) scene->placed-prefab stripped
+# ref whose placed target is UI-DEFERRED leak into ``_inboundRefsToDeferred`` and
+# get REBOUND, defeating the cross-domain policy?
+#
+# EMPIRICAL ANSWER (this test): NO. The ``_inboundRefsToDeferred`` branch only
+# fires when ``self._deferredInstanceIds[scopedTarget]`` is set at scene-ref wire
+# time. But ``start()`` wires ALL scene refs FIRST (the scene loop, :2759-2849)
+# and only THEN boots placements (:2925-2980), where a placed UI miss calls
+# ``_deferUiInstance`` -> sets the deferred marker. So at the moment the scene
+# cross-domain ref is wired, the placed target's marker is NOT yet set -> the
+# ``_inboundRefsToDeferred`` branch CANNOT fire for this ref class. It instead
+# hits the ``elseif not crossDomainNil ...`` branch, which is gated, so the
+# policy-nil'd ref enters NEITHER queue. When the deferred batch later completes
+# and drains, the ref is queued nowhere -> nothing to rebind -> the field stays
+# nil. The bypass is refuted-at-integration; no production change is warranted.
+#
+# This test drives the REAL host (no stubbing of _wireReferences /
+# _drainPendingPlacementRefs / _completeDeferredBatch): a UI-deferred placed
+# SERVER prefab + a scene CLIENT source holding a cross-domain ref to it, plus a
+# same-domain (client->client) UI-deferred placed ref on the same source to prove
+# the deferred binding path itself still works (regression guard).
+# ---------------------------------------------------------------------------
+
+class TestCrossDomainUiDeferredPlacedTargetHoldsThroughDeferredDrain:
+
+    def _scenario(self) -> str:
+        # Placement ``Main:9`` of server prefab ``pfbS`` (instance ``pfbS:222``,
+        # host goid ``pfbS:host``). Its engine registry key when the deferred
+        # batch builds it is ``_idWithPlacement("Main:9","pfbS:222")`` =
+        # ``Main:9:pfbS:222`` -- exactly the scene ref's resolved ``target_ref``.
+        # The deferred resolver is keyed on the namespaced host goid:
+        # ``_idWithPlacement("Main:9","pfbS:host")`` = ``Main:9:pfbS:host``.
+        #
+        # A second placement ``Main:8`` of CLIENT prefab ``pfbC`` (same shape) is
+        # the same-domain control: its client->client ref MUST bind through the
+        # deferred path, proving the UI-deferred placed binding works for a
+        # legitimate same-domain ref.
+        return textwrap.dedent("""\
+            -- Scene CLIENT source holding two refs: ``srvPeer`` (cross-domain ->
+            -- server placed UI-deferred) and ``cliPeer`` (same-domain -> client
+            -- placed UI-deferred).
+            local Src = {} ; Src.__index = Src
+            function Src.new(_) return setmetatable({}, Src) end
+            -- Placed SERVER UI component (cross-domain target).
+            local Srv = {} ; Srv.__index = Srv
+            function Srv.new(_) return setmetatable({mark="SRV"}, Srv) end
+            function Srv:Awake() assert(self.gameObject ~= nil, "Srv.go bound") end
+            -- Placed CLIENT UI component (same-domain target).
+            local Cli = {} ; Cli.__index = Cli
+            function Cli.new(_) return setmetatable({mark="CLI"}, Cli) end
+            function Cli:Awake() assert(self.gameObject ~= nil, "Cli.go bound") end
+
+            local SRV_KEY = "Main:9:pfbS:222"   -- scene ref target_ref (engine key)
+            local CLI_KEY = "Main:8:pfbC:333"
+
+            local plan = {
+                modules = {
+                    src = {stem = "Src", runtime_bearing = true,
+                           module_path = "x", domain = "client"},
+                    srv = {stem = "Srv", runtime_bearing = true,
+                           module_path = "y", domain = "server"},
+                    cli = {stem = "Cli", runtime_bearing = true,
+                           module_path = "z", domain = "client"},
+                },
+                scenes = {
+                    Main = {
+                        instances = {
+                            {instance_id = "Main:1", script_id = "src",
+                             game_object_id = "sgo", active = true,
+                             enabled = true, config = {}},
+                        },
+                        references = {
+                            -- cross-domain (client -> server placed UI-deferred)
+                            {["from"] = "Main:1", field = "srvPeer", index = nil,
+                             target_kind = "component", target_ref = SRV_KEY,
+                             target_script_id = "srv", target_is_ui = false},
+                            -- same-domain (client -> client placed UI-deferred)
+                            {["from"] = "Main:1", field = "cliPeer", index = nil,
+                             target_kind = "component", target_ref = CLI_KEY,
+                             target_script_id = "cli", target_is_ui = false},
+                        },
+                        lifecycle_order = {"Main:1"},
+                    },
+                },
+                prefabs = {
+                    ["pfbS"] = {
+                        name = "Srv",
+                        instances = {{instance_id = "pfbS:222", script_id = "srv",
+                                      game_object_id = "pfbS:host", active = true,
+                                      enabled = true, config = {},
+                                      instance_owner_is_ui = true}},
+                        references = {}, lifecycle_order = {"pfbS:222"},
+                    },
+                    ["pfbC"] = {
+                        name = "Cli",
+                        instances = {{instance_id = "pfbC:333", script_id = "cli",
+                                      game_object_id = "pfbC:host", active = true,
+                                      enabled = true, config = {},
+                                      instance_owner_is_ui = true}},
+                        references = {}, lifecycle_order = {"pfbC:333"},
+                    },
+                },
+                scene_prefab_placements = {
+                    {placement_id = "Main:9", prefab_id = "pfbS",
+                     active = true, enabled = true},
+                    {placement_id = "Main:8", prefab_id = "pfbC",
+                     active = true, enabled = true},
+                },
+                domain_overrides = {},
+            }
+            -- Only the scene source host exists in workspace at boot. NO clone
+            -- for either placement (so _findUnboundClonePerPrefab returns nil and
+            -- workspaceFind misses for the placed hosts) -> each placed UI-owned
+            -- instance DEFERS via _deferUiInstance during the placement boot loop.
+            local instances = {
+                sgo = {Name = "Src", _sceneRuntimeId = "sgo", _children = {}},
+            }
+            local services = servicesFor(plan, {src = Src, srv = Srv, cli = Cli}, instances)
+            -- The deferred batch resolves each placed host clone LATE (clone has
+            -- landed by then). Keyed on the namespaced host goid.
+            local srvClone = {Name = "SrvHost", _sceneRuntimeId = "Main:9:pfbS:host",
+                              _children = {}}
+            local cliClone = {Name = "CliHost", _sceneRuntimeId = "Main:8:pfbC:host",
+                              _children = {}}
+            services.awaitUiHost = function(id)
+                if id == "Main:9:pfbS:host" then return srvClone end
+                if id == "Main:8:pfbC:host" then return cliClone end
+                return nil
+            end
+
+            local engine = SceneRuntime.new(services, plan)
+            -- Run BOTH domains so the placed SERVER component IS constructed +
+            -- registered locally -- the deferred drain therefore COULD rebind the
+            -- cross-domain ref if it had been queued. This is the strong form of
+            -- the gate test.
+            local edges = engine:start(nil)
+            runDeferred()  -- flush deferred Starts + late UI batch
+
+            local srcComp = engine._componentByInstanceId["Main:1"]
+            assert(srcComp ~= nil, "source component must exist")
+
+            -- (a) cross-domain ref injected nil at scene-wire time.
+            if srcComp.srvPeer == nil then print("INJECT_NIL_OK") end
+
+            -- (b) the cross-domain ref is in NEITHER back-patch queue (it was
+            -- never queued: the _inboundRefsToDeferred branch couldn't fire at
+            -- scene-wire time because the placement hadn't booted/deferred yet,
+            -- and the _pendingPlacementRefs branch is gated on not-cross-domain).
+            local queuedCross = false
+            for _, rec in ipairs(engine._pendingPlacementRefs or {}) do
+                if rec.field == "srvPeer" then queuedCross = true end
+            end
+            for _, rec in ipairs(engine._inboundRefsToDeferred or {}) do
+                if rec.field == "srvPeer" then queuedCross = true end
+            end
+            if not queuedCross then print("NOT_QUEUED_OK") end
+
+            -- (c) STAYS nil after the deferred batch built + registered the
+            -- placed SERVER component and re-ran the drain. Drain once more to be
+            -- explicit (idempotent; the placed server comp now exists in the
+            -- registry, so a leaked queue entry WOULD bind it).
+            engine:_drainPendingPlacementRefs()
+            assert(engine._componentByInstanceId[SRV_KEY] ~= nil,
+                "placed server component must be registered (drain could rebind)")
+            if srcComp.srvPeer == nil then print("STAYS_NIL_AFTER_DRAIN") end
+
+            -- cross-domain edge recorded.
+            local edgeOk = false
+            for _, e in ipairs(edges) do
+                if e.field == "srvPeer" and e.from_domain == "client"
+                   and e.to_domain == "server" then edgeOk = true end
+            end
+            if edgeOk then print("EDGE_RECORDED") end
+
+            -- (d) the SAME-DOMAIN client->client UI-deferred placed ref DID bind
+            -- through the deferred drain -- proving the deferred binding path
+            -- itself works and the gate doesn't over-block legitimate refs.
+            if type(srcComp.cliPeer) == "table" and srcComp.cliPeer.mark == "CLI" then
+                print("SAME_DOMAIN_BOUND")
+            end
+            print("DONE")
+        """)
+
+    def test_cross_domain_ui_deferred_placed_target_stays_nil(self):
+        rc, out, err = _run_scenario(self._scenario())
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "INJECT_NIL_OK" in out, (
+            f"cross-domain ref must inject nil at scene-wire; got:\n{out}")
+        assert "NOT_QUEUED_OK" in out, (
+            f"cross-domain ref must NOT be queued in any back-patch list "
+            f"(neither _pendingPlacementRefs nor _inboundRefsToDeferred); "
+            f"got:\n{out}")
+        assert "STAYS_NIL_AFTER_DRAIN" in out, (
+            f"cross-domain ref must stay nil after the UI-deferred placed target "
+            f"is built + registered and the drain re-runs; got:\n{out}")
+        assert "EDGE_RECORDED" in out, (
+            f"cross-domain edge must be recorded; got:\n{out}")
+        assert "SAME_DOMAIN_BOUND" in out, (
+            f"a same-domain client->client UI-deferred placed ref must still bind "
+            f"through the deferred drain; got:\n{out}")
