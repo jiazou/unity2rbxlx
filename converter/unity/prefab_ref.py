@@ -48,14 +48,18 @@ def prefab_id_for_guid(guid: str, guid_index: GuidIndexLike) -> str | None:
     `guid` is in the index AND its asset is a `.prefab` AND canonical_prefab_id
     yields a non-empty id; else None. An empty/all-zero guid simply misses the
     lookup → None, byte-identical to the closure on the resolver path.
+
+    Reads through ``getattr`` like the original closure so a partial/malformed
+    duck-typed ``guid_index`` (or an entry missing ``asset_path``) fails soft to
+    None rather than raising ``AttributeError``.
     """
-    entry = guid_index.guid_to_entry.get(guid)
-    if entry is None:
-        return None
-    path = entry.asset_path
+    guid_to_entry = getattr(guid_index, "guid_to_entry", {})
+    entry = guid_to_entry.get(guid)
+    path = getattr(entry, "asset_path", None) if entry is not None else None
     if path is None or path.suffix != ".prefab":
         return None
-    pid = canonical_prefab_id(guid, path, guid_index.project_root)
+    project_root = getattr(guid_index, "project_root", None)
+    pid = canonical_prefab_id(guid, path, project_root)
     return pid or None
 
 

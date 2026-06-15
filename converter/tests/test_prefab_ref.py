@@ -90,6 +90,44 @@ def test_rootless_index_known_guid_yields_bare_guid():
     assert prefab_id_for_guid("catguid", gi) == "catguid"
 
 
+# --- Regression: byte-identical getattr fail-soft on partial duck-typed shapes
+# The OLD nested closure read via getattr(...), so a malformed/partial guid_index
+# (or an entry missing asset_path) dropped to None rather than raising. Pin that.
+
+def test_partial_index_missing_project_root_resolves_not_crash():
+    """A duck-typed index missing ``project_root`` must not raise; getattr falls
+    back to None (rootless), so a known .prefab guid resolves to the bare guid."""
+    from types import SimpleNamespace
+
+    entry = GuidEntry(
+        guid="catguid",
+        asset_path=Path("/anywhere/character.prefab"),
+        relative_path=Path("character.prefab"),
+        kind="prefab",
+    )
+    gi = SimpleNamespace(guid_to_entry={"catguid": entry})  # no project_root attr
+    assert prefab_id_for_guid("catguid", gi) == "catguid"
+
+
+def test_partial_index_missing_guid_to_entry_returns_none():
+    """A duck-typed index missing ``guid_to_entry`` must fail soft to None, not
+    raise AttributeError (getattr falls back to an empty mapping)."""
+    from types import SimpleNamespace
+
+    gi = SimpleNamespace(project_root=Path("/proj"))  # no guid_to_entry attr
+    assert prefab_id_for_guid("catguid", gi) is None
+
+
+def test_entry_missing_asset_path_returns_none():
+    """An entry object missing ``asset_path`` must fail soft to None (getattr ->
+    None hits the ``if path is None`` branch), not raise AttributeError."""
+    from types import SimpleNamespace
+
+    bad_entry = SimpleNamespace(guid="catguid")  # no asset_path attr
+    gi = SimpleNamespace(project_root=Path("/proj"), guid_to_entry={"catguid": bad_entry})
+    assert prefab_id_for_guid("catguid", gi) is None
+
+
 # --- Acceptance #4: {fileID}-only ref (missionPopup shape) -> None, no crash --
 
 def test_ref_fileid_only_returns_none():
