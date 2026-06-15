@@ -3984,3 +3984,63 @@ class TestAddressableHostResolution:
         rc, out, err = _run_scenario(scenario)
         assert rc == 0, f"luau failed: {err}\n{out}"
         assert "OK" in out
+
+    def test_non_table_addressables_block_fails_soft_no_raise(self):
+        # D9 fail-soft: a TRUTHY non-table addressables value (e.g. 123)
+        # must NOT raise on index -> instantiatePrefab returns nil and
+        # never reaches clonePrefabTemplate.
+        scenario = textwrap.dedent("""\
+            local plan = {
+                modules = {}, scenes = {}, prefabs = {},
+                addressables = 123,
+                domain_overrides = {},
+            }
+            local cloneCalled = false
+            local services = servicesFor(plan, {}, {})
+            services.clonePrefabTemplate = function(prefabId, parent, cframe)
+                cloneCalled = true
+                return {Name = "C", _sceneRuntimeId = "c", _children = {}}
+            end
+            local engine = SceneRuntime.new(services, plan)
+            local ok, result = pcall(function()
+                return engine:instantiatePrefab("Trash Cat", nil, nil, nil)
+            end)
+            assert(ok, "non-table addressables must not raise: " .. tostring(result))
+            assert(result == nil, "non-table addressables must return nil")
+            assert(not cloneCalled,
+                "clonePrefabTemplate must NOT be called for a malformed block")
+            print("OK")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "OK" in out
+
+    def test_non_table_by_address_fails_soft_no_raise(self):
+        # D9 fail-soft: a TRUTHY non-table by_address value (e.g. 123)
+        # must NOT raise on index -> instantiatePrefab returns nil and
+        # never reaches clonePrefabTemplate.
+        scenario = textwrap.dedent("""\
+            local plan = {
+                modules = {}, scenes = {}, prefabs = {},
+                addressables = {by_address = 123, by_label = {}},
+                domain_overrides = {},
+            }
+            local cloneCalled = false
+            local services = servicesFor(plan, {}, {})
+            services.clonePrefabTemplate = function(prefabId, parent, cframe)
+                cloneCalled = true
+                return {Name = "C", _sceneRuntimeId = "c", _children = {}}
+            end
+            local engine = SceneRuntime.new(services, plan)
+            local ok, result = pcall(function()
+                return engine:instantiatePrefab("Trash Cat", nil, nil, nil)
+            end)
+            assert(ok, "non-table by_address must not raise: " .. tostring(result))
+            assert(result == nil, "non-table by_address must return nil")
+            assert(not cloneCalled,
+                "clonePrefabTemplate must NOT be called for a malformed by_address")
+            print("OK")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "OK" in out

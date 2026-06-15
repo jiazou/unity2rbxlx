@@ -2031,7 +2031,23 @@ end
 -- (D9). ``by_label`` is emitted but NOT consumed here (Unit-2 concern,
 -- D10).
 function SceneRuntime:_resolveAddressToPrefabId(address)
-	local addr = (self._plan.addressables or {}).by_address or {}
+	-- Fail soft on a malformed addressables block: a truthy non-table
+	-- ``addressables`` (or ``by_address``) would otherwise raise on index.
+	local addressables = self._plan.addressables
+	if addressables ~= nil and type(addressables) ~= "table" then
+		self._warn(string.format(
+			"[scene_runtime] instantiatePrefab: malformed addressables block (%s); no prefab for address %q",
+			type(addressables), tostring(address)))
+		return nil
+	end
+	local addr = (addressables or {}).by_address
+	if addr ~= nil and type(addr) ~= "table" then
+		self._warn(string.format(
+			"[scene_runtime] instantiatePrefab: malformed addressables.by_address (%s); no prefab for address %q",
+			type(addr), tostring(address)))
+		return nil
+	end
+	addr = addr or {}
 	local ids = addr[address]
 	if type(ids) ~= "table" or #ids == 0 then
 		self._warn(string.format(
