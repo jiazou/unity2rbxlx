@@ -115,6 +115,9 @@ def verify_module(
     violations.extend(_check_unity_message_callbacks(statements, stripped, source))
     violations.extend(_check_gameobject_touch(stripped, source))
     violations.extend(_check_script_parent(stripped, source))
+    # Phase 1 (relation #8): runs for EVERY generic module (not gated on player), but is
+    # NON-load-bearing -- a surviving ``im`` reject fails OPEN (tagged ``contract-verifier-impulse``).
+    violations.extend(_check_raw_apply_impulse(stripped, source))
     if is_player_controller:
         violations.extend(_check_player_camera_write(stripped, source))
         violations.extend(_check_player_humanoid_move(stripped, source))
@@ -1109,6 +1112,43 @@ def _check_script_parent(stripped: str, source: str) -> list[Violation]:
                 scopes.pop()
             # The following ``then`` pushes the new branch scope.
 
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 (relation #8) -- raw linear impulse (rule ``im``) -- NON-load-bearing.
+#
+# A raw ``part:ApplyImpulse(...)`` applies the AI's Unity force against the
+# STUDS_PER_METER³-inflated Roblox mass, so a force-launched body barely moves.
+# The faithful launch routes through ``self.host.applyImpulse(part, force)`` (the
+# host applies ``Δv = (force / _UnityMass) * STUDS_PER_METER``). An unrouted
+# impulse only DEGRADES launch faithfulness (it does not crash), so a surviving
+# reject warns + fails OPEN (caller tags ``contract-verifier-impulse``) -- it
+# reprompts but never knocks a module out of generic mode.
+#
+# Scope is LINEAR ApplyImpulse only: ``ApplyImpulseAtPosition`` /
+# ``ApplyAngularImpulse`` have other chars after ``ApplyImpulse`` so the regex
+# never matches them, and the host call ``self.host.applyImpulse`` is a dot /
+# lowercase-``a`` form so it is never matched either.
+# ---------------------------------------------------------------------------
+
+_RE_RAW_APPLY_IMPULSE = re.compile(r":ApplyImpulse\s*\(")
+
+
+def _check_raw_apply_impulse(stripped: str, source: str) -> list[Violation]:
+    out: list[Violation] = []
+    for m in _RE_RAW_APPLY_IMPULSE.finditer(stripped):
+        line = source.count("\n", 0, m.start()) + 1
+        out.append(Violation(
+            rule="im",
+            line=line,
+            message=(
+                "raw ``:ApplyImpulse(`` does not apply the Unity->Roblox launch-velocity "
+                "scaling: a force-launched body barely moves against the inflated Roblox mass. "
+                "Route the linear impulse through ``self.host.applyImpulse(part, force)`` (the host "
+                "applies the faithful stud-scaled velocity); never call ``:ApplyImpulse(`` directly."
+            ),
+        ))
     return out
 
 
