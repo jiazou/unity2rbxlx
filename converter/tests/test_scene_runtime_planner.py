@@ -1905,6 +1905,7 @@ class TestStrippedRefResolution:
         emit_placement: bool = True,
         subplan_has_instance: bool = True,
         script_guid_matches: bool = True,
+        source_prefab_guid_matches: bool = True,
     ) -> tuple[list[ParsedScene], PrefabLibrary, GuidIndex]:
         """Assemble parsed inputs reproducing the real stripped-ref shape.
 
@@ -1985,11 +1986,19 @@ class TestStrippedRefResolution:
             tmp_path / "Assets" / "Scenes" / "Main.unity",
             roots=[loadout_go], all_nodes={"100": loadout_go},
         )
+        # The fail-closed source-prefab-guid gate compares the placement's
+        # prefab guid (== ``_PREFAB_GUID``) against this recorded value. The
+        # mismatch variant points it at a DIFFERENT prefab guid so the gate
+        # fires even though the pi_fid + src_obj_fid + script_guid all line up.
+        recorded_source_guid = (
+            self._PREFAB_GUID if source_prefab_guid_matches
+            else ("beef" + "0" * 28)
+        )
         scene.stripped_components = {
             self._STRIPPED_FID: StrippedComponentRecord(
                 file_id=self._STRIPPED_FID, class_id=114,
                 source_object_file_id=self._SRC_OBJ_FID,
-                source_object_guid=self._PREFAB_GUID,
+                source_object_guid=recorded_source_guid,
                 prefab_instance_file_id=self._PI_FID,
                 script_guid=self._SCRIPT_GUID,
             )
@@ -2078,6 +2087,23 @@ class TestStrippedRefResolution:
 
     def test_fail_closed_when_script_guid_mismatch(self, tmp_path: Path):
         scenes, lib, idx = self._build(tmp_path, script_guid_matches=False)
+        artifact = plan_scene_runtime(
+            parsed_scenes=scenes, prefab_library=lib, guid_index=idx,
+            unity_project_root=tmp_path,
+        )
+        row = self._missionpopup_row(artifact)
+        assert row["target_ref"] == (
+            f"Assets/Scenes/Main.unity:{self._STRIPPED_FID}"
+        )
+        assert "target_script_id" not in row
+
+    def test_fail_closed_when_source_prefab_guid_mismatch(self, tmp_path: Path):
+        """A stripped ref whose recorded ``source_object_guid`` does NOT match
+        the placement's prefab guid keeps the unresolvable fallback (the new
+        prefab-identity fail-closed gate fires)."""
+        scenes, lib, idx = self._build(
+            tmp_path, source_prefab_guid_matches=False,
+        )
         artifact = plan_scene_runtime(
             parsed_scenes=scenes, prefab_library=lib, guid_index=idx,
             unity_project_root=tmp_path,
@@ -2213,23 +2239,44 @@ class TestStrippedRefRealPlan:
         assert row["target_script_id"] == "fff2f071f7335eb43a712a702b990041"
 
     def test_all_three_stripped_refs_resolve_fail_closed(self):
-        """All 3 real stripped refs (137514649, 80306028, 926798345) resolve
-        to a ``<placement>:<prefab>:<src_fid>`` key that IS a prefab-local
-        instance_id in the bound subplan, with a matching script_id."""
+        """All 3 real stripped refs (137514649->MissionUI, 80306028->MissionUI,
+        926798345->HighscoreUI) resolve to the EXACT byte-exact engine-union
+        key ``<ns>:<pi_fid>:<prefab_id>:<src_fid>`` and target_script_id the
+        planner produces over the real Trash-Dash inputs."""
         artifact = self._real_artifact()
         refs = artifact["scenes"]["Assets/Scenes/Main.unity"]["references"]
         prefabs = artifact["prefabs"]
-        # The 3 (from_instance, field) rows that cite a stripped fileID.
+        # The 3 (from_instance, field) rows that cite a stripped fileID, each
+        # pinned to its EXACT resolved target_ref + target_script_id.
         cases = [
-            ("Assets/Scenes/Main.unity:869760749", "missionPopup"),
-            ("Assets/Scenes/Main.unity:455205752", "missionPopup"),
-            ("Assets/Scenes/Main.unity:1815696064", "playerEntry"),
+            (
+                "Assets/Scenes/Main.unity:869760749", "missionPopup",
+                "Assets/Scenes/Main.unity:1822972501:"
+                "a53fe2875371488408daf0df7d69a981:"
+                "Assets/Prefabs/UI/MissionPopup.prefab:114000011972273750",
+                "fff2f071f7335eb43a712a702b990041",
+            ),
+            (
+                "Assets/Scenes/Main.unity:455205752", "missionPopup",
+                "Assets/Scenes/Main.unity:80306026:"
+                "a53fe2875371488408daf0df7d69a981:"
+                "Assets/Prefabs/UI/MissionPopup.prefab:114000011972273750",
+                "fff2f071f7335eb43a712a702b990041",
+            ),
+            (
+                "Assets/Scenes/Main.unity:1815696064", "playerEntry",
+                "Assets/Scenes/Main.unity:972301424:"
+                "ac361d43768a861498da8046b83b94f5:"
+                "Assets/Prefabs/UI/Score.prefab:114000010752991706",
+                "1a6452b9bb1a07a45b7eb7869a8a49ab",
+            ),
         ]
-        for src, field in cases:
+        for src, field, expected_ref, expected_script_id in cases:
             row = next(
                 r for r in refs if r["from"] == src and r["field"] == field
             )
-            assert "target_script_id" in row, (src, field)
+            assert row["target_ref"] == expected_ref, (src, field)
+            assert row["target_script_id"] == expected_script_id, (src, field)
             target = row["target_ref"]
             # Resolved key shape: <ns>:<pi_fid>:<prefab_id>:<src_fid>.
             # Split off the scene namespace + pi_fid prefix to recover the

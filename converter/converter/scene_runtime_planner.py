@@ -1614,27 +1614,23 @@ def _resolve_stripped_refs(
     placements_block: list[SceneRuntimeScenePrefabPlacement],
     parsed_scenes: list[ParsedScene],
     modules_block: dict[str, SceneRuntimeModule],
-    guid_index: GuidIndex | None,
-    by_guid: dict[str, PrefabTemplate],
     unity_project_root: Path | None,
 ) -> None:
     """In-place rewrite of unresolvable stripped-MB component refs to the
     runtime engine-union key. Mutates ``scenes_block[*].references`` rows.
 
     Fail-CLOSED: only rewrites a row when EVERY link in the bridge is verified
-    — the prefab instance has an emitted placement, the bound subplan contains
-    the source-object instance_id, AND that instance's ``script_id`` resolves
-    to the same ``.cs`` GUID the stripped doc's ``m_Script`` named. When any
-    link is missing the row is left as its unresolvable scene-local fallback
-    (identical to today's behaviour; the runtime leaves the field nil + WARN).
+    — the prefab instance has an emitted placement, the placement's prefab guid
+    matches the stripped doc's recorded source-prefab guid, the bound subplan
+    contains the source-object instance_id, AND that instance's ``script_id``
+    resolves to the same ``.cs`` GUID the stripped doc's ``m_Script`` named.
+    When any link is missing the row is left as its unresolvable scene-local
+    fallback (identical to today's behaviour; the runtime leaves the field nil
+    + WARN).
 
     The resolved ``target_ref`` is anchored on the deterministic upstream
     ``m_CorrespondingSourceObject.fileID`` (→ prefab-local instance_id), never
     on a fingerprint of generated output.
-
-    ``guid_index`` / ``by_guid`` are part of the canonical post-pass signature
-    (the placement + subplan they would resolve are already materialised in
-    ``placements_block`` / ``prefabs_block``, so this pass reads those directly).
     """
     # Map each scene namespace to its ParsedScene so we can read
     # ``stripped_components`` (the bridge identity recorded by the parser).
@@ -1673,6 +1669,16 @@ def _resolve_stripped_refs(
             if placement is None:
                 continue  # no placement -> keep fallback (fail-soft)
             placement_id, prefab_id = placement
+
+            # Fail-CLOSED on prefab identity: the placement's prefab guid (the
+            # guid segment of its ``prefab_id``, format ``"<guid>:<path>"``)
+            # MUST equal the stripped doc's recorded source-prefab guid
+            # (``m_CorrespondingSourceObject.guid``). Defends against a corrupt
+            # scene whose m_PrefabInstance points at a placement of a DIFFERENT
+            # prefab that happens to share a source-object fileID + script guid.
+            placement_prefab_guid = prefab_id.split(":", 1)[0]
+            if placement_prefab_guid != rec.source_object_guid:
+                continue  # prefab identity mismatch -> keep fallback
 
             subplan = prefabs_block.get(prefab_id)
             if subplan is None:
@@ -1773,7 +1779,7 @@ def plan_scene_runtime(
     # can fail-CLOSE on subplan-instance + script-guid verification.
     _resolve_stripped_refs(
         scenes_block, prefabs_block, placements_block, parsed_scenes,
-        modules_block, guid_index, by_guid, unity_project_root,
+        modules_block, unity_project_root,
     )
 
     return {
