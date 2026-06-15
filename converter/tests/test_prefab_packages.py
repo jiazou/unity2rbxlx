@@ -1690,3 +1690,303 @@ class TestSelectEmittedPrefabIds:
             icon_template, gi, lib.by_guid, gi.project_root,
         )
         assert emitted == {expected_icon_id} == {icon_id}
+
+
+# Hex guids so ``_guid6_of`` (and thus ``resolve_template_child_names``) can
+# disambiguate. First-6 hex chosen to match the design's expected suffixes.
+_CAT_GUID = "473ffa01abcd0000000000000000aaaa"
+_RACCOON_GUID = "2ae64d0eefab0000000000000000bbbb"
+_ICON_GUID = "cafef00d00000000000000000000cccc"
+
+
+class TestSlice13EmitResolvedNames:
+    """Slice 1.3 — the emitter READS the planner's resolved Templates child
+    name (single source of truth, D8b), unions the addressable target set
+    (D14), reports ``referenced_but_missing`` on the BARE axis, and threads
+    the consumers (animation join D12, edge-9 collision guard)."""
+
+    def _make_lib(self, tmp_path: Path):
+        """Cat + Raccoon (both base ``character``, distinct hex guids) +
+        IconConsumable (unique base). Returns the lib, a real GuidIndex, and
+        the three canonical prefab_ids."""
+        cat_path = tmp_path / "Assets/Bundles/Characters/Cat/character.prefab"
+        rac_path = tmp_path / "Assets/Bundles/Characters/Raccoon/character.prefab"
+        icon_path = tmp_path / "Assets/Icons/IconConsumable.prefab"
+        for p in (cat_path, rac_path, icon_path):
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("")
+        cat = _real_prefab_template("character", prefab_path=cat_path, root_file_id="11")
+        rac = _real_prefab_template("character", prefab_path=rac_path, root_file_id="22")
+        icon = _real_prefab_template("IconConsumable", prefab_path=icon_path, root_file_id="33")
+        from core.unity_types import PrefabLibrary
+        lib = PrefabLibrary(prefabs=[cat, rac, icon], by_guid={})
+        gi = _guid_index_multi(tmp_path, {
+            _CAT_GUID: cat_path,
+            _RACCOON_GUID: rac_path,
+            _ICON_GUID: icon_path,
+        })
+        from converter.scene_converter import _prefab_stable_id
+        cat_id = _prefab_stable_id(cat, gi, {}, gi.project_root)
+        rac_id = _prefab_stable_id(rac, gi, {}, gi.project_root)
+        icon_id = _prefab_stable_id(icon, gi, {}, gi.project_root)
+        return lib, gi, cat_id, rac_id, icon_id
+
+    def _resolved(self, *pairs):
+        """Mimic what ``plan_scene_runtime`` would store: a resolved-name map
+        built by the SAME ``resolve_template_child_names`` the planner runs.
+        Driving the real resolver (not a hand-seeded map) keeps the test from
+        passing for the wrong reason."""
+        return resolve_template_child_names(dict(pairs))
+
+    def test_ac1_colliding_emits_two_distinct_resolved_names(self, tmp_path):
+        """AC1 (via emitter): two ``character`` prefabs both emitted → two
+        templates with DISTINCT resolved ``.name`` (character__473ffa /
+        character__2ae64d)."""
+        lib, gi, cat_id, rac_id, icon_id = self._make_lib(tmp_path)
+        resolved = self._resolved(
+            (cat_id, "character"), (rac_id, "character"),
+        )
+        result = generate_prefab_packages(
+            lib, None, guid_index=gi,
+            resolved_template_names=resolved,
+            addressable_prefab_ids={cat_id, rac_id},
+        )
+        names = sorted(t.name for t in result.templates)
+        assert names == ["character__2ae64d", "character__473ffa"]
+
+    def test_ac2_non_colliding_keeps_bare_name(self, tmp_path):
+        """AC2: a non-colliding prefab keeps its bare ``.name``."""
+        lib, gi, cat_id, rac_id, icon_id = self._make_lib(tmp_path)
+        resolved = self._resolved((icon_id, "IconConsumable"))
+        result = generate_prefab_packages(
+            lib, None, guid_index=gi,
+            resolved_template_names=resolved,
+            addressable_prefab_ids={icon_id},
+        )
+        assert [t.name for t in result.templates] == ["IconConsumable"]
+
+    def test_ac7_emitted_count_grows_with_addressable_set(self, tmp_path):
+        """AC7: the addressable union grows the emitted set beyond the
+        bare-name ``referenced`` selection; the manifest carries the
+        emitted-vs-total surface."""
+        lib, gi, cat_id, rac_id, icon_id = self._make_lib(tmp_path)
+        # Only IconConsumable is referenced by a script; Cat/Raccoon reach the
+        # set ONLY via the addressable union.
+        refs = {"Assets/Player.cs": {"iconPrefab": "IconConsumable"}}
+        resolved = self._resolved(
+            (cat_id, "character"), (rac_id, "character"),
+            (icon_id, "IconConsumable"),
+        )
+        result = generate_prefab_packages(
+            lib, refs, guid_index=gi,
+            resolved_template_names=resolved,
+            addressable_prefab_ids={cat_id, rac_id},
+        )
+        names = sorted(t.name for t in result.templates)
+        assert names == ["IconConsumable", "character__2ae64d", "character__473ffa"]
+        m = result.manifest
+        assert m["emitted_count"] == 3
+        assert m["emitted_count"] >= m["addressable_referenced"] == 2
+        assert m["total_prefabs"] == 3
+
+    def test_addressable_only_emits_without_script_reference(self, tmp_path):
+        """A prefab whose bare name is NOT referenced by any script still
+        emits when it is in the addressable set (D14 union)."""
+        lib, gi, cat_id, rac_id, icon_id = self._make_lib(tmp_path)
+        resolved = self._resolved((cat_id, "character"), (rac_id, "character"))
+        result = generate_prefab_packages(
+            lib, None, guid_index=gi,  # no serialized_field_refs at all
+            resolved_template_names=resolved,
+            addressable_prefab_ids={cat_id, rac_id},
+        )
+        assert sorted(t.name for t in result.templates) == [
+            "character__2ae64d", "character__473ffa",
+        ]
+
+    def test_referenced_but_missing_bare_axis(self, tmp_path):
+        """``referenced_but_missing`` FIX: a colliding-but-emitted base is NOT
+        falsely reported missing (compared on the BARE axis), while a
+        genuinely-missing referenced name IS reported."""
+        lib, gi, cat_id, rac_id, icon_id = self._make_lib(tmp_path)
+        # ``character`` IS emitted (via addressables, suffixed); ``Ghost`` is
+        # referenced but has no prefab in the library.
+        refs = {"Assets/P.cs": {"a": "character", "b": "Ghost"}}
+        resolved = self._resolved((cat_id, "character"), (rac_id, "character"))
+        result = generate_prefab_packages(
+            lib, refs, guid_index=gi,
+            resolved_template_names=resolved,
+            addressable_prefab_ids={cat_id, rac_id},
+        )
+        missing = result.manifest["referenced_but_missing"]
+        # ``character`` emitted (suffixed) → NOT missing despite suffixed .name.
+        assert "character" not in missing
+        assert "Ghost" in missing
+
+    def test_edge9_post_resolve_collision_warns(self, tmp_path, caplog):
+        """edge-9: two colliding bases whose resolved names are IDENTICAL
+        (a degenerate planner map) produce a real on-disk collision; the
+        emitter logs a WARNING."""
+        import logging
+        lib, gi, cat_id, rac_id, icon_id = self._make_lib(tmp_path)
+        # Force a degenerate resolved map: both map to the SAME child name.
+        resolved = {cat_id: "character__dup", rac_id: "character__dup"}
+        with caplog.at_level(logging.WARNING, logger="converter.prefab_packages"):
+            result = generate_prefab_packages(
+                lib, None, guid_index=gi,
+                resolved_template_names=resolved,
+                addressable_prefab_ids={cat_id, rac_id},
+            )
+        assert any(
+            "post-resolve child-name collision" in r.message
+            for r in caplog.records
+        )
+        # Both still emit (the warning is diagnostic, not a drop).
+        assert len(result.templates) == 2
+
+    def test_miss_on_colliding_base_warns_and_skips(self, tmp_path, caplog):
+        """D15 MISS policy: a colliding base with NO resolved-name entry is
+        WARN+skipped (fail-soft, no raise, no wrong-template clone). The
+        unique sibling in the same run is unaffected."""
+        import logging
+        lib, gi, cat_id, rac_id, icon_id = self._make_lib(tmp_path)
+        # Resolved map MISSES both colliding ``character`` ids (defensive
+        # can't-happen path) but has the unique IconConsumable.
+        resolved = {icon_id: "IconConsumable"}
+        refs = {"Assets/P.cs": {"icon": "IconConsumable"}}
+        with caplog.at_level(logging.WARNING, logger="converter.prefab_packages"):
+            result = generate_prefab_packages(
+                lib, refs, guid_index=gi,
+                resolved_template_names=resolved,
+                addressable_prefab_ids={cat_id, rac_id},
+            )
+        emitted = sorted(t.name for t in result.templates)
+        # Colliding ``character`` pair skipped; unique IconConsumable kept.
+        assert emitted == ["IconConsumable"]
+        assert any(
+            "no resolved name for colliding prefab" in r.message
+            for r in caplog.records
+        )
+
+    def test_miss_on_unique_base_falls_back_to_bare(self, tmp_path):
+        """A MISS on a UNIQUE base bare-falls-back harmlessly (no skip,
+        no warn) — it is unambiguous."""
+        lib, gi, cat_id, rac_id, icon_id = self._make_lib(tmp_path)
+        refs = {"Assets/P.cs": {"icon": "IconConsumable"}}
+        result = generate_prefab_packages(
+            lib, refs, guid_index=gi,
+            resolved_template_names={},  # total miss
+            addressable_prefab_ids=None,
+        )
+        assert [t.name for t in result.templates] == ["IconConsumable"]
+
+
+class TestSlice13AnimationJoinThreading:
+    """Slice 1.3 / D12 — the prefab-scoped animation join indexes templates by
+    the RESOLVED name. A non-colliding prefab (resolved==bare) attaches as
+    before; a colliding base is skipped + WARNed (the bare ``script_scopes``
+    key can't identify which resolved template — never misroute)."""
+
+    def _make_pipeline(self, tmp_path: Path):
+        from converter.pipeline import Pipeline
+        from core.roblox_types import RbxPlace
+        (tmp_path / "Assets").mkdir(parents=True, exist_ok=True)
+        pipeline = Pipeline(unity_project_path=tmp_path, output_dir=tmp_path / "out")
+        pipeline.state.rbx_place = RbxPlace()
+        return pipeline
+
+    def _make_lib(self, tmp_path: Path):
+        cat_path = tmp_path / "Assets/Bundles/Characters/Cat/character.prefab"
+        rac_path = tmp_path / "Assets/Bundles/Characters/Raccoon/character.prefab"
+        vehicle_path = tmp_path / "Assets/Vehicles/Vehicle.prefab"
+        for p in (cat_path, rac_path, vehicle_path):
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("")
+        cat = _real_prefab_template("character", prefab_path=cat_path, root_file_id="11")
+        rac = _real_prefab_template("character", prefab_path=rac_path, root_file_id="22")
+        vehicle = _real_prefab_template("Vehicle", prefab_path=vehicle_path, root_file_id="33")
+        from core.unity_types import PrefabLibrary
+        lib = PrefabLibrary(prefabs=[cat, rac, vehicle], by_guid={})
+        gi = _guid_index_multi(tmp_path, {
+            _CAT_GUID: cat_path,
+            _RACCOON_GUID: rac_path,
+            _ICON_GUID: vehicle_path,
+        })
+        from converter.scene_converter import _prefab_stable_id
+        cat_id = _prefab_stable_id(cat, gi, {}, gi.project_root)
+        rac_id = _prefab_stable_id(rac, gi, {}, gi.project_root)
+        veh_id = _prefab_stable_id(vehicle, gi, {}, gi.project_root)
+        return lib, gi, cat_id, rac_id, veh_id
+
+    def _seed(self, pipeline, lib, gi, resolved, addr_ids):
+        """Populate the pipeline state the join reads — the prefab_library,
+        guid_index, serialized_field_refs, and the planner's resolved
+        ``ctx.scene_runtime`` block (single source of truth)."""
+        pipeline.state.prefab_library = lib
+        pipeline.state.guid_index = gi
+        pipeline.ctx.serialized_field_refs = None
+        pipeline.ctx.scene_runtime = {
+            "prefabs": {pid: {"template_name": name} for pid, name in resolved.items()},
+            "addressables": {"by_address": {"addr": list(addr_ids)}, "by_label": {}},
+        }
+
+    def test_ac9_non_colliding_attaches(self, tmp_path):
+        """A non-colliding animated prefab (Vehicle: resolved==bare) still
+        gets its prefab-scoped script attached under the template."""
+        from core.roblox_types import RbxPart, RbxScript
+        from converter.animation_converter import AnimationConversionResult
+
+        pipeline = self._make_pipeline(tmp_path)
+        lib, gi, cat_id, rac_id, veh_id = self._make_lib(tmp_path)
+        resolved = resolve_template_child_names({veh_id: "Vehicle"})
+        self._seed(pipeline, lib, gi, resolved, {veh_id})
+
+        pipeline.state.animation_result = AnimationConversionResult(
+            script_scopes={"Anim_Vehicle_Wheel_Spin": "Vehicle"},
+        )
+        pipeline.state.rbx_place.scripts.append(
+            RbxScript(name="Anim_Vehicle_Wheel_Spin", source="-- a",
+                      script_type="Script", parent_path="ServerScriptService"),
+        )
+        template = RbxPart(name="Vehicle", class_name="Model")
+        pipeline.state.rbx_place.replicated_templates.append(template)
+
+        pipeline._attach_prefab_scoped_animation_scripts_to_templates()
+
+        assert len(template.scripts) == 1
+        assert template.scripts[0].name == "Anim_Vehicle_Wheel_Spin"
+
+    def test_ac9_colliding_skips_with_warn(self, tmp_path, caplog):
+        """A colliding animated prefab (base ``character``) is skipped with a
+        WARN — no exception, no misroute onto an arbitrary resolved template."""
+        import logging
+        from core.roblox_types import RbxPart, RbxScript
+        from converter.animation_converter import AnimationConversionResult
+
+        pipeline = self._make_pipeline(tmp_path)
+        lib, gi, cat_id, rac_id, veh_id = self._make_lib(tmp_path)
+        resolved = resolve_template_child_names({
+            cat_id: "character", rac_id: "character",
+        })
+        self._seed(pipeline, lib, gi, resolved, {cat_id, rac_id})
+
+        pipeline.state.animation_result = AnimationConversionResult(
+            script_scopes={"Anim_character_Ctrl_Walk": "character"},
+        )
+        pipeline.state.rbx_place.scripts.append(
+            RbxScript(name="Anim_character_Ctrl_Walk", source="-- a",
+                      script_type="Script", parent_path="ServerScriptService"),
+        )
+        # The emitted templates carry RESOLVED (suffixed) names.
+        t_cat = RbxPart(name="character__473ffa", class_name="Model")
+        t_rac = RbxPart(name="character__2ae64d", class_name="Model")
+        pipeline.state.rbx_place.replicated_templates.extend([t_cat, t_rac])
+
+        with caplog.at_level(logging.WARNING, logger="converter.pipeline"):
+            pipeline._attach_prefab_scoped_animation_scripts_to_templates()
+
+        # Neither resolved template received the ambiguous driver.
+        assert t_cat.scripts == []
+        assert t_rac.scripts == []
+        assert any(
+            "colliding base name" in r.message for r in caplog.records
+        )

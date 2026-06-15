@@ -5920,6 +5920,24 @@ script.Disabled = true
             os.environ.get("U2R_LEGACY_PREFAB_PIVOT", "").lower()
             in {"1", "true", "yes"}
         )
+        # Single source of truth (D8b): read the RESOLVED Templates child names
+        # + the addressable emission target set from ``ctx.scene_runtime``,
+        # freshly recomputed by the now-essential ``plan_scene_runtime`` (D8).
+        scene_runtime = self.ctx.scene_runtime or {}
+        resolved_template_names: dict[str, str] = {}
+        for pid, sub in (scene_runtime.get("prefabs") or {}).items():
+            tname = sub.get("template_name") if isinstance(sub, dict) else None
+            if isinstance(tname, str):
+                resolved_template_names[pid] = tname
+        addressable_prefab_ids: set[str] = set()
+        addr_block = scene_runtime.get("addressables") or {}
+        for axis in ("by_address", "by_label"):
+            for ids in (addr_block.get(axis) or {}).values():
+                if isinstance(ids, (list, tuple, set)):
+                    addressable_prefab_ids.update(
+                        pid for pid in ids if isinstance(pid, str)
+                    )
+
         result = generate_prefab_packages(
             prefab_library=prefab_library,
             serialized_field_refs=self.ctx.serialized_field_refs or None,
@@ -5927,6 +5945,8 @@ script.Disabled = true
             material_mappings=self.state.material_mappings,
             uploaded_assets=self.ctx.uploaded_assets,
             legacy_prefab_pivot=legacy_pivot,
+            resolved_template_names=resolved_template_names,
+            addressable_prefab_ids=addressable_prefab_ids,
         )
 
         if not result.templates:
@@ -6010,9 +6030,30 @@ script.Disabled = true
             s.name: s for s in self.state.rbx_place.scripts
         }
 
+        # D12: ``script_scopes`` keys templates by the BARE prefab name, but the
+        # emitted templates now carry the RESOLVED (possibly suffixed) name. For
+        # a non-colliding prefab resolved == bare, so the direct lookup hits and
+        # the join is unchanged. For a COLLIDING base, the bare key cannot
+        # identify WHICH template the driver belongs to (identity was lost
+        # upstream — see D12), so we skip + WARN rather than misroute it onto an
+        # arbitrary colliding template. Bare bases that collide among emitted
+        # templates are reconstructed from the planner's resolved-name map.
+        colliding_bare_bases = self._colliding_emitted_bare_bases()
+
         from copy import copy as _shallow_copy
         attached = 0
         for script_name, template_name in anim.script_scopes.items():
+            if (
+                template_name not in templates_by_name
+                and template_name in colliding_bare_bases
+            ):
+                log.warning(
+                    "[write_output] prefab-scoped animation %r targets "
+                    "colliding base name %r; skipping (cannot identify which "
+                    "resolved template — D12)",
+                    script_name, template_name,
+                )
+                continue
             template = templates_by_name.get(template_name)
             script = scripts_by_name.get(script_name)
             if template is None or script is None:
@@ -6032,6 +6073,59 @@ script.Disabled = true
                 "script(s) under ReplicatedStorage.Templates.<Prefab>",
                 attached,
             )
+
+    def _colliding_emitted_bare_bases(self) -> set[str]:
+        """Bare prefab base names that COLLIDE among the emitted templates.
+
+        Reconstructed from the planner's single-source-of-truth resolved-name
+        map (``ctx.scene_runtime["prefabs"][pid]["template_name"]``) paired with
+        each prefab's BARE base name from the library — keyed on the SAME
+        ``_prefab_stable_id`` the planner used (D8b/D14). A base is colliding
+        iff 2+ emitted prefabs share it; for those, the resolved name is
+        suffixed (``base__guid6``) so a bare ``script_scopes`` key can't pick
+        the right template (D12).
+        """
+        scene_runtime = self.ctx.scene_runtime or {}
+        prefab_library = self.state.prefab_library
+        if prefab_library is None:
+            return set()
+
+        from converter.prefab_packages import select_emitted_prefab_ids
+        from converter.scene_converter import _prefab_stable_id
+
+        addr_block = scene_runtime.get("addressables") or {}
+        addressable_prefab_ids: set[str] = set()
+        for axis in ("by_address", "by_label"):
+            for ids in (addr_block.get(axis) or {}).values():
+                if isinstance(ids, (list, tuple, set)):
+                    addressable_prefab_ids.update(
+                        pid for pid in ids if isinstance(pid, str)
+                    )
+
+        # Scope the collision domain to the EMITTED set (D14), NOT the full
+        # plan's ``prefabs`` block (which carries every parsed prefab).
+        emitted_ids = select_emitted_prefab_ids(
+            prefab_library,
+            self.ctx.serialized_field_refs or None,
+            addressable_prefab_ids,
+            guid_index=self.state.guid_index,
+        )
+
+        by_guid = getattr(prefab_library, "by_guid", None) or {}
+        guid_index = self.state.guid_index
+        project_root = (
+            getattr(guid_index, "project_root", None) if guid_index else None
+        )
+
+        base_counts: dict[str, int] = {}
+        for template in getattr(prefab_library, "prefabs", None) or []:
+            pid = _prefab_stable_id(template, guid_index, by_guid, project_root)
+            if pid not in emitted_ids:
+                continue
+            base = getattr(template, "name", None)
+            if base:
+                base_counts[base] = base_counts.get(base, 0) + 1
+        return {b for b, c in base_counts.items() if c > 1}
 
     def _attach_monobehaviour_scripts_to_templates(self) -> None:
         """Attach MonoBehaviour scripts under their prefab template parts.
