@@ -257,3 +257,72 @@ class TestMChildrenOrderPreserved:
             f"from m_Children order. Falling back to YAML order would "
             f"break ``transform.GetChild(i)`` for any prefab."
         )
+
+
+REAL_SCENE = Path("/Users/jiazou/workspace/trash-dash/Assets/Scenes/Main.unity")
+
+# Self-contained synthetic scene (CI gate, no source project needed).
+STRIPPED_SCENE_YAML = """%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1 &900001
+GameObject:
+  m_Name: Holder
+  m_IsActive: 1
+--- !u!114 &137514649 stripped
+MonoBehaviour:
+  m_CorrespondingSourceObject: {fileID: 114000011972273750, guid: a53fe2875371488408daf0df7d69a981,
+    type: 3}
+  m_PrefabInstance: {fileID: 1822972501}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_Script: {fileID: 11500000, guid: fff2f071f7335eb43a712a702b990041, type: 3}
+  m_Name:
+--- !u!114 &555 stripped
+MonoBehaviour:
+  m_CorrespondingSourceObject: {fileID: 0, guid: 00000000000000000000000000000000, type: 3}
+  m_PrefabInstance: {fileID: 1822972501}
+  m_Script: {fileID: 11500000, guid: bbbb2222bbbb2222bbbb2222bbbb2222, type: 3}
+"""
+
+
+class TestStrippedComponents:
+    def _parse(self, tmp_path, text):
+        scene_file = tmp_path / "stripped.unity"
+        scene_file.write_text(text, encoding="utf-8")
+        return parse_scene(scene_file)
+
+    def test_stripped_components_populated(self, tmp_path):
+        scene = self._parse(tmp_path, STRIPPED_SCENE_YAML)
+        rec = scene.stripped_components["137514649"]
+        assert rec.file_id == "137514649"
+        assert rec.class_id == 114
+        assert rec.source_object_file_id == "114000011972273750"
+        assert rec.source_object_guid == "a53fe2875371488408daf0df7d69a981"
+        assert rec.prefab_instance_file_id == "1822972501"
+        assert rec.script_guid == "fff2f071f7335eb43a712a702b990041"
+
+    def test_stripped_record_without_source_object_skipped(self, tmp_path):
+        # fileID 555 has m_CorrespondingSourceObject.fileID 0 -> not bridgeable.
+        scene = self._parse(tmp_path, STRIPPED_SCENE_YAML)
+        assert "555" not in scene.stripped_components
+
+    def test_default_empty_for_scene_without_stripped(self):
+        scene = parse_scene(FIXTURES_DIR / "simple_scene.yaml")
+        assert scene.stripped_components == {}
+
+
+class TestStrippedComponentsRealScene:
+    def test_real_scene_bridge_fields(self):
+        if not REAL_SCENE.exists():
+            import pytest
+            pytest.skip("real Trash-Dash scene not present")
+        scene = parse_scene(REAL_SCENE)
+        rec = scene.stripped_components["137514649"]
+        assert rec.source_object_file_id == "114000011972273750"
+        assert rec.prefab_instance_file_id == "1822972501"
+        assert rec.source_object_guid.startswith("a53fe287")
+        assert rec.script_guid.startswith("fff2f071")
+        # All 3 real stripped MBs are captured.
+        for fid in ("137514649", "80306028", "926798345"):
+            assert fid in scene.stripped_components

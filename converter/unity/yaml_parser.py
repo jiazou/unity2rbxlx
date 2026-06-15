@@ -232,6 +232,7 @@ def ordered_child_go_fids(
 def parse_documents(
     raw_text: str,
     warnings_out: list[str] | None = None,
+    stripped_out: list[tuple[int, str, dict]] | None = None,
 ) -> list[tuple[int, str, dict]]:
     """Parse a Unity YAML file into (classID, fileID, body_dict) triples.
 
@@ -246,6 +247,11 @@ def parse_documents(
     If ``warnings_out`` is provided, per-document parse errors are appended
     to it so callers can surface them through the final conversion report
     instead of only the logger.
+
+    If ``stripped_out`` is provided, each stripped document is appended to it
+    as a ``(classID, fileID, body_dict)`` triple. The returned ``result`` list
+    is unaffected — stripped docs are still excluded from it — so existing
+    callers that do not pass ``stripped_out`` see byte-identical output.
     """
     # Step 1: collect (classID, fileID, is_stripped)
     doc_headers: list[tuple[int, str, bool]] = []
@@ -288,6 +294,8 @@ def parse_documents(
         else:
             cid, fid, stripped = 0, "0", False
         if stripped:
+            if stripped_out is not None:
+                stripped_out.append((cid, fid, doc))
             continue
         result.append((cid, fid, doc))
 
