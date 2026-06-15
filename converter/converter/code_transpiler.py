@@ -1676,8 +1676,6 @@ def _contract_reprompt_user_message(
     )
 
 
-_PLAYER_RULES: frozenset[str] = frozenset({"p1", "p2"})
-
 # Rules whose SURVIVING violation is NON-load-bearing -> fails OPEN. Each maps to a distinct
 # ``contract-verifier-<suffix>`` tag (a hyphen form that never matches ``_is_post_reprompt_warning``,
 # so it never promotes to a project fail-closed). p1/p2 = paradigm-B player rejects; im = a raw linear
@@ -1689,15 +1687,15 @@ _FAIL_OPEN_RULES: frozenset[str] = frozenset(_FAIL_OPEN_RULE_TAGS)
 def _format_contract_survivor_warning(violation) -> str:
     """Tag a SURVIVING verifier violation for the ``TranspiledScript``.
 
-    Player rejects (``p1``/``p2``, paradigm B) get the distinct
-    ``contract-verifier-player`` tag -- it starts with ``contract-verifier-``
-    so it NEVER matches ``_is_post_reprompt_warning`` (which keys on the
-    ``contract-verifier `` space / ``contract-verifier:`` colon forms) -->
-    never promotes to a fail-closed --> B stays NON-load-bearing. Contract
-    rules (a)-(h) keep the ``contract-verifier `` (space) tag and stay
-    fail-closed. Shared between the cold ``_verify_and_reprompt`` path and
-    the ``_refresh_contract_warnings`` cache-replay path so both fail open
-    on a surviving player reject identically.
+    Fail-open rules (``_FAIL_OPEN_RULE_TAGS``: ``p1``/``p2`` paradigm-B player rejects,
+    ``im`` raw-impulse routing) get a distinct ``contract-verifier-<suffix>`` tag
+    (``-player`` / ``-impulse``) -- it starts with ``contract-verifier-`` so it NEVER
+    matches ``_is_post_reprompt_warning`` (which keys on the ``contract-verifier `` space
+    / ``contract-verifier:`` colon forms) --> never promotes to a fail-closed -->
+    NON-load-bearing. Contract rules (a)-(h) and ``fc`` keep the ``contract-verifier ``
+    (space) tag and stay fail-closed. Shared between the cold ``_verify_and_reprompt``
+    path and the ``_refresh_contract_warnings`` cache-replay path so both fail open on a
+    surviving fail-open reject identically.
     """
     suffix = _FAIL_OPEN_RULE_TAGS.get(violation.rule)
     if suffix is not None:
@@ -1741,8 +1739,10 @@ def _refresh_contract_warnings(
     matches ``_is_post_reprompt_warning`` and would promote to a hard
     fail-closed on replay, making B load-bearing. The ``-player`` tag never
     matches that promotion, so a surviving player reject fails OPEN on the
-    cache-replay path exactly as on the cold path. Contract rules (a)-(h)
-    keep the space tag and stay fail-closed.
+    cache-replay path exactly as on the cold path. The ``im`` rule (raw-impulse
+    routing) rides this SAME fail-open path on every module (not gated on
+    ``is_player_controller``) via its ``contract-verifier-impulse`` tag. Contract
+    rules (a)-(h) and ``fc`` keep the space tag and stay fail-closed.
     """
     from converter.runtime_contract import verify_module
     non_contract = [
@@ -1787,11 +1787,12 @@ def _verify_and_reprompt(
         FIRST AI output had. Emitted only when reprompt was actually called.
       * ``contract-verifier`` -- a contract-rule (a)-(h) violation that
         survived the reprompt (routes to project-level fail-closed).
-      * ``contract-verifier-player`` -- a SURVIVING paradigm-B player reject
-        (``p1``/``p2``). NON-load-bearing: fails OPEN (the ``-player`` tag
-        never matches ``_is_post_reprompt_warning``). Player rules emit NO
-        ``-pre`` tag, so a FIXED ``p1``/``p2`` leaves NO surviving player
-        warning, and the counter taxonomy never false-counts it as rescued.
+      * ``contract-verifier-player`` / ``contract-verifier-impulse`` -- a SURVIVING
+        fail-open reject (``p1``/``p2`` paradigm-B player; ``im`` raw-impulse routing —
+        ``_FAIL_OPEN_RULE_TAGS``). NON-load-bearing: fails OPEN (the hyphen tag never
+        matches ``_is_post_reprompt_warning``). Fail-open rules emit NO ``-pre`` tag, so a
+        FIXED ``p1``/``p2``/``im`` leaves NO surviving warning, and the counter taxonomy
+        never false-counts it as rescued.
 
     A module with only ``-pre`` warnings means the reprompt fixed
     everything; a module with both means partial fix; a module with no

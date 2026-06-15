@@ -8,12 +8,42 @@ excluded from the compliance-spike contract stats).
 from __future__ import annotations
 
 from converter.runtime_contract import verify_module
-from converter.code_transpiler import _format_contract_survivor_warning, _FAIL_OPEN_RULES
+from converter.code_transpiler import (
+    _format_contract_survivor_warning, _FAIL_OPEN_RULES,
+    _verify_and_reprompt, _refresh_contract_warnings,
+)
 from converter.contract_pipeline import _is_contract_warning, _is_post_reprompt_warning
+
+_RAW_IMPULSE_MODULE = "function C:Start() self.rb:ApplyImpulse(Vector3.new(1,0,0)) end\nreturn C\n"
 
 
 def _im_rules(src: str):
     return [v for v in verify_module(src).violations if v.rule == "im"]
+
+
+def test_im_fails_open_through_verify_and_reprompt():
+    # Through the REAL reprompt seam: a surviving raw impulse is tagged contract-verifier-impulse,
+    # fails OPEN (never matches the fail-closed promotion predicate), and emits NO -pre warning.
+    def reprompt(_msg):
+        return _RAW_IMPULSE_MODULE  # reprompt did NOT route it through the host
+
+    _out, warnings = _verify_and_reprompt(_RAW_IMPULSE_MODULE, "csharp", "generic", reprompt)
+    imp = [w for w in warnings if "contract-verifier-impulse" in w]
+    assert imp, f"im survivor must be tagged contract-verifier-impulse: {warnings}"
+    assert not any(_is_post_reprompt_warning(w) for w in imp), f"im must fail open: {imp}"
+    assert not any(_is_contract_warning(w) for w in imp), f"im must stay out of contract stats: {imp}"
+    assert not any(w.startswith("contract-verifier-pre") and "rule im" in w for w in warnings), (
+        f"im must emit no -pre warning (fail-open rule): {warnings}"
+    )
+
+
+def test_im_fails_open_on_cache_replay():
+    # Through the REAL cache-replay seam: a cached raw impulse re-emits under the fail-open tag.
+    refreshed = _refresh_contract_warnings(_RAW_IMPULSE_MODULE, [])
+    assert any("contract-verifier-impulse" in w for w in refreshed), f"cache replay lost -impulse: {refreshed}"
+    assert not any(_is_post_reprompt_warning(w) and "rule im" in w for w in refreshed), (
+        f"cache-replayed im matched fail-closed: {refreshed}"
+    )
 
 
 def test_raw_apply_impulse_is_flagged():
