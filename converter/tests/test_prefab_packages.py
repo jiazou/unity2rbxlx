@@ -16,6 +16,8 @@ from converter.prefab_packages import (
     _collect_referenced_prefab_names,
     _SPAWNER_LUAU,
     generate_prefab_packages,
+    resolve_template_child_names,
+    select_emitted_prefab_ids,
     write_packages_manifest,
 )
 from core.roblox_types import RbxPart
@@ -1558,3 +1560,158 @@ class TestTemplateSceneRuntimeIdStamping:
         assert conv == plan, (
             f"prefab-outside-root drift: conv={conv!r} plan={plan!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Slice 1.1 — collision-conditional resolved-name map + shared emit-selector
+# ---------------------------------------------------------------------------
+
+# Distinct real Cat / Raccoon prefab guids from the design spec.
+_CAT_ID = "473ffa01abcd:Assets/Bundles/Characters/Cat/character.prefab"
+_RACCOON_ID = "2ae64d0eefab:Assets/Bundles/Characters/Raccoon/character.prefab"
+
+
+class TestResolveTemplateChildNames:
+    def test_ac1_colliding_base_distinct_guid_suffixes(self):
+        """AC1: two prefab_ids with base ``character`` + distinct guids
+        resolve to distinct ``character__<guid6>`` names."""
+        resolved = resolve_template_child_names({
+            _CAT_ID: "character",
+            _RACCOON_ID: "character",
+        })
+        assert resolved[_CAT_ID] == "character__473ffa"
+        assert resolved[_RACCOON_ID] == "character__2ae64d"
+        assert resolved[_CAT_ID] != resolved[_RACCOON_ID]
+
+    def test_ac2_unique_base_stays_bare(self):
+        """AC2: a unique base name resolves unchanged (bare)."""
+        resolved = resolve_template_child_names({
+            "guidA:Assets/Icons/IconConsumable.prefab": "IconConsumable",
+            "guidB:Assets/Icons/PowerupIcon.prefab": "PowerupIcon",
+        })
+        assert resolved == {
+            "guidA:Assets/Icons/IconConsumable.prefab": "IconConsumable",
+            "guidB:Assets/Icons/PowerupIcon.prefab": "PowerupIcon",
+        }
+
+    def test_emitted_set_scoping_single_element_stays_bare(self):
+        """The input IS the emitted set: a base shared with a NON-emitted
+        sibling must NOT force a suffix when only one is in the input map."""
+        resolved = resolve_template_child_names({_CAT_ID: "character"})
+        assert resolved == {_CAT_ID: "character"}
+
+    def test_empty_guid_colon_free_id_keeps_bare(self):
+        """A colon-free prefab_id (genuine empty guid) cannot disambiguate
+        → bare name even when the base collides."""
+        resolved = resolve_template_child_names({
+            "Assets/A/character.prefab": "character",
+            "Assets/B/character.prefab": "character",
+        })
+        # No guid on either → both keep the bare name (can't disambiguate).
+        assert resolved == {
+            "Assets/A/character.prefab": "character",
+            "Assets/B/character.prefab": "character",
+        }
+
+    def test_empty_string_id_keeps_bare(self):
+        """The ``""`` prefab_id shape keeps the bare name."""
+        resolved = resolve_template_child_names({"": "character"})
+        assert resolved == {"": "character"}
+
+    def test_mixed_guid_and_guidless_collision(self):
+        """A colliding base where one id has a guid and the other does not:
+        the guid'd one suffixes, the guid-less one stays bare."""
+        resolved = resolve_template_child_names({
+            _CAT_ID: "character",
+            "Assets/B/character.prefab": "character",
+        })
+        assert resolved[_CAT_ID] == "character__473ffa"
+        assert resolved["Assets/B/character.prefab"] == "character"
+
+    def test_idempotent_twice_call(self):
+        """Pure function: calling twice yields identical output."""
+        bases = {_CAT_ID: "character", _RACCOON_ID: "character"}
+        first = resolve_template_child_names(bases)
+        second = resolve_template_child_names(bases)
+        assert first == second
+        # Re-running over the previously-resolved input is a no-op shape:
+        # the resolved names are now unique, so they stay bare.
+        third = resolve_template_child_names(first)
+        assert set(third.values()) == {"character__473ffa", "character__2ae64d"}
+
+    def test_empty_input(self):
+        assert resolve_template_child_names({}) == {}
+
+
+def _prefab_with_path(name: str, prefab_path: Path):
+    return SimpleNamespace(name=name, prefab_path=prefab_path)
+
+
+def _guid_index_multi(tmp_path: Path, mapping: dict[str, Path]):
+    """Build a minimal real GuidIndex: guid -> resolved prefab path."""
+    from core.unity_types import GuidIndex
+    idx = GuidIndex(project_root=tmp_path)
+    for guid, path in mapping.items():
+        idx.path_to_guid[path.resolve()] = guid
+    return idx
+
+
+class TestSelectEmittedPrefabIds:
+    def _setup(self, tmp_path: Path):
+        cat_path = tmp_path / "Assets/Bundles/Characters/Cat/character.prefab"
+        raccoon_path = tmp_path / "Assets/Bundles/Characters/Raccoon/character.prefab"
+        icon_path = tmp_path / "Assets/Icons/IconConsumable.prefab"
+        cat = _prefab_with_path("character", cat_path)
+        raccoon = _prefab_with_path("character", raccoon_path)
+        icon = _prefab_with_path("IconConsumable", icon_path)
+        lib = SimpleNamespace(prefabs=[cat, raccoon, icon], by_guid={})
+        gi = _guid_index_multi(tmp_path, {
+            "catguid": cat_path,
+            "racguid": raccoon_path,
+            "iconguid": icon_path,
+        })
+        cat_id = "catguid:Assets/Bundles/Characters/Cat/character.prefab"
+        raccoon_id = "racguid:Assets/Bundles/Characters/Raccoon/character.prefab"
+        icon_id = "iconguid:Assets/Icons/IconConsumable.prefab"
+        return lib, gi, cat_id, raccoon_id, icon_id
+
+    def test_referenced_only(self, tmp_path):
+        lib, gi, cat_id, raccoon_id, icon_id = self._setup(tmp_path)
+        refs = {"Assets/Player.cs": {"iconPrefab": "IconConsumable"}}
+        emitted = select_emitted_prefab_ids(lib, refs, None, guid_index=gi)
+        assert emitted == {icon_id}
+
+    def test_addressable_only(self, tmp_path):
+        lib, gi, cat_id, raccoon_id, icon_id = self._setup(tmp_path)
+        emitted = select_emitted_prefab_ids(lib, None, {cat_id, raccoon_id}, guid_index=gi)
+        assert emitted == {cat_id, raccoon_id}
+
+    def test_union_referenced_and_addressable(self, tmp_path):
+        lib, gi, cat_id, raccoon_id, icon_id = self._setup(tmp_path)
+        refs = {"Assets/Player.cs": {"iconPrefab": "IconConsumable"}}
+        emitted = select_emitted_prefab_ids(lib, refs, {cat_id, raccoon_id}, guid_index=gi)
+        assert emitted == {cat_id, raccoon_id, icon_id}
+
+    def test_none_inputs(self, tmp_path):
+        lib, gi, *_ = self._setup(tmp_path)
+        assert select_emitted_prefab_ids(lib, None, None, guid_index=gi) == set()
+        assert select_emitted_prefab_ids(None, None, None) == set()
+        # None library but addressable ids → still returns them.
+        assert select_emitted_prefab_ids(None, None, {"x"}) == {"x"}
+
+    def test_matches_emitter_real_selection(self, tmp_path):
+        """The predicate's ``referenced`` selection matches the emitter's
+        real bare-name selection (lines ~281-282, 327-332): a referenced
+        base is selected, a non-referenced one is not — and the emitted ids
+        are the same ``_prefab_stable_id`` keys the emitter computes."""
+        from converter.scene_converter import _prefab_stable_id
+        lib, gi, cat_id, raccoon_id, icon_id = self._setup(tmp_path)
+        # Emitter selects by bare name ∈ referenced; here only IconConsumable.
+        refs = {"Assets/Player.cs": {"iconPrefab": "IconConsumable"}}
+        emitted = select_emitted_prefab_ids(lib, refs, None, guid_index=gi)
+        # Re-derive each selected id via the emitter's own helper.
+        icon_template = lib.prefabs[2]
+        expected_icon_id = _prefab_stable_id(
+            icon_template, gi, lib.by_guid, gi.project_root,
+        )
+        assert emitted == {expected_icon_id} == {icon_id}

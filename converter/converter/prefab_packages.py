@@ -33,6 +33,7 @@ allowed for pure convenience helpers.
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -129,6 +130,123 @@ def _collect_referenced_prefab_names(
             if isinstance(target, str) and not target.startswith("audio:"):
                 names.add(target)
     return names
+
+
+def _guid6_of(prefab_id: str) -> str | None:
+    """Return the first 6 hex chars of ``prefab_id``'s leading ``<guid>``.
+
+    A ``prefab_id`` has three real shapes (design fact 2): ``""``,
+    ``"<guid>:<rel>"``, and a colon-free ``"<rel>"`` (genuine empty guid).
+    A guid is present iff a ``:`` is found AND the leading segment is a
+    non-empty hex-ish token (NOT a path). Inputs reaching here are
+    project-relative posix ``Assets/...`` ids (no ``C:/`` drive case),
+    but we stay robust: only the part before the FIRST ``:`` counts, and
+    only when it looks like a guid (hex digits), never a path segment.
+
+    Returns ``None`` when no guid can be detected — the caller then keeps
+    the bare name (cannot disambiguate).
+    """
+    head, sep, _rest = prefab_id.partition(":")
+    if not sep or not head:
+        return None
+    # A Unity guid is a hex token; a path head (e.g. ``Assets``) is not.
+    if not all(c in "0123456789abcdefABCDEF" for c in head):
+        return None
+    return head[:6]
+
+
+def resolve_template_child_names(
+    prefab_bases: Mapping[str, str],
+) -> dict[str, str]:
+    """Resolve each prefab's on-disk Templates child name, COLLISION-CONDITIONALLY.
+
+    The INPUT is the EMITTED prefab set (design fact 11) — the caller passes
+    only prefabs that will reach ``ReplicatedStorage.Templates`` (referenced ∪
+    addressable, via the shared ``select_emitted_prefab_ids`` predicate).
+    Scoping to the emitted set is load-bearing: a same-base sibling that is NOT
+    emitted must NOT cause a suffix (else a working bare-name spawn breaks with
+    no real on-disk collision).
+
+    Args:
+        prefab_bases: ``{prefab_id: bare_template_name}`` for the EMITTED set.
+
+    Returns:
+        ``{prefab_id: resolved_child_name}``. For a base name UNIQUE within the
+        input → the bare name unchanged (zero change for non-colliding prefabs,
+        preserving every bare-name consumer). For a base shared by 2+ input
+        prefabs → ``f"{base}__{guid6}"`` where ``guid6`` is the first 6 hex
+        chars of the prefab_id's leading ``<guid>`` (design fact 2: detected via
+        ``partition(':')``). A prefab_id with NO guid keeps the bare name
+        (cannot disambiguate — single-mode tests / no GuidIndex).
+
+    Pure, deterministic, and idempotent: a pure function of the input map.
+    """
+    by_base: dict[str, list[str]] = {}
+    for prefab_id, base in prefab_bases.items():
+        by_base.setdefault(base, []).append(prefab_id)
+
+    resolved: dict[str, str] = {}
+    for base, ids in by_base.items():
+        if len(ids) == 1:
+            resolved[ids[0]] = base
+            continue
+        for prefab_id in ids:
+            guid6 = _guid6_of(prefab_id)
+            # No guid → cannot disambiguate → keep the bare name.
+            resolved[prefab_id] = f"{base}__{guid6}" if guid6 else base
+    return resolved
+
+
+def select_emitted_prefab_ids(
+    prefab_library: PrefabLibrary | None,
+    serialized_field_refs: dict[str, dict[str, str]] | None,
+    addressable_prefab_ids: set[str] | None,
+    guid_index: GuidIndex | None = None,
+) -> set[str]:
+    """prefab_ids that will be emitted to ``ReplicatedStorage.Templates``.
+
+    ``{pid : base_name(pid) ∈ _collect_referenced_prefab_names(serialized_field_refs)}``
+    ∪ ``(addressable_prefab_ids or set())``.
+
+    Reproduces the EXACT bare-name ``referenced`` selection that
+    ``generate_prefab_packages`` uses today (lines ~281-282, 327-332), so the
+    collision domain (``resolve_template_child_names`` input) and the emitter's
+    target set are BOTH derived from this one predicate and never diverge
+    (design fact 11 / D14).
+
+    Each library prefab's prefab_id is derived the SAME way the emitter does —
+    via ``scene_converter._prefab_stable_id(template, guid_index, by_guid,
+    project_root)`` — and its bare base name is ``template.name``. ``guid_index``
+    is an optional keyword (the spec's 3-positional contract is preserved): the
+    planner / emitter pass the real index so the ids match the artifact's
+    ``prefabs`` keys; when omitted the ids fall back to guid-less posix paths.
+    """
+    if prefab_library is None or not getattr(prefab_library, "prefabs", None):
+        return set(addressable_prefab_ids or set())
+
+    referenced = _collect_referenced_prefab_names(serialized_field_refs)
+
+    # Lazy import (mirrors generate_prefab_packages) to avoid a top-level
+    # scene_converter import cycle during pipeline setup.
+    from converter.scene_converter import _prefab_stable_id
+
+    by_guid = getattr(prefab_library, "by_guid", None) or {}
+    project_root = (
+        getattr(guid_index, "project_root", None) if guid_index else None
+    )
+
+    emitted: set[str] = set()
+    for template in prefab_library.prefabs:
+        name = getattr(template, "name", None)
+        if not name or name not in referenced:
+            continue
+        prefab_id = _prefab_stable_id(
+            template, guid_index, by_guid, project_root,
+        )
+        emitted.add(prefab_id)
+
+    emitted |= set(addressable_prefab_ids or set())
+    return emitted
 
 
 _BASEPART_CLASSES = (
