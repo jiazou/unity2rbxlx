@@ -452,3 +452,47 @@ pre-injection source. Mitigated by test_h1_elseif_* (drives real lowering on the
 corpus elseif shape). Optional hardening: add a committed test that reconstructs the
 raw (pre-injection) corpus Player source and re-runs the lowering, asserting
 present=True. reviewed-sha dcc7660.
+
+## Run drive-door-20260616T011635 (2026-06-16) — generic-mode door visual fix
+
+# Follow-ups — drive-door run
+
+## FU1 (P3) — Animator-param writes by hash or variable, not string literal
+The Phase-2 source-narrowing parser matches param names from string-literal Set* writes
+(SetBool/SetTrigger/SetFloat/SetInteger("name", ...)). Two forms are NOT yet handled and
+degrade to today's safe server fallback (no regression):
+- by hash: SetBool(Animator.StringToHash("open"), ...) — name is a literal one call deeper.
+- by variable/const: SetBool(OpenParam, ...) where OpenParam="open" is declared elsewhere.
+Neither appears in any of the 9 bundled test projects (empirical scan 2026-06-16: only 2
+scripted animator writes total — SetBool("open") door + SetInteger("actionNumber")). Build
+only if a real game surfaces them. StringToHash is the cheap one (scan the literal inside).
+
+## OO1 (P3) — >=2-serialized-ref disambiguation via animator identity
+Phase-2 source-narrowing fires ONLY for the 0-serialized-ref case. The >=2-ref ambiguity stays
+unresolved (server fallback) — resolving it safely needs animator identity (controller GUID + GO
+match), not param-name matching. Separate slice with an identity check if a real game needs it.
+
+## OO3 (P3) — anonymous-receiver Animator writes
+`GetComponent<Animator>().SetBool("x")` (no bound identifier) is NOT matched by the receiver-bound
+parser → degrades to server fallback. Not present in SimpleFPS (Door binds via the `doorAnim`
+property). Build only if a real game surfaces it (FU1-adjacent).
+
+## OO4 (P4) — unify module_domain Animator-write domain-signal regex with the new parser
+module_domain.py:496-503 keeps a flat `\bAnimator\b...SetBool` domain SIGNAL (no param extraction)
+that MISSES doorAnim.SetBool. Left alone (default per design.md). Optional cleanup to route it
+through extract_animator_param_writes.
+
+## slop (deferred to finalize)
+converter/converter/scene_runtime_topology/animation_driver_analyzer.py:1 — module docstring verbosity
+converter/converter/scene_runtime_topology/animation_routing.py:285 — resolve_driver docstring/comment verbosity
+converter/tests/test_scene_runtime_topology.py:2134 — test helper/comment verbosity
+converter/tests/test_scene_runtime_topology.py:2327 — assertion-block comment verbosity
+converter/tests/test_contract_corpus.py:279 — key-check test comment verbosity
+
+## FU2 (P3) — Animator-param parser: file-global identifier binding
+extract_animator_param_writes binds Animator-typed identifiers file-globally, so a same-named non-Animator local (`Animator anim;` field + `bool anim;` local writing `anim.SetBool("open")`) false-positives. Pathological C# (name shadowing), ZERO instances in the 9 bundled projects, no-regression (worst case: one mis-domained anim script, no crash). Proper fix = method-scope-aware binding (real C# scope analysis); deferred as over-design for an edge that does not occur. Verified by codex 2026-06-16.
+
+## FU3 (P3) — Animator-param parser: verbatim/interpolated string param forms
+The write regex matches only bare "..." param literals; `@"open"` (verbatim) and `$"open"` (interpolated) are dropped even though the preserve_strings accessor keeps them. ZERO corpus instances; degrades to server fallback (no-regression), same class as FU1 (hash/variable). Not widened because `$"{x}"` interpolation would mis-capture a non-literal name. Build only if a real game surfaces `@`/`$` animator-param writes.
+
+HANDOFF: [D4/D13] Phase-2 Animator-driver source-narrowing LANDED — fold the "What this resolves (Bug 3 door visual)" bullet in converter/docs/design/scene-runtime-pr148-followups.md + scene-runtime-architecture-ir.md back into a Phase-1+2 combined statement; Door driver now resolves to client via C# SetBool param-name match (animation_driver_analyzer.extract_animator_param_writes + resolve_driver 0-ref hook). Land before next scene-runtime run.

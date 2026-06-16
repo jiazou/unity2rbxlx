@@ -1875,3 +1875,103 @@ Slop deferred to /drive-finalize (no slop fixed here).
   `tools/check_no_any.sh` pass; new tests RED against pre-fix, green after. Changed files:
   `converter/converter/rifle_rig_retarget_lowering.py`, `converter/tests/test_rifle_rig_retarget.py`.
 - 2026-06-14T08:42:05Z FINALIZE de-slop: removed verified-dead rig-ordinal-write chain from contract_verifier.py (_rig_has_surviving_ordinal_write + _rig_statement_rhs_end + _rig_collapse_code_ws + _rig_is_ident_char + _RIG_ORDINAL_WRITE_TAIL_RE; kept live _rig_code_projection/_rig_line_continues); pruned dead-only test + dead assertions from test_rig_binding_present.py; trimmed round-by-round counter-commentary docstrings (lowering header+_binding_discharged, contract_verifier exemption/discharge/bracket-key, pipeline rehydrate, regen_contract_corpus _FIELDS) and fixed stale test-name citation. No behavior change; 3243 passed/45 skipped, no-Any pass.
+
+## Run drive-door-20260616T011635 (2026-06-16) — generic-mode door visual fix
+
+# Decisions — drive-door run
+
+## D1 — Premise scope (user-confirmed)
+Fix BOTH generic-mode door root causes:
+1. Door key-check: in generic scene-runtime mode the door key-check packs (door_*_player_to_attribute, etc.) DO NOT FIRE (generic skips coherence packs). The door cannot tell the player holds the key. Fix belongs in the generic contract pipeline / generic prompt as a CANONICAL-CONTRACT wiring (writer+reader from one source on the replicating Player instance), NOT a resurrected AI-output fingerprint pack.
+2. Door animation routing (Slice D, scene-runtime-pr148-followups): door's dynamic Animator driver (transform.parent.Find("door").GetComponent<Animator>()) leaves routing_status=unresolved -> Anim_Door_* script placed server-side -> client-side doorAnim:SetAttribute("open") never replicates -> mesh never moves. Fix = source-narrowing of C# SetBool/SetTrigger writes matched to the clip's observed_attribute to resolve the driver and route the Anim script to the CLIENT domain.
+
+## D2 — Base branch
+baseRef = pr/generic-require-so-fixes (current branch, 31 commits ahead of upstream/main, generic-mode work the door fix depends on). Both fixes are generic-mode.
+
+## D3 — Corrected root cause (empirical, current tree 2026-06-16)
+Premise "key-check packs don't fire in generic mode" is IMPRECISE. Fresh generic conversion of SimpleFPS on the current tree (output/drive-door-generic) shows:
+- KEY-CHECK ALREADY WORKS: Door:_hasKey reads plr:GetAttribute("hasKey") (+ Character fallback); Player:_setSharedFlag("hasKey",true) writes it + fires PlayerSetSharedFlag funnel (server-replicated). Coherent canonical contract. The 2026-05-26 e2e (pr148-followups doc) confirms the `open` attribute flips after pickup.
+- ANIMATION ROUTING BROKEN (the one real bug): Anim_Door_door_open/_close land in server_scripts; Door (domain=client host) writes doorObj:SetAttribute("open") client-side; client attribute writes do not replicate to server → server-placed Anim listener never fires → door visual never moves.
+
+## D4 — Fix approach (Slice D, Path 1: source-narrowing — doc-endorsed, architecturally clean)
+Implement Phase-2 source narrowing in animation_routing.resolve_driver: when Phase-1 serialized-ref resolution returns None (0 or 2+ Animator-ref candidates), parse the candidate MonoBehaviour C# source for SetBool/SetTrigger/SetFloat/SetInteger("<param>",...) calls on Animator refs; match <param> to the clip's observed_attribute; the matching MB is the driver → inherit its domain (Door=client) → build_topology stamps routing_status="resolved"+domain=client → pipeline.py:5654 routes Anim_Door to LocalScript in StarterPlayer.StarterPlayerScripts → same-domain write→read, door visual moves.
+Scope boundary: HostilePlane/PlaneHolder stay unresolved+server (autoplay clips, no driver — intended-permanent per doc). Multiplayer visual-sync of the door (other clients) is OUT of scope — Door is already client-domain; following its driver to client is consistent with the topology, not a client-only collapse.
+Honor "fix both": key-check addressed by a regression guard (test pinning writer+reader+funnel contract) + e2e re-verification, since it already works.
+
+## D5 — Fix sites (grounded)
+- animation_routing.py:269-346 resolve_driver (extend with Phase-2 narrowing); build_topology.py:885-982 _build_animation_drivers_block (consumes resolved domain); pipeline.py:5654-5699 (client→LocalScript/StarterPlayerScripts vs server fallback).
+- C# SetBool/etc parsing: NONE exists; module_domain.py:497-503 has Animator-write REGEX (domain-signal only, no param extraction). New parser in script_analyzer.py (or animation_driver_analyzer.py).
+- observed_attribute computed at animation_converter.py:2095-2113.
+- Test: tests/test_scene_runtime_topology.py:1913-2200 test_simplefps_topology_authority_contract_on_cold_conversion (assertion 5 lines 2158-2192: flip Anim_Door_ from unresolved→resolved+client+LocalScript; keep HostilePlane/PlaneHolder unresolved+server).
+
+## D6 — Phase-2 hook location (Classification: Mechanical)
+Source-narrowing slots INSIDE resolve_driver (animation_routing.py:269-346) as a fallback after the Phase-1 `None` (0 or 2+ Animator-ref candidates), preserving its `tuple[str,str] | None` return. build_topology.py:928-953 and pipeline.py:5654-5668 (resolved+client → LocalScript/StarterPlayerScripts) are unchanged — the only gap is the resolver returning None too early.
+
+## D7 — C# source access (Classification: Mechanical)
+Reuse the existing `_load_cs_source(script_id, guid_index)` helper (module_domain.py:1742) for candidate-MB C# source; guid_index is already threaded into build_topology. No new source plumbing. Anchors the fix on the deterministic upstream C# source (not AI/transpiler output) per project rule — a source parser over deterministic C# is acceptable.
+
+## D8 — Driver selection key (Classification: Taste)
+Match the clip's observed_attribute (animation_converter.py:2095-2113, first Bool/Int/Trigger controller param) against each candidate MonoBehaviour's set of Animator params written via SetBool/SetTrigger/SetFloat/SetInteger("<param>",…). Unique containment → that MB is the driver (inherit its domain). No match or multi-MB match → return None (server fallback preserved).
+
+## D9 — Key-check handled by regression guard only (Classification: User-Challenge)
+The user asked to "fix both", but D3 established the key-check ALREADY works on the current tree. Honor "fix both" with a regression test pinning the writer+reader+funnel contract + e2e re-verification — NOT a new code path.
+
+## Phasing — ONE phase
+Linear dependency, not fan-out and not staged-risk: the C# parser and its resolve_driver consumer are validated by the SAME end-state test (Door resolves to client) plus the parser's own unit tests, and the parser is the consumer's only caller, so they land+verify together. No separate "parser foundation" phase. Est. ~80–140 production SLOC, ~3–4 prod touch-points → ≲150 (small) review-depth tripwire.
+
+## Design-review round 1 (dual-voice) — FINDINGS folded into design.md
+- D6 (Mechanical): Phase-2 narrowing slots inside resolve_driver after Phase-1 None; preserves tuple|None contract.
+- D7 (Mechanical, REVISED): do NOT reuse _load_cs_source (it blanks string literals — module_domain.py:1766/601/680); add a comment-strip-but-preserve-strings source accessor. (codex F1 BLOCKING)
+- D8 (Taste): selection key = clip's NON-EMPTY observed_attribute ⊆ MB's written Animator-param set; unique → driver; else None.
+- D9 (Taste): key-check = regression test only (already works, D3).
+- D10 (Mechanical): Phase-2 enumerates ALL scope MBs from `instances` (candidate_mbs is empty in the 0-ref Door case); thread guid_index + observed_attribute build_topology→_build_animation_drivers_block→resolve_driver. (codex F2 BLOCKING + Claude)
+- D11 (Taste): Phase-2 fires ONLY for the 0-serialized-ref case; ≥2-ref ambiguity stays unresolved (needs animator identity, not param-name match). (codex F3 MAJOR)
+- D12 (Mechanical): reject empty observed_attribute up front so autoplay clips never match. (Claude F4 MINOR)
+
+## D13 (Mechanical — robustness, raised at Gate A) — receiver-bound parser, not flat regex
+The parser is a TWO-STEP receiver-bound extraction, not a flat param-name regex: (1) bind
+Animator-typed identifiers from their C# declarations (Animator <name>, [SerializeField]
+Animator <name>, <name> = GetComponent<Animator>()); (2) match Set*("<param>") writes ONLY on
+those bound identifiers. Proof a flat regex fails: the door's write is doorAnim.SetBool("open")
+(Door.cs:37) on `doorAnim` declared `private Animator doorAnim` (Door.cs:12); the existing
+\bAnimator\b[^;]*\.SetBool regex (module_domain.py:497) MISSES it. Robustness rests on the
+SYSTEM (binding ∩ clip-param-name join ∩ unique-writer-in-scope ∩ fail-safe to server), not the
+regex alone. Input is deterministic Unity C# SOURCE (not LLM output), so the regex-on-AI-output
+fragility rule does not apply. Heightened-review fixtures: comment-stripped, string-literal-
+preserved, multiline write, wrong-receiver (non-Animator .SetBool), binding via property vs
+field vs local. Formal-AST escalation (Roslyn/tree-sitter-c#) deferred unless a real game breaks
+the extraction.
+
+## Gate A — APPROVED (user "go", 2026-06-16)
+Direction approved after pre-approval scrutiny on generality (param-name join, lookup-agnostic)
+and robustness (D13 receiver-bound parser, not flat regex). One phase. Proceeding to execute.
+
+## Phase-1 detailed design (drive-design) — new decisions
+- DP1 (Mechanical): factor _load_cs_source's read path into `_read_cs_text(script_id, guid_index) -> str | None`; _load_cs_source + new `_load_cs_source_preserving_strings` both call it, applying `_strip_cs_noise(preserve_strings=...)`. One resolve path, two scrub modes.
+- DP2 (Taste): parser home = NEW `scene_runtime_topology/animation_driver_analyzer.py` (resolves design.md open-Q1). Co-located with its only consumer (animation_routing.resolve_driver) + its accessor dep (module_domain.py, same package); avoids a cross-package edge into unity/script_analyzer.py.
+- DP3 (Mechanical): Phase-2 enumerates scope MBs via `instance_to_script.values()` (already returned by _iter_scope_references), deduped — NOT a new walk, NOT candidate_mbs (empty in 0-ref case). Confirms D10 vs real code.
+- DP4 (Mechanical): Phase-2 fires ONLY for len(candidate_mbs)==0; split the existing `len != 1` branch so >=2 returns None immediately (D11) — the >=2 path never reads source.
+- DP5 (Taste): resolve_driver's new params (guid_index, observed_attribute) are keyword-only, default None/"" → existing tests calling resolve_driver without them keep Phase-1-only behavior.
+- [REAL CODE divergence vs design.md/D7]: observed_attribute is read at build_topology.py:955 AFTER the resolve_driver call — threading must HOIST that read above line 929. instance_to_script (animation_routing.py:312) already enumerates ALL scope instances, so D10's "all scope MBs" = instance_to_script.values() (no new scope walk).
+
+## Slice 1.1 implementation — spec deviations (logged per /drive)
+- **DV1 (Mechanical, REQUIRED).** design-phase1.md hooks Phase-2 at the
+  `len(candidate_mbs)` split but did NOT anticipate the pre-existing
+  `if not references: return None` guard at animation_routing.py:325, which
+  short-circuits the 0-ref case (the real SimpleFPS Door prefab can have zero
+  Animator-typed refs) BEFORE Phase-2 runs. Removed that early-return: an
+  empty/Animator-ref-free reference list now yields `len(candidate_mbs)==0`
+  and reaches `_narrow_driver_by_param_writes`. Safe: a non-existent scope
+  returns an empty `instance_to_script` so Phase-2 finds no MBs → None;
+  guid_index=None (the unit-test default) returns None immediately. Verified
+  by the full topology test file + the cold-conversion authority test.
+- **DV2 (Taste).** design-phase1.md acceptance 6 asserted the Door SOURCE has
+  a Character-fallback READ (`char`/`Character` + `GetAttribute("hasKey")`).
+  The REAL fixture (tests/fixtures/contract_corpus/SimpleFPS/fixture.json)
+  Door reads ONLY `plr:GetAttribute("hasKey")`. The Character mirror lives in
+  the WRITER: `Player:_setSharedFlag` sets the attr on BOTH plr and char
+  (`SetAttribute(flag…)`) so a Character-scoped read would also see it. The
+  key-check regression test pins the real contract: Door reads
+  `GetAttribute("hasKey")`; Player writes plr+char (`SetAttribute(flag`,
+  `Character`/`char`) AND fires the funnel (`PlayerSetSharedFlag`,
+  `FireServer(flag`). Same writer+reader+funnel pin D9 intended.
