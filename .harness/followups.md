@@ -217,3 +217,68 @@ converter/runtime/scene_runtime.luau (queue site ~:1300) — self-contradictory/
 
 ## From Unit 2 phase-3 harden (WARN-timing residual — reverted net-negative patch)
 - converter/runtime/scene_runtime.luau — the residual "stripped ref never resolved" WARN has imperfect timing across MULTIPLE async UI-deferred host groups: it can fire PREMATURELY (a ref that a later group will bind) — that's the last-good behavior we kept. A harden attempt to gate it on a _deferredGroupsPending counter + a final drain was REVERTED because it introduced the opposite bug (WARN SUPPRESSED forever when the last group completes as an empty batch — codex). The WARN is DIAGNOSTIC-ONLY; binding is correct either way (cross-domain refs never queued; same-domain incl. missionPopup bind via the original post-placement + per-batch drains). Getting the WARN's exact multi-group async timing right is deferred (no real game exercises it: Trash-Dash's 3 stripped refs are client→client and their targets register). Fix when a real case appears.
+
+## Run addressables-split-closure-20260616T060438 (2026-06-16)
+
+# Followups — addressables-split-closure run
+
+## F1 — Working branch vs. D2 base
+The repo is currently on `pr/generic-require-so-fixes` (@af596c7), but D2 says base
+the fix on the Unit-2 branch `drive/addressables-unit2-20260615T193738` (@e2f2069).
+Implementation must branch from the Unit-2 base, not the current checkout. Landing/
+rebase concern, not a design change.
+
+## F2 — CharacterDatabase roster (deferred per D1)
+Once the require cascade is gone, re-run the trash-dash e2e and re-observe whether
+the CharacterDatabase roster is still dead (it is currently MASKED by the PlayerData:9
+failure). If still broken, that is the follow-on run.
+
+## F3 — Open question: Script+domain=client as a client seed
+Whether to include `Script` with inferred domain=client in the client seed set (vs.
+LocalScript / character / loader only). Resolve in the phase's detailed design against
+real trash-dash domain verdicts — risk is a mis-inferred client Script over-pulling a
+server-only subtree into ReplicatedStorage.
+
+## F4 — DD4 degraded-service fallback (out of scope for Phase 1)
+The reachability override does not apply on the degraded storage path
+(`storage_classifier.py:565-613`). Known limitation; record + revisit if a degraded
+conversion needs the split fix.
+
+## F5 — dependency_map param cleanup
+After Phase 1 removes `dependency_map` from `derive_reachability_requirements`
+(P1D3), audit remaining readers. `infer_module_domains` still uses it; no behavior
+change. Pure cleanup, not Phase 1.
+
+## F4 — degraded-service fallback bypass (from phase-1 design review)
+The reachability override does not apply on the degraded-service path
+(`storage_classifier.py:565-613`), which bypasses the topology tree. Out of scope for this
+fix; revisit if a degraded conversion shows the require cascade.
+
+## F5 — dependency_map param cleanup
+After this fix removes `dependency_map` from `derive_reachability_requirements`'s closure,
+audit other readers (the `infer_module_domains` reader is unaffected). Non-behavioral tidy-up.
+
+## F6 — extract_require_edges bare-CR line-comment terminator (MINOR, from slice review r4)
+`roblox_dead_modules.py:395`: the line-comment arm stops only on "\n", not bare "\r". On
+bare-CR Luau the rest of the file is treated as comment (drops require edges / suppresses
+has_genuine_roblox_effect). One-line fix: stop the line comment at the first "\r" OR "\n".
+Cannot occur in the current pipeline (emitted Luau uses \n/CRLF), so deferred. Add bare-CR
+regressions for extract_require_edges + has_genuine_roblox_effect when fixed.
+
+## F4 (EXPANDED) — legacy/degraded fallback path is string-literal-unsafe (SECURITY)
+Beyond the reachability-override gap, the legacy/degraded fallback (storage_classifier.py:
+565-613, reached on no-transpile resume / script_id_by_name miss / no topology) classifies by
+RAW source regex with NO comment/string stripping:
+- `_build_call_graph` (:413): `re.finditer(r'require\(', s.source)` → a string-literal
+  "require(...)" manufactures a false caller edge → server-only module → ReplicatedStorage
+  (server-code leak). Codex live-repro: LocalScript source
+  `print('require(...FindFirstChild("Secret"))')` + server-only Secret → Secret to RS.
+- `_CLIENT_ONLY_PATTERNS` (:474) + `_SERVER_ONLY_PATTERNS` (:493): `re.search(p, s.source)`
+  over raw source → a string literal containing a client/server API token gives a false
+  domain signal.
+FIX (when addressed): route all legacy-path source scans through the string-aware Luau lexer
+(`roblox_dead_modules._scan_luau`, built this run) — OR delete the legacy path once topology
+coverage is complete (the path's own docstring plans this). Add string-literal regressions.
+Deferred per D3 (does not affect the fresh-conversion acceptance path).
+
+HANDOFF: [split-unit] client/server split require-closure fix LANDED (this unit) — note in converter/docs/design/addressables-prefab-conversion.md; F4 (legacy/degraded-path string-literal safety) remains deferred per D3.

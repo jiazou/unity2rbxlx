@@ -656,3 +656,108 @@ themeIcon (sprite) / skyMesh (mesh) → None.
 - **D-P3-6 (Reversible, codex Major 1):** Planner stamps `target_script_id` on rewritten rows so
   the runtime cross-domain policy classifies the target domain without finding it in scene-local
   `instanceById` (placement-scoped key never appears there). Closes the cross-domain bypass.
+
+## Run addressables-split-closure-20260616T060438 (2026-06-16) — client/server split require-closure fix
+
+# Decisions — addressables-split-closure run
+
+## D1 — Pivot scope from Unit 4 (CharacterDatabase) to client/server split require-closure
+Evidence: the last trash-dash boot dies at `PlayerData:9` requiring `Missions`
+(ServerStorage) → `require(nil)` on the client → full cascade. `Missions`,
+`LoadoutState`, `Consumable`, `Helpers`, `Modifier`, `GameState`, `GameManager` are
+placed in ServerStorage but are in the client require-closure (verified by parsing
+`output/trash-dash-unit2-proper-20260616/converted_place.rbxlx`). PlayerData:9
+(`Missions`) fails before line 10 (`CharacterDatabase`), so Unit 4's dead-roster is
+MASKED — unobservable/unverifiable until the split is fixed.
+Decision (user-confirmed, AskUserQuestion): this run owns the split require-closure fix
+ONLY, then re-runs the e2e to re-observe the true roster state. CharacterDatabase
+deferred to a follow-on once de-masked.
+
+## D2 — Base on drive/addressables-unit2-20260615T193738 (Unit 1 + Unit 2)
+The split fix is a GENERIC converter change, but the e2e target (trash-dash boots) is
+only meaningful on the full addressables stack. PR #22 (Unit 2) is unmerged, so Unit-2's
+branch (@e2f2069) is the most complete addressables base. The generic require/SO-identity
+work on `pr/generic-require-so-fixes` is a separate facet (module identity, not
+placement) — NOT folded in.
+
+## DA1 — Fix in the seeding of derive_reachability_requirements, not storage_classifier
+Classification: design/architecture.
+The classifier's `_decide_script_container_from_topology` already checks
+`reachability_requirements[sid]` (rule 3) BEFORE the all-server-caller→ServerStorage
+branch (rule 4), so the override the bug needs already exists. The defect is solely
+an under-seeded client closure in `derive_reachability_requirements`. Smallest correct
+seam; keeps the override in one place.
+
+## DA2 — Client seed = placement-independent client ENTRY signals, not domain==client
+Classification: design/architecture.
+Seed the client-reachability closure from LocalScript (intrinsic script class) ∪
+character_attached ∪ is_loader ∪ (Script with inferred domain=client), instead of
+domain==client modules. Resolves the domain-vs-placement mismatch: PlayerData has
+domain=server (DataStoreService) but is client-required by UI; under entry-point
+seeding it (and its transitive deps) fall inside the client closure and get RS.
+General-purpose — derived from structural script class + structural row flags + the
+existing domain classifier; never hardcodes module names.
+
+## DA3 — No fixpoint; single closure pass
+Classification: design/architecture.
+All seed signals are placement-independent and already computed in
+`_maybe_run_topology_prepass` before `classify_storage`, so the existing
+infer→derive→classify linear order holds and the placement↔reachability cycle never
+forms. One closure pass; no iteration to convergence.
+
+## DA4 — Reuse _closure, the __excluded__ both-sides rule, and rule-3-over-rule-4 override unchanged
+Classification: scope/reuse.
+Server closure seeding and the both-sides conflict sentinel are correct as-is; only
+the client seed set changes. No new TopologyInputs fields, no new call-sites.
+
+## P1D1 — Resume strategy: gate the emitted-require closure on transpile_ran
+Classification: design/architecture.
+Thread `transpile_ran: bool` into `derive_reachability_requirements`; return `{}`
+when False. Real-code divergence (vs DD5 framing): today the empty-reqs resume path
+is produced INDIRECTLY by the `dependency_map or None` guard
+(`pipeline.py:5046` → `module_domain.py:1036`), and `transpile_ran` is computed only
+later (`pipeline.py:5235`) and never passed to this function. Switching the edge
+source to `extract_require_edges(RbxScript.source)` removes that indirection
+(`RbxScript.source` IS populated on resume), so an EXPLICIT `transpile_ran` gate is
+required to preserve the byte-identical resume contract
+(`module_domain.py:856-874`; tests `test_storage_classifier.py:671`,
+`test_scene_runtime_topology.py:4456`). Rejected DD5 option (b) (adopt richer resume
++ rewrite resume tests) as out-of-scope risk on a security-sensitive seam.
+
+## P1D2 — Thread call-site script_by_sid + lifecycle_roles; do not recompute
+Classification: scope/reuse.
+DD6: the gated `lifecycle_roles` dict and `script_by_sid` map are already computed at
+`pipeline.py:5119-5137`. Pass them in (keeps the pure function pure — the AST test
+`test_module_domain_prepass.py:297` forbids parent_path reads). Real-code divergence:
+both are currently computed AFTER the `derive_reachability_requirements` call; the
+fix HOISTS their computation above the call (a pure move — neither depends on `reqs`).
+Threading also guarantees the seed predicate cannot drift from the planner/storage
+gate (one computation site).
+
+## P1D3 — Replace dependency_map with emitted-require edges in the closure
+Classification: design/architecture.
+Closure walks `extract_require_edges(RbxScript.source, known_names)`
+(`roblox_dead_modules.py:795`), keyed by script.name, NOT the C# `dependency_map`
+(DA5). REPLACE not union — union would mix class_name and script_name keyspaces and
+re-open the DA6 asymmetric-join hazard. `dependency_map` param is REMOVED from
+`derive_reachability_requirements` (still read upstream by `infer_module_domains`).
+
+## P1D4 — Closure runs end-to-end in script-name/sid space
+Classification: scope/correctness.
+Seeds resolved sid→name via `script_by_sid`; closure over name→{name} graph; reached
+names mapped back name→sid via the inverse. `_closure` is keyspace-agnostic (no
+signature change). `finalize_topology_containers`'s reachability arm moves to the same
+`sid`-space join (DD7), replacing the class-name join that dropped colliding rows.
+Resolves F3: `Script+domain==client` IS a seed but ONLY when `low_confidence is False`.
+
+## D3 — Defer the degraded-path string-literal over-pull (user-approved, phase review r2)
+Codex phase review r2 found a confirmed server-code leak: storage_classifier._build_call_graph
+(legacy/degraded fallback path, storage_classifier.py:413/565-613) scans raw Luau for
+`require(` without stripping comments/strings, so a string-literal "require(...)" manufactures
+a false caller edge → server-only module routed to ReplicatedStorage. CONFIRMED true, but:
+(a) on the F4 degraded path already scoped out; (b) NOT exercised by the trash-dash
+fresh-conversion acceptance path (fresh convert uses the topology path, which is converged);
+(c) the fix is the whole legacy-path string-safety (also _CLIENT/_SERVER_ONLY_PATTERNS raw
+scans), not a point fix; the legacy path is slated for deletion. User chose DEFER (option 1).
+Classification: scope/User-Challenge-resolved. Recorded as expanded F4. Phase converges on the
+fresh-conversion scope.
