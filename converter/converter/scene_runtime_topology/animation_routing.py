@@ -300,8 +300,7 @@ def resolve_driver(
         extra animator identity (controller GUID + GO match). Phase 2's
         C#-source narrowing pass will pick the writer of the clip's
         parameter names. Until then, an ambiguous scope falls back to
-        today's server placement (consumer sees ``routing_status =
-        "unresolved"``) rather than silently misrouting.
+        today's server placement rather than silently misrouting.
 
     ``scope_ref`` MUST be the planner-stable scope identifier (a scene
     namespace like ``Assets/Scenes/Main.unity`` or a stable prefab id
@@ -310,12 +309,10 @@ def resolve_driver(
     ``EmittedAnimation`` in build_topology for the upstream contract
     (codex B3 fix).
 
-    Returns ``None`` when:
-      - ``scope_kind == "orphan"`` (no scope to walk),
-      - the scope's references don't include any Animator-typed ref,
-      - multiple distinct MBs reference Animators (ambiguous; Phase 2),
-      - or the lone candidate's module has a non-runtime domain
-        (``"helper"`` / ``"excluded"`` / unresolvable).
+    Returns ``None`` for orphan scopes, scopes with no Animator-typed
+    ref, ambiguous scopes with multiple distinct MB candidates, or a lone
+    candidate whose module has a non-runtime domain (``"helper"`` /
+    ``"excluded"`` / unresolvable).
     """
     if scope_kind == "orphan":
         return None
