@@ -27,6 +27,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.test_theme_seed_plan import THEME_DB_CS, THEME_DB_LUAU
+
 HOST_RUNTIME_PATH = Path(__file__).parent.parent / "runtime" / "scene_runtime.luau"
 
 
@@ -374,6 +376,214 @@ dumpLogs()
         line.startswith("WARN_LINE=[seed] database module did not resolve to a table:")
         for line in out.splitlines()
     ), out
+
+
+class TestThemeSeedEndToEnd:
+    """Cross-phase END-TO-END seam (offline): a REAL ThemeData ScriptableObject
+    with a ``prefabList`` AssetReference flows through the REAL Phase-1
+    conversion (``convert_asset_file``) → the REAL Phase-2 seed
+    (``_build_theme_seed_plan``) → the REAL luau shim
+    (``seedAddressableDatabases``) → consumer lookup + ``instantiatePrefab``.
+
+    Both halves are real production code; the prefab id the runtime instantiates
+    is the one Phase-1 RESOLVED (captured from the conversion), never a literal —
+    so the test reds if the ``prefabList`` stops resolving to a string, if the
+    seed record stops binding to the drain, or if the registry stays nil.
+    """
+
+    # A .prefab the AssetReference resolves to (Phase-1 output is "<guid>:<rel>").
+    _PREFAB_GUID = "2d4807022e73aa34ab8f01892dbdfe1d"
+    _PREFAB_REL = "Assets/Bundles/Day/Segment.prefab"
+    _SO_GUID = "0d80a5ee0a199154784a904ed88da003"
+
+    def _real_guid_index(self, root):
+        from core.unity_types import GuidEntry, GuidIndex
+
+        idx = GuidIndex(project_root=root)
+        prefab_abs = root / self._PREFAB_REL
+        prefab_abs.parent.mkdir(parents=True, exist_ok=True)
+        prefab_abs.write_text("# stub prefab\n", encoding="utf-8")
+        idx.guid_to_entry[self._PREFAB_GUID] = GuidEntry(
+            guid=self._PREFAB_GUID,
+            asset_path=prefab_abs,
+            relative_path=Path(self._PREFAB_REL),
+            kind="prefab",
+        )
+        # the SO .asset guid (so the addressables group resolves to an SO module)
+        so_abs = root / "Assets" / "ThemeData_Day.asset"
+        idx.guid_to_entry[self._SO_GUID] = GuidEntry(
+            guid=self._SO_GUID,
+            asset_path=so_abs,
+            relative_path=Path("Assets/ThemeData_Day.asset"),
+            kind="scriptable_object",
+        )
+        return idx
+
+    def _phase1_convert_themedata(self, root, guid_index):
+        """Run the REAL Phase-1 SO conversion on a ThemeData .asset whose
+        ``zones[].prefabList[]`` is a Unity AssetReference; return the converted
+        luau source. No backing class → bare ``return data`` (loadstring-able)."""
+        from converter.scriptable_object_converter import convert_asset_file
+
+        asset = root / "Assets" / "ThemeData_Day.asset"
+        asset.parent.mkdir(parents=True, exist_ok=True)
+        asset.write_text(
+            "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n"
+            "--- !u!114 &11400000\nMonoBehaviour:\n"
+            "  m_Name: ThemeData_Day\n"
+            "  themeName: Day\n"
+            "  zones:\n"
+            "  - prefabList:\n"
+            f"    - m_AssetGUID: {self._PREFAB_GUID}\n"
+            f"      m_CachedAsset: {{fileID: 1000011175313116, guid: {self._PREFAB_GUID}, type: 3}}\n",
+            encoding="utf-8",
+        )
+        converted = convert_asset_file(asset, guid_index)
+        assert converted is not None
+        return converted.luau_source
+
+    def _theme_group_asset(self) -> str:
+        return (
+            "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n"
+            "--- !u!114 &11400000\nMonoBehaviour:\n"
+            "  m_Name: Themes\n  m_GroupName: Themes\n"
+            "  m_SerializeEntries:\n"
+            f"  - m_GUID: {self._SO_GUID}\n    m_Address: themeData\n"
+            "    m_SerializedLabels:\n    - themeData\n"
+        )
+
+    def _build_phase2_seed(self, root, out_dir, db_luau, so_module_path):
+        """Run the REAL Phase-2 ``_build_theme_seed_plan`` against a pipeline whose
+        rehydrated state carries the transpiled DB body + the SO guid->module map."""
+        from converter.pipeline import Pipeline
+        from core.roblox_types import RbxPlace, RbxScript
+
+        # Addressables group (label "themeData" -> the SO guid) + the DB's C#.
+        groups = root / "Assets" / "AddressableAssetsData" / "AssetGroups"
+        groups.mkdir(parents=True, exist_ok=True)
+        (groups / "Themes.asset").write_text(self._theme_group_asset(), encoding="utf-8")
+        (root / "Assets" / "ThemeDatabase.cs").write_text(THEME_DB_CS, encoding="utf-8")
+
+        pipe = Pipeline(root, output_dir=out_dir, skip_upload=True)
+        pipe.state.guid_index = self._real_guid_index(root)
+        pipe.state.rbx_place = RbxPlace()
+        pipe.state.rbx_place.scripts = [
+            RbxScript(name="ThemeDatabase", source=db_luau,
+                      script_type="ModuleScript", parent_path="ReplicatedStorage"),
+        ]
+        sr: dict[str, object] = {
+            "scriptable_objects": {self._SO_GUID: so_module_path},
+        }
+        pipe._build_theme_seed_plan(sr)
+        return sr
+
+    def _lua_str_list(self, items) -> str:
+        return "{ " + ", ".join('"%s"' % i for i in items) + " }"
+
+    def test_phase1_resolved_id_flows_into_phase2_runtime(self, tmp_path):
+        # ---- Phase 1: REAL conversion; capture the resolved prefabList id -----
+        root = tmp_path / "proj"
+        root.mkdir()
+        guid_index = self._real_guid_index(root)
+        so_luau = self._phase1_convert_themedata(root, guid_index)
+
+        resolved_id = f"{self._PREFAB_GUID}:{self._PREFAB_REL}"
+        # Phase-1 output: prefabList element is the resolved STRING, not a table.
+        assert f'"{resolved_id}"' in so_luau
+        assert "AssetGUID" not in so_luau
+        assert "CachedAsset" not in so_luau
+
+        so_module_path = "ReplicatedStorage.ThemeData_Day"
+
+        # ---- Phase 2: REAL seed plan; bind to the drain --------------------
+        sr = self._build_phase2_seed(
+            root, tmp_path / "out", THEME_DB_LUAU, so_module_path)
+        seeds = sr["addressable_db_seeds"]
+        assert isinstance(seeds, list) and len(seeds) == 1
+        seed = seeds[0]
+        assert seed["db_module_path"] == "ReplicatedStorage.ThemeDatabase"
+        assert seed["drain_field"] == "_pendingThemeData"
+        assert seed["appender_name"] == "Register"
+        assert seed["key_field"] == "themeName"
+        assert seed["so_module_paths"] == [so_module_path]
+
+        # ---- Runtime: REAL luau shim drives the REAL converted SO module ----
+        # The seed record is rendered into the luau plan from the Phase-2 output;
+        # the SO module the shim resolves is the REAL Phase-1 converted luau;
+        # instantiatePrefab is invoked with the Phase-1-RESOLVED id pulled out of
+        # the seeded registry (theme.zones[1].prefabList[1]), never a literal.
+        so_paths_lua = self._lua_str_list(seed["so_module_paths"])
+        scenario = f"""
+local SO_SOURCE = [==[
+{so_luau}
+]==]
+local soChunk = assert(loadstring(SO_SOURCE, "ThemeData_Day"))
+local soModule = soChunk()
+
+local db = makeThemeDatabase()
+local modules = {{
+    ["{seed['db_module_path']}"] = db,
+    ["{so_module_path}"] = soModule,
+}}
+local plan = {{
+    addressable_db_seeds = {{
+        {{
+            db_module_path = "{seed['db_module_path']}",
+            load_method_name = "{seed['load_method_name']}",
+            drain_field = "{seed['drain_field']}",
+            appender_name = "{seed['appender_name']}",
+            key_field = "{seed['key_field']}",
+            so_module_paths = {so_paths_lua},
+        }},
+    }},
+}}
+
+SceneRuntime.seedAddressableDatabases(plan, servicesFor(modules))
+db.LoadDatabase()
+
+-- Consumer lookup path: GetThemeData(PlayerData.themes[usedTheme+1]) == "Day".
+local PlayerData = {{ themes = {{"Day"}}, usedTheme = 0 }}
+local theme = db.GetThemeData(PlayerData.themes[PlayerData.usedTheme + 1])
+print("E2E_THEME_NONNIL=" .. tostring(theme ~= nil))
+
+-- The prefabList id the runtime instantiates is the Phase-1-RESOLVED string,
+-- pulled straight out of the seeded registry (NOT a hardcoded literal).
+local prefabId = theme and theme.zones and theme.zones[1] and theme.zones[1].prefabList[1]
+print("E2E_PREFAB_ID=" .. tostring(prefabId))
+
+local cloneInstance = {{ Name = "Segment", _sceneRuntimeId = "seg" }}
+local engineServices = {{
+    warn = logWarn,
+    task = {{ spawn = function(fn) pcall(fn) end, defer = function() end,
+             delay = function() end, wait = function() end }},
+    resolveModule = function() return nil end,
+    workspaceFind = function() return nil end,
+    findFirstChildWhichIsA = function() return nil end,
+    heartbeat = {{ Connect = function() return {{ Disconnect = function() end }} end }},
+    fixedStep = 0.02,
+    now = function() return 0 end,
+    getInstanceId = function(inst) return inst and inst._sceneRuntimeId end,
+    clonePrefabTemplate = function(pid)
+        if pid == prefabId then return cloneInstance end
+        return nil
+    end,
+}}
+local enginePlan = {{
+    modules = {{}}, scenes = {{}}, domain_overrides = {{}},
+    prefabs = {{
+        [prefabId] = {{ name = "Segment", instances = {{}}, references = {{}}, lifecycle_order = {{}} }},
+    }},
+}}
+local engine = SceneRuntime.new(engineServices, enginePlan)
+local clone = engine:instantiatePrefab(prefabId, nil, nil, nil)
+print("E2E_INSTANCE_NONNIL=" .. tostring(clone ~= nil))
+print("E2E_IS_CLONE=" .. tostring(clone == cloneInstance))
+"""
+        out = _run(scenario)
+        assert "E2E_THEME_NONNIL=true" in out
+        assert f"E2E_PREFAB_ID={resolved_id}" in out, out
+        assert "E2E_INSTANCE_NONNIL=true" in out
+        assert "E2E_IS_CLONE=true" in out
 
 
 def test_named_appender_falls_back_to_drain_table_when_appender_missing():

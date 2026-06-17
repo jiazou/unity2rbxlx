@@ -358,14 +358,9 @@ class TestBuildThemeSeedPlanIntegration:
         ]
 
     def test_seed_resolves_database_loaded_by_address(self, tmp_path):
-        """codex P1 (phase2): Unity ``LoadAssetsAsync<T>(key)`` accepts a LABEL
-        *or* an ADDRESS. A database whose load key is an ADDRESS (present in
-        ``by_address``, absent from ``by_label``) must still seed — resolved via
-        the by_address index.
-
-        Pre-fix (``so_addr.by_label.get(ownership.label)`` only) finds nothing
-        and silently emits no seed → empty registry; post-fix the union resolves
-        the guids via by_address."""
+        """Unity ``LoadAssetsAsync<T>(key)`` accepts a LABEL *or* an ADDRESS. A
+        database whose load key is an ADDRESS (in ``by_address``, absent from
+        ``by_label``) must still seed — resolved via the by_address index."""
         root = _make_project(
             tmp_path, group_asset=_theme_group_asset_address_only())
         pipe = _pipeline_with_state(root, tmp_path)

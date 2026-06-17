@@ -52,11 +52,10 @@ log = logging.getLogger(__name__)
 # Unit-3 theme registration — ownership derivation + drain-bind detector
 # ---------------------------------------------------------------------------
 #
-# Generic, no game-specific literals. The owned addressable LABEL + the store
-# KEY field are derived from the database's C# load method (the deterministic
-# upstream); the WRITE SURFACE the boot shim appends to is derived from the
-# transpiled database module body and BOUND to the list its (C#-derived,
-# consumer-called) ``LoadDatabase`` drains. design-phase2 §1.3/§1.4, D13/D16.
+# Generic (no game literals): the owned addressable LABEL + store KEY field come
+# from the database's C# load method; the WRITE SURFACE the boot shim appends to
+# is bound to the list its consumer-called ``LoadDatabase`` drains.
+# design-phase2 §1.3/§1.4, D13/D16.
 
 
 class AddressableDbSeed(TypedDict):
@@ -228,8 +227,8 @@ def _derive_drain_field(db_luau_source: str, load_method_name: str) -> str | Non
     return next(iter(fields))
 
 
-# Sentinel: multiple distinct public appenders bind to the drain field, so no
-# single ingress can be chosen unambiguously → the caller abstains loud.
+# Sentinel: multiple distinct public appenders bind to the drain field → the
+# caller abstains loud rather than guess an ingress.
 _AMBIGUOUS_APPENDER = "\x00<ambiguous-appender>"
 
 
@@ -7247,12 +7246,9 @@ script.Disabled = true
                 source_by_name.setdefault(name, src)
 
         seeds: list[AddressableDbSeed] = []
-        # Dedupe by DB IDENTITY (the seed's own module path), NOT by the load
-        # key: two DISTINCT database modules may legitimately share an
-        # Addressables key (both ``LoadAssetsAsync<T>("themeData")``) and each
-        # needs its own seed — keying off the label would silently drop the
-        # second DB onto an empty registry. Each ``db_name`` is already unique in
-        # the loop, so this only guards an impossible same-module double-seed.
+        # Dedupe by DB IDENTITY (module path), NOT the load key: two distinct DB
+        # modules may legitimately share an Addressables key and each needs its
+        # own seed.
         seeded_db_paths: set[str] = set()
         # The owning DB is the transpiled module whose originating C# issues a
         # ``LoadAssetsAsync<T>(key, …)`` whose KEY has emitted SO guids. Unity's

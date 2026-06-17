@@ -67,8 +67,8 @@ def _lua_escape_string(s: str) -> str:
     return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
 
-# A Unity AssetReference ALWAYS pairs m_AssetGUID with m_CachedAsset (both
-# required); only the sub-asset field m_SubObjectName is optional.
+# Unity AssetReference: m_AssetGUID + m_CachedAsset both required;
+# m_SubObjectName (sub-asset) optional.
 _ASSETREF_REQUIRED = {"m_AssetGUID", "m_CachedAsset"}
 _ASSETREF_KEYS = {"m_AssetGUID", "m_CachedAsset", "m_SubObjectName"}
 
@@ -76,14 +76,9 @@ _ASSETREF_KEYS = {"m_AssetGUID", "m_CachedAsset", "m_SubObjectName"}
 def _is_asset_reference(d: dict[object, object]) -> bool:
     """True iff *d* is a Unity AssetReference struct.
 
-    Requires BOTH m_AssetGUID AND m_CachedAsset to be present, and every key to
-    be a known AssetReference field (only m_SubObjectName is optional).
-    Requiring m_CachedAsset refuses to swallow an unrelated one-field struct that
-    merely *carries* an m_AssetGUID (e.g. a bare ``{m_AssetGUID}`` or
-    ``{m_AssetGUID, weight}``); such a struct falls through to the generic-dict
-    branch UNRESOLVED (fail-soft, identical to today's behavior — nothing is
-    erased to a string/nil). A struct carrying an extra non-AssetReference field
-    likewise fails the subset upper bound and falls through with its data intact.
+    Requiring m_CachedAsset (not just m_AssetGUID) and subset-bounding the keys
+    keeps an unrelated m_AssetGUID-carrying struct from being swallowed — it
+    falls through to the generic-dict branch with its data intact.
     """
     keys = set(d.keys())
     return _ASSETREF_REQUIRED <= keys <= _ASSETREF_KEYS
@@ -117,12 +112,10 @@ def _value_to_lua(
     if isinstance(value, dict):
         if not value:
             return "{}"
-        # Unity AssetReference (Addressables): {m_AssetGUID, m_CachedAsset[,
-        # m_SubObjectName]} collapses to ONE prefab-id string in place of the
-        # whole struct. Checked BEFORE the {fileID,guid,type} object-ref arm
-        # (the two predicates are disjoint). Resolve on the bare-guid
-        # m_AssetGUID first; fall back to the embedded {fileID,guid,type}
-        # m_CachedAsset. Both go through the UNCHANGED shared .prefab filter.
+        # Unity AssetReference collapses to ONE prefab-id string in place of the
+        # whole struct (checked before the disjoint {fileID,guid,type} arm).
+        # Resolve on the bare-guid m_AssetGUID, falling back to the embedded
+        # m_CachedAsset; both via the shared .prefab filter.
         if _is_asset_reference(value):
             pid = None
             if guid_index is not None:

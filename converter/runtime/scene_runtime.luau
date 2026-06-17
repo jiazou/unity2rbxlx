@@ -150,23 +150,17 @@ _UNITY_TO_ROBLOX_CLASS.RectTransform = _CLASS_TRANSFORM_SELF
 -- Addressable database seeding (Unit-3 theme registration)
 -- ---------------------------------------------------------------------
 --
--- A converter-owned boot shim. For each SO-loaded database the converter
--- routed (``plan.addressable_db_seeds``), this requires the database module
--- and the owned ScriptableObject modules and appends each SO instance onto the
--- database's PROVEN write surface — the public appender fn whose target field
--- is the same list the database's (C#-derived, consumer-called) ``LoadDatabase``
--- drains, ELSE that drain-field table directly (drain-bind, design-phase2 §1.4).
+-- A converter-owned boot shim. For each SO-loaded database in
+-- ``plan.addressable_db_seeds`` it requires the DB + owned SO modules and
+-- appends each SO instance onto the DB's PROVEN write surface — the public
+-- appender bound to the drain field, ELSE that drain-field table directly
+-- (design-phase2 §1.4).
 --
--- Boot order is load-bearing: the entrypoint calls this AFTER
--- ``SceneRuntime.new`` and BEFORE ``engine:start`` — i.e. before any lifecycle
--- method fires ``LoadDatabase`` — so the seed lands before the (once-only,
--- ``themeDataList == nil``-guarded) drain. It does NOT call ``LoadDatabase`` and
--- does NOT set ``loaded()``: the deterministic consumer-called ``LoadDatabase``
--- drains the seeded list and owns the ``m_Loaded = true`` transition.
---
--- A database whose build-time drain-bind FAILED contributes NO record (the
--- converter abstained + warned), so every record present is a proven surface.
--- Generic no-op when ``plan.addressable_db_seeds`` is absent/empty.
+-- Boot order is load-bearing: the entrypoint runs this AFTER ``SceneRuntime.new``
+-- and BEFORE ``engine:start`` — before any lifecycle fires the once-only,
+-- ``themeDataList == nil``-guarded ``LoadDatabase`` drain. The shim does NOT call
+-- ``LoadDatabase`` or set ``loaded()``; the consumer-called ``LoadDatabase`` owns
+-- the drain + the ``m_Loaded = true`` transition. Generic no-op on an empty plan.
 function SceneRuntime.seedAddressableDatabases(plan, services)
 	assert(type(plan) == "table", "seedAddressableDatabases: plan required")
 	assert(type(services) == "table", "seedAddressableDatabases: services required")
