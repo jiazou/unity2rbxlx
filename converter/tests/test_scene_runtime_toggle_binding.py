@@ -642,3 +642,80 @@ class TestToggleBindingEdges:
         rc, out, err = _build(scenario)
         assert rc == 0, f"luau failed: {err}\n{out}"
         assert "VISIBLE=true" in out, out
+
+    def test_absent_plan_key_no_crash(self):
+        """The ``ui_toggle_bindings`` plan key may be ABSENT (a scene with no
+        Toggle) or an EMPTY list. On the client (watch service present) the
+        install must no-op cleanly: no index build, no scan, no crash."""
+        for key_decl in ("", "ui_toggle_bindings = {},"):
+            scenario = textwrap.dedent("""\
+                local watch = mkWatchSurface()
+                local plan = {
+                    modules = {}, scenes = {}, prefabs = {}, domain_overrides = {},
+                    %s
+                }
+                local services = servicesFor(plan, {}, {})
+                services.installUiDescendantWatch = function(h) return watch:Connect(h) end
+                local engine = SceneRuntime.new(services, plan)
+                engine:start("client")
+                runDeferred()
+                -- A late DescendantAdded with no rows indexed must short-circuit.
+                watch:fire(mkInst("whatever"))
+                print("CONNECTS=" .. tostring(watch.connectCount))
+                print("DONE")
+            """) % key_decl
+            rc, out, err = _build(scenario)
+            assert rc == 0, f"luau failed (key_decl={key_decl!r}): {err}\n{out}"
+            lines = out.strip().splitlines()
+            assert "DONE" in lines, out
+            # No rows -> the watch is never even connected (install bails before
+            # connecting), so a stray DescendantAdded can't reach a nil index.
+            assert "CONNECTS=0" in lines, out
+
+    def test_non_guiobject_graphic_noops_without_error(self):
+        """``_setGraphicVisible`` on an endpoint that rejects ``.Visible``
+        (a non-GuiObject) must NOT propagate an error (pcall-guarded); the rest
+        of the run continues. Regression pin for the fail-closed guard."""
+        scenario = textwrap.dedent("""\
+            local toggle = mkInst("tog")
+            -- A graphic whose ``.Visible`` assignment ERRORS (non-GuiObject):
+            -- a proxy table whose __newindex throws for ``Visible``.
+            local badGraphic = setmetatable(
+                {_sri = "gfx"},
+                {__newindex = function(_, k, _v)
+                    if k == "Visible" then error("not a GuiObject") end
+                end}
+            )
+            function badGraphic:GetAttribute(name)
+                if name == "_SceneRuntimeId" then return self._sri end
+                return nil
+            end
+            local watch = mkWatchSurface()
+            local plan = {
+                modules = {}, scenes = {}, prefabs = {}, domain_overrides = {},
+                ui_toggle_bindings = {
+                    {toggle_sri = "tog", graphic_sri = "gfx",
+                     initial_on = true, attr_name = "isOn"},
+                },
+            }
+            local services = servicesFor(plan, {}, {tog = toggle, gfx = badGraphic})
+            services.installUiDescendantWatch = function(h) return watch:Connect(h) end
+            local engine = SceneRuntime.new(services, plan)
+            -- The bind sets .Visible on the bad graphic during the install scan;
+            -- if it propagated, start() would error. It must not.
+            local ok = pcall(function()
+                engine:start("client")
+                runDeferred()
+            end)
+            print("OK=" .. tostring(ok))
+            -- A subsequent flip likewise must not error.
+            local ok2 = pcall(function() toggle:SetAttribute("isOn", false) end)
+            print("OK2=" .. tostring(ok2))
+            print("DONE")
+        """)
+        rc, out, err = _build(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        lines = out.strip().splitlines()
+        assert "DONE" in lines, out
+        assert "OK=true" in lines, out
+        assert "OK2=true" in lines, out

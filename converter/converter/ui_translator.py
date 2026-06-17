@@ -838,17 +838,15 @@ def _apply_toggle_properties(
     """
     if not hasattr(element, 'attributes'):
         element.attributes = {}
-    is_on = props.get("m_IsOn", 1)
-    initial_on = True
-    # ``m_IsOn`` is an int/bool/str from parsed YAML; narrow before ``int()``.
-    if isinstance(is_on, (int, str, bool)):
-        try:
-            initial_on = bool(int(is_on))
-            element.attributes["ToggleIsOn"] = initial_on
-        except (TypeError, ValueError):
-            return
-    else:
+    # ``m_IsOn`` crosses the YAML boundary untyped (int/float/bool/str);
+    # ``_coerce_int`` is the file's canonical scalar coercion (accepts a float
+    # like ``1.0`` and a float-string, ``None`` on genuine failure) -- matching
+    # the rest of this module and the pre-slice ``bool(int(is_on))`` behavior.
+    is_on_int = _coerce_int(props.get("m_IsOn", 1))
+    if is_on_int is None:
         return
+    initial_on = bool(is_on_int)
+    element.attributes["ToggleIsOn"] = initial_on
 
     # Emit a binding row iff the serialized ``graphic`` (a *component* fileID)
     # resolves to its owning GameObject. The Toggle's own element already

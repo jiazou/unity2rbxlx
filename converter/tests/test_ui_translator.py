@@ -517,6 +517,47 @@ class TestToggleGraphicBinding:
         self._convert(node, owner_index=owner_index, bindings=bindings)
         assert bindings[0]["initial_on"] is True
 
+    def test_float_m_is_on_coerces_not_dropped(self):
+        """``m_IsOn`` may cross the YAML boundary as a float (``1.0`` when
+        written ``1.0``); it must coerce (NOT silently drop ``ToggleIsOn`` and
+        the row). Regression pin: an over-strict ``isinstance`` narrowing once
+        sent every float ``m_IsOn`` to an early ``return``, diverging from the
+        pre-slice ``bool(int(is_on))`` behavior."""
+        owner_index = {"gc": "gg"}
+        for raw, expected in ((1.0, True), (0.0, False), ("1.0", True)):
+            bindings: list = []
+            node = SceneNode(
+                name="T", file_id="t", active=True, layer=0, tag="Untagged",
+                components=[ComponentData(
+                    component_type="Toggle", file_id="toggleComp",
+                    properties={"m_IsOn": raw, "graphic": {"fileID": "gc"}},
+                )],
+                children=[], parent_file_id=None,
+            )
+            element = self._convert(
+                node, owner_index=owner_index, bindings=bindings,
+            )
+            assert element.attributes["ToggleIsOn"] is expected, raw
+            assert len(bindings) == 1, raw
+            assert bindings[0]["initial_on"] is expected, raw
+
+    def test_unparseable_m_is_on_emits_no_row(self):
+        """A non-numeric ``m_IsOn`` (no valid int) returns early: no
+        ``ToggleIsOn`` attribute, no binding row, no crash."""
+        owner_index = {"gc": "gg"}
+        bindings: list = []
+        node = SceneNode(
+            name="T", file_id="t", active=True, layer=0, tag="Untagged",
+            components=[ComponentData(
+                component_type="Toggle", file_id="toggleComp",
+                properties={"m_IsOn": "nope", "graphic": {"fileID": "gc"}},
+            )],
+            children=[], parent_file_id=None,
+        )
+        element = self._convert(node, owner_index=owner_index, bindings=bindings)
+        assert "ToggleIsOn" not in element.attributes
+        assert bindings == []
+
     def test_graphic_zero_emits_no_row(self):
         """E1 — ``graphic:{fileID:0}`` -> no binding row."""
         owner_index = {"gc": "gg"}
