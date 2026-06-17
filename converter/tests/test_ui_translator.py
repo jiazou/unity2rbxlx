@@ -436,3 +436,224 @@ class TestBuildComponentOwnerIndex:
         build_component_owner_index([go])
         after = [(c.component_type, c.file_id) for c in go.components]
         assert before == after
+
+
+def _toggle_node(
+    *, toggle_fid: str, graphic_comp_fid: object, m_is_on: int = 0,
+    name: str = "TheToggle",
+) -> SceneNode:
+    """A Toggle GameObject whose Toggle component serializes a ``graphic`` ref."""
+    return SceneNode(
+        name=name,
+        file_id=toggle_fid,
+        active=True,
+        layer=0,
+        tag="Untagged",
+        components=[
+            ComponentData(
+                component_type="Toggle", file_id="toggleComp",
+                properties={
+                    "m_IsOn": m_is_on,
+                    "graphic": {"fileID": graphic_comp_fid},
+                },
+            ),
+        ],
+        children=[],
+        parent_file_id=None,
+    )
+
+
+class TestToggleGraphicBinding:
+    """Slice 1.2 — ``_apply_toggle_properties`` emits a ``ToggleBinding`` row
+    when the Toggle's serialized ``graphic`` resolves to an owning GameObject.
+
+    Anchored on the Unity Toggle component + ``graphic`` fileID, resolved via
+    ``build_component_owner_index`` to the checkmark's ``_SceneRuntimeId``.
+    NO node-name matching, NO transport attribute on the produced element.
+    """
+
+    NS = "Assets/Scenes/main.unity"
+
+    def _convert(self, node: SceneNode, *, owner_index, bindings):
+        from converter.ui_translator import _convert_ui_element
+        return _convert_ui_element(
+            node, scene_namespace=self.NS,
+            component_owner_index=owner_index,
+            toggle_bindings=bindings,
+        )
+
+    def test_resolvable_graphic_emits_row(self):
+        """A1 pipeline-path: a Toggle whose ``graphic`` resolves emits a row
+        with the toggle + checkmark SRIs, ``initial_on`` from ``m_IsOn``, and
+        ``attr_name`` = the single-source constant."""
+        from converter.ui_translator import _TOGGLE_ISON_ATTR
+
+        # graphic component fileID 250410366 is owned by GameObject 250410364.
+        owner_index = {"250410366": "250410364"}
+        bindings: list = []
+        node = _toggle_node(
+            toggle_fid="264237063", graphic_comp_fid="250410366", m_is_on=0,
+        )
+        element = self._convert(node, owner_index=owner_index, bindings=bindings)
+
+        assert len(bindings) == 1
+        row = bindings[0]
+        assert row["toggle_sri"] == f"{self.NS}:264237063"
+        assert row["graphic_sri"] == f"{self.NS}:250410364"
+        assert row["initial_on"] is False
+        assert row["attr_name"] == _TOGGLE_ISON_ATTR
+        # The real attribute ToggleIsOn is still recorded.
+        assert element.attributes["ToggleIsOn"] is False
+        # NO transport attribute leaked onto the produced element (r2 MINOR).
+        for k in element.attributes:
+            assert "graphic" not in k.lower()
+            assert "togglegraphicref" not in k.lower().replace("_", "")
+
+    def test_initial_on_true_when_m_is_on_set(self):
+        """E2 — ``m_IsOn=1`` -> ``initial_on=True``."""
+        owner_index = {"gc": "gg"}
+        bindings: list = []
+        node = _toggle_node(toggle_fid="t", graphic_comp_fid="gc", m_is_on=1)
+        self._convert(node, owner_index=owner_index, bindings=bindings)
+        assert bindings[0]["initial_on"] is True
+
+    def test_graphic_zero_emits_no_row(self):
+        """E1 — ``graphic:{fileID:0}`` -> no binding row."""
+        owner_index = {"gc": "gg"}
+        bindings: list = []
+        node = _toggle_node(toggle_fid="t", graphic_comp_fid=0, m_is_on=1)
+        element = self._convert(node, owner_index=owner_index, bindings=bindings)
+        assert bindings == []
+        # ToggleIsOn still recorded (it is a real attribute).
+        assert element.attributes["ToggleIsOn"] is True
+
+    def test_unresolvable_graphic_emits_no_row(self):
+        """E1 — a ``graphic`` fileID with no owner in the index -> no row."""
+        owner_index = {"other": "gg"}  # does not contain "gc"
+        bindings: list = []
+        node = _toggle_node(toggle_fid="t", graphic_comp_fid="gc", m_is_on=0)
+        self._convert(node, owner_index=owner_index, bindings=bindings)
+        assert bindings == []
+
+    def test_none_index_or_accumulator_emits_no_row(self):
+        """Legacy / synthetic callers (``None`` index or accumulator) emit
+        nothing -- byte-identical legacy output, no crash."""
+        node = _toggle_node(toggle_fid="t", graphic_comp_fid="gc", m_is_on=1)
+        # None index, with accumulator present.
+        bindings: list = []
+        el = self._convert(node, owner_index=None, bindings=bindings)
+        assert bindings == []
+        assert el.attributes["ToggleIsOn"] is True
+        # Index present, None accumulator (no crash, no row recorded anywhere).
+        el2 = self._convert(node, owner_index={"gc": "gg"}, bindings=None)
+        assert el2.attributes["ToggleIsOn"] is True
+
+    def test_non_hud_toggle_still_emits_row(self):
+        """E3 — a Toggle anywhere (not HUD-specific) emits a row; keyed on the
+        component + graphic, never node names."""
+        owner_index = {"gc": "gg"}
+        bindings: list = []
+        node = _toggle_node(
+            toggle_fid="optTog", graphic_comp_fid="gc", m_is_on=0,
+            name="OptionsMenuSoundToggle",
+        )
+        self._convert(node, owner_index=owner_index, bindings=bindings)
+        assert len(bindings) == 1
+        assert bindings[0]["toggle_sri"] == f"{self.NS}:optTog"
+
+    def test_graphic_equals_toggle_resolves_to_self(self):
+        """E4 — ``graphic`` owned by the Toggle's own GameObject -> the toggle
+        hides/shows itself (well-defined)."""
+        owner_index = {"gc": "t"}  # graphic component owned by the toggle GO
+        bindings: list = []
+        node = _toggle_node(toggle_fid="t", graphic_comp_fid="gc", m_is_on=0)
+        self._convert(node, owner_index=owner_index, bindings=bindings)
+        assert bindings[0]["graphic_sri"] == f"{self.NS}:t"
+        assert bindings[0]["toggle_sri"] == f"{self.NS}:t"
+
+    def test_convert_canvas_threads_accumulator(self):
+        """Pipeline path: ``convert_canvas`` threads the by-ref accumulator so
+        a Toggle under a Canvas appends its row (no transport attribute)."""
+        from converter.ui_translator import convert_canvas
+
+        toggle = _toggle_node(
+            toggle_fid="264237063", graphic_comp_fid="250410366", m_is_on=0,
+        )
+        canvas = SceneNode(
+            name="Canvas", file_id="canvasFid", active=True, layer=0,
+            tag="Untagged",
+            components=[ComponentData("Canvas", "canvasComp", {})],
+            children=[toggle], parent_file_id=None,
+        )
+        owner_index = {"250410366": "250410364"}
+        bindings: list = []
+        convert_canvas(
+            [canvas], scene_namespace=self.NS,
+            component_owner_index=owner_index, toggle_bindings=bindings,
+        )
+        assert len(bindings) == 1
+        assert bindings[0]["toggle_sri"] == f"{self.NS}:264237063"
+        assert bindings[0]["graphic_sri"] == f"{self.NS}:250410364"
+
+
+class TestToggleIsOnAttrConvention:
+    """A4 — pin ``_TOGGLE_ISON_ATTR`` to the converter's Toggle-``isOn``
+    LOWERING CONVENTION, checked against EVERY converted-writer shape in the
+    contract corpus (not just one fixture line).
+
+    The transpiler lowers ``GetComponent<Toggle>().isOn = ...`` to
+    ``<inst>:SetAttribute("<name>", ...)`` and stamps a
+    ``GetComponent<Toggle>().isOn`` comment above it. This test asserts every
+    such corpus write uses an attribute name equal to ``_TOGGLE_ISON_ATTR`` --
+    so a convention/casing drift fails RED at converter-build time (the
+    residual is an AI-output fingerprint, surfaced + guarded here, see §2.5).
+    """
+
+    def test_constant_value(self):
+        from converter.ui_translator import _TOGGLE_ISON_ATTR
+        assert _TOGGLE_ISON_ATTR == "isOn"
+
+    def test_constant_matches_corpus_toggle_writer_convention(self):
+        import json
+        import re
+        from pathlib import Path
+
+        from converter.ui_translator import _TOGGLE_ISON_ATTR
+
+        corpus_root = (
+            Path(__file__).parent / "fixtures" / "contract_corpus"
+        )
+        # The lowering marker the transpiler emits above each Toggle-isOn write.
+        marker_re = re.compile(r"GetComponent<Toggle>\(\)\.(\w+)")
+        setattr_re = re.compile(
+            r"SetAttribute\(\s*[\"']([^\"']+)[\"']"
+        )
+
+        checked = 0
+        for fixture in corpus_root.glob("*/fixture.json"):
+            data = json.loads(fixture.read_text(encoding="utf-8"))
+            for script in data.get("scripts", []):
+                src = script.get("source", "")
+                if not isinstance(src, str):
+                    continue
+                for line in src.splitlines():
+                    m = marker_re.search(line)
+                    if not m:
+                        continue
+                    # The lowered attr name the convention produced for this
+                    # Toggle-isOn write. The comment names the Unity member
+                    # (``isOn``); the binding's constant must equal it AND the
+                    # actual SetAttribute literal in this writer.
+                    assert m.group(1) == _TOGGLE_ISON_ATTR, (
+                        f"{script.get('name')}: Toggle member {m.group(1)!r} "
+                        f"!= constant {_TOGGLE_ISON_ATTR!r}"
+                    )
+                    checked += 1
+                # Every SetAttribute("isOn", ...) literal in a Toggle writer
+                # must equal the constant.
+                if "GetComponent<Toggle>" in src:
+                    for name in setattr_re.findall(src):
+                        if name == _TOGGLE_ISON_ATTR:
+                            checked += 1
+        # The corpus must contain at least one Toggle-isOn writer to anchor on.
+        assert checked >= 1, "no Toggle-isOn writer found in contract corpus"
