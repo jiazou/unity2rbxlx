@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 
 import yaml
 
-from unity.prefab_ref import prefab_id_for_ref, GuidIndexLike
+from unity.prefab_ref import prefab_id_for_ref, prefab_id_for_guid, GuidIndexLike
 
 if TYPE_CHECKING:
     from unity.guid_resolver import GuidIndex
@@ -67,6 +67,28 @@ def _lua_escape_string(s: str) -> str:
     return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
 
+# A Unity AssetReference ALWAYS pairs m_AssetGUID with m_CachedAsset (both
+# required); only the sub-asset field m_SubObjectName is optional.
+_ASSETREF_REQUIRED = {"m_AssetGUID", "m_CachedAsset"}
+_ASSETREF_KEYS = {"m_AssetGUID", "m_CachedAsset", "m_SubObjectName"}
+
+
+def _is_asset_reference(d: dict[object, object]) -> bool:
+    """True iff *d* is a Unity AssetReference struct.
+
+    Requires BOTH m_AssetGUID AND m_CachedAsset to be present, and every key to
+    be a known AssetReference field (only m_SubObjectName is optional).
+    Requiring m_CachedAsset refuses to swallow an unrelated one-field struct that
+    merely *carries* an m_AssetGUID (e.g. a bare ``{m_AssetGUID}`` or
+    ``{m_AssetGUID, weight}``); such a struct falls through to the generic-dict
+    branch UNRESOLVED (fail-soft, identical to today's behavior — nothing is
+    erased to a string/nil). A struct carrying an extra non-AssetReference field
+    likewise fails the subset upper bound and falls through with its data intact.
+    """
+    keys = set(d.keys())
+    return _ASSETREF_REQUIRED <= keys <= _ASSETREF_KEYS
+
+
 def _value_to_lua(
     value: object,
     indent: int = 1,
@@ -95,6 +117,29 @@ def _value_to_lua(
     if isinstance(value, dict):
         if not value:
             return "{}"
+        # Unity AssetReference (Addressables): {m_AssetGUID, m_CachedAsset[,
+        # m_SubObjectName]} collapses to ONE prefab-id string in place of the
+        # whole struct. Checked BEFORE the {fileID,guid,type} object-ref arm
+        # (the two predicates are disjoint). Resolve on the bare-guid
+        # m_AssetGUID first; fall back to the embedded {fileID,guid,type}
+        # m_CachedAsset. Both go through the UNCHANGED shared .prefab filter.
+        if _is_asset_reference(value):
+            pid = None
+            if guid_index is not None:
+                guid = value.get("m_AssetGUID")
+                if isinstance(guid, str):
+                    pid = prefab_id_for_guid(guid, guid_index)
+                if pid is None:
+                    cached = value.get("m_CachedAsset")
+                    if isinstance(cached, dict):
+                        pid = prefab_id_for_ref(cached, guid_index)
+            if pid is not None:
+                if counts is not None:
+                    counts.resolved += 1
+                return f'"{_lua_escape_string(pid)}"'
+            if counts is not None:
+                counts.skipped += 1
+            return "nil --[[(Unity AssetReference)]]"
         # Check if it looks like a Unity object reference (fileID/guid)
         if set(value.keys()) <= {"fileID", "guid", "type"}:
             pid = prefab_id_for_ref(value, guid_index) if guid_index is not None else None
