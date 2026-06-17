@@ -8,12 +8,13 @@ scene conversion, and output generation in a deterministic, resumable sequence.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING
-from typing import Any, cast
+from typing import Any, NamedTuple, TypedDict, cast
 
 if TYPE_CHECKING:
     from unity.addressables_resolver import PrefabAddressables
@@ -45,6 +46,240 @@ from converter.sprite_extractor import SpriteExtractionResult
 from unity.yaml_parser import ref_guid
 
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Unit-3 theme registration — ownership derivation + drain-bind detector
+# ---------------------------------------------------------------------------
+#
+# Generic, no game-specific literals. The owned addressable LABEL + the store
+# KEY field are derived from the database's C# load method (the deterministic
+# upstream); the WRITE SURFACE the boot shim appends to is derived from the
+# transpiled database module body and BOUND to the list its (C#-derived,
+# consumer-called) ``LoadDatabase`` drains. design-phase2 §1.3/§1.4, D13/D16.
+
+
+class AddressableDbSeed(TypedDict):
+    """One per-DB seed record the entrypoint shim replays at boot.
+
+    A DB whose build-time drain-bind FAILED contributes NO record — the
+    converter abstains + warns, so every record emitted is a proven surface.
+    """
+    db_module_path: str
+    load_method_name: str
+    drain_field: str
+    appender_name: str | None
+    key_field: str | None
+    so_module_paths: list[str]
+
+
+class _CsLoadOwnership(NamedTuple):
+    """The ownership facts derived from a DB's C# ``LoadAssetsAsync<T>`` call."""
+    label: str
+    key_field: str | None
+    load_method_name: str
+
+
+# ``Addressables.LoadAssetsAsync<T>("label", op => ... callback ...)``. The
+# label is the first string literal arg; the type ``<T>`` is the owned SO type.
+_CS_LOAD_ASSETS_ASYNC = re.compile(
+    r"LoadAssetsAsync\s*<\s*(?P<sotype>[\w.]+)\s*>\s*\(\s*"
+    r"(?P<q>[\"'])(?P<label>(?:(?!(?P=q)).)*)(?P=q)",
+    re.DOTALL,
+)
+# The store-key field: ``<dict>.Add(op.<field>, op)`` (or ``Add(x.<field>, x)``)
+# in the load callback. The key expression is ``<ident>.<field>``.
+_CS_DICT_ADD_KEY = re.compile(
+    r"\.\s*Add\s*\(\s*[A-Za-z_]\w*\s*\.\s*(?P<field>[A-Za-z_]\w*)\s*,",
+)
+
+
+# A C# method header: ``<modifiers> <ret> <Name>(`` — used to name the load
+# method (the method enclosing the ``LoadAssetsAsync`` call) so the transpiled
+# counterpart's drain body can be isolated by the SAME name.
+_CS_METHOD_HEADER = re.compile(
+    r"(?:public|private|protected|internal|static|virtual|override|async|\s)+"
+    r"[\w<>,.\[\]]+\s+(?P<name>[A-Za-z_]\w*)\s*\([^;{]*\)\s*\{",
+)
+
+
+def _enclosing_method_name(cs_source: str, pos: int) -> str | None:
+    """Name of the C# method whose header most-recently precedes ``pos`` (the
+    method enclosing the ``LoadAssetsAsync`` call)."""
+    name: str | None = None
+    for hm in _CS_METHOD_HEADER.finditer(cs_source):
+        if hm.start() > pos:
+            break
+        name = hm.group("name")
+    return name
+
+
+def _matched_paren_end(cs_source: str, open_paren_pos: int) -> int | None:
+    """Index just past the ``)`` that closes the ``(`` at ``open_paren_pos``,
+    skipping string/char literals so a paren inside a literal doesn't unbalance
+    the count. Returns ``None`` if unbalanced (truncated source)."""
+    if open_paren_pos >= len(cs_source) or cs_source[open_paren_pos] != "(":
+        return None
+    depth = 0
+    i = open_paren_pos
+    n = len(cs_source)
+    while i < n:
+        c = cs_source[i]
+        if c in ("\"", "'"):
+            quote = c
+            i += 1
+            while i < n:
+                if cs_source[i] == "\\":
+                    i += 2
+                    continue
+                if cs_source[i] == quote:
+                    break
+                i += 1
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return None
+
+
+def _derive_cs_load_ownership(cs_source: str) -> _CsLoadOwnership | None:
+    """Parse a DB's C# source for its ``LoadAssetsAsync<T>(LABEL, …Add(op.F,op))``
+    load call. Returns the owned ``label``, the store ``key_field`` (the field
+    the load callback indexes the store by), and the enclosing ``load_method``
+    name — or ``None`` when no such call is present (a non-SO-loading module:
+    generic no-op, edge 6).
+
+    No game literal: the label + key field + method name are READ from the
+    source, never hardcoded. The ``<T>`` type arg is part of the matched call so
+    the derivation is bound to the right ``LoadAssetsAsync`` (not a later bare
+    call), and the key field is searched ONLY within that call's argument list
+    (the callback span) — never the rest of the file, so an unrelated
+    ``.Add(op.otherKey, op)`` elsewhere in the method cannot mis-derive it
+    (codex P1).
+    """
+    m = _CS_LOAD_ASSETS_ASYNC.search(cs_source)
+    if m is None:
+        return None
+    label = m.group("label")
+    if not label:
+        return None
+    load_method = _enclosing_method_name(cs_source, m.start())
+    if not load_method:
+        return None
+    # Scope the ``.Add(op.field, op)`` search to the ``LoadAssetsAsync<T>( … )``
+    # argument list (the callback span), bounded by the matching close paren of
+    # the call's own ``(`` — NOT the rest of the file. The call's open paren is
+    # the ``(`` that opens the arg list; locate it from the matched ``<T>(``.
+    open_paren = cs_source.find("(", m.start())
+    call_end = _matched_paren_end(cs_source, open_paren) if open_paren != -1 else None
+    # The label literal ends inside the arg list; search the span AFTER it up to
+    # the call's close paren. Key field is optional — a DB may index by a
+    # non-``op.field`` expression; the seed still supplies instances and uses the
+    # key field only to abstain on a key-less SO.
+    key_field: str | None = None
+    if call_end is not None:
+        add = _CS_DICT_ADD_KEY.search(cs_source, m.end(), call_end)
+        if add is not None:
+            key_field = add.group("field")
+    return _CsLoadOwnership(label=label, key_field=key_field, load_method_name=load_method)
+
+
+def _derive_drain_field(db_luau_source: str, load_method_name: str) -> str | None:
+    """From the transpiled DB module body, derive the field the C#-derived load
+    method drains — ``for _, op in ipairs(<MODULE>.<DRAIN_FIELD>)`` inside the
+    ``LoadDatabase`` (``load_method_name``) function. ``LoadDatabase``'s NAME is
+    deterministic (C#-derived), so anchoring on it is stable across
+    re-transpiles even though the appender's name is not.
+
+    Returns the single ``DRAIN_FIELD`` the load method iterates. Returns ``None``
+    (→ FAIL-LOUD abstain, edge 7) when EITHER no recognizable drain is found OR
+    the load method iterates MULTIPLE DISTINCT candidate fields (ambiguous —
+    an earlier unrelated ``ipairs`` loop would otherwise silently mis-select the
+    first; abstain loud > mis-bind, codex P1).
+    """
+    # Isolate the ``function <Module>.<load_method>(...) ... end`` body. The
+    # transpiled module functions are top-level ``function X.name(`` defs; the
+    # body runs to the next top-level ``function `` or ``return`` at column 0.
+    fn_re = re.compile(
+        r"function\s+[\w.]+\.%s\s*\(" % re.escape(load_method_name)
+    )
+    fm = fn_re.search(db_luau_source)
+    if fm is None:
+        return None
+    body = db_luau_source[fm.end():]
+    # Bound the body at the next top-level ``function `` def (column 0) so a
+    # later function's ipairs can't be mis-attributed.
+    nxt = re.search(r"\n(?:function\s|return\b)", body)
+    if nxt is not None:
+        body = body[: nxt.start()]
+    fields = {
+        d.group("field")
+        for d in re.finditer(
+            r"\bin\s+ipairs\s*\(\s*(?:[\w.]*\.)?(?P<field>[A-Za-z_]\w*)\s*\)", body,
+        )
+    }
+    if len(fields) != 1:
+        # 0 → no drain (edge 7); >1 → ambiguous (which list does the store build
+        # from?) → abstain rather than guess the first.
+        return None
+    return next(iter(fields))
+
+
+# Sentinel: multiple distinct public appenders bind to the drain field, so no
+# single ingress can be chosen unambiguously → the caller abstains loud.
+_AMBIGUOUS_APPENDER = "\x00<ambiguous-appender>"
+
+
+def _derive_appender_name(db_luau_source: str, drain_field: str) -> str | None:
+    """Find THE PUBLIC appender fn on the DB module whose ``table.insert`` targets
+    ``drain_field`` — the BIND that proves the surface feeds the same list
+    ``LoadDatabase`` drains (D16). Returns the appender fn name, or ``None`` when
+    no public appender binds to ``drain_field`` (the shim then seeds the drain
+    field table directly, since that field IS what ``LoadDatabase`` drains).
+
+    A name match alone is NEVER sufficient: a candidate is kept ONLY when its
+    ``table.insert`` target field == ``drain_field`` (rejects edge 8's
+    mismatched appender that feeds a different list).
+
+    Returns ``_AMBIGUOUS_APPENDER`` when MULTIPLE distinct public fns bind to
+    ``drain_field`` — picking the first could select a ``SeedDefaults()``-style
+    helper over the real consumer ingress; the caller then abstains loud rather
+    than seeding through an arbitrarily-chosen surface (abstain > mis-bind, codex
+    P1). Returns ``None`` when ZERO public fns bind (the shim then seeds the drain
+    table directly, since the drain field IS the proven surface).
+    """
+    # Each ``function <Module>.<name>(arg) ... table.insert(<Module>.<field>, …)``.
+    binders: set[str] = set()
+    for fm in re.finditer(r"function\s+[\w.]+\.(?P<name>[A-Za-z_]\w*)\s*\(", db_luau_source):
+        name = fm.group("name")
+        body = db_luau_source[fm.end():]
+        nxt = re.search(r"\n(?:function\s|return\b)", body)
+        if nxt is not None:
+            body = body[: nxt.start()]
+        for ins in re.finditer(
+            r"table\.insert\s*\(\s*(?:[\w.]*\.)?(?P<field>[A-Za-z_]\w*)\s*,", body,
+        ):
+            if ins.group("field") == drain_field:
+                binders.add(name)
+                break
+    if not binders:
+        return None
+    if len(binders) > 1:
+        return _AMBIGUOUS_APPENDER
+    return next(iter(binders))
+
+
+def _drain_field_is_writable_table(db_luau_source: str, drain_field: str) -> bool:
+    """True when the module declares ``<Module>.<drain_field> = {}`` (a writable
+    table the shim can ``table.insert`` into directly when no public appender
+    binds)."""
+    return re.search(
+        r"[\w.]+\.%s\s*=\s*\{\s*\}" % re.escape(drain_field), db_luau_source,
+    ) is not None
+
 
 # Ordered list of pipeline phases.
 PHASES: list[str] = [
@@ -6818,6 +7053,12 @@ script.Disabled = true
         # ModuleScript reflects the final shape.
         self._build_scriptable_object_module_map(scene_runtime)
         self._rewrite_scene_runtime_asset_refs(scene_runtime)
+        # Unit-3: RECOMPUTE the addressable-db theme seed onto the in-memory
+        # scene_runtime in THIS window — after the SO map exists, before the
+        # plan module is filtered + emitted — so the (allowlisted) seed key is
+        # on the dict when generate_scene_runtime_plan_module runs. NOT persisted
+        # through conversion_plan.json; recomputed every write_output (D17).
+        self._build_theme_seed_plan(scene_runtime)
 
         _replace_or_add(generate_scene_runtime_plan_module(
             cast("dict", scene_runtime),
@@ -6924,6 +7165,204 @@ script.Disabled = true
                 "[write_output] scene-runtime generic: emitted %d "
                 "scriptable_object refs in plan map", len(so_map),
             )
+
+    def _find_cs_source_for_module(self, module_name: str) -> str | None:
+        """Re-read a transpiled module's originating C# source off disk by class
+        name (``<module_name>.cs`` under the Unity project). The ``.cs`` files
+        persist, so this is resume-safe and does NOT depend on transient
+        ``transpilation_result`` (D17). Returns the source text or ``None``.
+        """
+        root = getattr(self, "unity_project_path", None)
+        if root is None:
+            return None
+        for cs in Path(root).rglob(f"{module_name}.cs"):
+            try:
+                return cs.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+        return None
+
+    def _build_theme_seed_plan(self, scene_runtime: dict[str, object]) -> None:
+        """RECOMPUTE ``scene_runtime["addressable_db_seeds"]`` — the per-DB seed
+        records the entrypoint shim replays at boot to populate an SO-loaded
+        database's write surface before its consumer-called ``LoadDatabase``
+        drains it (design-phase2 §2.2, D17).
+
+        Generic: the owned LABEL + store KEY field are derived from the
+        database's C# load method (``LoadAssetsAsync<T>(LABEL, …Add(op.F,op))``);
+        the WRITE SURFACE is derived from the transpiled DB module body and BOUND
+        to the list ``LoadDatabase`` drains (D16). On a drain-bind miss the DB
+        contributes NO record + a converter WARNING (loud abstain > silent dead).
+
+        RECOMPUTED every ``write_output`` — NOT persisted through
+        ``conversion_plan.json``. All inputs are rehydrated by ESSENTIAL phases
+        on a no-retranspile resume (the addressables groups + ``.cs`` re-read off
+        disk; the transpiled DB body from ``rbx_place.scripts[*].source`` which
+        ``materialize_and_classify`` rehydrates), so the seed is NOT
+        transpile-gated.
+        """
+        # Recompute is AUTHORITATIVE each run: clear any seed left on the dict by
+        # a prior run BEFORE any early-return/abstain, so every abstain path
+        # results in NO seed (loud, not a STALE record onto a now-wrong/dead
+        # registry). Without this, an abstain on a re-run keeps a stale seed and
+        # defeats the D16 fail-loud guarantee (codex P1).
+        scene_runtime.pop("addressable_db_seeds", None)
+        project_root = getattr(self, "unity_project_path", None)
+        if project_root is None:
+            return
+        so_map_obj = scene_runtime.get("scriptable_objects")
+        if not isinstance(so_map_obj, dict) or not so_map_obj:
+            return
+        so_map: dict[str, str] = {
+            g: p for g, p in so_map_obj.items()
+            if isinstance(g, str) and isinstance(p, str)
+        }
+        if not so_map:
+            return
+        guid_index = getattr(self.state, "guid_index", None)
+        if guid_index is None:
+            return
+
+        # The SO-addressables surface: label/address -> emitted-SO guids. Re-parse
+        # the raw Addressables groups (the persisted ``scene_runtime.addressables``
+        # block is PREFAB-narrowed and has already dropped the .asset SO guids), so
+        # the SO label entries are present. Resume-safe (off-disk parse).
+        from unity.addressables_resolver import (
+            parse_addressables,
+            resolve_scriptable_object_addressables,
+        )
+        index = parse_addressables(project_root)
+        so_addr = resolve_scriptable_object_addressables(
+            index, guid_index, set(so_map.keys()),
+        )
+        if not so_addr.by_label and not so_addr.by_address:
+            return
+
+        scripts = list(getattr(self.state.rbx_place, "scripts", []) or [])
+        source_by_name: dict[str, str] = {}
+        for script in scripts:
+            name = getattr(script, "name", None)
+            src = getattr(script, "source", None)
+            if isinstance(name, str) and isinstance(src, str):
+                source_by_name.setdefault(name, src)
+
+        seeds: list[AddressableDbSeed] = []
+        # Dedupe by DB IDENTITY (the seed's own module path), NOT by the load
+        # key: two DISTINCT database modules may legitimately share an
+        # Addressables key (both ``LoadAssetsAsync<T>("themeData")``) and each
+        # needs its own seed — keying off the label would silently drop the
+        # second DB onto an empty registry. Each ``db_name`` is already unique in
+        # the loop, so this only guards an impossible same-module double-seed.
+        seeded_db_paths: set[str] = set()
+        # The owning DB is the transpiled module whose originating C# issues a
+        # ``LoadAssetsAsync<T>(key, …)`` whose KEY has emitted SO guids. Unity's
+        # ``LoadAssetsAsync<T>(key)`` accepts a LABEL *or* an ADDRESS, so resolve
+        # the captured load key against BOTH indexes (union, deduped) — a
+        # database loaded by address would resolve to nothing in by_label alone.
+        for db_name, db_luau in sorted(source_by_name.items()):
+            cs_source = self._find_cs_source_for_module(db_name)
+            if cs_source is None:
+                continue
+            ownership = _derive_cs_load_ownership(cs_source)
+            if ownership is None:
+                continue
+            owned_guids: list[str] = []
+            _seen_owned: set[str] = set()
+            for guid in (
+                list(so_addr.by_label.get(ownership.label) or [])
+                + list(so_addr.by_address.get(ownership.label) or [])
+            ):
+                if guid not in _seen_owned:
+                    _seen_owned.add(guid)
+                    owned_guids.append(guid)
+            if not owned_guids:
+                # A derived DB-shaped module (LoadAssetsAsync<T> ownership +,
+                # below, a drain surface) that resolves to NO SO guids in either
+                # index is a likely-dead registry — fail loud, consistent with
+                # the drain-bind abstain warnings, rather than silently skip.
+                if _derive_drain_field(db_luau, ownership.load_method_name) is not None:
+                    log.warning(
+                        "[seed] %s load key %r resolves to no emitted SO guids "
+                        "(by_label or by_address) on %s; skipping — registry "
+                        "would be empty",
+                        ownership.load_method_name, ownership.label, db_name,
+                    )
+                continue
+
+            # The DB's own plan module path (so the runtime can require it). The
+            # DB is a runtime-bearing module; resolve its container the same way
+            # the SO map does — via its parent_path in rbx_place.scripts.
+            db_module_path = self._module_plan_path(db_name)
+            if db_module_path is None:
+                continue
+            if db_module_path in seeded_db_paths:
+                continue  # guard: never double-seed the SAME store
+
+            # Drain-bind detector (P1 — design-phase2 §1.4):
+            drain_field = _derive_drain_field(db_luau, ownership.load_method_name)
+            if drain_field is None:
+                log.warning(
+                    "[seed] could not bind write surface to %s drain on %s; "
+                    "abstaining — registry will be empty",
+                    ownership.load_method_name, db_name,
+                )
+                continue
+            appender = _derive_appender_name(db_luau, drain_field)
+            if appender is _AMBIGUOUS_APPENDER:
+                # Multiple distinct public appenders feed the drained field — no
+                # single ingress can be chosen without guessing. Abstain loud
+                # rather than seed through an arbitrary surface (D16).
+                log.warning(
+                    "[seed] multiple appenders bind to the %s drain on %s; "
+                    "abstaining — registry will be empty",
+                    ownership.load_method_name, db_name,
+                )
+                continue
+            if appender is None and not _drain_field_is_writable_table(db_luau, drain_field):
+                log.warning(
+                    "[seed] could not bind write surface to %s drain on %s; "
+                    "abstaining — registry will be empty",
+                    ownership.load_method_name, db_name,
+                )
+                continue
+
+            so_module_paths: list[str] = []
+            seen_paths: set[str] = set()
+            for guid in owned_guids:
+                path = so_map.get(guid)
+                if path and path not in seen_paths:
+                    seen_paths.add(path)
+                    so_module_paths.append(path)
+            if not so_module_paths:
+                continue
+
+            seeds.append(AddressableDbSeed(
+                db_module_path=db_module_path,
+                load_method_name=ownership.load_method_name,
+                drain_field=drain_field,
+                appender_name=appender,
+                key_field=ownership.key_field,
+                so_module_paths=so_module_paths,
+            ))
+            seeded_db_paths.add(db_module_path)
+
+        if seeds:
+            scene_runtime["addressable_db_seeds"] = seeds
+            log.info(
+                "[write_output] scene-runtime generic: built %d addressable "
+                "db seed(s) (%d SO module(s) total)",
+                len(seeds), sum(len(s["so_module_paths"]) for s in seeds),
+            )
+
+    def _module_plan_path(self, module_name: str) -> str | None:
+        """The dotted DataModel path of a runtime-bearing module by name —
+        ``<parent_path>.<name>`` from ``rbx_place.scripts`` (the same shape the
+        SO map / scene-runtime plan use). Returns ``None`` if not present."""
+        for script in getattr(self.state.rbx_place, "scripts", []) or []:
+            if getattr(script, "name", None) == module_name:
+                container = getattr(script, "parent_path", None) or "ReplicatedStorage"
+                return f"{container}.{module_name}"
+        return None
 
     def _rewrite_scene_runtime_asset_refs(
         self, scene_runtime: dict[str, object],
