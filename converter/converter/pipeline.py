@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 from typing import Any, NamedTuple, TypedDict, cast
 
 if TYPE_CHECKING:
+    from converter.contract_verifier import StaticEventDecl
     from unity.addressables_resolver import PrefabAddressables
     from converter.scene_runtime_topology.build_topology import (
         TopologyArtifact,
@@ -326,6 +327,80 @@ def _carry_unconverted(
     if carrier is None:
         return
     carrier.extend(entries)
+
+
+def _character_name_from_field(
+    pid: str,
+    sub: dict[str, object],
+    modules_dict: dict[str, object],
+) -> str | None:
+    """Rung 1 of the D5 characterName chain: select by FIELD-PRESENCE.
+
+    Returns the str value of the selected instance's ``config["characterName"]``,
+    or ``None`` when no instance carries the key (caller falls through to the
+    address/stem rungs) or the selected value is non-str (skip-with-warning,
+    then fall through — never coerced, never Any). Pure.
+
+    Selection: among the prefab's instances, the one whose ``config`` CONTAINS
+    the key ``characterName`` (the consumer's ``GetAttribute("characterName")``
+    contract key, NOT a class literal). Ties are broken ONLY via
+    ``modules[script_id]["class_name"]``; on remaining ties the first-in-
+    lifecycle instance is chosen and a warning logged.
+    """
+    instances = sub.get("instances")
+    if not isinstance(instances, list):
+        return None
+
+    # Field-presence candidates, in lifecycle/visit order.
+    candidates: list[dict[str, object]] = []
+    for inst in instances:
+        if not isinstance(inst, dict):
+            continue
+        config = inst.get("config")
+        if isinstance(config, dict) and "characterName" in config:
+            candidates.append(inst)
+
+    if not candidates:
+        return None
+
+    chosen = candidates[0]
+    if len(candidates) > 1:
+        # Tiebreak ONLY via the module class_name. A best-effort,
+        # never-primary signal (class_name may be "").
+        def _class_name(inst: dict[str, object]) -> str:
+            sid = inst.get("script_id")
+            if not isinstance(sid, str):
+                return ""
+            mod = modules_dict.get(sid)
+            if isinstance(mod, dict):
+                cn = mod.get("class_name")
+                if isinstance(cn, str):
+                    return cn
+            return ""
+
+        named = [c for c in candidates if _class_name(c)]
+        if len(named) == 1:
+            chosen = named[0]
+        else:
+            # Remaining tie: deterministic first-in-lifecycle + warn.
+            log.warning(
+                "[roster] prefab_id %s: %d instances carry "
+                "'characterName' and the class_name tiebreak did not "
+                "resolve to one — picking first-in-lifecycle (%r)",
+                pid, len(candidates), candidates[0].get("instance_id"),
+            )
+            chosen = candidates[0]
+
+    config = chosen.get("config")
+    value = config.get("characterName") if isinstance(config, dict) else None
+    if isinstance(value, str):
+        return value
+    log.warning(
+        "[roster] prefab_id %s: non-str characterName %r — falling back to "
+        "address/stem",
+        pid, value,
+    )
+    return None
 
 
 def _scene_needs_collision_recook(parts: list) -> bool:
@@ -3293,6 +3368,10 @@ return table.concat(allData, "\\n")'''
                     # Generic-mode rig-retarget binding carrier (or None) for the
                     # contract verifier's binding-present fail-closed check.
                     rig_binding=ts.rig_binding,
+                    # Generic-mode roster-consumer binding carrier (or None) for
+                    # the dead-module exemption (a re-lowered roster consumer is
+                    # live by construction; its canonical body is inert).
+                    roster_binding=ts.roster_binding,
                 ))
 
         # Write animation scripts to output directory AND add to RbxPlace.
@@ -3464,6 +3543,14 @@ return table.concat(allData, "\\n")'''
             for s in self.state.rbx_place.scripts:
                 if s.name not in persisted_set:
                     continue
+                if getattr(s, "roster_binding", None):
+                    # Unit-4 Phase 2 (NEW-FINDING-B): a rehydrated roster consumer
+                    # carrying the re-lowering carrier is live by construction even
+                    # though its canonical body is output-inert -- never re-add it
+                    # to the dead set on resume (it would otherwise be re-flagged
+                    # and rerouted to an inert stub, clobbering the re-lowering).
+                    dropped.append(s.name)
+                    continue
                 if is_output_inert(s.source) and not has_genuine_roblox_effect(
                     s.source
                 ):
@@ -3514,6 +3601,15 @@ return table.concat(allData, "\\n")'''
             if csharp is None:
                 # No C# source for this module (injected runtime helper,
                 # autogen, etc.) -- never a Roblox-dead Unity module.
+                continue
+            if getattr(s, "roster_binding", None):
+                # Unit-4 Phase 2 (NEW-FINDING-B): a roster consumer that was
+                # deterministically re-lowered to read the by_label tagged surface
+                # is LIVE BY CONSTRUCTION, even though its canonical body is
+                # output-inert (no dotted prop write to veto). Exempt it from the
+                # dead set BEFORE the strategy gate so the storage classifier does
+                # not reroute it to an inert stub and clobber the re-lowering. Pure
+                # exemption -- does not touch ``strategy`` (D-P2-8).
                 continue
             if strategy_by_name.get(s.name) not in _DECISIVE_STRATEGIES:
                 # Non-deterministic fallback body -- inertness is unreliable.
@@ -4798,6 +4894,7 @@ script.Disabled = true
         plan_lookup = self._load_storage_plan_for_rehydration()
         child_ref_lookup = self._load_child_ref_resolution_for_rehydration()
         rig_binding_lookup = self._load_rig_binding_for_rehydration()
+        roster_binding_lookup = self._load_roster_binding_for_rehydration()
         luau_files = sorted(scripts_dir.rglob("*.luau"))
         from_plan = 0
         rehydrated = 0
@@ -4864,6 +4961,12 @@ script.Disabled = true
             rb = rig_binding_lookup.get(name)
             if rb is not None:
                 script.rig_binding = rb
+            # Restore the roster-consumer carrier so the dead-module exemption
+            # survives a preserve/resume assemble (else the inert canonical body
+            # is re-classified dead and rerouted to an inert stub).
+            rob = roster_binding_lookup.get(name)
+            if rob is not None:
+                script.roster_binding = rob
             self.state.rbx_place.scripts.append(script)
             rehydrated += 1
 
@@ -5032,6 +5135,47 @@ script.Disabled = true
             out[name] = row
         return out
 
+    def _load_roster_binding_for_rehydration(
+        self,
+    ) -> dict[str, dict[str, object]]:
+        """Load the persisted per-script roster-consumer binding carrier from
+        ``conversion_plan.json`` into ``name -> {label, receiver, lowered}``.
+
+        Mirrors the ``rig_binding`` rehydration. Returns ``{}`` on a
+        missing/malformed plan or a plan that pre-dates the field; a malformed row
+        is dropped (absent -> the dead-module exemption does not fire, the safe
+        pre-field default). All THREE keys must be well-formed (str label, str
+        receiver, ``lowered is True``) or the row is dropped -- a partial carrier
+        would exempt a module blind from the dead set."""
+        plan_path = self.output_dir / "conversion_plan.json"
+        if not plan_path.exists():
+            return {}
+        import json as _json
+        try:
+            raw = _json.loads(plan_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            log.debug("[rehydrate] conversion_plan.json unreadable: %s", exc)
+            return {}
+        block = raw.get("roster_binding")
+        if not isinstance(block, dict):
+            return {}
+        out: dict[str, dict[str, object]] = {}
+        for name, rb in block.items():
+            if not isinstance(name, str) or not isinstance(rb, dict):
+                continue
+            label = rb.get("label")
+            receiver = rb.get("receiver")
+            lowered = rb.get("lowered")
+            if not (isinstance(label, str) and isinstance(receiver, str)
+                    and lowered is True):
+                continue
+            out[name] = {
+                "label": label,
+                "receiver": receiver,
+                "lowered": True,
+            }
+        return out
+
     def _classify_storage(self) -> None:
         """Phase 4a.5: run the storage classifier on populated scripts.
 
@@ -5126,6 +5270,16 @@ script.Disabled = true
             s.name: s.rig_binding
             for s in self.state.rbx_place.scripts
             if s.rig_binding is not None
+        }
+
+        # Persist each re-lowered roster consumer's carrier so a preserve/resume
+        # assemble that rehydrates from disk keeps the dead-module exemption
+        # (without it the inert canonical body is re-classified dead on resume).
+        # Keyed by script name; ``None`` carriers are dropped (no re-lowering).
+        roster_binding: dict[str, dict[str, object]] = {
+            s.name: s.roster_binding
+            for s in self.state.rbx_place.scripts
+            if s.roster_binding is not None
         }
 
         # Animation routing (Phase 4.5): per-clip target + reason.
@@ -5293,6 +5447,7 @@ script.Disabled = true
                 "script_paths": script_paths,
                 "child_ref_resolution": child_ref_resolution,
                 "rig_binding": rig_binding,
+                "roster_binding": roster_binding,
                 "animation_routing": animation_routing,
                 "scene_runtime": scene_runtime,
             }, indent=2),
@@ -5303,6 +5458,63 @@ script.Disabled = true
             len(plan.decisions),
             plan_path.name,
         )
+
+    def _static_events_by_module_id(
+        self, scene_runtime: dict[str, object],
+    ) -> "dict[str, StaticEventDecl]":
+        """Map each runtime-bearing PRODUCER MODULE — keyed by its FULL UNIQUE
+        ``module_id`` (the ``modules`` dict key) — to a ``StaticEventDecl`` (its
+        emitted name, the C# ``static event`` members it declares, and the
+        producer's resolved domain).
+
+        Deterministic upstream signal for the rendezvous verifier: enumerate the
+        C# ``static event`` declarations off the ``.cs`` source via the GUID. Keying
+        by ``module_id`` (NOT the emitted-name tail) keeps two modules that lower to
+        the SAME emitted name (e.g. two ``Player`` classes on different VMs)
+        SEPARATE and verified INDEPENDENTLY, so a canonical one cannot mask a
+        different broken one. ``decl.name`` carries the emitted name the verifier
+        scans the Luau for (``<name>.<field>``). NEVER reads the AI output to decide
+        WHICH channels should exist.
+        """
+        from converter.contract_verifier import StaticEventDecl
+        from unity.script_analyzer import analyze_script
+
+        modules_obj = scene_runtime.get("modules")
+        if not isinstance(modules_obj, dict):
+            return {}
+        guid_index = getattr(self.state, "guid_index", None)
+        if guid_index is None:
+            return {}
+        result: dict[str, StaticEventDecl] = {}
+        for script_id, module in modules_obj.items():
+            if not isinstance(module, dict):
+                continue
+            # Apply the SAME same-domain gate as ``build_static_event_channels``
+            # so the verifier only demands a rendezvous for channels the runtime
+            # actually pre-sets. A helper/excluded/cross-domain/unstamped or
+            # non-runtime-bearing module gets NO channel, so flagging its static
+            # events would be spurious noise.
+            domain = module.get("domain")
+            if domain not in ("client", "server"):
+                continue
+            if not module.get("runtime_bearing"):
+                continue
+            module_path = module.get("module_path")
+            if not isinstance(module_path, str) or not module_path:
+                continue
+            cs_path = guid_index.resolve(script_id)
+            if cs_path is None or cs_path.suffix != ".cs":
+                continue
+            events = analyze_script(cs_path).static_events
+            if not events:
+                continue
+            name = module_path.rsplit(".", 1)[-1]
+            # Key by the UNIQUE ``module_id`` (``script_id``), not the emitted
+            # ``name`` tail (see the docstring), so same-name modules stay distinct.
+            result[script_id] = StaticEventDecl(
+                name=name, events=list(events), domain=str(domain),
+            )
+        return result
 
     def _run_contract_verifier(self, scene_runtime: dict[str, object]) -> None:
         """Run the shadow-mode contract verifier and store the current run's
@@ -5327,7 +5539,10 @@ script.Disabled = true
 
         topology = cast("TopologyArtifact", scene_runtime.get("topology", {}))
         scripts = list(self.state.rbx_place.scripts or [])
-        result = contract_verifier.verify_contract(topology, scripts)
+        static_events_by_module = self._static_events_by_module_id(scene_runtime)
+        result = contract_verifier.verify_contract(
+            topology, scripts, static_events_by_module,
+        )
 
         # REPLACE the rows (not append): ``ctx.scene_runtime`` persists + reloads
         # across a resume (conversion_context.json), so an append-only stash
@@ -6459,6 +6674,28 @@ script.Disabled = true
         # turret-fired bullets fall to the ground inert.
         self._attach_monobehaviour_scripts_to_templates()
 
+        # Addressables Unit 4 / Phase 1 — assemble the roster surface from
+        # ``addressables.by_label`` and extend the typed ``rosters`` channel.
+        # Both emit paths (rbxlx_writer + luau_place_builder) materialize a
+        # second, CollectionService-tagged, attributed instance per member under
+        # a dedicated ReplicatedStorage container. Trigger is structural (any
+        # label with >=1 emitted prefab) — no game-specific literal. Reuses
+        # ``resolved_template_names`` (prefab_id->template_name) and
+        # ``addr_block.by_label`` already in scope; no new resolver pass.
+        from converter.roster_assembly import assemble_rosters
+        by_label_raw = addr_block.get("by_label") or {}
+        if isinstance(by_label_raw, dict) and by_label_raw:
+            emitted_names = {
+                t.name for t in self.state.rbx_place.replicated_templates
+            }
+            rosters = assemble_rosters(
+                by_label=by_label_raw,
+                resolved_template_names=resolved_template_names,
+                emitted_template_names=emitted_names,
+                character_names=self._collect_character_names(scene_runtime),
+            )
+            self.state.rbx_place.rosters.extend(rosters)
+
         # Persist a small manifest under packages/ — closes the packages
         # half of Phase 4.11's disk-rewrite deferred item.
         try:
@@ -6471,6 +6708,77 @@ script.Disabled = true
             "ReplicatedStorage.Templates (%d in manifest)",
             len(result.templates), result.manifest.get("total_templates", 0),
         )
+
+    def _collect_character_names(
+        self, scene_runtime: dict[str, object]
+    ) -> dict[str, str]:
+        """Resolve prefab_id -> characterName for the roster surface (D5/P1).
+
+        Full fallback chain, per prefab (D5/§1.2/AC3):
+
+        1. FIELD-PRESENCE — the instance whose ``config`` CONTAINS the key
+           ``characterName`` (the consumer's ``GetAttribute("characterName")``
+           contract key, NOT a "Character" class literal). Ties (multiple
+           instances carrying ``characterName``) are broken ONLY via
+           ``modules[script_id]["class_name"]``; on remaining ties the
+           first-in-lifecycle instance is chosen and a warning logged.
+        2. ADDRESSABLE ADDRESS — when no instance carries a usable str
+           ``characterName``, fall back to the addressable address bound to that
+           prefab_id (the inverse of ``addressables.by_address``).
+        3. PREFAB/TEMPLATE STEM — when there is no address either, fall back to
+           the prefab's resolved Templates child name (``template_name``).
+
+        Every value read is narrowed with ``isinstance(v, str)`` — a non-str
+        candidate is skipped-with-warning (never coerced, never Any) and the
+        chain continues to the next rung. A prefab with no usable value at any
+        rung is omitted (the member is still tagged + clonable downstream).
+        """
+        out: dict[str, str] = {}
+        prefabs = scene_runtime.get("prefabs")
+        if not isinstance(prefabs, dict):
+            return out
+        modules = scene_runtime.get("modules")
+        modules_dict: dict[str, object] = modules if isinstance(modules, dict) else {}
+
+        # Rung 2 source: invert ``addressables.by_address`` (address -> [pid])
+        # into prefab_id -> address. First-seen address wins for a pid under
+        # multiple addresses (deterministic; by_address preserves insertion).
+        address_by_pid: dict[str, str] = {}
+        addr_block = scene_runtime.get("addressables")
+        if isinstance(addr_block, dict):
+            by_address = addr_block.get("by_address")
+            if isinstance(by_address, dict):
+                for address, ids in by_address.items():
+                    if not isinstance(address, str):
+                        continue
+                    if not isinstance(ids, (list, tuple)):
+                        continue
+                    for pid in ids:
+                        if isinstance(pid, str) and pid not in address_by_pid:
+                            address_by_pid[pid] = address
+
+        for pid, sub in prefabs.items():
+            if not isinstance(pid, str) or not isinstance(sub, dict):
+                continue
+
+            # --- Rung 1: field-presence on the prefab's instances ------------
+            name = _character_name_from_field(pid, sub, modules_dict)
+
+            # --- Rung 2: addressable address bound to this prefab_id ---------
+            if name is None:
+                addr = address_by_pid.get(pid)
+                if isinstance(addr, str) and addr:
+                    name = addr
+
+            # --- Rung 3: the prefab/template file stem -----------------------
+            if name is None:
+                stem = sub.get("template_name")
+                if isinstance(stem, str) and stem:
+                    name = stem
+
+            if name is not None:
+                out[pid] = name
+        return out
 
     def _attach_prefab_scoped_animation_scripts_to_templates(self) -> None:
         """Attach copies of prefab-scoped animation scripts under their
@@ -7051,6 +7359,7 @@ script.Disabled = true
         # happen in-place on ``scene_runtime`` so the embedded plan
         # ModuleScript reflects the final shape.
         self._build_scriptable_object_module_map(scene_runtime)
+        self._build_static_event_channels(scene_runtime)
         self._rewrite_scene_runtime_asset_refs(scene_runtime)
         # Unit-3: RECOMPUTE the addressable-db theme seed onto the in-memory
         # scene_runtime in THIS window — after the SO map exists, before the
@@ -7359,6 +7668,54 @@ script.Disabled = true
                 container = getattr(script, "parent_path", None) or "ReplicatedStorage"
                 return f"{container}.{module_name}"
         return None
+
+    def _build_static_event_channels(
+        self, scene_runtime: dict[str, object],
+    ) -> None:
+        """Build ``scene_runtime.static_channels`` — the C#-static-event channels
+        the host runtime pre-sets before any ``Awake`` batch so a producer +
+        consumer share the same BindableEvent field regardless of scene-vs-prefab
+        Awake order (the (d) ordering bug, design-phase1.md §2A).
+
+        Source of truth: the DETERMINISTIC C# ``static event`` enumeration
+        (``script_analyzer.analyze_script(...).static_events``) keyed by the same
+        canonical script id the module rows use (the ``.cs`` GUID). NEVER the
+        AI-emitted Luau. Module ``domain`` / ``container`` / ``module_path`` are
+        read off the now-final module rows (storage-classify already ran), so this
+        must run in write_output, not the planner phase.
+
+        Idempotent: rebuilds the list every run from the same deterministic inputs.
+        """
+        from unity.script_analyzer import analyze_script
+        from converter.scene_runtime_planner import build_static_event_channels
+
+        modules_obj = scene_runtime.get("modules")
+        if not isinstance(modules_obj, dict):
+            return
+        guid_index = getattr(self.state, "guid_index", None)
+        if guid_index is None:
+            return
+
+        # Enumerate C# static events for every module that resolves to a .cs path.
+        static_events_by_script_id: dict[str, list[str]] = {}
+        for script_id in modules_obj:
+            cs_path = guid_index.resolve(script_id)
+            if cs_path is None or cs_path.suffix != ".cs":
+                continue
+            events = analyze_script(cs_path).static_events
+            if events:
+                static_events_by_script_id[script_id] = events
+
+        channels = build_static_event_channels(
+            modules_obj, static_events_by_script_id,
+        )
+        scene_runtime["static_channels"] = channels
+        if channels:
+            log.info(
+                "[write_output] scene-runtime generic: emitted %d "
+                "static-event channel(s) across %d module(s)",
+                len(channels), len(static_events_by_script_id),
+            )
 
     def _rewrite_scene_runtime_asset_refs(
         self, scene_runtime: dict[str, object],

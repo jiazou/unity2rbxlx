@@ -630,6 +630,61 @@ HANDOFF: [gravity] gravityDesiredBaseStuds — plan field (in _PLAN_KEYS_FOR_HOS
 |unity_g|*STUDS_PER_METER, parsed early in plan_scene_runtime from DynamicsManager m_Gravity (abs(y),
 9.81 default). Consumed by the client clone-site hook; baked into the server script.
 
+# === Run hud-values-generic-20260616T161253 (2026-06-16) ===
+
+## Phase-1 out-of-scope followups
+- Respawn / ResetOnSpawn re-clone rebind of instance.gameObject (scene_runtime.luau:2861-2863) — pull into
+  scope only if §5 instrumentation proves it is the lead blank-Total cause.
+- StarterGui-template-fallback observability: emit a warn if a PlayerGui-nil template write happens silently.
+- Cross-domain (server-producer / client-consumer) BindableEvent channels must route via RemoteEvents; the
+  event-channel pre-pass is gated to same-domain signals and must NOT mask a missing cross-domain bridge.
+
+## Slice 1.1 residuals (static-event channel identity) — non-blocking, dual-voice findings
+
+- **Verifier alias-read false-POSITIVE (fail-open noise).** `contract_verifier._check_static_event_rendezvous` accepts a read only in the direct forms `<M>.<F>.Event` / `:Connect` / `:Fire` / `if <M>.<F> then`. A valid aliased read `local ev = Player.AmmoUpdate; if ev then ev:Connect(...) end` warns spuriously. Fail-OPEN (a visible warning, not a blocked build); all real SimpleFPS shapes use direct reads. Broadening the read matcher risks re-opening the string-literal bypass — defer until a real project trips it.
+- **Multi-declarator `static event` surfaces only the last name.** `script_analyzer._RE_STATIC_EVENT` on `public static event H A, B;` captures `B` only; `A`'s channel is silently never pre-set. Rare C# idiom; a comma-split would fix it. No real test project uses it.
+- **`findOrCreateChannel` wrong-class collision (now mitigated, residual edge).** Hardened to scan children for an existing BindableEvent of the right name+class before creating. If a non-BindableEvent of the same name persists alongside, the channel BindableEvent coexists (no duplicate BindableEvent), but the AI producer's own `ensureEvent`-under-RS could still pick a different instance if its parent differs from the module's container. The cross-domain/cross-container divergence (AI parents under RS by name; pre-pass parents under the module container) is a Slice-1.2-or-later generality concern; SimpleFPS modules are in RS so they coincide.
+- **Slice 1.2 (host-resolution / blank-Total)** remains probe-gated per design §5/§6 — NOT in 1.1.
+
+## [slice 1.1 r3] Generic RS-name-lookup consumer + folderized channels
+The round-2 folderization moves a static-event BindableEvent under a per-module Folder. The real SimpleFPS
+consumer reads the module FIELD (unaffected), but a HYPOTHETICAL generic consumer that resolves the event by
+NAME under ReplicatedStorage (e.g. `ReplicatedStorage:WaitForChild("AmmoUpdate")`) would break. No corpus
+instance. Harden: extend the rendezvous verifier to also fail-closed on RS-name-lookup consumers of a
+folderized channel, or keep the channel discoverable by a stable name. (Also: regen the SimpleFPS contract
+corpus fixture — codex flagged it may diverge from the real emitted HudControl shape.)
+
+## [scope B] Health-bar fill (Unity Slider visual binding) — deferred
+Same lowering class as the Phase-2 Toggle→Checkmark binding: UpdatePlayerHealth sets SetAttribute("value")/
+("Value") with nothing resizing the Health fill ImageLabel. Build the Slider→fill side of the generic UI-control
+visual binding when health/damage is back in scope. (User deprioritized damage 2026-06-16.)
+
+## [phase2 design] Subagent authored against wrong base (concurrent-session branch move)
+The Phase-2 design subagent ran in the MAIN repo cwd (moved by a concurrent session to addressables@2892b00),
+NOT the design2 worktree (drive/RUNID@babdbcf). ui_translator.py (main fix site) is IDENTICAL across bases, so
+the core design holds; but scene_runtime.luau/autogen.py differ — the runtime-integration citations
+(_applyToggleGraphicBindings site, _PLAN_KEYS_FOR_HOST, workspaceFind SRI resolver) must be re-anchored against
+drive/RUNID at implement. LESSON: always pass subagents the explicit worktree path AND have them verify HEAD.
+
+## [FOLLOW-ON RUN] Item-pickup checkmark — generic Unity Toggle isOn->Checkmark visual binding
+Scoped out of this run (user chose A: ship Phase 1 alone). The detailed design + dual-voice review are ready:
+- Design: design-phase2.md (in this RUN_DIR). Core mechanism sound: capture the Toggle's serialized graphic
+  GameObject SceneRuntimeId + m_IsOn into a plan key; runtime pass resolves via workspaceFind SRI resolver,
+  connects GetAttributeChangedSignal("isOn")->graphic.Visible, applies initial m_IsOn. Anchored on the Unity
+  Toggle component + serialized graphic ref (generic, no node names). ui_translator.py:738 currently emits only
+  ToggleIsOn and drops the graphic ref.
+- Review findings to address (review-phasedesign2-1.md + codex-review-phasedesign2.md):
+  1. [BLOCKING] Need a NEW component-fileID->GameObject resolver in the parser (onClick m_Target stores
+     target_file_id RAW with zero readers; no component->GameObject map exists). Build the index from the parsed
+     scene; thread into _convert_ui_element. This is a real slice seam — NOT one slice.
+  2. [P1 codex] Binding must apply initial isOn->visibility BEFORE the Awake/OnEnable batches (the proposed
+     end-of-start() site is too late); hook before _runAwakeEnableStart in _completeDeferredBatch.
+  3. [P1 codex] Late-clone coverage isn't generic — a Toggle in a late-cloned ScreenGui with no deferred UI
+     component on its host never rebinds. Need a generic mechanism (e.g. PlayerGui.DescendantAdded watch).
+  4. Re-anchor all scene_runtime.luau/autogen.py line citations against the run base (base-drift).
+  5. Re-decode the SRI values from the real rbxlx before pinning acceptance tests.
+- Also covers health-fill (Slider) via the same lowering when health is back in scope.
+- FIRST: confirm the checkmark actually fails in Studio (collect an item) before building — not yet playtest-confirmed.
 ## Run turret-bullet-damage-20260616T101918 (2026-06-16T08:27:13Z)
 
 self.gameObject.Parent:X() under-detection edge (self. skip precedes field promotion) — minor, design lists only self.gameObject. Consider hardening if a real conversion exercises it.
@@ -902,3 +957,80 @@ converter/tests/test_theme_seed_plan.py:361 — over-narrated codex/pre-fix/post
   theme-seed feature on the SimpleFPS/Trash-Dash corpus where names are unique); a durable fix anchors DB
   discovery on the artifact identity (guid / emitted-module path) rather than the basename. Generic-converter
   robustness follow-up.
+## From Unit 4 phase-2 harden (addressables consumer re-lowering) — 2026-06-17
+- **[P3] `roster_signal_absent` covers TOTAL stale but not PARTIAL stale.** `_roster_fail_closed` (contract_pipeline.py) fail-closes when a C# `Addressables.LoadAssetsAsync` loader exists but the `scene_runtime` carries NO `addressables` block at all (total stale artifact). It does NOT fire when the `addressables` block IS present but is MISSING the specific label a C# loader requests (partial stale) — `find_roster_consumers` then silently abstains for that loader (its label is not a `by_label` key) and the consumer ships un-relowered (empty loadout) with no fail-closed row. This mirrors the player-binding precedent (`player_signal_absent` is also total-only) and is pre-existing behavior, not introduced by Phase 2. Out of Phase-2 scope; do not expand the mechanism. Fix: extend the guard to diff the C#-requested labels (`csharp_label_loader_paths` already enumerates the loaders; would need per-loader label extraction) against `by_label` keys and emit `roster_signal_absent` (or a new `roster_label_absent`) for the gap.
+
+## Run addressables-unit4-20260616T084409 (Addressables Unit 4 — roster) — 2026-06-17
+
+# Follow-ups / out-of-scope discoveries — Addressables Unit 4 (roster)
+
+- **Consumables prototype materialization** (the other half of design-doc Unit 4): resolve `Consumables.asset` refs to usable `Consumable` objects carrying `.gameObject` (prefab id) AND the serialized component fields (`canBeSpawned`, type, price, icon) read from the referenced prefab's `Consumable`-derived component. Consumers: `TrackManager.luau:557` (`.canBeSpawned`), `ShopItemList.luau:48` / `LoadoutState.luau:357` (`GetConsumableType`/`GetPrice`/icon). Separate effort.
+
+- **`CharacterDatabase.luau` AI-output drift is a generic risk signal.** The transpiled consumer emitted 3 different roster-access shapes across outputs (WaitForChild folder / FindFirstChild folder / CollectionService:GetTagged). Any future load-bearing surface whose ACCESS the AI transpiler emits should be anchored on a deterministic upstream contract, not on the emitted string — consider a general roster/label-load re-lowering rule beyond `characters`.
+
+- **`RbxPart` has no `tags` field** (`core/roblox_types.py:169`); CollectionService Tags currently ride a separate writer path from `m_TagString` (`rbxlx_writer.py:942`). If the roster emit needs to tag instances at the data-model level (not via that path), a `tags` field on `RbxPart` may be warranted — evaluate at detailed-design (keep it minimal; don't gold-plate).
+
+- **LoadoutState accessories sub-roster** (`c.accessories`, `c.gameObject:Clone()` at `LoadoutState.luau:~315`): determine empirically whether the boot needs accessory rosters wired or whether a tagged character instance + `characterName` + clonable prefab unblocks it. May be a thin extension of this phase or a follow-on.
+
+---
+## New discoveries from dual-voice review revision — 2026-06-16
+
+- **Generic roster/label-load re-lowering pass is broadly applicable beyond `characters`.** The consumer re-lowering built here (normalize an Addressables label-load consumer to read the deterministic tagged roster + wrap members in their component object graph) generalizes to any `Addressables.LoadAssetsAsync<T>(label)` consumer. Once Unit 4 lands, evaluate promoting it as a general contract_pipeline facet covering all labels, not just the boot-gating roster.
+
+- **`RbxPlace` lacks a generic ReplicatedStorage tree** (`core/roblox_types.py`, only `replicated_templates` at ~498). Unit 4 adds a roster-specific channel; if more generic RS-children emit needs accrue (themes, consumables, other label rosters), consider a single generic RS-children data-model channel rather than per-feature channels.
+
+- **Writer Tags path is single-tag from `m_TagString`** (`rbxlx_writer.py:942-948`) and there is no `tags` field on `RbxPart` (`core/roblox_types.py:169`). Unit 4 adds an explicit roster-tag path; a general multi-tag (null-delimited Tags list) capability on the data model is a candidate cleanup if more tagging needs arise.
+
+- **Accessories sub-roster (`c.accessories`, `c.gameObject:Clone()` ~LoadoutState.luau:315/291/363):** if the Unit-4 spike shows accessories are dereferenced only AFTER boot (not on the boot path), wiring the per-character accessory rosters becomes a follow-on rather than part of this effort. Carry forward pending the spike result.
+
+---
+## Phase-1 detailed-design discoveries (post-spike) — 2026-06-16
+- **Populated accessory sub-roster is a FOLLOW-ON (spike-confirmed).** The boot path reads `#c.accessories` (LoadoutState.luau:291) but only ENTERS the loop when `#c.accessories > 0`; `.accessories = {}` clears the boot crash. The CharacterAccessories object materialization (each member's `.accessoryName`/`.accessoryIcon`/`.gameObject`) is only exercised via `ChangeAccessory` (LoadoutState.luau:226) AFTER boot. NOT in Phase 1 (producer) NOR boot-blocking in Phase 2 (Phase 2's wrapper sets `.accessories = {}`); the populated sub-roster is a separate effort.
+- **Existing single-tag `Tags` writer path is plain-text, not base64 NUL-delimited (rbxlx_writer.py:947).** Real Roblox `Tags` BinaryString is base64 of a NUL-delimited tag list. The roster-tag path emits the correct form; the EXISTING single-tag path is left untouched in Phase 1 but is a latent fidelity bug — evaluate a general `_emit_collection_tags` migration of the old path once the roster path proves the format in Studio.
+- **luau_place_builder emits ZERO CollectionService tags (spike finding).** The headless publish path has no tag parity even for the existing single-tag path. Phase 1 adds `CollectionService:AddTag` for the roster; a general tag-parity pass for the existing single-tag `attributes["Tag"]` path on the headless builder is a candidate cleanup.
+- **`_collect_character_names()` reads prefab Character-component config from `scene_runtime.prefabs[pid].instances[*].config`.** If more per-member component fields are needed later (icon, cost — cf. consumables), generalize to a `_collect_member_attributes(component_type, fields)` reader rather than per-field helpers.
+
+---
+## Phase-1 detailed-design REVISION follow-ups (review-phasedesign1-1.md) — 2026-06-16
+- **Tags wire-encoding decision is a VERIFY-stage task.** Phase 1 locks ONE codec + ONE `name="Tags"` element via the merged `_emit_collection_tags` helper, but the exact wire bytes (plain text vs base64 NUL-delimited) are chosen empirically in the cold-Studio VERIFY boot — whichever Studio's loader actually `GetTagged`-discovers. Because there is one codec in one place, flipping the encoding later is a one-line change. (Was P2 / E8.)
+- **Folding the existing single-`Tag` path into `_emit_collection_tags` now covers Unity-tagged non-roster parts too.** This Phase-1 merge (mandatory, P2) means the general `_emit_collection_tags` migration previously listed as a deferred cleanup is effectively done for the rbxlx writer; verify in VERIFY that pre-existing single-Tag parts still emit correctly under the merged codec, and that the headless builder's new single AddTag-site also covers the existing `attributes["Tag"]` parts (closes the prior "luau emits ZERO CollectionService tags" gap for non-roster parts too — confirm no regression).
+- **`class_name`-based tiebreak in the characterName selector is best-effort.** `modules[script_id]["class_name"]` is populated best-effort (can be `""`, scene_runtime_planner.py:1083-1084). The selector tolerates this (field-presence is primary; first-in-lifecycle + warning is the final fallback), but if a game legitimately has multiple `characterName`-bearing instances per prefab, evaluate a stronger disambiguator (e.g. an explicit component-type tag on the planner row) as a follow-on rather than relying on lifecycle order.
+
+---
+## Phase-1 detailed-design REVISION 2 follow-ups (review-phasedesign1-2.md) — 2026-06-16
+- **General referent re-key helper for ANY deep-copied RbxPart subtree.** Phase-1 adds a per-copy unity_file_id→referent remap for roster members; if other features later materialize a second copy of a template/prefab subtree in the rbxlx writer (themes, variant spawns, multi-instance placement), extract the re-key (fresh fids + intra-subtree connected_body_file_id rewrite + pre-pass walk) into a shared helper rather than duplicating it. Today only roster members need it.
+- **Dedicated RS container is a candidate generalization point.** The roster container Folder (collision-checked name added to _reserved_rs_names on both writers) is the first non-Templates RS child the converter emits via the data model. If more RS-children channels accrue (D1 followup), fold the container-naming + reserved-name registration into the same generic RS-children emit path so each new channel automatically participates in the reserved-name dedup on BOTH writers.
+- **`_RosterTag` marker-attribute convention.** Phase 1 uses an attributes["_RosterTag"] marker (root-only, stripped from AttributesSerialize) to drive root-only tagging through the merged tag helper. If future features need other root-vs-descendant emit distinctions on a copied subtree (e.g. a root-only Anchored override), consider a small typed "copy-emit directives" struct rather than a growing set of underscore-prefixed marker attributes.
+- **Reserved-RS-name logic is duplicated across the two writers.** rbxlx_writer.py:1685-1701 and luau_place_builder.py:617-629 build the reserved-name set independently (and now BOTH must include the roster container name). A shared pure helper computing the reserved set + the disambiguated container name from an RbxPlace would remove the parity-drift risk between the two writers — candidate cleanup, not in Phase 1.
+
+---
+## Phase-1 detailed-design REVISION 3 follow-ups (review-phasedesign1-3.md) — 2026-06-16
+- **SUPERSEDED — "Tags wire-encoding decision is a VERIFY-stage task" (REVISION-1 followup above).** No longer a VERIFY task. P1-D4 revision 3 SPECIFIES the canonical codec (base64 of the \0-joined dedup'd tag list) in Phase 1 and asserts it offline (AC4/AC11 decode the BinaryString). ONLY the live GetTagged boot remains a VERIFY confirmation (AC6). Disregard the earlier "plain vs base64 chosen empirically in VERIFY" item.
+- **General `_emit_collection_tags` migration for non-roster Unity-tagged parts (now effectively done for rbxlx, confirm in VERIFY).** The Phase-1 fold makes `_emit_collection_tags` the sole name="Tags" writer for ALL parts (Unity-Tag + roster-label), lifted to the common tail so even Model-rooted Unity-tagged parts emit their tag (a pre-existing drop, now closed). VERIFY should confirm pre-existing single-Tag parts still emit correctly under the merged base64 codec, and that the headless builder's new single AddTag-site also covers existing attributes["Tag"] parts (closes the "luau emits ZERO CollectionService tags" gap for non-roster parts too — confirm no regression).
+- **Studio-loader codec confirmation (VERIFY, narrowed).** The wire bytes are no longer an open choice; VERIFY only needs to confirm Studio's loader actually GetTagged-discovers the base64-NUL-encoded Tags on a Model-rooted member at cold boot. If (and only if) the loader rejects the canonical encoding, that is a single-helper one-line change — but the canonical Roblox codec is the locked default, not a hypothesis to be picked in VERIFY.
+
+---
+## Phase-2 detailed-design follow-ups (consumer re-lowering) — 2026-06-16
+- **Generic `.gameObject` bind via prefab_id when characterName != template_name (D-P2-4 residual).** The Phase-2 canonical body binds c.gameObject to ReplicatedStorage.Templates:FindFirstChild(characterName), which assumes characterName == the template's child name (the prefab stem). Phase 1 permits characterName != template_name (characterName from the component field, template_name from the prefab stem keyed on prefab_id). A fully-generic bind would carry the member->template prefab_id relation through the roster surface (e.g. a member attribute) so the consumer resolves the exact Templates child regardless of name divergence. Not boot-blocking for Trash-Dash (characterName == template stem there). Verify in VERIFY; generalize if a game diverges.
+- **Promote the roster re-lowering to ALL by_label labels, not just the boot-gating roster.** Phase 2 re-lowers any module that LoadAssetsAsync<...>(L) for L in by_label, but the canonical body returns a Character-shaped graph tuned to the boot consumer. A general label-load re-lowering facet (each label -> its component object graph) covers other Addressables.LoadAssetsAsync<T>(label) consumers; evaluate once Unit 4 lands (cf. the existing followup on the generic roster/label-load re-lowering rule).
+- **Populated accessories sub-roster (still a follow-on).** Phase 2 sets .accessories = {} (spike: clears the boot crash). The CharacterAccessories object materialization (.accessoryName/.accessoryIcon/.gameObject per member), exercised only via ChangeAccessory AFTER boot, remains a separate effort (consumer reads LoadoutState.luau:342-343 / Character:SetupAcessory).
+
+---
+## Phase-2 detailed-design REVISION 2 follow-up (review-phasedesign2-2.md) — 2026-06-17
+- **Reconcile post-boot character-object consumers with the re-lowered Character-wrapper return (D-P2-9).** The re-lowering changes GetCharacter/dictionary() from returning a raw tagged Instance to a `Character.new` WRAPPER TABLE (required+correct for the boot — LoadoutState derefs c.gameObject/c.accessories/c.characterName). Two POST-boot, NON-boot-critical consumers expect a raw Instance and DIVERGE (verified against converter/output/trash-dash-unit2-proper-20260616/scripts/ in the main repo):
+  - TrackManager.luau:204→:209 (unit2-proper): `local charPrefab = CharacterDatabase.GetCharacter(charName)` then `self.host.instantiatePrefab(charPrefab, …)` passes the return DIRECTLY to a clone-an-Instance host call → wrapper table → player fails to spawn on Run.
+  - ShopCharacterList.luau:39 + :46-49: `local dict = CharacterDatabase.dictionary()` then per value `c:GetAttribute("icon"/"characterName"/"cost"/"premiumCost")` → wrapper table has no :GetAttribute → error on shop open.
+  - (ShopAccessoriesList.luau:55-56 reads `#c.accessories` off dict values → wrapper carries .accessories = {}, so it is incidentally SATISFIED — member skipped, no error.)
+  Resolution: either re-lower those modules (instantiatePrefab(GetCharacter(...)) → resolve the wrapper's .gameObject/prefab_id; dictionary()-value :GetAttribute → read the wrapper's typed fields) OR define an Instance-compatible wrapper (e.g. a proxy carrying both the dotted props AND :GetAttribute / clonability). SHAPE-SPECIFIC: unit2-proper affected; unit1 TrackManager.luau:152 passes the NAME STRING (`_charName`) straight to instantiatePrefab and never calls GetCharacter → unaffected. Per the tier-problems rule this is downstream-conditional (post-boot), scoped out of the boot-only Phase 2 (AC10).
+
+### D-P2-9 followup — enumeration accuracy notes (from phasedesign2 round-3 review)
+When reconciling post-boot character-object consumers, the §1.6 enumeration must also reflect:
+- `CharacterDatabase.loaded()` is consumed by `LoadoutState:Tick` (unit2:184 / unit1:158) as the boot-gate `interactable = ThemeDatabase.loaded() and CharacterDatabase.loaded()`. The re-lowered `loaded()` returns the pass-owned boolean (bool→bool unchanged) → SATISFIED; add it to the table for completeness.
+- `ShopCharacterList` is SHAPE-SPECIFIC: unit2-proper uses `c:GetAttribute(...)` (table has no method → ERRORS); unit1 derefs dotted table fields `c.icon/.cost/.premiumCost` (Character.new defaults cost=0/premiumCost=0, .icon nil → DEGRADED, NON-crashing). The table currently conflates both under "errors on shop open" — split them. Both post-boot, both in this followup's scope.
+
+## FU — TrackManager transpiles to an inert no-return stub; cascades into its requirers (converter quality, NOT Unit-4)
+Observed in the Unit-4 e2e cold-boot (2026-06-17), but PRE-EXISTING + roster-unrelated (roster pass is identity-gated; TrackManager carries zero roster markers):
+- TrackManager.cs transpiled to a body ending in `-- TODO: implement Update logic` + `print("TrackManager loaded")` with NO `return <classTable>` (return-count 0) → at runtime "module did not return a table". AI-transpile NON-DETERMINISM: TrackManager was LIVE (returned a table) in the pre-Unit-4 base conversion (reobs24) and inert here — two independent cold transpiles produced different bodies; the dead-module classifier then (correctly) flags the inert one dead.
+- CASCADE: CharacterInputController (line 1) and CharacterCollider (line 2) both `require(TrackManager)` at the top, so TrackManager returning no table makes BOTH fail "Module code did not return exactly one value". One root (TrackManager), three console errors.
+- Two follow-on angles: (a) transpile robustness — a complex MonoBehaviour (TrackManager) intermittently transpiles to a TODO-stub with no class-table return; (b) require-resilience — the emitted `require(X "..." ) or ServerStorage...` pattern does not guard against X loading to nil/non-table, so one inert module cascades into every requirer. Consider a fail-soft require wrapper or a post-transpile "module returns a class table" verifier.
+- Also: TrackManager is the D-P2-9 scoped-out post-boot consumer; its failure here is the stub/no-return issue, NOT the wrapper-vs-Instance concern (which only bites with a live body).
