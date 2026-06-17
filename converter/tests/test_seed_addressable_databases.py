@@ -99,6 +99,15 @@ def _run(scenario: str) -> str:
                 resolveModule = function(_id, path) return modules[path] end,
             }}
         end
+
+        -- Emit every captured warn on its own stable-prefixed line so a test
+        -- can assert the fail-loud WARNING actually fired (not just "no crash").
+        local function dumpLogs()
+            for _, msg in ipairs(logs) do
+                print("WARN_LINE=" .. msg)
+            end
+            print("WARN_COUNT=" .. tostring(#logs))
+        end
     """)
     src = preamble + "\n" + scenario
     with tempfile.NamedTemporaryFile("w", suffix=".luau", delete=False) as fh:
@@ -296,14 +305,96 @@ print("AC2_IS_CLONE=" .. tostring(clone == cloneInstance))
 
 
 def test_warns_when_proven_surface_absent_at_runtime():
-    """If the resolved DB module lacks BOTH the appender fn and the drain-field
-    table at runtime, the shim warns and seeds nothing (defensive)."""
+    """Fail-loud (scene_runtime.luau:195): if the resolved DB module lacks BOTH
+    the appender fn AND the drain-field table at runtime, the shim must WARN and
+    seed nothing. Asserts the warning actually fires (a silent regression that
+    drops the warn makes this RED) and that no SO was registered."""
     scenario = _PLAN_AND_MODULES + """
--- swap the DB module for one missing the appender AND the drain table
-modules["ReplicatedStorage.ThemeDatabase"] = { GetThemeData = function() return nil end }
+-- A DB missing BOTH the appender fn (Register) AND a drain-field TABLE: the
+-- seed's drain_field ("_pendingThemeData") is present but is NOT a table, so
+-- neither write-surface branch matches -> fail-loud. GetThemeData stays empty.
+local broken = {
+    _pendingThemeData = false,   -- present but not a table -> no drain-field write
+    GetThemeData = function() return nil end,
+}
+modules["ReplicatedStorage.ThemeDatabase"] = broken
 local svc = servicesFor(modules)
 SceneRuntime.seedAddressableDatabases(plan, svc)
-print("WARN_OK=true")
+print("SEEDED_DAY=" .. tostring(broken.GetThemeData("Day") ~= nil))
+print("DRAIN_UNTOUCHED=" .. tostring(broken._pendingThemeData == false))
+dumpLogs()
 """
     out = _run(scenario)
-    assert "WARN_OK=true" in out
+    # The fail-loud warn fired with the documented message + offending path.
+    assert any(
+        line.startswith("WARN_LINE=[seed] proven write surface absent at runtime on")
+        and "ReplicatedStorage.ThemeDatabase" in line
+        for line in out.splitlines()
+    ), out
+    # ... and nothing was seeded (the drain field was left untouched).
+    assert "SEEDED_DAY=false" in out
+    assert "DRAIN_UNTOUCHED=true" in out
+
+
+def test_warns_when_db_module_does_not_resolve_to_a_table():
+    """Sibling fail-loud branch (scene_runtime.luau:181): when resolveModule
+    returns a non-table (nil) for the DB module path, the shim must WARN and
+    seed nothing — never index a non-table. A silent regression (warn removed)
+    makes this RED."""
+    scenario = _PLAN_AND_MODULES + """
+-- the DB module fails to resolve (require miss) -> resolveModule returns nil
+modules["ReplicatedStorage.ThemeDatabase"] = nil
+local svc = servicesFor(modules)
+SceneRuntime.seedAddressableDatabases(plan, svc)
+print("NO_CRASH=true")
+dumpLogs()
+"""
+    out = _run(scenario)
+    assert "NO_CRASH=true" in out
+    assert any(
+        line.startswith("WARN_LINE=[seed] database module did not resolve to a table:")
+        and "ReplicatedStorage.ThemeDatabase" in line
+        for line in out.splitlines()
+    ), out
+
+
+def test_warns_when_db_module_resolves_to_non_table_scalar():
+    """Same fail-loud branch (scene_runtime.luau:181) with a non-nil non-table
+    (a scalar) — proves the guard keys on ``type(db) ~= "table"``, not just nil."""
+    scenario = _PLAN_AND_MODULES + """
+modules["ReplicatedStorage.ThemeDatabase"] = 42  -- non-table scalar
+local svc = servicesFor(modules)
+SceneRuntime.seedAddressableDatabases(plan, svc)
+print("NO_CRASH=true")
+dumpLogs()
+"""
+    out = _run(scenario)
+    assert "NO_CRASH=true" in out
+    assert any(
+        line.startswith("WARN_LINE=[seed] database module did not resolve to a table:")
+        for line in out.splitlines()
+    ), out
+
+
+def test_named_appender_falls_back_to_drain_table_when_appender_missing():
+    """Compat fallback (scene_runtime.luau:191->193): the seed NAMES an appender
+    (``Register``) but the runtime DB exposes only the drained table, not the
+    appender fn. The shim must fall back to inserting into the drain-field table
+    directly (still drain-bound) — and seed successfully, no warn."""
+    scenario = _PLAN_AND_MODULES + """
+-- runtime DB drains _pendingThemeData via LoadDatabase but exposes NO Register fn
+local noAppender = makeThemeDatabase()
+noAppender.Register = nil
+modules["ReplicatedStorage.ThemeDatabase"] = noAppender
+local svc = servicesFor(modules)
+SceneRuntime.seedAddressableDatabases(plan, svc)
+noAppender.LoadDatabase()
+print("FALLBACK_DAY=" .. tostring(noAppender.GetThemeData("Day") ~= nil))
+print("FALLBACK_NIGHT=" .. tostring(noAppender.GetThemeData("NightTime") ~= nil))
+dumpLogs()
+"""
+    out = _run(scenario)
+    assert "FALLBACK_DAY=true" in out
+    assert "FALLBACK_NIGHT=true" in out
+    # The drain-field fallback is a proven surface, so NO fail-loud warn fired.
+    assert "WARN_COUNT=0" in out

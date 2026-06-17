@@ -205,3 +205,13 @@ class TestScriptableObjectSurface:
         idx = parse_addressables(_project(tmp_path, group))
         so = resolve_scriptable_object_addressables(idx, _guid_index({}), {"dayguid"})
         assert so.by_label["themeData"] == ["dayguid"]  # appears once
+
+    def test_dedupes_repeated_guid_per_address(self, tmp_path):
+        """Symmetric to the per-label dedupe: a guid repeated under the same
+        ADDRESS is retained exactly once on the by_address axis."""
+        group = THEME_GROUP.replace("nightguid", "dayguid")  # force dup guid
+        idx = parse_addressables(_project(tmp_path, group))
+        # Sanity: parse keeps both raw rows on the address axis before dedupe.
+        assert idx.by_address["themeData"].count("dayguid") == 2
+        so = resolve_scriptable_object_addressables(idx, _guid_index({}), {"dayguid"})
+        assert so.by_address["themeData"] == ["dayguid"]  # appears once
