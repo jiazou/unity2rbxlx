@@ -496,7 +496,13 @@ def _convert_ui_element(
             _apply_inputfield_properties(element, comp.properties)
         elif ct in ("Dropdown", "TMP_Dropdown"):
             _apply_dropdown_properties(element, comp.properties)
-        elif ct == "Toggle":
+        elif ct == "Toggle" or (
+            comp.component_type == "MonoBehaviour" and "m_IsOn" in comp.properties
+        ):
+            # Unity serializes a UI Toggle as a MonoBehaviour (m_Script GUID),
+            # never a literal "Toggle" component_type — identify it by its
+            # defining ``m_IsOn`` field (mirrors the Button m_OnClick heuristic
+            # above). The bare ``ct == "Toggle"`` form is dead on real scenes.
             _apply_toggle_properties(
                 element, comp.properties,
                 component_owner_index=component_owner_index,

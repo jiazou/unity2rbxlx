@@ -440,9 +440,15 @@ class TestBuildComponentOwnerIndex:
 
 def _toggle_node(
     *, toggle_fid: str, graphic_comp_fid: object, m_is_on: int = 0,
-    name: str = "TheToggle",
+    name: str = "TheToggle", component_type: str = "MonoBehaviour",
 ) -> SceneNode:
-    """A Toggle GameObject whose Toggle component serializes a ``graphic`` ref."""
+    """A Toggle GameObject whose Toggle component serializes a ``graphic`` ref.
+
+    Defaults to ``MonoBehaviour`` — the way Unity ACTUALLY serializes a UI
+    Toggle (an m_Script GUID, never a literal ``Toggle`` component_type). The
+    earlier fixtures used the literal type, which is dead on real scenes and
+    let the no-row regression slip past review.
+    """
     return SceneNode(
         name=name,
         file_id=toggle_fid,
@@ -451,7 +457,7 @@ def _toggle_node(
         tag="Untagged",
         components=[
             ComponentData(
-                component_type="Toggle", file_id="toggleComp",
+                component_type=component_type, file_id="toggleComp",
                 properties={
                     "m_IsOn": m_is_on,
                     "graphic": {"fileID": graphic_comp_fid},
@@ -508,6 +514,38 @@ class TestToggleGraphicBinding:
         for k in element.attributes:
             assert "graphic" not in k.lower()
             assert "togglegraphicref" not in k.lower().replace("_", "")
+
+    def test_monobehaviour_serialized_toggle_emits_row(self):
+        """REGRESSION (e2e-found): a real Unity Toggle is a ``MonoBehaviour``
+        with ``m_IsOn`` (NOT a literal ``Toggle`` component_type). The dispatch
+        must detect it by ``m_IsOn`` (mirroring the Button ``m_OnClick``
+        heuristic), else NO row is emitted on real scenes — which is exactly
+        what shipped silently broken until a live SimpleFPS conversion (the
+        Battery toggle: 4 HUD toggles, 0 rows)."""
+        owner_index = {"250410366": "250410364"}
+        bindings: list = []
+        node = _toggle_node(
+            toggle_fid="264237063", graphic_comp_fid="250410366", m_is_on=0,
+            component_type="MonoBehaviour",   # the REAL serialization
+        )
+        # sanity: the component is NOT the literal "Toggle" type
+        assert node.components[0].component_type == "MonoBehaviour"
+        self._convert(node, owner_index=owner_index, bindings=bindings)
+        assert len(bindings) == 1
+        assert bindings[0]["toggle_sri"] == f"{self.NS}:264237063"
+        assert bindings[0]["graphic_sri"] == f"{self.NS}:250410364"
+
+    def test_literal_toggle_component_type_still_emits_row(self):
+        """Backward-compat: a literal ``Toggle`` component_type (if a parser
+        ever resolves the GUID to the type name) still dispatches."""
+        owner_index = {"gc": "gg"}
+        bindings: list = []
+        node = _toggle_node(
+            toggle_fid="t", graphic_comp_fid="gc", m_is_on=0,
+            component_type="Toggle",
+        )
+        self._convert(node, owner_index=owner_index, bindings=bindings)
+        assert len(bindings) == 1
 
     def test_initial_on_true_when_m_is_on_set(self):
         """E2 — ``m_IsOn=1`` -> ``initial_on=True``."""
