@@ -612,6 +612,53 @@ class TestBuildThemeSeedPlanIntegration:
         assert "addressable_db_seeds" not in sr
         assert any("abstaining" in r.message for r in caplog.records)
 
+    def test_two_distinct_dbs_sharing_one_key_both_seeded(self, tmp_path):
+        """codex P1 (phase2): two DISTINCT database modules that legitimately
+        load the SAME Addressables key each need their OWN seed. Dedupe must key
+        off DB IDENTITY (module path), NOT the load key.
+
+        Pre-fix (``seeded_keys`` keyed by ``ownership.label``) silently suppresses
+        the SECOND DB → it boots with an EMPTY registry; post-fix (dedupe by
+        ``db_module_path``) BOTH DBs get a seed row.
+        """
+        # A second DB module with a DIFFERENT name + class but the SAME
+        # ``LoadAssetsAsync<T>("themeData")`` key (shared label) and its own
+        # distinct drain/appender field names (still a valid registry).
+        second_cs = (
+            THEME_DB_CS.replace("class ThemeDatabase", "class ThemeMirror")
+        )
+        second_luau = (
+            THEME_DB_LUAU.replace("ThemeDatabase", "ThemeMirror")
+        )
+        root = _make_project(tmp_path)
+        # Second DB's .cs is re-read by name (ThemeMirror.cs).
+        (root / "Assets" / "ThemeMirror.cs").write_text(second_cs, encoding="utf-8")
+        pipe = _pipeline_with_state(root, tmp_path)
+        # BOTH DB module bodies live on rbx_place.scripts (rehydrated state).
+        pipe.state.rbx_place.scripts = [
+            RbxScript(name="ThemeDatabase", source=THEME_DB_LUAU,
+                      script_type="ModuleScript", parent_path="ReplicatedStorage"),
+            RbxScript(name="ThemeMirror", source=second_luau,
+                      script_type="ModuleScript", parent_path="ReplicatedStorage"),
+        ]
+        sr = _scene_runtime_with_so_map()
+        pipe._build_theme_seed_plan(sr)
+        seeds = sr["addressable_db_seeds"]
+        assert isinstance(seeds, list) and len(seeds) == 2, (
+            "both distinct DBs sharing one key must each get a seed"
+        )
+        paths = {s["db_module_path"] for s in seeds}
+        assert paths == {
+            "ReplicatedStorage.ThemeDatabase",
+            "ReplicatedStorage.ThemeMirror",
+        }
+        # Each seed carries the full SO write surface (neither is dropped).
+        for seed in seeds:
+            assert seed["so_module_paths"] == [
+                "ReplicatedStorage.ThemeData_Day",
+                "ReplicatedStorage.ThemeData_Night",
+            ]
+
     def test_keyless_so_still_emits_record(self, tmp_path):
         """A missing key_field (DB indexes by non-op.field) still seeds; the
         shim handles key-less abstain at runtime (key_field=None → no filter)."""

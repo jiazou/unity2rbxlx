@@ -7247,7 +7247,13 @@ script.Disabled = true
                 source_by_name.setdefault(name, src)
 
         seeds: list[AddressableDbSeed] = []
-        seeded_keys: set[str] = set()
+        # Dedupe by DB IDENTITY (the seed's own module path), NOT by the load
+        # key: two DISTINCT database modules may legitimately share an
+        # Addressables key (both ``LoadAssetsAsync<T>("themeData")``) and each
+        # needs its own seed — keying off the label would silently drop the
+        # second DB onto an empty registry. Each ``db_name`` is already unique in
+        # the loop, so this only guards an impossible same-module double-seed.
+        seeded_db_paths: set[str] = set()
         # The owning DB is the transpiled module whose originating C# issues a
         # ``LoadAssetsAsync<T>(key, …)`` whose KEY has emitted SO guids. Unity's
         # ``LoadAssetsAsync<T>(key)`` accepts a LABEL *or* an ADDRESS, so resolve
@@ -7282,8 +7288,6 @@ script.Disabled = true
                         ownership.load_method_name, ownership.label, db_name,
                     )
                 continue
-            if ownership.label in seeded_keys:
-                continue  # dedupe: a load key is owned by exactly one DB
 
             # The DB's own plan module path (so the runtime can require it). The
             # DB is a runtime-bearing module; resolve its container the same way
@@ -7291,6 +7295,8 @@ script.Disabled = true
             db_module_path = self._module_plan_path(db_name)
             if db_module_path is None:
                 continue
+            if db_module_path in seeded_db_paths:
+                continue  # guard: never double-seed the SAME store
 
             # Drain-bind detector (P1 — design-phase2 §1.4):
             drain_field = _derive_drain_field(db_luau, ownership.load_method_name)
@@ -7338,7 +7344,7 @@ script.Disabled = true
                 key_field=ownership.key_field,
                 so_module_paths=so_module_paths,
             ))
-            seeded_keys.add(ownership.label)
+            seeded_db_paths.add(db_module_path)
 
         if seeds:
             scene_runtime["addressable_db_seeds"] = seeds
