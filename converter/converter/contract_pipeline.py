@@ -486,20 +486,19 @@ def transpile_with_contract(
     # carries forward.
     _apply_require_resolutions(transpilation.scripts, require_resolutions)
 
-    # Camera-facet lowering (allowlisted deterministic lowering pass, PR5):
-    # route a flattened first-person DRONE/TURRET controller's look math onto
-    # the SceneCameraInput runtime service so generic-mode FPS games yaw, not
-    # just pitch. Structure-gated, never per-game; see camera_facet_lowering.py
-    # and docs/design/camera-input-fidelity-plan.md. The PLAYER is owned by
-    # paradigm C (the deterministic host authority in scene_runtime.luau, keyed
-    # on the upstream ``has_character_controller`` signal), so the player script
-    # is EXCLUDED from this pass (§3) -- it is never the camera/move writer here.
-    # Player identity comes from the DETERMINISTIC UPSTREAM Unity signal (the
-    # planner's per-module ``has_character_controller``), NOT a fingerprint of
-    # the transpiled output -- the latter abstained silently on AI shape
-    # variance, decoupling camera/movement/character (the systemic bug this
-    # closes). ``_player_controller_paths`` fail-closes (``∅``) on 0 or >1
-    # distinct CC-scripts.
+    # Camera-facet lowering (allowlisted deterministic lowering pass): route a
+    # flattened first-person DRONE/TURRET controller's look math onto the
+    # SceneCameraInput runtime service so generic-mode FPS games yaw, not just
+    # pitch. Structure-gated, never per-game; see camera_facet_lowering.py. The
+    # PLAYER is owned by paradigm C (the deterministic host authority in
+    # scene_runtime.luau, keyed on the upstream ``has_character_controller``
+    # signal), so the player script is EXCLUDED from this pass (§3) -- it is never
+    # the camera/move writer here. Player identity comes from the DETERMINISTIC
+    # UPSTREAM Unity signal (the planner's per-module ``has_character_controller``),
+    # NOT a fingerprint of the transpiled output -- the latter abstained silently
+    # on AI shape variance, decoupling camera/movement/character.
+    # ``_player_controller_paths`` fail-closes (``∅``) on 0 or >1 distinct
+    # CC-scripts.
     # Surface upstream player identity that did NOT cleanly bind, rather than
     # abstaining silently. ``cc_module_count`` is the number of distinct
     # CC-bearing scripts the planner saw on placed GameObjects.
@@ -515,9 +514,8 @@ def transpile_with_contract(
     # the operator re-plans instead of shipping an unbound player.
     dict_mods = [m for m in modules.values() if isinstance(m, dict)]
     signal_present = any("has_character_controller" in m for m in dict_mods)
-    # Gate on runtime_bearing too (present since PR1) so an artifact old enough
-    # to also predate ``is_component_class`` still trips the guard (codex
-    # re-review false-negative).
+    # Gate on runtime_bearing too so an artifact old enough to also predate
+    # ``is_component_class`` still trips the guard.
     has_runnable = any(
         m.get("is_component_class") or m.get("runtime_bearing")
         for m in dict_mods
@@ -587,22 +585,21 @@ def transpile_with_contract(
         log.info("[contract] camera-facet lowering routed %d controller(s) "
                  "to SceneCameraInput", lowered)
 
-    # NOTE: paradigm C (the deterministic host authority in scene_runtime.luau,
-    # keyed on the upstream ``has_character_controller`` signal) owns the
-    # player's look + move; paradigm A is deleted, so there is no A-locator
-    # abstention concept any more. The signal-based fail-closeds
-    # (player_signal_absent / player_ambiguous / player_unresolved) key on C's
-    # own identity and remain above.
+    # Paradigm C (the deterministic host authority in scene_runtime.luau, keyed
+    # on the upstream ``has_character_controller`` signal) owns the player's
+    # look + move. The signal-based fail-closeds (player_signal_absent /
+    # player_ambiguous / player_unresolved) key on C's own identity and remain
+    # above.
 
-    # Child-index handling is now done by the pre-transpile child-ref resolver
+    # Child-index handling is done by the pre-transpile child-ref resolver
     # (``child_ref_resolver.build_child_ref_map`` + ``prerewrite_child_index``,
     # threaded into ``transpile_scripts`` above): transform-rooted
     # ``transform.GetChild(n)`` sites are resolved to named ``Find("<name>")``
     # lookups in the C# BEFORE the AI sees them, so no positional ordinal reaches
-    # the output. The post-transpile ``lower_child_index`` pass is retired here;
-    # the contract verifier's child-ordinal backstop fail-closes on any survivor
-    # for a fully-resolved script. (``child_index_lowering.py`` stays — the
-    # legacy packs still use it, and the backstop reuses ``source_has_child_index``.)
+    # the output. The contract verifier's child-ordinal backstop fail-closes on
+    # any survivor for a fully-resolved script. (``child_index_lowering.py`` stays
+    # — the legacy packs still use it, and the backstop reuses
+    # ``source_has_child_index``.)
 
     # OnTriggerStay lowering (allowlisted deterministic lowering pass): the
     # transpiler collapses Unity OnTriggerStay onto the same ``.Touched`` EDGE
@@ -716,8 +713,8 @@ def transpile_with_contract(
     fail_closed.extend(roster_fail_closed)
     # Surface stem collisions FIRST -- a colliding stem was never added to
     # the path sets, so the per-script verifier loop below can't flag it.
-    # Without this surface the module silently disappears (codex P1 finding
-    # on PR3a). Component-class collisions subsume runtime-bearing ones
+    # Without this surface the module silently disappears. Component-class
+    # collisions subsume runtime-bearing ones
     # (every placed MonoBehaviour is a component class), so iterate the
     # superset and dedupe by stem.
     seen_collision_stems: set[str] = set()
@@ -742,22 +739,19 @@ def transpile_with_contract(
         # surviving violation) would still throw when first instantiated.
         if Path(script.source_path) not in component_class_paths:
             continue
-        # PR3b: stub_strategy fail-closed (carry-over from PR3a P2 #1).
-        # When the AI transpiler is unavailable / disabled / errored,
-        # ``code_transpiler.transpile`` falls through to the stub
-        # generator (``strategy="stub"``) which emits a placeholder
-        # ``print(...)`` body. A component module can't host the
-        # contract on stub output; ``auto`` mode must treat this as a
-        # fail-closed signal to fall back to legacy.
+        # stub_strategy fail-closed: when the AI transpiler is unavailable /
+        # disabled / errored, ``code_transpiler.transpile`` falls through to the
+        # stub generator (``strategy="stub"``) which emits a placeholder
+        # ``print(...)`` body. A component module can't host the contract on stub
+        # output; ``auto`` mode must treat this as a fail-closed signal to fall
+        # back to legacy.
         #
         # EXCEPTION: an INTENTIONALLY inert-stubbed component (a visual-only
         # water-shader / particle helper, OR an empty subclass of a dead base)
         # is a contract-valid inert ModuleScript (see ``_inert_component_stub``),
-        # so it is a legitimate terminal state, not an AI failure. The
-        # transpiler stamps ``intentional_inert_stub`` for those -- trust the
-        # stamp (the empty-subclass verdict needs project context this site
-        # lacks; recomputing ``_is_visual_only_script`` here would miss it and
-        # turn a clean stub into a spurious stub_strategy fail-close). The
+        # a legitimate terminal state, not an AI failure. The transpiler stamps
+        # ``intentional_inert_stub`` for those -- trust the stamp (the
+        # empty-subclass verdict needs project context this site lacks). The
         # ``_is_visual_only_script`` recompute is retained as a backstop for any
         # stub path that predates the stamp. Only genuine fallthrough fails
         # closed.

@@ -14,8 +14,7 @@ and the emitted scripts. See design doc §"Phase 3 — Contract verifier".
     structurally; the literal Luau scan was reverted after false positives.
 
 Every check records ``severity="warning"`` (or ``"info"`` for unverifiable
-joins) — never fails the build; the per-check fail-closed flip lands in slice 4.
-Import-light (typed against ``RbxScript`` / ``TopologyArtifact``, no ``Any``).
+joins). Import-light (typed against ``RbxScript`` / ``TopologyArtifact``, no ``Any``).
 """
 
 from __future__ import annotations
@@ -140,9 +139,9 @@ def verify_contract(
     violations.extend(_check_consumer_compliance(topology, scripts))
     violations.extend(_check_component_availability(topology, scripts))
     violations.extend(_check_cross_domain_attribute(topology, scripts))
-    # FIX 5 ordering: the BINDING floor reports BEFORE the secondary ordinal
-    # floor (check D) — a dropped/reshaped rig binding is the real cause; the
-    # surviving ordinal it might leave behind is the downstream symptom.
+    # The BINDING floor reports BEFORE the secondary ordinal floor (check D) —
+    # a dropped/reshaped rig binding is the real cause; the surviving ordinal it
+    # might leave behind is the downstream symptom.
     violations.extend(_check_rig_binding_present(topology, scripts))
     violations.extend(_check_surviving_child_ordinal(topology, scripts))
     violations.extend(
@@ -572,7 +571,7 @@ def stash_violations(
 
 
 # ---------------------------------------------------------------------------
-# Per-check fail-closed flip (slice 4)
+# Per-check fail-closed flip
 # ---------------------------------------------------------------------------
 #
 # A check flips from shadow (warning-only metric) to fail-closed PER-CHECK, on
@@ -588,10 +587,9 @@ def stash_violations(
 #   * component_availability (B): flipped — SimpleFPS exercises it (20 literal-arg
 #     GetComponent sites); all reachable.
 #   * cross_domain_attribute (C): flipped — the MiniNet networked corpus project
-#     (slice 6) exercises it (1 runtime client<->server edge, correctly bridged);
-#     SimpleFPS alone has 0 edges, which is why a second project was needed.
-#     (Class-2 store-mismatch is a separate deferred backstop — see the design
-#     doc §"Phase 3" slice 4d.)
+#     exercises it (1 runtime client<->server edge, correctly bridged); SimpleFPS
+#     alone has 0 edges, which is why a second project was needed. (Class-2
+#     store-mismatch is a separate deferred backstop.)
 #   * child_ordinal_survivor (D): flipped — fact-based. Fires ONLY on a surviving
 #     positional child ordinal in a FULLY-resolved script (the pre-rewrite should
 #     have eliminated it -> a real regression). The non-promoting
@@ -902,8 +900,8 @@ def _receiver_roots_at_engine_global(receiver: str) -> bool:
 @dataclass(frozen=True)
 class _RigDeadWriteExempt:
     """The deterministic upstream identity of the ONE rig dead-init-write that check
-    D may exempt (REDESIGN r3). All three are projections of the resolver fact carried
-    on ``RbxScript.rig_binding`` — the AI-STABLE identity, NOT an output-shape
+    D may exempt. All three are projections of the resolver fact carried on
+    ``RbxScript.rig_binding`` — the AI-STABLE identity, NOT an output-shape
     fingerprint. A surviving ``self.<field> = self.<cam_receiver>:GetChildren()[k]``
     site is exempted ONLY when it matches this EXACT triple (field + receiver +
     ordinal) AND the statement-anchored shape; every mismatch biases to COUNT."""
@@ -928,26 +926,26 @@ def _count_surviving_child_ordinals(
     roots at a known-safe ENGINE GLOBAL (``workspace``/``game``/...) are EXCLUDED
     — they are engine-tree iterations, not unresolved child-ref ordinals.
 
-    RIG-AWARE exemption (SITE-ANCHORED, POSITIVELY anchored — REDESIGN r3): when
-    ``exempt`` is set (the caller has independently confirmed a DISCHARGED rig
-    binding) AT MOST ONE adjacent ``self.<field> = self.<cam_receiver>:GetChildren()[k]``
-    dead init-write site is skipped from the count — the EXACT credited site the
-    Path-A read-reroute superseded. The decision is made INSIDE this same walk,
-    AFTER the identical ``_luau_pos_is_code`` + engine-global filters that COUNT a
-    site, and ONLY when ``_site_is_discharged_rig_dead_write`` confirms a TIGHT
-    POSITIVE match of the credited site: the r7 statement identity (the enclosing Luau
-    statement is EXACTLY ``self.<field> = <site>``, the site being its whole RHS) ANDed
-    with the r3 receiver anchor (receiver is exactly ``self.<cam_receiver>``, never a
-    bare local) AND the r3 ordinal anchor (the surviving ``[k]`` equals
-    ``cam_ordinal + 1``). So the exemption can only ever remove a site this function
-    WOULD have counted (``exempt ⊆ counted-survivors``, structurally), it never spans
-    the across-lines factored form, and the ``< 1`` cap exempts only the SINGLE credited
-    write — a second same-shape write, a READ survivor, a DIFFERENT-receiver write
-    (``self.muzzle:...`` — codex r8), a SAME-receiver DIFFERENT-ordinal write
-    (``...[2]`` when the credited init was ``[1]`` — codex r3), a bare-``cam`` receiver,
-    the direct no-seed form, a substring-LHS look-alike, or an engine-global/bracket
-    survivor this function did NOT count all REMAIN counted and still fail closed.
-    Any mismatch / ambiguous site is NOT exempted — it is counted (fail closed)."""
+    RIG-AWARE exemption (SITE-ANCHORED, POSITIVELY anchored): when ``exempt`` is set
+    (the caller has independently confirmed a DISCHARGED rig binding) AT MOST ONE
+    adjacent ``self.<field> = self.<cam_receiver>:GetChildren()[k]`` dead init-write
+    site is skipped from the count — the EXACT credited site the Path-A read-reroute
+    superseded. The decision is made INSIDE this same walk, AFTER the identical
+    ``_luau_pos_is_code`` + engine-global filters that COUNT a site, and ONLY when
+    ``_site_is_discharged_rig_dead_write`` confirms a TIGHT POSITIVE match of the
+    credited site: the statement identity (the enclosing Luau statement is EXACTLY
+    ``self.<field> = <site>``, the site being its whole RHS) ANDed with the receiver
+    anchor (receiver is exactly ``self.<cam_receiver>``, never a bare local) AND the
+    ordinal anchor (the surviving ``[k]`` equals ``cam_ordinal + 1``). So the
+    exemption can only ever remove a site this function WOULD have counted
+    (``exempt ⊆ counted-survivors``, structurally), it never spans the across-lines
+    factored form, and the ``< 1`` cap exempts only the SINGLE credited write — a
+    second same-shape write, a READ survivor, a DIFFERENT-receiver write
+    (``self.muzzle:...``), a SAME-receiver DIFFERENT-ordinal write (``...[2]`` when
+    the credited init was ``[1]``), a bare-``cam`` receiver, the direct no-seed form,
+    a substring-LHS look-alike, or an engine-global/bracket survivor this function did
+    NOT count all REMAIN counted and still fail closed. Any mismatch / ambiguous site
+    is NOT exempted — it is counted (fail closed)."""
     exempted = 0
     count = 0
     for m in _GETCHILDREN_INDEX_ANY_RE.finditer(source):
@@ -1158,10 +1156,10 @@ def _site_is_discharged_rig_dead_write(
 ) -> bool:
     """True iff the GetChildren survivor SITE spanning ``[site_start, site_end)`` is the
     EXACT credited dead init-write of a discharged rig binding — a TIGHT POSITIVE match
-    of the one site the resolver fact credited (REDESIGN r3), NOT a negative text filter.
+    of the one site the resolver fact credited, NOT a negative text filter.
     ALL of the following must hold; every mismatch biases to COUNT (return False):
 
-      (statement identity — the r7 protections, RETAINED and ANDed, NOT replaced)
+      (statement identity)
         the single Luau statement physically containing the site is EXACTLY the
         assignment ``self.<field> = <recv>:GetChildren()[k]`` whose ENTIRE RHS is that
         one site:
@@ -1175,18 +1173,18 @@ def _site_is_discharged_rig_dead_write(
               ``+ bar:Get...`` operand). So an arbitrary RHS that merely CONTAINS a
               GetChildren (``self.<field> = nil or foo:GetChildren()[1]``) is NOT exempt.
 
-      (receiver anchor — REDESIGN r3, NEW) the GetChildren RECEIVER is exactly
-        ``self.<cam_receiver>`` — the dot-form member access of the carrier's deterministic
-        C# receiver text, matched ONLY in the ``self.<member>`` form. A bare-``cam`` local,
-        a DIFFERENT receiver (``self.muzzle`` — codex r8), or the direct no-seed form
+      (receiver anchor) the GetChildren RECEIVER is exactly ``self.<cam_receiver>`` —
+        the dot-form member access of the carrier's deterministic C# receiver text,
+        matched ONLY in the ``self.<member>`` form. A bare-``cam`` local, a DIFFERENT
+        receiver (``self.muzzle``), or the direct no-seed form
         (``cam_receiver=="Camera.main.transform"`` forms no ``self.<member>``) does NOT
         match -> COUNTED (the direct form is a SAFE false-positive).
 
-      (ordinal anchor — REDESIGN r3, NEW) the surviving ``:GetChildren()[k]`` ordinal
-        ``k`` equals ``cam_ordinal + 1`` (the carrier's 0-based ``GetChild(n)``; Luau
+      (ordinal anchor) the surviving ``:GetChildren()[k]`` ordinal ``k`` equals
+        ``cam_ordinal + 1`` (the carrier's 0-based ``GetChild(n)``; Luau
         ``GetChildren()`` is 1-based). A same-receiver write at a DIFFERENT ordinal
-        (``self.cam:GetChildren()[2]`` when the credited init was ``[1]`` — codex r3)
-        does NOT match -> COUNTED.
+        (``self.cam:GetChildren()[2]`` when the credited init was ``[1]``) does NOT
+        match -> COUNTED.
 
     Any gate failure (incl. an un-parseable/ambiguous statement, an empty ``field``, or
     an empty ``cam_receiver``) returns False — the site is counted, fail closed (a
@@ -1252,7 +1250,7 @@ def _check_surviving_child_ordinal(
         rt = r.get("resolved_total")
         if gt is None or rt is None or gt <= 0:
             continue
-        # RIG-AWARE exemption (POSITIVELY anchored): a surviving positional ordinal
+        # RIG-AWARE exemption: a surviving positional ordinal
         # that is the EXACT credited dead init-WRITE of a DISCHARGED rig binding
         # (``self.<field> = self.<cam_receiver>:GetChildren()[k]``, ``k == cam_ordinal
         # + 1``) is superseded by the read reroute (Path A) — it is
@@ -1284,7 +1282,7 @@ def _check_surviving_child_ordinal(
         # different lvalue, fails the gate and stays counted). Forging the carrier
         # requires tampering the internal ``conversion_plan.json``, which the converter
         # writes itself — out of threat model (an attacker who can edit it can edit the
-        # output Luau directly). See test_rig_binding_present.py §f-r3-INERT-BOUND.
+        # output Luau directly).
         exempt: _RigDeadWriteExempt | None = None
         rb = script.rig_binding
         if rb:
@@ -1415,8 +1413,8 @@ def _rig_pos_is_real_code(source: str, pos: int) -> bool:
     """A position that is BOTH code (not in a short string / line-comment) AND NOT
     inside a Luau long-bracket string/comment (``[[...]]`` / ``[=[...]=]`` /
     ``--[[...]]``). The single code-position predicate every rig scan uses so a
-    token inside a long-bracket literal never counts as live code (codex BLOCKING:
-    a fake ``_resolve...`` token inside ``[[ ]]`` must not false-discharge)."""
+    token inside a long-bracket literal never counts as live code (a fake
+    ``_resolve...`` token inside ``[[ ]]`` must not false-discharge)."""
     return _luau_pos_is_code(source, pos) and not _luau_pos_in_long_bracket(
         source, pos
     )
@@ -1440,7 +1438,7 @@ def _rig_enclosing_method(source: str, pos: int) -> str | None:
 # only rewrites the AI-STABLE ``self.<field>`` dot read; ANY OTHER field-access of
 # the same token that survives is a raw consumption the lowering could not rewrite,
 # so the binding is NOT discharged — fail closed. We do NOT enumerate receiver
-# shapes (the round-1 blacklist a long tail of exotic receivers evaded). Instead we
+# shapes (a blacklist lets a long tail of exotic receivers evade). Instead we
 # close the whole class: a SURVIVING field-access READ of ``<field>`` fails closed
 # REGARDLESS of receiver, with exactly two known-good exceptions (assignment LHS;
 # the injected resolver's own internals).
@@ -1460,8 +1458,8 @@ def _rig_field_token_re(field: str) -> "re.Pattern[str]":
 #     grammar is decoded by ``_rig_decode_luau_string_key`` (short strings with escape
 #     processing, long-bracket strings, and ``..`` concatenations of these), so an
 #     ENCODED key that resolves to the field (``[[weaponSlot]]``, ``["wea\\x70onSlot"]``,
-#     ``["wea\\x70on".."Slot"]``) is caught — closing the raw-text-only bypass (codex
-#     BLOCKING). A NON-static / dynamic key (``self[var]``, ``self[fn()]``,
+#     ``["wea\\x70on".."Slot"]``) is caught — closing the raw-text-only bypass. A
+#     NON-static / dynamic key (``self[var]``, ``self[fn()]``,
 #     ``self["a"..var]``) decodes to None and is NEVER flagged (no false-fail).
 
 
@@ -1478,8 +1476,7 @@ def _rig_pos_is_assignment_lhs(proj: str, end: int) -> bool:
       * MULTI-TARGET assignment list — the access is followed (modulo ws) by one or
         more ``, <lvalue>`` targets and then a single ``=``:
         ``self.<field>, other = a, b``. The access sits to the LEFT of the ``=`` in
-        an assignment-target list, so it is still a WRITE, not a READ (codex MINOR:
-        a multi-assignment write false-failed as a read before this).
+        an assignment-target list, so it is still a WRITE, not a READ.
 
     The target-list scan walks ``, <balanced-lvalue>`` segments at bracket depth 0
     up to a bare ``=``; a ``;`` / ``)`` / EOF / a binary ``==`` (not preceded by a
@@ -1677,8 +1674,7 @@ def _rig_decode_luau_string_key(expr: str) -> str | None:
     (a variable, a call, an arithmetic term, or any operand that is not a string
     literal -> dynamic, not provably the field).
 
-    Decodes the FINITE Luau string-literal grammar (codex BLOCKING FIX 1 — closes the
-    encoded-key class for good):
+    Decodes the FINITE Luau string-literal grammar (closes the encoded-key class):
 
       * SHORT strings (``"..."`` / ``'...'``) with full escape processing
         (``\\xHH``, ``\\ddd``, ``\\u{...}``, ``\\n``/``\\t``/...; ``\\z``; line
@@ -1856,8 +1852,8 @@ def _rig_has_surviving_dynamic_self_index_read(source: str) -> bool:
     decode (a variable, a ``..`` concat with a non-literal operand, a call, any
     computed key).
 
-    Why this fails discharge (codex r2 BLOCKING — dynamic-read discharge gap): the
-    dot-form read reroute ONLY rewrites ``self.<field>``; a STATIC ``self["<field>"]``
+    Why this fails discharge (dynamic-read discharge gap): the dot-form read reroute
+    ONLY rewrites ``self.<field>``; a STATIC ``self["<field>"]``
     is separately decoded by ``_rig_has_decoded_field_bracket_read`` (already fails
     discharge — correct). But a DYNAMIC ``self[k]`` (``self["weapon".."Slot"]``;
     ``local k = ...; self[k]``) COULD read ``<field>`` at runtime and was NOT
@@ -1895,15 +1891,14 @@ def _rig_index_receiver_is_self(proj: str, open_idx: int) -> bool:
     are already blanked in the code projection ``proj``) are stripped and the receiver
     reduces to the keyword ``self`` at a word boundary.
 
-    Round-3 BLOCKING fix (codex): the prior version matched only a BARE ``self`` token
-    immediately before ``[``, so a PARENTHESIZED receiver ``(self)[k]`` /
-    ``( self )["weapon"..suffix]`` / ``((self))[k]`` — semantically identical to
-    ``self[k]`` in Luau — slipped through as "not self" and discharged True, masking a
-    live dynamic read. Rather than enumerate one more literal form (per-form
-    whack-a-mole), normalize the receiver: peel balanced ``( ... )`` wrappers and
-    whitespace, then test the residual token. This closes ``self[k]``, ``(self)[k]``,
-    ``( self )[k]``, ``((self))[k]``, ``self [k]``, and ``self --c\\n[k]`` (the comment
-    is whitespace in ``proj``) in one robust check.
+    A BARE ``self`` token immediately before ``[`` is not the only self-receiver
+    form: a PARENTHESIZED receiver ``(self)[k]`` / ``( self )["weapon"..suffix]`` /
+    ``((self))[k]`` is semantically identical to ``self[k]`` in Luau and must not slip
+    through as "not self" (which would discharge True, masking a live dynamic read).
+    Rather than enumerate one more literal form, normalize the receiver: peel balanced
+    ``( ... )`` wrappers and whitespace, then test the residual token. This closes
+    ``self[k]``, ``(self)[k]``, ``( self )[k]``, ``((self))[k]``, ``self [k]``, and
+    ``self --c\\n[k]`` (the comment is whitespace in ``proj``) in one robust check.
 
     Stays gated to a self-receiver dynamic index: ``other[k]`` / ``t[k]`` / a member
     access ``a.self[k]`` / a substring ``myself[k]`` / a parenthesized non-self
@@ -2004,8 +1999,8 @@ def _rig_has_surviving_field_consumption(source: str, field: str) -> bool:
     safely rewrite — so the binding is NOT discharged. Path A re-anchor: this is the
     load-bearing discharge gate (replaces the old surviving-WRITE gate).
 
-    RECEIVER-AGNOSTIC (round-1 BLOCKING fix): the discriminator is "a raw
-    ``<field>`` field-access READ survived", NOT the receiver shape. We do NOT
+    RECEIVER-AGNOSTIC: the discriminator is "a raw ``<field>`` field-access READ
+    survived", NOT the receiver shape. We do NOT
     enumerate receiver forms (the blacklist a long tail of exotic receivers —
     ``(owner).<field>``, ``getOwner().<field>``, ``owners[1].<field>``,
     ``other.self.<field>``, ``(self)["<field>"]`` — silently evaded). A field-access
@@ -2060,7 +2055,7 @@ def _rig_has_surviving_field_consumption(source: str, field: str) -> bool:
     # DECODES to exactly ``<field>`` is a surviving READ (write-LHS exempt); a
     # dynamic / non-static key decodes to None and is never flagged. This subsumes
     # the old clean-literal matcher AND the old computed-key folder, closing the
-    # encoded-key bypass class (codex BLOCKING FIX 1).
+    # encoded-key bypass class.
     if _rig_has_decoded_field_bracket_read(source, field):
         return True
 
@@ -2097,8 +2092,8 @@ def _rig_line_continues(source: str, start: int, nl_pos: int) -> bool:
     (bracket depth 0): the text from ``start`` to ``nl_pos`` ends with a
     binary/continuation operator, OR the next non-blank line begins with one.
     Mirrors the lowering's ``_line_continues`` so the verifier's RHS span is
-    continuation-aware (codex BLOCKING: a multiline surviving ordinal write must be
-    spanned, not truncated at the first newline), AND closes the postfix-head class
+    continuation-aware (a multiline surviving ordinal write must be spanned, not
+    truncated at the first newline), AND closes the postfix-head class
     (``[``/``(``/``.``/``:``) so a write split before a trailing index/call/member is
     spanned — guarded by a statement-boundary check so a ``(``/``[`` head does not
     swallow a following statement."""
@@ -2128,7 +2123,7 @@ def _rig_code_projection(source: str) -> str:
     length as ``source`` so the char-index machinery (RHS span, continuation scan)
     maps 1:1.
 
-    This is the STRUCTURAL normalization the round-3 fix is built on: once a comment
+    This is the STRUCTURAL normalization the rig scans are built on: once a comment
     span (delimiter and all) is whitespace, a ``--`` between tokens can never
     truncate an RHS span and a token inside a string can never match. Walks the
     source with the SAME state machine as ``_luau_pos_is_code`` (line/block comments,
@@ -2203,7 +2198,7 @@ def _rig_method_body_end(source: str, decl_start: int) -> int:
     # upcoming ``then``'s increment (net 0 for the whole chain). ``else`` follows no
     # ``then`` (pure +0 continuation), so it is not a token here. Without this,
     # an ``elseif`` chain over-counts openers and the span overruns the method's
-    # closing ``end`` into later unrelated code (codex round-4 BLOCKING).
+    # closing ``end`` into later unrelated code.
     opener_re = re.compile(r"\b(function|do|then|repeat)\b")
     closer_re = re.compile(r"\b(end|until|elseif)\b")
     while i < n:
@@ -2283,13 +2278,13 @@ def _rig_resolver_body_is_rig_lookup(source: str, suffix: str, child: str) -> bo
     ``FindFirstChild("<child>", true)`` (the real S1 emit, anchored on the
     deterministic ``child``).
 
-    Codex BLOCKING: a FOREIGN same-named stub (``return nil`` / a wrong lookup) +
-    a forged/stale ``present=True`` must NOT count as discharged. Requiring the rig-
-    lookup body as live code inside the method span is the fail-closed floor — a
-    bare same-named method without that body does not discharge.
+    A FOREIGN same-named stub (``return nil`` / a wrong lookup) + a forged/stale
+    ``present=True`` must NOT count as discharged. Requiring the rig-lookup body as
+    live code inside the method span is the fail-closed floor — a bare same-named
+    method without that body does not discharge.
 
-    Codex HARDEN BLOCKING: the method must also be declared on the module's PRIMARY
-    CLASS (the class the lowering injects on). A wrong-class same-named resolver
+    The method must also be declared on the module's PRIMARY CLASS (the class the
+    lowering injects on). A wrong-class same-named resolver
     (``function Helper:_resolve<suffix>(`` carrying the real body) is NOT the host's
     method — the rerouted ``self:_resolve<suffix>(`` calls bind to the host class,
     not ``Helper`` — so it must NOT false-discharge."""
@@ -2379,7 +2374,7 @@ def _rig_binding_discharged(source: str, field: str, child: str) -> bool:
     call = f"self:_resolve{suffix}("
     # (1a) the resolver METHOD declaration is present at a code position AND its
     # BODY is the rig resolver (the distinctive ``_MainCameraRig`` lookup as live
-    # code) — a foreign same-named stub does NOT discharge (codex BLOCKING).
+    # code) — a foreign same-named stub does NOT discharge.
     if not _rig_resolver_body_is_rig_lookup(source, suffix, child):
         return False
     # (1b) >=1 ``self:_resolve<suffix>(`` CALL (distinct from the declaration —
@@ -2392,8 +2387,8 @@ def _rig_binding_discharged(source: str, field: str, child: str) -> bool:
     # boundary the read-reroute cannot safely rewrite.
     if _rig_has_surviving_field_consumption(source, field):
         return False
-    # (3) no surviving DYNAMIC ``self[<expr>]`` index read (codex r2 BLOCKING): a
-    # computed key (``self["weapon".."Slot"]``, ``self[k]``) the analyzer cannot
+    # (3) no surviving DYNAMIC ``self[<expr>]`` index read: a computed key
+    # (``self["weapon".."Slot"]``, ``self[k]``) the analyzer cannot
     # decode COULD read ``<field>`` and was NOT rerouted -> the field is not provably
     # unread -> fail closed. (A static ``self["<field>"]`` is already caught by (2).)
     if _rig_has_surviving_dynamic_self_index_read(source):
@@ -2403,7 +2398,7 @@ def _rig_binding_discharged(source: str, field: str, child: str) -> bool:
 
 def _rig_code_contains(source: str, token: str) -> bool:
     """True if ``token`` appears at a code position (not in a comment/string and
-    NOT inside a Luau long-bracket literal — codex BLOCKING)."""
+    NOT inside a Luau long-bracket literal)."""
     idx = source.find(token)
     while idx != -1:
         if _rig_pos_is_real_code(source, idx):

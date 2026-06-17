@@ -562,13 +562,9 @@ def transpile_scripts(
         if pattern_warnings:
             warnings = pattern_warnings + warnings
 
-        # Fall back to stub if AI didn't run or failed. The stub comments
-        # out the original C# as reference and generates a minimal module
-        # skeleton. This is intentionally minimal — AI transpilation is the
-        # primary path and the stub is only a safety net for offline/no-key
-        # scenarios. The old regex-based transpiler was removed because AI
-        # produces superior output and the regex patterns were a maintenance
-        # burden (catastrophic backtracking, 500+ lines of fragile patterns).
+        # Fall back to stub if AI didn't run or failed. The stub comments out
+        # the original C# and generates a minimal module skeleton — a safety
+        # net for offline/no-key scenarios; AI transpilation is the primary path.
         if not luau or confidence < 0.1:
             from converter.stub_generator import generate_stub
             luau = generate_stub(csharp_source, info)

@@ -82,31 +82,17 @@ _RE_STATIC_EVENT = re.compile(
 _RE_DECLARATOR = re.compile(r"\b\w+\b")
 
 # GLOBAL scene-lookup generics whose type argument is NOT a dependency
-# edge at all: ``FindObjectOfType<T>()`` locates an ALREADY-EXISTING
-# instance of T somewhere in the scene. T's reachability/placement comes
-# from its own scene authoring or instantiation — NOT from the finder — so
-# the finder creates no structural relationship and no ``require()`` need.
-# Counting the type arg poisons ``dependency_map`` (e.g. ``Plane`` doing
-# ``FindObjectOfType<GameManager>()`` misroutes ``GameManager`` to
-# ServerStorage). If T is genuinely required it appears via a
-# field/``new``/param/base reference, captured by the other patterns.
-#
-# NOTE (Codex review, 2026-06-01): this set is deliberately LIMITED to
-# GLOBAL lookups. ``GetComponent<T>`` / ``AddComponent<T>`` /
-# ``TryGetComponent<T>`` / ``GetComponentInChildren<T>`` etc. are NOT here:
-# those reference a PEER component (or, for ``AddComponent``, create it),
-# which IS a real dependency edge that ``dependency_map`` feeds to
-# ``resolve_caller_graph`` / ``derive_reachability_requirements`` /
-# ``_compute_network_behaviour_reachable`` — none of which re-scan these
-# APIs. Dropping a component-lookup edge would ORPHAN a component that's
-# referenced only that way. (Whether such edges should also drive a
-# ``require()`` is a separate, pre-existing concern at the injection site,
-# out of scope here.)
+# edge: ``FindObjectOfType<T>()`` locates an ALREADY-EXISTING instance of
+# T, so the finder creates no structural relationship and no ``require()``
+# need; counting the type arg poisons ``dependency_map``. The set is
+# deliberately LIMITED to GLOBAL lookups — component lookups
+# (``GetComponent<T>`` / ``AddComponent<T>`` / …) reference a real peer
+# edge the reachability consumers need, so they are NOT excluded here.
 _GLOBAL_LOOKUP_GENERIC_METHODS = frozenset({
     # Legacy global finders.
     "FindObjectOfType", "FindObjectsOfType",
-    # ``Resources.FindObjectsOfTypeAll<T>()`` is PLURAL "Objects" (Codex
-    # review 2026-06-01 — the singular form does not exist as an API).
+    # ``Resources.FindObjectsOfTypeAll<T>()`` is PLURAL "Objects" (the
+    # singular form does not exist as an API).
     "FindObjectsOfTypeAll",
     # Unity 2023+ replacements for the deprecated finders above.
     "FindFirstObjectByType", "FindAnyObjectByType", "FindObjectsByType",
@@ -219,17 +205,8 @@ def analyze_script(script_path: str | Path) -> ScriptInfo:
         _type_refs.add(m2.group(1))
     # Generic type args: List<TypeName>, Dictionary<K, TypeName>.
     # EXCLUDE the type arg of GLOBAL scene-lookup generics
-    # (``FindObjectOfType<T>`` etc.): those locate an already-existing T,
-    # creating no dependency edge and no ``require()`` need. Counting them
-    # poisons ``dependency_map`` (which feeds the legacy require-injector
-    # AND the topology caller_graph), e.g. ``Plane`` calling
-    # ``FindObjectOfType<GameManager>()`` misroutes ``GameManager`` to
-    # ServerStorage. Component-lookup generics (``GetComponent<T>`` /
-    # ``AddComponent<T>`` / …) are NOT excluded — they are real peer edges
-    # the reachability consumers need (see _GLOBAL_LOOKUP_GENERIC_METHODS).
-    # If T is genuinely require-worthy it's also captured by the
-    # new/field/param/base patterns. See TODO.md "Transpiler false-positive
-    # require() injection".
+    # (``FindObjectOfType<T>`` etc.) — see _GLOBAL_LOOKUP_GENERIC_METHODS
+    # for why; component-lookup generics are kept.
     # Capture the optional token immediately before ``<`` so we can tell a
     # global-lookup method (``FindObjectOfType<Foo>``) from a collection
     # type (``List<Foo>``) or a component lookup (``GetComponent<Foo>``).

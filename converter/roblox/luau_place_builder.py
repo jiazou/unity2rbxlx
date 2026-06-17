@@ -92,7 +92,7 @@ def _luau_str(s: str) -> str:
 def _mat_enum(mat: str | int) -> str:
     """Convert material to Enum.Material.X."""
     if isinstance(mat, int):
-        # Reverse-lookup from token value is complex; just use Plastic
+        # No reverse-lookup for int tokens; default to Plastic.
         return "Enum.Material.Plastic"
     name = mat if mat in MATERIAL_NAME_TO_TOKEN else "Plastic"
     return f"Enum.Material.{name}"
@@ -516,11 +516,9 @@ def _emit_part(
         # Additional MeshPart properties
         _emit_part_extras(b, part, var)
 
-        # Note: part.size already has the correct final size from the converter.
-        # The mkMesh function sets mp.Size = sz (the pre-computed size).
-        # The _ScaleX/Y/Z attributes are only used by the MeshLoader runtime
-        # fallback where mp.Size starts as MeshSize (native) and needs scaling.
-        # Here we DON'T apply _Scale — it would double the scaling.
+        # part.size is already the final size; DON'T apply _ScaleX/Y/Z here
+        # (that would double-scale). _Scale is only for the MeshLoader runtime
+        # fallback, where mp.Size starts as native MeshSize and needs scaling.
 
         # TextureID
         if part.texture_id:
@@ -1291,14 +1289,3 @@ def generate_place_luau_chunked(
         max_chunk_bytes / (1024 * 1024),
     )
     return [full_script]
-
-
-def _validate_output(script: str) -> None:
-    """Basic sanity checks on generated output."""
-    size = len(script.encode("utf-8"))
-    if size > _MAX_SCRIPT_BYTES:
-        log.warning(
-            "Generated script is %.1f MB, exceeds 4 MB limit. "
-            "Large projects may need multiple execution batches.",
-            size / (1024 * 1024),
-        )
