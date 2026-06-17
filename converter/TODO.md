@@ -99,21 +99,26 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
   trigger (camera-aligned W-drive — `Player:Move` is camera-`_yaw`-relative, not character-facing).
   F10 won't pass until pattern #9 lands AND the fixture walks in. See the next item for F15.
 
-- [ ] **P1 (e2e fixture) — F10 door fixture contact-miss. (F15 mine FIXED 2026-06-17.)**
+- [ ] **P1 (e2e fixture) — F10 door tween awaits a post-#195 fresh conversion. (F15 mine + F10 harness FIXED 2026-06-17.)**
   Harness-only (`tests/fixtures/upload_snapshots/SimpleFPS.behavior.json`), no converter change.
   Original setups single-teleport the player to a point that doesn't overlap the trigger.
-  **F15 mine — FIXED 2026-06-17 (live-verified, this commit):** the `mine.Position+3` hover floated
-  the whole character above the 0.87-tall mine body and a static teleport-into-overlap doesn't fire
-  `Touched`. Replaced with a translation-only swept `PivotTo` through the mine at its own vertical
-  level (`c.Y+0.5`, 30 frames), overriding physics each frame → crosses the non-touching→touching
-  boundary → client `Touched → Explode → Humanoid:TakeDamage`. Driven live in Studio against the
-  `2026-06-05` SimpleFPS conversion: 100→90, char alive. NO facing reliance (the dead
-  `PivotTo(CFrame.lookAt)` reface was avoided — movement is camera-`_yaw`-relative).
-  **F10 door — STILL OPEN.** The door converter fix (#9) landed (PR #195), but the fixture still
-  teleports `door_mesh.Position - LookVector*6 + (0,2,0)` which doesn't enter the door TriggerZone
-  volume; it needs a swept walk-in like the mine, AND it `depends_on` `walk_to_cardkey_picks_it_up`
-  (hasKey first). Apply the same swept-entry pattern through the TriggerZone, then live-verify the
-  visual tween (`dPos>1 or dRot>0.2`).
+  **F15 mine — FIXED 2026-06-17 (live-verified):** the `mine.Position+3` hover floated the whole
+  character above the 0.87-tall mine body and a static teleport-into-overlap doesn't fire `Touched`.
+  Replaced with a translation-only swept `PivotTo` through the mine at its own vertical level
+  (`c.Y+0.5`, 30 frames), overriding physics each frame → crosses the non-touching→touching boundary
+  → client `Touched → Explode → Humanoid:TakeDamage`. Driven live: 100→90, char alive.
+  **F10 door — HARNESS FIXED 2026-06-17 (contact live-verified); tween confirmation owed.** The old
+  setup aimed at the `door` PANEL (~Y61, 42 studs up), teleporting the player into the air. The Door
+  component connects `Touched` on its `TriggerZone` child (a ~21-stud CanCollide=false cube at ground
+  level ~Y18.5, under `Door/base`), and a key-holder entering it runs `ToggleDoor(true)`. Fix: sweep
+  the HRP from outside INTO the TriggerZone center and STOP (passing through fires
+  `TouchEnded→ToggleDoor(false)` and re-closes it, zeroing the end-state motion). Live-verified on the
+  pre-#195 `2026-06-05` conversion: entering with hasKey flips and HOLDS `open=true` (5/5 samples);
+  `hasKey` is a CHARACTER attr (cardkey pickup sets it, Door reads it via `playerFromTouch` —
+  char-only confirmed sufficient). REMAINING: the visual tween only plays when the animation driver is
+  routed client-side, which needs a conversion built AFTER #195 (all on-disk conversions still emit
+  `Anim_Door` as a ServerScriptService Script). Confirm `dPos>1 or dRot>0.2` on the next `/e2e-test`
+  fresh conversion.
 
 - [x] **P1 — Generic-mode SimpleFPS canary failures (dual-voice investigation 2026-06-11; NOT Step-1b regressions).** See `docs/design/scene-runtime-pr5-8-recut-plan.md` §"The canary failures" — the PR5 canary gate (SimpleFPS plays under generic). Slices: **T** turret child-index lowering, **T-bullet** nil-parent→workspace default, **R** generic `weaponSlot` rebind, **D** door dynamic-Animator-driver narrowing, **H** HudControl client-domain rule.
   STATUS (verified 2026-06-17): **T** ✅ Phase-1 canary merged #193; **R** ✅ merged #191 (`drive/rifle-dropped-ref`); **D** ✅ merged #195; **H** ✅ done (HudControl classifies `domain:client`/`LocalScript` — `simplefps_minimal.json`). The remaining turret **projectile-physics + damage** half (#8 stages 3–4) is ACTIVELY OWNED by `drive/turret-bullet-damage-real` (tip `58651d7` "bind damage Touched to the colliding body") — tracked under the F16 turret P0 above, not here. Nothing in this entry is outstanding-and-unowned.
