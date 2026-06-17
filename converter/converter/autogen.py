@@ -653,6 +653,10 @@ _PLAN_KEYS_FOR_HOST: tuple[str, ...] = (
     # it off the embedded plan; without it here the filter would silently elide
     # the field and the client would fall back to a frozen 9.81.
     "gravityDesiredBaseStuds",
+    # Unit-3 theme registration: per-DB seed records the entrypoint shim replays
+    # at boot. LOAD-BEARING — without the allowlist entry the recomputed key is
+    # elided from the emitted plan and the shim sees ``{}`` (dead registry).
+    "addressable_db_seeds",
 )
 
 
@@ -1018,6 +1022,7 @@ local services = {
 }
 
 local engine = SceneRuntime.new(services, Plan)
+SceneRuntime.seedAddressableDatabases(Plan, services)
 engine:start("client")
 '''
 
@@ -1218,6 +1223,7 @@ local services = {
 }
 
 local engine = SceneRuntime.new(services, Plan)
+SceneRuntime.seedAddressableDatabases(Plan, services)
 engine:start("server")
 '''
 

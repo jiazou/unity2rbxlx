@@ -836,6 +836,127 @@ converter/runtime/scene_runtime.luau (queue site ~:1300) — self-contradictory/
 ## From Unit 2 phase-3 harden (WARN-timing residual — reverted net-negative patch)
 - converter/runtime/scene_runtime.luau — the residual "stripped ref never resolved" WARN has imperfect timing across MULTIPLE async UI-deferred host groups: it can fire PREMATURELY (a ref that a later group will bind) — that's the last-good behavior we kept. A harden attempt to gate it on a _deferredGroupsPending counter + a final drain was REVERTED because it introduced the opposite bug (WARN SUPPRESSED forever when the last group completes as an empty batch — codex). The WARN is DIAGNOSTIC-ONLY; binding is correct either way (cross-domain refs never queued; same-domain incl. missionPopup bind via the original post-placement + per-batch drains). Getting the WARN's exact multi-group async timing right is deferred (no real game exercises it: Trash-Dash's 3 stripped refs are client→client and their targets register). Fix when a real case appears.
 
+
+## ── /drive run addressables-unit3-themes-20260617T080323 — Addressables Unit 3 (Themes) — 2026-06-17T04:00:11Z ──
+
+
+## Plan-stage note (Unit 3 themes)
+- Codex second opinion on the Register approach was attempted twice (medium + low effort) and BOTH hit a
+  transient WSS/connection outage (chatgpt.com responses endpoint, os error 54). Treated as flakiness per
+  prior sessions, not a DOWN. A Claude design subagent DID review and its two load-bearing findings are
+  integrated (converter-owned register contract; no themeData/themeName hardcodes; foundation/consumer
+  split). The drive-review DESIGN gate will supply the independent voice on this doc. Re-run codex on the
+  design at the review gate when the endpoint recovers.
+
+## General SO-addressable ownership/routing model (deferred from Unit 3)
+- Unit 3 routes ONLY the theme database (label→owning-DB derived from the consuming load method, keyed by
+  the DB's index field). Generalizing this derived routing to EVERY SO-addressable consumer
+  (CharacterDatabase and future SO-loaded databases) is a larger, generic ownership model deferred out of
+  this unit. Pick it up when a second SO-addressable consumer needs registry seeding. (D6.)
+
+## Bootstrap-order / LoadDatabase-clobber as a generic seeding concern
+- The converted `LoadDatabase` resets its store to `{}` then sets `m_Loaded=true`, and IS invoked
+  (PlayerData.luau:191 / ShopUI.luau:30). The seed-vs-load ordering must be pinned per-DB so the seed
+  isn't clobbered. If multiple SO-loaded DBs are seeded later, factor this ordering guarantee generically
+  rather than per-DB. (P2; spiked at Phase 2 detailed design for the theme DB.)
+
+## Planned guid-fallback abstain test (P3)
+- Add a test: an SO lacking the identifying field -> the seed ABSTAINS (best-effort guid/stem fallback or
+  skip), does NOT crash. Note the fallback entry is best-effort (consumer never retrieves it by that key),
+  not a reachability guarantee.
+
+## Design-review round-1 residuals (P2/P3 — Phase-2 detailed-design constraints, non-blocking)
+- [P2] Isolatable-acceptance probe must read via the CONSUMER's lookup-key path (the field/path the
+  converted consumer actually indexes the registry by), NOT echo the seed's own derived key — else the
+  acceptance check is self-satisfying (asserts the seed wrote what the seed computed). Pin at Phase-2
+  detailed design.
+- [P3] (claude design reviewer) minor doc nit folded; codex flagged none beyond the deferred spike.
+
+## Phase-1 detailed-design followups (AssetReference resolution)
+- [FU-P1-a] Sub-asset `fileID`/`m_SubObjectName` disambiguation of AssetReferences is out of scope — one
+  id per `.prefab`; a sub-object-name reference resolves to the parent prefab id (matcher tolerates
+  `m_SubObjectName` but ignores its value). Matches Unit 2's documented scope. Not exercised by trash-dash
+  (0 `m_SubObjectName` occurrences). Revisit only when a real game references a sub-asset within a `.prefab`.
+- [FU-P1-b] The AssetReference key-set allowed by the matcher is `{m_AssetGUID, m_CachedAsset,
+  m_SubObjectName}` (the full set Unity emits, pinned empirically). If a future game serializes an
+  as-yet-unseen Unity AssetReference field, the subset matcher correctly declines it (falls through to the
+  generic-dict branch). Re-enumerate the real key-set against that input before widening `_ASSETREF_KEYS`;
+  do NOT widen speculatively.
+
+## Slice 1.1 review P2s (codex, non-blocking → HARDEN targets)
+- [P2] test_object_ref_arm_unaffected asserts only the prefab POSITIVE case; add an explicit
+  regression assertion for the `nil --[[(Unity object reference)]]` nil-marker path (AC-6/AC-7).
+- [P2] AC-1 prefabList list test proves SOME resolved string appears + AssetGUID/CachedAsset absent
+  globally, but not that EVERY list element collapsed to a string (a mixed {"id", nil} would pass).
+  Tighten to assert each element is a string.
+
+## slop (deferred to finalize)
+converter/converter/scriptable_object_converter.py:70 — verbose docstring (Phase-1 AssetReference branch)
+converter/converter/scriptable_object_converter.py:76 — verbose predicate docstring/comment
+converter/converter/scriptable_object_converter.py:120 — redundant inline comment
+converter/tests/test_scriptable_object_converter.py:583 — verbose test docstring
+converter/tests/test_scriptable_object_converter.py:614 — verbose test comment
+converter/tests/test_scriptable_object_converter.py:813 — verbose test comment
+
+## Phase-2 detailed-design followups (theme registration data-seeding)
+- [FU-P2-a] Generalize the derived label→owning-DB routing to EVERY SO-addressable consumer (CharacterDatabase
+  has the identical `LoadAssetsAsync<CharacterData>` shape + a `loaded()` gate). The `addressable_db_seeds`
+  plan list + `SceneRuntime.seedAddressableDatabases` shim are already generic; deferred work is wiring the 2nd+
+  DB through the same derivation. (D6 / design.md Out-of-scope.)
+- [FU-P2-b] The single residual AI-name dependency is the write-surface ingress, now drain-bound + fail-loud
+  (D16): a public appender is accepted only if its `table.insert` target == the field `LoadDatabase` drains,
+  else the drain field is seeded directly, else the seed ABSTAINS + WARNS (AC-7). If a re-transpile emits a
+  theme DB where nothing binds to the drain, loud abstain (registry empty, observable). Revisit only if a real
+  re-transpile trips it; do not pre-harden.
+- [FU-P2-c] The shim relies on the AI `LoadDatabase` body's `Add(op.keyField, op)` drain to index correctly. A
+  future re-transpile that indexes `LoadDatabase` by a different key would key the registry wrong (detected only
+  at runtime/AC-1). Consider a build-time assertion that the transpiled `LoadDatabase` indexes by the derived
+  key field; deferred (not exercised by trash-dash).
+- [FU-P2-d] Spike artifacts `/tmp/theme_seed_spike.luau` + `/tmp/theme_boot_order_spike.luau` validated the
+  mechanism + ordering + abstain + loaded()-coupling (both PASS); not committed. Fold their assertions into the
+  AC-5 host test at implement.
+- [FU-P2-e] [IMPL-OPEN] Exact ownership-extraction surface in pipeline.py. RESOLVED sourcing (D17, resume-safe):
+  owned label + key field from the DB's C# source re-read from `self.unity_project_path` (deterministic
+  upstream, `ThemeDatabase.cs:32`/`:36-37`); DB-module identity + drain/appender bind from the transpiled body
+  via `rbx_place.scripts[*].source` (rehydrated by ESSENTIAL `materialize_and_classify` on resume). The
+  remaining impl choice is parser shape (regex span vs light AST) over those two sources; the DATA is derivable.
+
+## Design-review round-2: P1 (drain-bind) + P2 (resume persistence) addressed (Phase-2 detailed design)
+- [P1 RESOLVED — D16] Write-surface detector is now BOUND to the list `LoadDatabase` drains (`DRAIN_FIELD` from
+  the C#-derived `LoadDatabase` body) and FAILS LOUD + abstains on a miss, instead of name-matching any
+  appender. Cross-check: appender-target-field == LoadDatabase-drained-field == store-build field. Verified on
+  real output by `/tmp/drain_link_probe.py` (not committed): `_pendingThemeData` on both sides, `Register`
+  binds. New AC-7 (fail-loud) / AC-9 (mismatch-reject); edges 7/8.
+- [P2 RESOLVED — D17] `addressable_db_seeds` derived in `write_output` after `_build_scriptable_object_module_map`
+  and persisted on `scene_runtime` (rides `conversion_plan.json` + `ctx.scene_runtime` like the SO map). All
+  inputs rehydrated by ESSENTIAL phases on resume; NOT gated on transient `transpilation_result`. New AC-10: a
+  no-retranspile `--phase=write_output`/`assemble` resume still emits the seed.
+- [P3 RESOLVED] C# citation corrected `LoadAssetsAsync` `:35`→`ThemeDatabase.cs:32`; once-only-guard wording
+  tightened (the drain executes exactly once, guarded on `themeDataList == nil`).
+
+## Slice 2.1 review residuals (P2/P3 — non-blocking → HARDEN/finalize candidates)
+- [P3] (claude r1) unused-but-symmetric `guid_index` param on a resolver helper; no test for a
+  non-default-container DB path.
+- [P3] (claude r2) the literal-aware paren matcher in _derive_cs_load_ownership doesn't skip C# `//` or
+  `/* */` comments; only effect is a safe early-abstain on an optional key field (fail-soft), non-blocking.
+
+## slop (deferred to finalize) — phase 2 harden round 1
+converter/converter/pipeline.py:155 — over-narrated comment
+converter/converter/pipeline.py — triple-stated recompute comment
+converter/converter/pipeline.py — _AMBIGUOUS_APPENDER sentinel over-abstraction
+converter/converter/pipeline.py — seeded_db_paths guard the code itself calls impossible (redundant)
+converter/converter/autogen.py:651 — over-narrated comment
+converter/runtime/scene_runtime.luau — over-long rationale comments
+converter/tests/test_theme_seed_plan.py:361 — over-narrated codex/pre-fix/post-fix comments
+
+### Architectural follow-up (from finalize)
+- pipeline.py (theme-seed DB discovery: _find_cs_source_for_module :7169, source_by_name :7241,
+  _module_plan_path :7357) — DB discovery is NAME-HEURISTIC (keys off basename / script.name only), so
+  duplicate module names or non-`<Module>.cs` project layouts can bind the wrong C# source, collapse
+  distinct DBs, or seed the wrong runtime module path. Out of scope for this run (Unit 3 ships the
+  theme-seed feature on the SimpleFPS/Trash-Dash corpus where names are unique); a durable fix anchors DB
+  discovery on the artifact identity (guid / emitted-module path) rather than the basename. Generic-converter
+  robustness follow-up.
 ## From Unit 4 phase-2 harden (addressables consumer re-lowering) — 2026-06-17
 - **[P3] `roster_signal_absent` covers TOTAL stale but not PARTIAL stale.** `_roster_fail_closed` (contract_pipeline.py) fail-closes when a C# `Addressables.LoadAssetsAsync` loader exists but the `scene_runtime` carries NO `addressables` block at all (total stale artifact). It does NOT fire when the `addressables` block IS present but is MISSING the specific label a C# loader requests (partial stale) — `find_roster_consumers` then silently abstains for that loader (its label is not a `by_label` key) and the consumer ships un-relowered (empty loadout) with no fail-closed row. This mirrors the player-binding precedent (`player_signal_absent` is also total-only) and is pre-existing behavior, not introduced by Phase 2. Out of Phase-2 scope; do not expand the mechanism. Fix: extend the guard to diff the C#-requested labels (`csharp_label_loader_paths` already enumerates the loaders; would need per-loader label extraction) against `by_label` keys and emit `roster_signal_absent` (or a new `roster_label_absent`) for the gap.
 
