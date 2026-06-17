@@ -1065,3 +1065,26 @@ Observed in the Unit-4 e2e cold-boot (2026-06-17), but PRE-EXISTING + roster-unr
 - CASCADE: CharacterInputController (line 1) and CharacterCollider (line 2) both `require(TrackManager)` at the top, so TrackManager returning no table makes BOTH fail "Module code did not return exactly one value". One root (TrackManager), three console errors.
 - Two follow-on angles: (a) transpile robustness — a complex MonoBehaviour (TrackManager) intermittently transpiles to a TODO-stub with no class-table return; (b) require-resilience — the emitted `require(X "..." ) or ServerStorage...` pattern does not guard against X loading to nil/non-table, so one inert module cascades into every requirer. Consider a fail-soft require wrapper or a post-transpile "module returns a class table" verifier.
 - Also: TrackManager is the D-P2-9 scoped-out post-boot consumer; its failure here is the stub/no-return issue, NOT the wrapper-vs-Instance concern (which only bites with a live body).
+
+## Run door-binding-race (2026-06-17)
+
+# Followups — door-binding-race run
+
+- A STATIC scene-baked copy of a runtime-placed prefab may also exist in workspace (a HostilePlane
+  Name tag appears under both Workspace and ReplicatedStorage in the converted rbxlx). Placement-dedup
+  concern, separate from this binding fix — the fix makes binding robust regardless, but the static
+  copy may cause a duplicate/ghost instance. Investigate whether generic mode should suppress the
+  static copy when a runtime placement exists.
+- Respawn/teardown rebind of the `workspace.DescendantAdded` listener: not added. LocalScript/Script
+  lifetime matches the place session; no explicit `:Disconnect()` lifecycle. Detailed design confirms no
+  leak (single connection per global driver, gated on `not _ownerIsContainer`). Revisit only if a
+  teardown/respawn flow is added that destroys+recreates the driver script.
+- The DescendantAdded child-BasePart fallback (decisions.md D3) relies on the child BasePart sharing a
+  matched name OR the Model resolving on its own event. For a generic Model whose root name differs from
+  its only BasePart child name and which is parented incrementally (not one-shot like autogen.py:951-959),
+  binding could miss until a same-named descendant arrives. Not reachable for the door/plane primary
+  cases (one-shot parent). Generic hardening follow-up if a real game exhibits incremental Model assembly.
+
+## slop (deferred to finalize)
+- converter/converter/animation_converter.py:29 — `Any` co-imported with `Literal` (Any pre-existing for parser sigs, not in this diff)
+- converter/converter/animation_converter.py:1305-1311 — "Runtime placement gate" rationale duplicated as Python `#` comment + emitted Luau `--` comments

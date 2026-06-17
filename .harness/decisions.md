@@ -3352,3 +3352,128 @@ The re-lowering changes the return from a raw tagged Instance to a `Character.ne
   - TrackManager.luau:204→:209 (unit2-proper, instantiatePrefab(GetCharacter(charName))) — POST-boot, Instance-expecting → DIVERGENT (table → player fails to spawn on Run).
   - ShopCharacterList.luau:39/:46-49 (dictionary()-value :GetAttribute) — POST-boot → DIVERGENT (table has no :GetAttribute → error on shop open).
 Per the tier-problems rule: root (boot) fixed in Phase 2; downstream-conditional (post-boot character-object consumers) scoped as a follow-on (followups.md). Phase 2 does NOT re-lower TrackManager/Shop and does NOT expand the mechanism, trigger, dead-module carrier, or .gameObject binding. SHAPE-SPECIFIC: unit2-proper affected; unit1 TrackManager.luau:152 passes the name string → unaffected. AC10 makes the boundary explicit so the divergence is disclosed, not a latent regression.
+
+## Run door-binding-race (2026-06-17) — placement-order-robust Anim_* binding
+
+# Decisions — door-binding-race run
+
+## D1 — Root cause confirmed empirically (premise grounding)
+The F10 door-never-opens bug is NOT a domain bug (PR #195 already fixed that). It is a
+binding-PLACEMENT-ORDER race in the emitted `Anim_*` animation-driver LocalScript:
+`generate_tween_script()` (converter/converter/animation_converter.py) emits a ONE-TIME
+startup scan (`workspace:FindFirstChild(name,true)` + a one-pass `workspace:GetDescendants()`
+fanout, no DescendantAdded/retry). Generic scene-runtime places the Door prefab at RUNTIME
+(scene_runtime.luau instantiatePrefab/_constructPrefabClone) AFTER the LocalScript's scan ran,
+so the script binds nothing and the door never tweens.
+- Fix lever: the binding template in generate_tween_script() — deterministic Python, has tests.
+- Fix approach (general): placement-order-robust binding — a workspace.DescendantAdded listener
+  that wires late-arriving same-named targets into the param-driven tween, preserving the eager
+  scan for parts that already exist at boot. Applies to ANY Animator-driven animation (generic).
+- baseRef: upstream/main @ 5b3efaa (includes #207). PRs target ntornow upstream.
+
+## D2 — Late-arrival mechanism: workspace.DescendantAdded (not retry-poll)
+Event-driven binding is order-robust by construction and has no poll window/timeout
+to tune; the runtime prefab placement is a discrete event the listener catches.
+Classification: Taste (close call vs bounded poll; design recommends DescendantAdded).
+
+## D3 — Ride the existing `not _ownerIsContainer` guard for the late-arrival path
+The guard already separates the flat-list scene-scoped driver (door's case, late
+listener REQUIRED) from the per-clone prefab-scoped driver (already binds its own
+instance, MUST NOT start a workspace-wide listener). The late-arrival path has the
+identical scoping need, so it emits under the same condition — keeps prefab-scoped
+shape unregressed. Classification: Mechanical.
+
+## D4 — Factor a single `bind(_t)` step shared by eager scan + late listener
+One closure per param branch (bool keeps its `_isActive` open/close state machine;
+int keeps its replay), called by both the boot loop and DescendantAdded, with a
+`_bound` set for idempotency. Guarantees boot and late paths are semantically
+identical. Classification: Mechanical.
+
+## D5 — Apply current param state on late bind
+A target placed after its param already flipped open should snap/tween to the active
+state on bind, not stay closed until the next flip. Read attribute on bind; drive
+playAnimation if active. Default-attribute write only when currently nil (don't
+clobber a runtime-set value). Classification: Taste.
+
+## D2 — Hoist late-arrival binding above the boot-target early-return (round-1 BLOCKING)
+The DescendantAdded listener must NOT be nested under the `if not target then return end`
+in generate_tween_script (animation_converter.py:1305-1308): for a door absent at boot the
+script returns before reaching it. Fix: in the scene-scoped (`not _ownerIsContainer`) case,
+don't hard-return on nil boot target — emit listeners + late-arrival path keyed on the
+compile-time name constant (target_name/clip.name/curve_roots), not a runtime target.Name.
+Classification: Mechanical (required for correctness).
+
+## D3 — DescendantAdded resolves on ANY matching event, not only the Model's own (round-1 MAJOR)
+A named Model can fire DescendantAdded before its PrimaryPart/BasePart exists. Listener matches
+same-named Model OR same-named BasePart so the target binds whenever a usable instance arrives.
+`_bound` weak-keyed / dropped on destroy to avoid unbounded retention. Classification: Mechanical.
+
+## D4 — No target-dependent prologue on the nil-boot path (round-2 BLOCKING)
+Removing the early-return is insufficient: Model-normalization (1310-1313) and `_initialTarget`
+(1331) dereference `target` and throw on nil. Structural rule: guard ALL target-dependent prologue
+inside `if target then ... end`; the param-listener + DescendantAdded emission runs unconditionally,
+keyed on compile-time name constants. Boundary ~1263-1331. Classification: Mechanical.
+
+## D5 — Reachability confirmed: generalize to the SHARED layer (all 4 trigger shapes)
+Empirical evidence (conversion run 2026-06-17T09-17-02, SimpleFPS generic):
+- The bug lives in the SHARED boot-scan + early-return (generate_tween_script:1305-1308), inherited by
+  ALL trigger branches: bool param, int param, loop-autoplay (1388-1392 / 1628-1632), play-once (1393-1395 / 1633-1635).
+- SECOND reachable symptom found: `Anim_HostilePlane_HostilePlane_Flying.luau` is a LOOP-autoplay anim
+  targeting the `HostilePlane.prefab` — a RUNTIME-placed prefab (1 entry in scene_prefab_placements,
+  same as Door's 6). Its script lives in ServerScriptService (global container) and does
+  `workspace:FindFirstChild("HostilePlane")` + early-return → the flying loop never starts (currently broken).
+DECISION: hoist the placement-order-robust binding to the SHARED layer so bool/int/loop/play-once ALL
+bind runtime-placed targets via one scaffold (eager scan + DescendantAdded late-arrival, gated on runtime
+`not _ownerIsContainer`); per-branch action varies trivially (connect listener / task.spawn loop / play once).
+Side effect (improvement): loop/play-once gain multi-instance fanout (previously single-target).
+Classification: Taste (scope width — user chose "general fix, verify reachability first"; reachability verified).
+
+## D6 — Per-iteration yield floor on the loop (round-4 MAJOR)
+The task.spawn loop emits `RunService.Heartbeat:Wait()` per iteration so a contentless clip
+(curves all simplify <2 keyframes → playAnimation never yields) cannot tight-spin and freeze the
+DataModel. Without it the fix would worsen "never animates" into "freezes" for a loop on a
+runtime-placed prefab. RunService already imported (1251). Detailed design SHOULD also skip the loop
+for no-content clips, but the yield floor is load-bearing. Classification: Mechanical.
+
+## D7 — `_bound` is a weak-key table, not a strong set drained on destroy (detailed-design)
+`setmetatable({}, {__mode="k"})`: a destroyed BasePart key is GC'd automatically → no unbounded
+retention (the only `_bound` concern, design.md §4) and zero per-instance lifecycle code (no
+`.Destroying` connect to remove keys). The loop branch's `while _t and _t.Parent do` guard
+independently stops work on a destroyed instance, so weak-key vs strong-drop is not load-bearing for
+correctness — choose the lower-code weak-key form. Classification: Mechanical.
+
+## D8 — Factor ONE Python emit helper for the bindTarget/scan/listener scaffold (detailed-design)
+`_emit_placement_robust_binding(lines, clip, match_names, action_kind, param_name)` emits the
+byte-identical bindTarget closure + `_bound` weak table + eager `bindTarget(target)` + GetDescendants
+fanout + DescendantAdded listener, dispatching only the per-shape ACTION body (bool/int/loop/once) and
+the param name. Rationale: the scaffold is identical across all four shapes and the match-name
+precedence (target_name → curve_roots → clip.name) must be computed ONCE and used in two emit sites
+(fanout + listener) so they cannot drift; four inline copies would be ~100 duplicated emitted-template
+lines and would fracture the shared contract. Strict typing: `list[str]` / `Literal[...]` / `str`, no
+`Any`. Classification: Mechanical.
+
+## D9 — Skip the loop AND keep the yield floor for no-content clips (detailed-design)
+Emit BOTH guards (belt-and-suspenders, per design.md §1 step-1 loop bullet): the load-bearing guard is
+the unconditional per-iteration `RunService.Heartbeat:Wait()` yield floor (cannot tight-spin even if the
+content predicate is ever wrong); ADDITIONALLY, when the clip has no surviving tween content (every
+curve simplifies to <2 keyframes — the same predicate `_generate_curves_code` uses at 1413-1415), emit a
+single `playAnimation(_t)` instead of the `task.spawn` loop, since a contentless loop animates nothing.
+The yield floor remains the authority; the content-skip is an optimization that also reads cleaner.
+Classification: Mechanical.
+
+## D10 — Hoist `_ownerIsContainer` to the shared prologue (detailed-design)
+Currently `_ownerIsContainer` is computed twice inside `_generate_parameter_driven_playback` (bool 1575,
+int 1609) and absent from the loop/play-once fallback. The unified scaffold needs it BEFORE the
+early-return (to gate the return) and in all four shapes (to gate fanout/listener), so emit it ONCE in
+the prologue (just after boot-resolve) and delete the two in-function copies. The early-return becomes
+`if not target and _ownerIsContainer then return end`. Classification: Mechanical.
+
+## D11 — Match set is a SUPERSET of the old resolved-name fanout (phase-design round 1, codex MAJOR)
+NEW match keys on compile-time literal(s) PLUS the resolved target.Name (added at runtime when a boot
+target exists). NEW >= OLD => never regresses which instances match (incl. the Model "Door" -> part
+"door" case); the literal adds the nil-boot late-arrival capability. For real door/plane both reduce to
+the same single name. Classification: Mechanical (no-regression hardening).
+
+## D12 — AC12 covers test_generate_rotation_tween (phase-design round 1, Claude MAJOR)
+test_generate_rotation_tween:1054 asserts the removed `while true do`; AC12 now requires updating EVERY
+test asserting the removed shape (grep `while true do`/`_targets`/`_ownerIsContainer`). Classification: Mechanical.
