@@ -51,7 +51,12 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
   **Order:** stage 3 is the first blocker but stage 4 is independent — fixing the projectile alone won't
   turn F16 green. Schema cross-refs: §3 row 8 (projectile), §8 T-bullet row (corrected 2026-06-15).
 
-- [ ] **P0 (generic) — F10 door never opens: animation driver-domain unresolved → server fallback (pattern #9). Empirically reproduced 2026-06-14.**
+- [x] **P0 (generic) — F10 door never opens: animation driver-domain unresolved → server fallback (pattern #9). Empirically reproduced 2026-06-14.**
+  FIXED 2026-06-16 (`fix/door-animator-source-narrowing`, PR #195 / `a10b60f`): dynamic-getter
+  Animator drivers are resolved via C# source narrowing (scan the scope for the param-write to the
+  clip's `observed_attribute`, inherit that writer's domain). NOTE: the F10 *e2e fixture* still
+  contact-misses (the player teleport doesn't walk into the trigger) — that harness-only half is
+  tracked in the F15/F10-fixture P1 below, NOT here.
   Implements the **CANDIDATE** in `docs/design/generic-converter-architecture.md` §3 row 9
   ("dynamic-component-ref → driver-domain"). Status was analysis-only (PR #188, 2026-06-11);
   this entry adds the live repro + the precise fix site + nuances.
@@ -94,19 +99,39 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
   trigger (camera-aligned W-drive — `Player:Move` is camera-`_yaw`-relative, not character-facing).
   F10 won't pass until pattern #9 lands AND the fixture walks in. See the next item for F15.
 
-- [ ] **P1 (e2e fixture) — F15 mine + F10 door fixtures contact-miss; mine is independently fixable. Verified 2026-06-14.**
-  Harness-only (`tests/fixtures/upload_snapshots/SimpleFPS.behavior.json`), no converter change.
-  Original setups single-teleport the player to a point that doesn't overlap the trigger (F15:
-  `mine.Position+3` hovers above the 0.87-tall mine; F10: above the door TriggerZone — see above).
-  **F15 fix (verified live):** Mine runs `domain:client` and client `Humanoid:TakeDamage` STICKS
-  in single-player (proved 100→75 held). A client-side swept `PivotTo` *through* the mine at
-  ground level fires the client `Touched` → `Explode` → `TakeDamage` (proved 100→90). Replace the
-  hover-teleport with a ground-level swept entry. F15 needs NO converter change and can land now.
-  Codex's earlier W-drive edit to these two fixtures is on the working tree (uncommitted) but has a
-  flaw — it refaces the character via `PivotTo(CFrame.lookAt)`, which is dead (movement is
-  camera-`_yaw`-relative, `scene_camera_input.luau:184,226`); revert/replace before using it.
+- [x] **P1 (e2e fixture) — F15 mine + F10 door behavior fixtures contact-miss. FIXED 2026-06-17 (PR #207; e2e-confirmed on a fresh generic post-#195 conversion).**
+  Harness-only (`tests/fixtures/upload_snapshots/SimpleFPS.behavior.json`), no converter change. Both
+  setups single-teleported the player to a point that doesn't overlap the trigger; replaced with
+  translation-only swept `PivotTo` entries.
+  **F15 mine — GREEN end-to-end.** Swept `PivotTo` through the mine at `c.Y+0.5` → `Touched` fires
+  (85× on the sweep) → `Explode → Humanoid:TakeDamage` → 100→90. Confirmed on the fresh generic
+  conversion (note: the Explode is slightly delayed; the fixture's 3.0s settle covers it).
+  **F10 door — harness FIXED + e2e-confirmed RED for a real converter reason** (see the new converter
+  bug below). The old setup aimed at the `door` PANEL (runtime-placed high above ground), teleporting
+  the player into the air. New setup sweeps the HRP from outside INTO the Door's `TriggerZone`
+  (~21-stud CanCollide=false cube at ground level under `Door/base`) and STOPS (passing through fires
+  `TouchEnded→ToggleDoor(false)` and re-closes it, zeroing the end-state motion). Live-verified:
+  entering with hasKey flips and HOLDS `open=true`; `hasKey` is a CHARACTER attr (cardkey pickup sets
+  it, Door reads it via `playerFromTouch` — char-only confirmed). The strict `dPos>1` assert correctly
+  stays RED because the panel never tweens — the residual converter bug below, NOT a harness flaw.
 
-- [ ] **P1 — Generic-mode SimpleFPS canary failures (dual-voice investigation 2026-06-11; NOT Step-1b regressions).** See `docs/design/scene-runtime-pr5-8-recut-plan.md` §"The canary failures" — the PR5 canary gate (SimpleFPS plays under generic). Slices: **T** turret child-index lowering from a stronger signal than AI-output text (turret won't spin/fire); **T-bullet** nil-parent→workspace default in the `instantiatePrefab` clone service (bullets never enter the DataModel); **R** generic `weaponSlot` rebind (rifle not held); **D** door dynamic-Animator-driver narrowing (`pr148-followups`); **H** HudControl client-domain rule. Highest leverage: Slice T (+ T-bullet) clears the turret. File:line evidence in the Step-1b run ledger.
+- [ ] **P1 (generic) — F10 door still doesn't visually open: Anim_Door LocalScript binds via a one-time startup scan that RACES runtime prefab placement. Found 2026-06-17 (e2e, post-#195).**
+  #195 correctly routed `Anim_Door_door_open/close` to client `LocalScript`s in StarterPlayerScripts
+  (domain fix). But the script (`Anim_Door_*.luau`, emitted by `animation_converter`) finds and
+  connects its door panels with a SINGLE `workspace:FindFirstChild("door", true)` + one-pass
+  `workspace:GetDescendants()` multi-target scan **at player-spawn**. In generic scene-runtime mode the
+  Door prefab instances are placed at RUNTIME (scene-runtime `_constructPrefabClone`), AFTER the
+  LocalScript's startup scan runs — so it never connects to the runtime-placed `Beach.Door.door`
+  panel. **Live proof (fresh generic conv, run `2026-06-17T09-17-02`):** a manual `open` flip on the
+  panel produces NO tween (real script not connected); a connection added AFTER placement tweens it
+  fine (+14.28 Y); direct `TweenService` moves and HOLDS the panel (engine/anchoring are not the
+  issue). Fix direction: make the Anim script's binding placement-order-robust — connect on
+  `DescendantAdded` for late-arriving `door` panels (or re-scan), OR co-place/parent the Anim driver
+  with the prefab clone so it binds when the panel is constructed. Door-scoped; gate on the generic
+  runtime-placement path. This is what turns the (now-correct) F10 fixture GREEN.
+
+- [x] **P1 — Generic-mode SimpleFPS canary failures (dual-voice investigation 2026-06-11; NOT Step-1b regressions).** See `docs/design/scene-runtime-pr5-8-recut-plan.md` §"The canary failures" — the PR5 canary gate (SimpleFPS plays under generic). Slices: **T** turret child-index lowering, **T-bullet** nil-parent→workspace default, **R** generic `weaponSlot` rebind, **D** door dynamic-Animator-driver narrowing, **H** HudControl client-domain rule.
+  STATUS (verified 2026-06-17): **T** ✅ Phase-1 canary merged #193; **R** ✅ merged #191 (`drive/rifle-dropped-ref`); **D** ✅ merged #195; **H** ✅ done (HudControl classifies `domain:client`/`LocalScript` — `simplefps_minimal.json`). The remaining turret **projectile-physics + damage** half (#8 stages 3–4) is ACTIVELY OWNED by `drive/turret-bullet-damage-real` (tip `58651d7` "bind damage Touched to the colliding body") — tracked under the F16 turret P0 above, not here. Nothing in this entry is outstanding-and-unowned.
 
 - [x] **P1 — Shared-flag name sanitization is unowned (pre-existing; surfaced by Phase 2b reframe, 2026-06-01).** FIXED 2026-06-02 (`fix/shared-flag-name-sanitization`, PR #165): canonical ASCII sanitizer applied at the runtime `"has" .. name` concat (emitted Luau `gsub("[^%w_]+","_")` from one constant in `core/flag_names.py`) at every writer + the Machine dynamic reader; `itemName`/`ItemType` kept RAW (gameplay payloads); scan made ASCII-explicit. See `docs/design/shared-flag-name-sanitization-brief.md`.
   The generator builds the shared-flag attribute name as `"has" .. itemName`
