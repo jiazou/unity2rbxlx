@@ -3095,7 +3095,7 @@ end
 function SceneRuntime:_buildUnboundToggleIndex()
 	-- ``sri -> LIST of rows``, seeded with BOTH endpoints of every row so a
 	-- ``DescendantAdded`` for either the toggle OR the graphic looks up the
-	-- row in O(1). A list because either SRI may be shared across rows (E8).
+	-- row in O(1). A list because either SRI may be shared across rows.
 	local index = {}
 	local function add(sri, row)
 		if type(sri) ~= "string" or sri == "" then return end
@@ -3120,11 +3120,11 @@ function SceneRuntime:_bindOneToggle(b, hint)
 	if self._boundRows[b] == toggle then return end   -- this ROW already bound to THIS live instance
 	local graphic = (hint and hint:GetAttribute("_SceneRuntimeId") == b.graphic_sri and hint)
 		or self._services.workspaceFind(b.graphic_sri)
-	if graphic == nil then return end                  -- E7: re-attempt when the sibling lands
-	-- Initial visibility from the LIVE attribute if ANYTHING already set it
-	-- (E10), else the static planner ``initial_on`` (E2). ``live == nil`` is the
-	-- NORMAL not-yet-flipped case (the writer sets ``isOn`` only on a runtime
-	-- event), so it is the silent ``initial_on`` fallback -- NOT a warn.
+	if graphic == nil then return end                  -- re-attempt when the sibling lands
+	-- Initial visibility from the LIVE attribute if ANYTHING already set it,
+	-- else the static planner ``initial_on``. ``live == nil`` is the NORMAL
+	-- not-yet-flipped case (the writer sets ``isOn`` only on a runtime event),
+	-- so it is the silent ``initial_on`` fallback -- NOT a warn.
 	local live = toggle:GetAttribute(b.attr_name)
 	local on = (live ~= nil and live == true) or (live == nil and b.initial_on == true)
 	self:_setGraphicVisible(graphic, on)
@@ -3133,7 +3133,7 @@ function SceneRuntime:_bindOneToggle(b, hint)
 	toggle:GetAttributeChangedSignal(b.attr_name):Connect(function()
 		self:_setGraphicVisible(graphic, toggle:GetAttribute(b.attr_name) == true)
 	end)
-	self._boundRows[b] = toggle                        -- per-row marker (E6/E8/E11)
+	self._boundRows[b] = toggle                        -- per-row exactly-once marker
 end
 
 function SceneRuntime:_applyToggleGraphicBindings()
@@ -3159,7 +3159,7 @@ function SceneRuntime:_installToggleGraphicWatch()
 	local engine = self
 	self._toggleWatchConn = install(function(desc)
 		local sri = desc:GetAttribute("_SceneRuntimeId")
-		if sri == nil then return end                    -- E12: non-matching short-circuit
+		if sri == nil then return end                    -- non-matching descendant short-circuit
 		local matched = engine._unboundToggleIndex[sri]
 		if matched == nil then return end                -- O(1) miss -> no rescan
 		for _, b in ipairs(matched) do
@@ -3454,8 +3454,8 @@ function SceneRuntime:start(domainFilter)
 	-- their PlayerGui clone resolves event-driven.
 	self:_resolveDeferredUiInstances()
 
-	-- Slice 1.2: install the standing client-only Toggle->checkmark watch
-	-- AFTER deferred UI resolution (connect-then-scan once). Client-gated on
+	-- Install the standing client-only Toggle->checkmark watch AFTER deferred
+	-- UI resolution (connect-then-scan once). Client-gated on
 	-- the ``installUiDescendantWatch`` service, so the server never binds. The
 	-- live-attribute read at bind makes initial visibility order-independent --
 	-- no pre-Awake hook needed (``start()`` never yields, so a present clone

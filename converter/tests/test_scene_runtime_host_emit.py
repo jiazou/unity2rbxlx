@@ -301,9 +301,9 @@ class TestEntrypointGenerators:
             )
 
     def test_plan_module_embeds_ui_toggle_bindings(self):
-        """Slice 1.2: ``ui_toggle_bindings`` must survive the
-        ``_PLAN_KEYS_FOR_HOST`` allowlist filter and land in the embedded
-        plan ModuleScript; without it the runtime never binds."""
+        """``ui_toggle_bindings`` must survive the ``_PLAN_KEYS_FOR_HOST``
+        allowlist filter and land in the embedded plan ModuleScript; without
+        it the runtime never binds."""
         rows = [
             {
                 "toggle_sri": "Assets/Scenes/main.unity:264237063",
@@ -325,10 +325,10 @@ class TestEntrypointGenerators:
         assert "Assets/Scenes/main.unity:250410364" in src
 
     def test_install_ui_descendant_watch_is_client_only(self):
-        """Slice 1.2: the standing late-clone watch service
-        ``installUiDescendantWatch`` is present on the CLIENT entrypoint's
-        services table and OMITTED from the server (so the server never binds
-        UI). E9 fail-closed-on-server is enforced by this asymmetry."""
+        """The standing late-clone watch service ``installUiDescendantWatch``
+        is present on the CLIENT entrypoint's services table and OMITTED from
+        the server (so the server never binds UI); fail-closed-on-server is
+        enforced by this asymmetry."""
         client = generate_scene_runtime_client_entrypoint().source
         server = generate_scene_runtime_server_entrypoint().source
         assert "installUiDescendantWatch" in client, (

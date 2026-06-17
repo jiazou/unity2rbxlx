@@ -1,4 +1,4 @@
-"""Slice 1.2: runtime Toggle ``isOn`` -> checkmark ``.Visible`` binding.
+"""Runtime Toggle ``isOn`` -> checkmark ``.Visible`` binding.
 
 Drives the production ``scene_runtime.luau`` through the shared standalone-luau
 harness (``_run_scenario`` / ``servicesFor`` from
@@ -443,8 +443,8 @@ class TestToggleBindingEdges:
         assert "AFTER_A=false" in lines, out
 
     def test_shared_toggle_sri_both_graphics_bind(self):
-        """E8 (codex r4 #1) — two rows sharing a TOGGLE instance each bind
-        their OWN graphic (per-row _boundRows, not per-instance)."""
+        """Two rows sharing a TOGGLE instance each bind their OWN graphic
+        (per-row _boundRows, not per-instance)."""
         scenario = textwrap.dedent("""\
             local toggle = mkInst("tog")        -- shared toggle
             local gfx1 = mkInst("gfx1")

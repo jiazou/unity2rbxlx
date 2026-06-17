@@ -21,7 +21,7 @@ log = logging.getLogger(__name__)
 # source of truth: ``_apply_toggle_properties`` stamps it onto each
 # ``ToggleBinding`` row as ``attr_name`` and the runtime reads ``b.attr_name``
 # (never a hard-coded literal). A convention-drift guard pins this against the
-# contract corpus at converter-build time (see test_ui_translator A4).
+# contract corpus at converter-build time (test_ui_translator).
 _TOGGLE_ISON_ATTR = "isOn"
 
 
@@ -834,14 +834,13 @@ def _apply_toggle_properties(
     transport attribute is written onto the element (the row goes straight to
     the accumulator, so nothing planner-internal serializes into the produced
     instance). If ``graphic`` is ``0`` / unresolvable, or either side is
-    missing, no row is appended (edge E1).
+    missing, no row is appended.
     """
     if not hasattr(element, 'attributes'):
         element.attributes = {}
     # ``m_IsOn`` crosses the YAML boundary untyped (int/float/bool/str);
     # ``_coerce_int`` is the file's canonical scalar coercion (accepts a float
-    # like ``1.0`` and a float-string, ``None`` on genuine failure) -- matching
-    # the rest of this module and the pre-slice ``bool(int(is_on))`` behavior.
+    # like ``1.0`` and a float-string, ``None`` on genuine failure).
     is_on_int = _coerce_int(props.get("m_IsOn", 1))
     if is_on_int is None:
         return
@@ -858,10 +857,10 @@ def _apply_toggle_properties(
         graphic_ref.get("fileID") if isinstance(graphic_ref, dict) else None
     )
     if not graphic_comp_fid:
-        return  # graphic:0 / absent -> no binding (E1)
+        return  # graphic:0 / absent -> no binding
     graphic_go_fid = component_owner_index.get(str(graphic_comp_fid))
     if not graphic_go_fid:
-        return  # unresolvable component fileID -> no binding (E1)
+        return  # unresolvable component fileID -> no binding
     toggle_sri = element.attributes.get("_SceneRuntimeId")
     if not isinstance(toggle_sri, str) or not toggle_sri or not scene_namespace:
         return  # the Toggle element wasn't SRI-stamped -> can't bind

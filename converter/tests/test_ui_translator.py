@@ -464,8 +464,8 @@ def _toggle_node(
 
 
 class TestToggleGraphicBinding:
-    """Slice 1.2 — ``_apply_toggle_properties`` emits a ``ToggleBinding`` row
-    when the Toggle's serialized ``graphic`` resolves to an owning GameObject.
+    """``_apply_toggle_properties`` emits a ``ToggleBinding`` row when the
+    Toggle's serialized ``graphic`` resolves to an owning GameObject.
 
     Anchored on the Unity Toggle component + ``graphic`` fileID, resolved via
     ``build_component_owner_index`` to the checkmark's ``_SceneRuntimeId``.
@@ -504,7 +504,7 @@ class TestToggleGraphicBinding:
         assert row["attr_name"] == _TOGGLE_ISON_ATTR
         # The real attribute ToggleIsOn is still recorded.
         assert element.attributes["ToggleIsOn"] is False
-        # NO transport attribute leaked onto the produced element (r2 MINOR).
+        # NO transport attribute leaked onto the produced element.
         for k in element.attributes:
             assert "graphic" not in k.lower()
             assert "togglegraphicref" not in k.lower().replace("_", "")
@@ -638,16 +638,16 @@ class TestToggleGraphicBinding:
 
 
 class TestToggleIsOnAttrConvention:
-    """A4 — pin ``_TOGGLE_ISON_ATTR`` to the converter's Toggle-``isOn``
-    LOWERING CONVENTION, checked against EVERY converted-writer shape in the
-    contract corpus (not just one fixture line).
+    """Pin ``_TOGGLE_ISON_ATTR`` to the converter's Toggle-``isOn`` LOWERING
+    CONVENTION, checked against EVERY converted-writer shape in the contract
+    corpus (not just one fixture line).
 
     The transpiler lowers ``GetComponent<Toggle>().isOn = ...`` to
     ``<inst>:SetAttribute("<name>", ...)`` and stamps a
     ``GetComponent<Toggle>().isOn`` comment above it. This test asserts every
     such corpus write uses an attribute name equal to ``_TOGGLE_ISON_ATTR`` --
     so a convention/casing drift fails RED at converter-build time (the
-    residual is an AI-output fingerprint, surfaced + guarded here, see §2.5).
+    attr_name is an AI-output fingerprint, surfaced + guarded here).
     """
 
     def test_constant_value(self):
