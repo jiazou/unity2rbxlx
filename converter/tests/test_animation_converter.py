@@ -1406,6 +1406,69 @@ class TestPlacementRobustBinding:
         assert "while true do" not in luau
         assert "playAnimation(_t)" in luau
 
+    def test_match_names_multiple_curve_roots_empty_name(self) -> None:
+        """Empty game_object_name with curves under 2+ distinct roots: the
+        match precedence falls through to sorted(curve_roots), so BOTH root
+        literals end up in the compile-time `_matchNames` initializer (the
+        ONLY match available on the nil-boot path) and the fanout/listener
+        match each."""
+        def _curve(path: str) -> AnimCurve:
+            return AnimCurve(
+                property_type="position",
+                path=path,
+                keyframes=[
+                    AnimKeyframe(time=0.0, value=(0.0, 0.0, 0.0)),
+                    AnimKeyframe(time=1.0, value=(0.0, 4.0, 0.0)),
+                ],
+            )
+
+        clip = AnimClip(
+            name="multi", duration=1.0, loop=False, sample_rate=60,
+            curves=[_curve("Body/X"), _curve("Wing/Y")],
+        )
+        # Empty name, no controller -> play-once placement-robust scaffold.
+        luau = generate_tween_script(clip, game_object_name="")
+
+        # curve_roots is sorted, so the literal order is deterministic.
+        assert 'local _matchNames = { "Body", "Wing" }' in luau
+        # Both roots also drive the boot FindFirstChild fallback chain.
+        assert 'workspace:FindFirstChild("Body", true)' in luau
+        assert 'workspace:FindFirstChild("Wing", true)' in luau
+
+    def test_contentless_loop_via_param_driven_path_no_spin(self) -> None:
+        """D9 through _generate_parameter_driven_playback's auto-play loop
+        fallback: a LOOP clip whose every curve simplifies to <2 keyframes,
+        with a controller whose only parameter is neither bool (4) nor int
+        (3), routes to the `loop` action body. Because the clip has no
+        surviving tween content, the loop emits a single `playAnimation(_t)`
+        — NOT the `task.spawn`/`while ... do` spin (which, given a no-op body,
+        would busy-loop with only the Heartbeat yield as a floor)."""
+        clip = AnimClip(
+            name="static", duration=1.0, loop=True, sample_rate=60,
+            curves=[AnimCurve(
+                property_type="position", path="",
+                keyframes=[AnimKeyframe(time=0.0, value=(0.0, 0.0, 0.0))],
+            )],
+        )
+        # A float (type 1) param has no bool/int handler, so
+        # _generate_parameter_driven_playback falls through to the clip.loop
+        # auto-play branch -> _emit_placement_robust_binding(..., "loop", "").
+        controller = AnimatorController(
+            name="mover",
+            parameters=[AnimParameter(name="Speed", param_type=1)],
+        )
+        luau = generate_tween_script(
+            clip, game_object_name="Door", controller=controller,
+        )
+
+        # We did route through the auto-play loop fallback...
+        assert "-- Auto-play looping animation" in luau
+        # ...but the contentless D9 guard collapses it to a single play, no spin.
+        assert "playAnimation(_t)" in luau
+        assert "task.spawn(" not in luau
+        assert "while true do" not in luau
+        assert "RunService.Heartbeat:Wait()" not in luau
+
 
 # ---------------------------------------------------------------------------
 # Test quaternion-to-Euler conversion
