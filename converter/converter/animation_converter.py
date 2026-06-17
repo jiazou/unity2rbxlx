@@ -1302,10 +1302,9 @@ def generate_tween_script(
                     lines.append(f'if not target then target = workspace:FindFirstChild("{root}", true) end')
             else:
                 lines.append(f'target = workspace:FindFirstChild("{clip.name}", true)')
-    # Runtime placement gate: a per-clone embedded driver owns exactly one
-    # instance; a global flat-list driver must fan out + listen for
-    # runtime-placed instances. Hoisted here (was duplicated inside the param
-    # function) so all four trigger shapes read one prologue local.
+    # Hoisted out of the param function (where it was duplicated) so all four
+    # trigger shapes read one prologue local; the emitted -- comment below
+    # carries the runtime rationale.
     lines.append("-- Runtime placement gate: a per-clone embedded driver owns exactly one instance;")
     lines.append("-- a global flat-list driver must fan out + listen for runtime-placed instances.")
     lines.append("local _ownerIsContainer = script.Parent and (script.Parent:IsA('BasePart') or script.Parent:IsA('Model'))")
