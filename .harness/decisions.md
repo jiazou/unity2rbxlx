@@ -2790,3 +2790,201 @@ themeIcon (sprite) / skyMesh (mesh) → None.
 - **D-P3-6 (Reversible, codex Major 1):** Planner stamps `target_script_id` on rewritten rows so
   the runtime cross-domain policy classifies the target domain without finding it in scene-local
   `instanceById` (placement-scoped key never appears there). Closes the cross-domain bypass.
+
+
+## ── /drive run addressables-unit3-themes-20260617T080323 — Addressables Unit 3 (Themes) — 2026-06-17T04:00:11Z ──
+
+# Decisions — Addressables Unit 3 (Themes)
+
+## D1 — Fix dead theme registration via data-seeding through a converter-owned contract
+Classification: Taste / Mechanical
+Populate the theme registry with a deterministic build-time seed (off the `scriptable_objects` guid→path
+map + addressables labels), NOT by re-lowering the AI's non-deterministic `LoadDatabase`/`Register`
+emission. The seed must register through a contract the converter owns, not the AI's incidental
+`Register`/`_pendingThemeData` shape (fingerprinting AI output is the anti-pattern this fix removes).
+
+## D2 — Resolve AssetReference via the existing primitive + `_value_to_lua` seam
+Classification: Mechanical
+Extend `scriptable_object_converter._value_to_lua` object-ref recognition to match the AssetReference
+`{m_AssetGUID, m_CachedAsset:{guid,fileID,type}}` shape and resolve via the Unit-2
+`prefab_id_for_ref`/`prefab_id_for_guid` primitive. No new resolver, no duplication; the consumer
+`host.instantiatePrefab(zone.prefabList[i])` is already wired to expect a prefab-id string.
+
+## D3 — Two phases on the foundation→consumer staged-risk seam
+Classification: Taste
+Phase 1 (AssetReference resolution) is an independently-verifiable foundation; Phase 2 (theme
+registration) end-to-end depends on Phase 1 being correct (a registered theme with unresolved prefabList
+spawns nothing — failure would scatter, hiding the broken layer). Split rather than one linear phase.
+
+## D4 — No game-specific hardcodes in the seed
+Classification: Mechanical
+Derive the owning label + key field from the consuming load method (not literal `themeData`/`themeName`);
+dedupe by guid; abstain (don't crash) on SOs lacking the identifying field (best-effort fallback). Never
+hardcode `themeData` or `themeName`. (Superseded the earlier "iterate ALL SO labels" framing — see D6.)
+
+## D5 — Strike option (b) coherence-pack; committed converter-owned write-time surface
+Classification: Mechanical
+Round-1 review (P1-A) verified: coherence packs are SKIPPED in generic scene-runtime mode — the generic
+`write_output` branch returns BEFORE `run_packs` (`converter/converter/pipeline.py:3139-3147`). The whole
+feature is generic, so a "coherence-pack structural guarantee" can never fire — option (b) is STRUCK.
+Also corrected: a PUBLIC `ThemeDatabase.Register(themeData)` DOES exist in captured output
+(`ThemeDatabase.luau:52-59`); the honest reason not to call it is that its name/shape is a
+non-deterministic AI emission (D1), NOT that "no write path exists." Committed direction: a
+converter-owned, generic-mode-safe deterministic registration surface emitted at write-time alongside the
+`scriptable_objects` map build (`pipeline.py:~6877-6925`), NOT fingerprinting the AI `Register`. The
+remaining open item is the precise write mechanism, to be SPIKED at Phase 2 detailed design against the
+real ThemeDatabase/PlayerData/TrackManager modules; if it forces a consumer registry-READ-site rewrite,
+that is absorbed in Phase 2 scope/SLOC and the "zero consumer change" claim is qualified to Phase 1 only.
+
+## D6 — Scope Unit 3 to the theme DB with a DERIVED ownership/routing model
+Classification: Taste / User-Challenge
+Round-1 review (P1-B): "retain all SO labels + key by identifying field" explains discovery but not which
+consumer DB owns a label nor the correct key function. Blindly iterating ALL SO-addressable labels +
+dedup-by-guid cross-registers unrelated SOs, and the guid/stem fallback creates entries the consumer never
+retrieves (registry looks populated but is behaviorally dead). Decision: route each label to the database
+whose converted load method requests it, keyed by the field that database indexes by — DERIVED from the
+source (`ThemeDatabase.LoadDatabase` issues `LoadAssetsAsync<…>("themeData")`, indexed by `op.themeName`),
+never hardcoded. Scope Unit 3 to the theme database only; a fully-general "every SO-addressable consumer"
+ownership model (CharacterDatabase, future SO-loaded DBs) is deferred.
+
+## D7 — Reframe Phase 2 acceptance to a directly-invoked criterion; name the Unit-1 dependency
+Classification: Taste
+Round-1 review (P1-C): "segments spawn" is gated on Unit 1 (character boot / client spawn-domain, "Error
+2"), not Phase 1/2 alone — so it is not honestly isolatable. Reframed Phase 2's isolatable acceptance to:
+`currentTheme` non-nil AND `host.instantiatePrefab(prefabList[i])` returns a real instance WHEN INVOKED
+DIRECTLY (probe-driven, decoupled from live gameplay). The Unit-1 character/spawn-domain dependency is
+named as an out-of-band precondition for the visible end-to-end (added to Out of scope / dependencies).
+
+## D8 — AssetReference matcher: require m_CachedAsset present + subset-bound the rest (Phase 1 detailed design)
+Classification: Mechanical
+`_value_to_lua` matches a Unity AssetReference iff `{m_AssetGUID, m_CachedAsset} <= set(d.keys()) <=
+{m_AssetGUID, m_CachedAsset, m_SubObjectName}` (pinned against `trash-dash/.../themeData.asset:22-31`;
+verified 152/152 real occurrences are exactly `{m_AssetGUID, m_CachedAsset}`). REQUIRE both `m_AssetGUID`
+AND `m_CachedAsset` (the real serialization always pairs them) and subset-bound the rest (only
+`m_SubObjectName` optional). Anti-swallow tightening: requiring `m_CachedAsset` stops a bare `{m_AssetGUID}`
+/ `{m_AssetGUID, m_SubObjectName}` one-field struct from being wrongly collapsed to a prefab-id string or
+nil — it falls through to the generic-dict branch UNRESOLVED with its data intact (fail-soft, no
+regression). Disjoint from the existing `set(keys) <= {fileID,guid,type}` object-ref arm.
+
+## D9 — Resolve via existing primitives; zero edits to prefab_ref.py (Phase 1 detailed design)
+Classification: Mechanical
+Resolve precedence: `m_AssetGUID` (bare guid -> `prefab_id_for_guid`) first, `m_CachedAsset`
+(`{fileID,guid,type}` -> `prefab_id_for_ref`) as fallback; both through the UNCHANGED shared `.prefab`
+filter (`prefab_ref.py:54`). No new resolver, NO edit to `prefab_ref.py` — the REAL primitives already
+suffice. [DIVERGENCE] design.md:159 allowed a "0-1" prefab_ref.py touch; the real code needs 0. Phase 1
+lives entirely in `_value_to_lua` (+ a one-line import of `prefab_id_for_guid`).
+
+## D10 — Unresolved AssetReference collapses to nil, not the old unresolved table (Phase 1)
+Classification: Taste
+A non-prefab/empty/dangling AssetReference emits `nil --[[(Unity AssetReference)]]`, NOT the prior
+unresolved `{AssetGUID=…, CachedAsset=…}` table. The consumer indexes `prefabList[i]` as a STRING for
+`host.instantiatePrefab`; a table there was already non-functional, so a uniform `nil` fail-soft is the
+honest, consumer-guardable contract and matches the object-ref arm's `nil`. No data loss vs a usable
+prior emit.
+
+## D11 — Write mechanism: converter-owned boot shim feeds deterministic consumer-called LoadDatabase (Phase 2 detailed design / spike)
+Classification: Mechanical / User-Challenge
+SPIKED against real modules + dual-voice review. The shim (a new converter-owned module, NOT a coherence-pack
+edit on AI output) seeds owned SO instances onto the DB's appendable write surface at boot; the deterministic,
+consumer-called `LoadDatabase` (`ThemeDatabase.luau:30`, C#-derived name) does the dict-fill AND sets
+`loaded()=true` — so the `LoadoutState.luau:184` `loaded()` UI gate works for free. STRUCK option (b) "rewrite
+the C#-derived read bodies" (GetThemeData/dictionnary/loaded): body-rewrites on transpiled output are
+coherence-pack-shaped and packs are SKIPPED in generic mode (the SAME constraint that killed the pack option in
+D5) — codex overruled the design subagent's (b) recommendation at integration. STRUCK "converter fully emits
+the DB module" (can't generically pick which AI module is the theme DB without fingerprinting D1/D6 forbid).
+The AI-name dependency is confined to ONE structurally-detected appender ingress (prefer a public list-appender
+fn, else a `*pending*` list field) with fail-soft no-op+warn. Consumer registry-READ-site rewrite is NOT
+required — "zero consumer change" extends to Phase 2 (design.md:128 caveat does NOT trigger).
+
+## D12 — Bootstrap order: entrypoint slot between SceneRuntime.new and engine:start (Phase 2)
+Classification: Mechanical
+The shim runs in `SceneRuntimeClient`/`Server` between `SceneRuntime.new(services, Plan)` and
+`engine:start(domain)` (`autogen.py:960-961`/`:1115-1116`). Verified: every `PlayerData.Create()` call (which
+fires `LoadDatabase` via `StartStaticCoroutine`, `PlayerData.luau:233-238`) is inside a lifecycle method
+(GameManager:OnEnable, MusicPlayer/LicenceDisplayer/ShopUI:Start) that runs in `engine:start()`'s
+`_runAwakeEnableStart` — strictly AFTER the shim slot. The `themeDataList == nil` guard
+(`ThemeDatabase.luau:32`) makes a too-late seed permanently invisible (spike 2 "Order BAD"), so the slot is
+load-bearing. The shim seeds the PENDING list (not the private store), so `LoadDatabase`'s `themeDataList={}`
+reset is re-filled in the same call — no clobber.
+
+## D13 — Ownership/routing derived generically; seed supplies instances, LoadDatabase owns the key (Phase 2)
+Classification: Mechanical
+Owned label derived from the C# `Addressables.LoadAssetsAsync<T>(LABEL, …)` call in the DB's load method
+(`ThemeDatabase.cs:35` → "themeData"); key field from the callback's `dict.Add(op.FIELD, op)`
+(`ThemeDatabase.cs:36-37` → `themeName`); owning DB = the module issuing the load; owned SO guids =
+`addressables.by_label[label]` ∩ emitted SO guids (the two `m_Address: themeData` entries,
+`Themes.asset:20-29`). NEVER hardcode `themeData`/`themeName`. The seed supplies SO INSTANCES only; the key
+field is used SOLELY to abstain on a key-less SO, never to write the registry key (that stays `LoadDatabase`'s
+job) — keeping AC-1 self-satisfaction-proof. Unit 3 scoped to the theme DB; CharacterDatabase/future deferred.
+
+## D14 — Parallel SO-addressables surface gated on positive evidence; shared .prefab filter untouched (Phase 2)
+Classification: Mechanical
+New `ScriptableObjectAddressables` + `resolve_scriptable_object_addressables` in `addressables_resolver.py`,
+PARALLEL to `resolve_prefab_addressables`. Retains label/address → SO guids gated on `so_guids` (an emitted SO
+module EXISTS — positive evidence), NOT on the absence of a `.prefab` (which would also catch sprites/audio).
+The shared `.prefab` filter (`prefab_ref.py:54`) and the existing prefab resolver are UNCHANGED (P2 hard
+constraint upheld; AC-8 pins byte-identical prefab maps).
+
+## D15 — Acceptance reads via the consumer's lookup path, not the seed's key (Phase 2; followups P2)
+Classification: Taste
+AC-1 reads `ThemeDatabase.GetThemeData(PlayerData.instance.themes[PlayerData.instance.usedTheme + 1])`
+(verbatim `TrackManager.luau:228`), indexing by `PlayerData.themes[1] == "Day"` (`PlayerData.luau:271`), NOT
+the seed's derived key. Self-satisfaction-proof because the seed never writes the registry key — `LoadDatabase`
+extracts it from `op.themeName` and the probe looks it up via `PlayerData.themes`, two independent paths that
+meet only if the registry is genuinely keyed right. Discharges followups P2.
+
+## D16 — Write-surface detection BOUND to the LoadDatabase drain list + FAIL-LOUD on a miss (Phase 2; review P1)
+Classification: Mechanical
+The write-surface detector must prove the surface it seeds is the SAME list the converted `LoadDatabase`
+drains into the private store — not merely that *some* appender to *some* list exists (a mismatched/false
+detection silently leaves `GetThemeData`/`currentTheme` nil, the D1 fingerprint-fragility this approach exists
+to avoid, with no consumer read-rewrite to compensate). Key the mechanism off the deterministic C#-derived
+`LoadDatabase` (name from C# `ThemeDatabase.LoadDatabase`, stable across re-transpiles): derive `DRAIN_FIELD` =
+the field its body iterates (`ipairs(<MODULE>.<DRAIN_FIELD>)` → `_pendingThemeData` on real output), accept a
+public appender ONLY if its `table.insert` `TARGET_FIELD == DRAIN_FIELD` (else seed `DRAIN_FIELD` directly).
+What is compared: appender-target-field == LoadDatabase-drained-field == the field the store is built from —
+all derived from that one converted module, never a name match (no `Register`/`_pendingThemeData`/`themeData`
+hardcode). If the linkage can't be proven (no recognizable drain, OR no surface binds), the seed records NO
+entry for that DB, emits a converter WARNING, and ABSTAINS — loud abstain > silent dead registry. Verified on
+the real `ThemeDatabase.luau` via `/tmp/drain_link_probe.py` (Register binds: `_pendingThemeData ==
+_pendingThemeData`). (design-phase2 §1.4; AC-7/AC-9; edges 7/8.)
+
+## D17 — Seed plan RECOMPUTED at emit time (not round-tripped through conversion_plan.json) so a no-retranspile resume keeps it (Phase 2; review P2)
+Classification: Mechanical
+`addressable_db_seeds` is **RECOMPUTED in `write_output` on every run** and set on the in-memory `scene_runtime`
+dict in the window after `_build_scriptable_object_module_map` (`pipeline.py:6819`) and BEFORE
+`generate_scene_runtime_plan_module` (`:6822`) — NOT persisted through `conversion_plan.json`. It does NOT rely
+on the conversion_plan round-trip: `_classify_storage` writes conversion_plan.json during
+`materialize_and_classify` (`:5056`/`:2798`) BEFORE this derivation point, and `_merge_scene_runtime` (`:5885`)
+preserves only keys already on disk while `plan_scene_runtime` resets `ctx.scene_runtime` (`:1159`) — so a
+late-added seed would NOT round-trip; recomputing each emit sidesteps the on-disk-only preservation entirely.
+Every input is recomputed by an ESSENTIAL phase on resume, so it is NOT gated on a fresh transpile: the
+`addressables` block via ESSENTIAL `plan_scene_runtime` → `_build_addressables_block`
+(`pipeline.py:691`,`:1041-1124`); the transpiled DB module body (drain/appender bind) via ESSENTIAL
+`materialize_and_classify` → `_rehydrate_scripts_from_disk` re-reading `<output>/scripts/*.luau` into
+`rbx_place.scripts[*].source` (`pipeline.py:696`,`:3034`,`:3162`); the DB C# (label + key field) re-read from
+`self.unity_project_path` by path. It does NOT read transient `transpilation_result` (`None` on a no-retranspile
+resume, `pipeline.py:175`/`:2212`) — unlike the dead-modules pass that sources C# from
+`transpilation_result.scripts` and abstains on resume. So a no-retranspile `--phase=write_output`/`assemble`
+resume re-emits the `seedAddressableDatabases` call AND a non-empty seed list **into the emitted
+`SceneRuntimePlan`**; the seed is NOT transpile-gated. (design-phase2 §2.2, §2.5; AC-10.)
+
+## D18 — Allowlist the seed key in `_PLAN_KEYS_FOR_HOST` so it reaches the runtime-required plan; re-point AC at the emitted plan (Phase 2; review P1, both reviewers)
+Classification: Mechanical
+The embedded `SceneRuntimePlan` ModuleScript the runtime actually `require`s is built by
+`generate_scene_runtime_plan_module` (`autogen.py:654`), which filters `scene_runtime` through the
+`_PLAN_KEYS_FOR_HOST` allowlist (`:643-651`; real current contents: `modules, scenes, prefabs,
+domain_overrides, scriptable_objects, scene_prefab_placements, addressables, gravityDesiredBaseStuds`). The
+subset is `{k: scene_runtime.get(k) for k in _PLAN_KEYS_FOR_HOST if k in scene_runtime}` (`:662-666`) — a key
+NOT in the allowlist is ELIDED from the emitted plan even when present on `scene_runtime`. So the D17-recomputed
+seed (written to `scene_runtime`/`conversion_plan.json`) would be dropped from the plan the runtime requires →
+`Plan.addressable_db_seeds == nil` → `seedAddressableDatabases` always sees `{}` → silent dead registry on a
+FRESH convert (not just resume) — the exact failure the phase exists to prevent. FIX: add
+`"addressable_db_seeds"` to `_PLAN_KEYS_FOR_HOST` (the SAME mechanism that carries
+`addressables`/`gravityDesiredBaseStuds`; confirmed the correct lever — the filter is the single gate the
+runtime-required plan passes through). Named as a fifth production TOUCH-POINT in the Interfaces + the slice
+`owns` (one-line, small but LOAD-BEARING; cannot be split off — a slice that built the seed without it ships a
+silently dead registry). AC-10 is RE-POINTED to assert the key is present in the EMITTED `SceneRuntimePlan`
+ModuleScript (the filtered artifact the runtime requires), NOT only `conversion_plan.json`, so the AC actually
+guards this seam; edge 9 covers "key on `scene_runtime` but absent from the emitted plan" (a test that drops the
+allowlist key must turn AC-10 RED). (design-phase2 §2.2a, §4 touch-point #5, AC-10(P1), edge 9.)
