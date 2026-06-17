@@ -57,6 +57,30 @@ _RE_SERIALIZED_FIELD = re.compile(
     r"\[SerializeField\]\s*(?:private\s+)?(\w+)\s+(\w+)",
 )
 
+# C# ``static event`` declarations. A static event is a TYPE-level entity the
+# converter lowers to a module-table FIELD shared across every instance of the
+# class (the same cached require table). Each member name is exactly the Luau
+# field name the producer assigns and the consumer reads (``Player.AmmoUpdate``),
+# so this is the DETERMINISTIC upstream signal the channel-identity fix anchors
+# on. We match ``[modifiers] static event <HandlerType[generic/qualified]>
+# <declarator-list>`` where ``static`` and ``event`` co-occur (either order is
+# legal C#). A SINGLE declaration may bind MULTIPLE members:
+# ``public static event H Foo, Bar;`` declares both ``Foo`` AND ``Bar`` of type
+# ``H``. We therefore capture the handler type (group 1, the first type token —
+# generic/qualified allowed) and the WHOLE comma-separated declarator span up to
+# the terminator (group 2), and split the names in ``analyze_script``. NEVER parse
+# the emitted Luau.
+_RE_STATIC_EVENT = re.compile(
+    r"\bstatic\b"                  # the static modifier (anywhere in the modifier list)
+    r"(?:\s+(?:public|private|protected|internal|readonly|new|abstract))*"
+    r"\s+event\s+"                 # the event keyword
+    r"([\w<>\.\[\]]+(?:\s*<[^;{}]*>)?)"  # handler type (generic / qualified ok), group 1
+    r"\s+([\w\s,]+?)\s*"          # declarator list (one or more comma-separated names), group 2
+    r"(?:;|=|\{)",                 # declaration terminator
+)
+# Split a captured declarator span (``Foo, Bar`` / ``Foo``) into member names.
+_RE_DECLARATOR = re.compile(r"\b\w+\b")
+
 # GLOBAL scene-lookup generics whose type argument is NOT a dependency
 # edge at all: ``FindObjectOfType<T>()`` locates an ALREADY-EXISTING
 # instance of T somewhere in the scene. T's reachability/placement comes
@@ -114,6 +138,11 @@ class ScriptInfo:
     is_test_script: bool = False
     suggested_type: str = "Script"  # Script, LocalScript, ModuleScript
     referenced_types: list[str] = field(default_factory=list)  # Project types used
+    # ``public static event`` member names. Each is a TYPE-level event the
+    # converter lowers to a shared module-table FIELD (``Player.AmmoUpdate``);
+    # the member name IS the Luau field name. Deterministic upstream signal for
+    # the static-event channel-identity fix — never derived from the AI output.
+    static_events: list[str] = field(default_factory=list)
 
 
 def analyze_script(script_path: str | Path) -> ScriptInfo:
@@ -159,6 +188,21 @@ def analyze_script(script_path: str | Path) -> ScriptInfo:
     info.serialized_fields = [
         (m.group(1), m.group(2)) for m in _RE_SERIALIZED_FIELD.finditer(decommented)
     ]
+
+    # Extract ``public static event`` member names (declaration order, deduped).
+    # These are the deterministic upstream signal for the static-event channel-
+    # identity fix: the member name is the Luau module-table field the converter
+    # lowers the event to.
+    _seen_events: set[str] = set()
+    for m in _RE_STATIC_EVENT.finditer(decommented):
+        # group(2) is the declarator list — one member (``Foo``) or a comma list
+        # (``Foo, Bar``). Split so EVERY member of a multi-declarator declaration
+        # reaches ``static_events`` (a single ``public static event H Foo, Bar;``
+        # declares both ``Foo`` and ``Bar``, not just the last).
+        for name in _RE_DECLARATOR.findall(m.group(2)):
+            if name and name not in _seen_events:
+                _seen_events.add(name)
+                info.static_events.append(name)
 
     # Extract type references (field types, method parameter types, etc.)
     # Matches PascalCase identifiers used as types in declarations
