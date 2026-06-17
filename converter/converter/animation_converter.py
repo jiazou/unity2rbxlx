@@ -1480,6 +1480,13 @@ def _emit_placement_robust_binding(
         lines.append(f"\tif _t:GetAttribute(\"{param_name}\") and not _isActive then")
         lines.append("\t\t_isActive = true")
         lines.append("\t\tplayAnimation(_t)")
+        if not clip.loop:
+            # Mirror the non-loop handler: a non-loop clip plays to completion,
+            # so clear _isActive on the bind-time snap too — otherwise a target
+            # bound while the attribute is already true latches active forever
+            # and ignores every later toggle. (Loop clips keep _isActive true;
+            # the handler's false edge clears it.)
+            lines.append("\t\t_isActive = false")
         lines.append("\tend")
     elif action_kind == "int":
         lines.append(f"\tif _t:GetAttribute(\"{param_name}\") == nil then")

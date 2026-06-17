@@ -1268,8 +1268,18 @@ class TestPlacementRobustBinding:
                                          controller=controller, prefab_scoped=True)
             # The listener/fanout are emitted unconditionally inside the source but
             # guarded at runtime by `if not _ownerIsContainer`. Structural check:
-            # they live under that guard (the embedded path binds only `target`).
+            # both the eager fanout (`workspace:GetDescendants()`) and the
+            # late-arrival listener (`workspace.DescendantAdded`) appear AFTER the
+            # guard and NOT before it — the embedded path binds only `target`.
             assert "if not _ownerIsContainer then" in luau
+            guard_idx = luau.index("if not _ownerIsContainer then")
+            fanout_idx = luau.index("workspace:GetDescendants()")
+            listener_idx = luau.index("workspace.DescendantAdded")
+            assert fanout_idx > guard_idx
+            assert listener_idx > guard_idx
+            # Neither appears before the guard (no earlier occurrence).
+            assert "workspace:GetDescendants()" not in luau[:guard_idx]
+            assert "workspace.DescendantAdded" not in luau[:guard_idx]
 
     def test_ac6_early_return_gated(self) -> None:
         luau = generate_tween_script(_once_clip(), game_object_name="Door")
@@ -1303,6 +1313,38 @@ class TestPlacementRobustBinding:
         assert '_t:SetAttribute("open", false)' in luau
         # On-bind snap reads the attribute and conditionally plays.
         assert 'if _t:GetAttribute("open") and not _isActive then' in luau
+
+    def test_ac9_on_bind_snap_isactive_reset_semantics(self) -> None:
+        """The on-bind snap must mirror the changed-signal handler's _isActive
+        semantics per clip-loop: a NON-LOOP clip plays to completion so the snap
+        clears _isActive (else a target bound while already-open latches active
+        and ignores later toggles); a LOOP clip leaves _isActive true (the
+        handler clears it on the open->false edge)."""
+        # Helper: isolate the on-bind snap block (from the snap comment to the
+        # first `\tend` that closes the `if ... then`).
+        def _snap_block(luau: str) -> str:
+            marker = "-- apply-current-state-on-bind"
+            start = luau.index(marker)
+            end = luau.index("\n\tend", start) + len("\n\tend")
+            return luau[start:end]
+
+        # NON-LOOP bool clip: snap ends with the _isActive reset.
+        non_loop = generate_tween_script(_bool_clip(loop=False),
+                                         game_object_name="Door",
+                                         controller=_bool_controller())
+        non_loop_snap = _snap_block(non_loop)
+        assert "\t\tplayAnimation(_t)" in non_loop_snap
+        assert "\t\t_isActive = false" in non_loop_snap
+        # The reset is the LAST statement before the block closes.
+        assert non_loop_snap.endswith("\t\t_isActive = false\n\tend")
+
+        # LOOP bool clip: snap does NOT reset _isActive (left true).
+        loop = generate_tween_script(_bool_clip(loop=True),
+                                     game_object_name="Door",
+                                     controller=_bool_controller())
+        loop_snap = _snap_block(loop)
+        assert "\t\tplayAnimation(_t)" in loop_snap
+        assert "_isActive = false" not in loop_snap
 
     def test_ac10_apply_current_state_on_bind_int(self) -> None:
         luau = generate_tween_script(
