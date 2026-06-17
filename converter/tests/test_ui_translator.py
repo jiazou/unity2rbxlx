@@ -649,11 +649,17 @@ class TestToggleIsOnAttrConvention:
                         f"!= constant {_TOGGLE_ISON_ATTR!r}"
                     )
                     checked += 1
-                # Every SetAttribute("isOn", ...) literal in a Toggle writer
-                # must equal the constant.
-                if "GetComponent<Toggle>" in src:
-                    for name in setattr_re.findall(src):
-                        if name == _TOGGLE_ISON_ATTR:
-                            checked += 1
+                # A Toggle-isOn writer must actually EMIT the lowered
+                # ``SetAttribute(_TOGGLE_ISON_ATTR, ...)`` literal -- assert the
+                # real literal is present (not merely "count the ones that
+                # already match", which a drifted literal would silently skip).
+                if "GetComponent<Toggle>().isOn" in src:
+                    setattr_names = setattr_re.findall(src)
+                    assert _TOGGLE_ISON_ATTR in setattr_names, (
+                        f"{script.get('name')}: Toggle-isOn writer emits no "
+                        f"SetAttribute({_TOGGLE_ISON_ATTR!r}, ...) literal "
+                        f"(found {setattr_names!r}) -- convention drift"
+                    )
+                    checked += 1
         # The corpus must contain at least one Toggle-isOn writer to anchor on.
         assert checked >= 1, "no Toggle-isOn writer found in contract corpus"

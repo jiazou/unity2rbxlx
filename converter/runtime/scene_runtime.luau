@@ -3166,6 +3166,10 @@ function SceneRuntime:_installToggleGraphicWatch()
 			engine:_bindOneToggle(b, desc)               -- reuse desc as the resolved endpoint
 		end
 	end)
+	-- Fail-closed: a present service may still decline (e.g. client with no
+	-- PlayerGui yet returns ``nil``). No standing watch -> never scan/bind, so
+	-- we never fall back to mutating the StarterGui template's ``.Visible``.
+	if self._toggleWatchConn == nil then return end
 	-- Now bind everything already present (connect-then-scan race close).
 	self:_applyToggleGraphicBindings()
 end

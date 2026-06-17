@@ -514,6 +514,62 @@ class TestToggleBindingEdges:
         # No change-signal was ever connected on the toggle.
         assert "HAS_SIGNAL=false" in lines, out
 
+    def test_present_service_returning_nil_binds_nothing(self):
+        """E9b — fail-closed when the watch service EXISTS but DECLINES.
+
+        On a client where ``installUiDescendantWatch`` is present but
+        ``install(handler)`` returns ``nil`` (the real service does this when
+        ``PlayerGui`` is absent), NOTHING binds: no standing watch -> no scan ->
+        no ``.Visible`` mutation and no change-signal connect. ``workspaceFind``
+        DOES resolve the instances here (simulating the StarterGui-template
+        fallback) -- so the pre-fix unconditional install scan WOULD have bound
+        and flipped ``.Visible`` on the template. This is RED on that pre-fix
+        code and GREEN with the nil-connection bail.
+        """
+        scenario = textwrap.dedent("""\
+            local toggle = mkInst("tog")
+            local graphic = mkInst("gfx")
+            local plan = {
+                modules = {}, scenes = {}, prefabs = {}, domain_overrides = {},
+                ui_toggle_bindings = {
+                    {toggle_sri = "tog", graphic_sri = "gfx",
+                     initial_on = true, attr_name = "isOn"},
+                },
+            }
+            -- workspaceFind RESOLVES both (the StarterGui-template fallback);
+            -- count its calls to prove the scan never runs.
+            local finds = 0
+            local landed = {tog = toggle, gfx = graphic}
+            local services = servicesFor(plan, {}, {})
+            services.workspaceFind = function(id)
+                finds = finds + 1
+                return landed[id]
+            end
+            -- Service PRESENT but declines: returns nil (no PlayerGui).
+            services.installUiDescendantWatch = function(_) return nil end
+
+            local engine = SceneRuntime.new(services, plan)
+            engine:start("client")
+            runDeferred()
+            -- A flip must NOT change visibility (nothing was ever bound).
+            toggle:SetAttribute("isOn", true)
+            print("FINDS=" .. tostring(finds))
+            print("VISIBLE=" .. tostring(graphic.Visible))
+            print("HAS_SIGNAL=" .. tostring(toggle._attrSignals["isOn"] ~= nil))
+            print("DONE")
+        """)
+        rc, out, err = _build(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        lines = out.strip().splitlines()
+        assert "DONE" in lines, out
+        # The install scan never ran -> no workspaceFind issued.
+        assert "FINDS=0" in lines, out
+        # initial_on=true would have shown the graphic IF the scan had bound --
+        # it must NOT (nil = never touched, no template mutation).
+        assert "VISIBLE=nil" in lines, out
+        # No change-signal was ever connected on the toggle.
+        assert "HAS_SIGNAL=false" in lines, out
+
     def test_resetonspawn_reclone_rebinds(self):
         """E11 — a respawn re-clone (NEW instance, SAME sri) re-binds via the
         per-row marker (instance value differs -> _boundRows[b] ~= new)."""
