@@ -114,6 +114,37 @@ def _enclosing_method_name(cs_source: str, pos: int) -> str | None:
     return name
 
 
+def _matched_paren_end(cs_source: str, open_paren_pos: int) -> int | None:
+    """Index just past the ``)`` that closes the ``(`` at ``open_paren_pos``,
+    skipping string/char literals so a paren inside a literal doesn't unbalance
+    the count. Returns ``None`` if unbalanced (truncated source)."""
+    if open_paren_pos >= len(cs_source) or cs_source[open_paren_pos] != "(":
+        return None
+    depth = 0
+    i = open_paren_pos
+    n = len(cs_source)
+    while i < n:
+        c = cs_source[i]
+        if c in ("\"", "'"):
+            quote = c
+            i += 1
+            while i < n:
+                if cs_source[i] == "\\":
+                    i += 2
+                    continue
+                if cs_source[i] == quote:
+                    break
+                i += 1
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return None
+
+
 def _derive_cs_load_ownership(cs_source: str) -> _CsLoadOwnership | None:
     """Parse a DB's C# source for its ``LoadAssetsAsync<T>(LABEL, …Add(op.F,op))``
     load call. Returns the owned ``label``, the store ``key_field`` (the field
@@ -122,7 +153,12 @@ def _derive_cs_load_ownership(cs_source: str) -> _CsLoadOwnership | None:
     generic no-op, edge 6).
 
     No game literal: the label + key field + method name are READ from the
-    source, never hardcoded.
+    source, never hardcoded. The ``<T>`` type arg is part of the matched call so
+    the derivation is bound to the right ``LoadAssetsAsync`` (not a later bare
+    call), and the key field is searched ONLY within that call's argument list
+    (the callback span) — never the rest of the file, so an unrelated
+    ``.Add(op.otherKey, op)`` elsewhere in the method cannot mis-derive it
+    (codex P1).
     """
     m = _CS_LOAD_ASSETS_ASYNC.search(cs_source)
     if m is None:
@@ -133,14 +169,21 @@ def _derive_cs_load_ownership(cs_source: str) -> _CsLoadOwnership | None:
     load_method = _enclosing_method_name(cs_source, m.start())
     if not load_method:
         return None
-    # Look for the ``.Add(op.field, op)`` in the remainder of the source after
-    # the load call (the callback body). Key field is optional — a DB may index
-    # by a non-``op.field`` expression; the seed still supplies instances and
-    # only uses the key field to abstain on a key-less SO.
+    # Scope the ``.Add(op.field, op)`` search to the ``LoadAssetsAsync<T>( … )``
+    # argument list (the callback span), bounded by the matching close paren of
+    # the call's own ``(`` — NOT the rest of the file. The call's open paren is
+    # the ``(`` that opens the arg list; locate it from the matched ``<T>(``.
+    open_paren = cs_source.find("(", m.start())
+    call_end = _matched_paren_end(cs_source, open_paren) if open_paren != -1 else None
+    # The label literal ends inside the arg list; search the span AFTER it up to
+    # the call's close paren. Key field is optional — a DB may index by a
+    # non-``op.field`` expression; the seed still supplies instances and uses the
+    # key field only to abstain on a key-less SO.
     key_field: str | None = None
-    add = _CS_DICT_ADD_KEY.search(cs_source, m.end())
-    if add is not None:
-        key_field = add.group("field")
+    if call_end is not None:
+        add = _CS_DICT_ADD_KEY.search(cs_source, m.end(), call_end)
+        if add is not None:
+            key_field = add.group("field")
     return _CsLoadOwnership(label=label, key_field=key_field, load_method_name=load_method)
 
 
@@ -151,8 +194,11 @@ def _derive_drain_field(db_luau_source: str, load_method_name: str) -> str | Non
     deterministic (C#-derived), so anchoring on it is stable across
     re-transpiles even though the appender's name is not.
 
-    Returns ``DRAIN_FIELD`` or ``None`` when no recognizable drain is found
-    (→ FAIL-LOUD abstain, edge 7).
+    Returns the single ``DRAIN_FIELD`` the load method iterates. Returns ``None``
+    (→ FAIL-LOUD abstain, edge 7) when EITHER no recognizable drain is found OR
+    the load method iterates MULTIPLE DISTINCT candidate fields (ambiguous —
+    an earlier unrelated ``ipairs`` loop would otherwise silently mis-select the
+    first; abstain loud > mis-bind, codex P1).
     """
     # Isolate the ``function <Module>.<load_method>(...) ... end`` body. The
     # transpiled module functions are top-level ``function X.name(`` defs; the
@@ -169,16 +215,26 @@ def _derive_drain_field(db_luau_source: str, load_method_name: str) -> str | Non
     nxt = re.search(r"\n(?:function\s|return\b)", body)
     if nxt is not None:
         body = body[: nxt.start()]
-    drain = re.search(
-        r"\bin\s+ipairs\s*\(\s*(?:[\w.]*\.)?(?P<field>[A-Za-z_]\w*)\s*\)", body,
-    )
-    if drain is None:
+    fields = {
+        d.group("field")
+        for d in re.finditer(
+            r"\bin\s+ipairs\s*\(\s*(?:[\w.]*\.)?(?P<field>[A-Za-z_]\w*)\s*\)", body,
+        )
+    }
+    if len(fields) != 1:
+        # 0 → no drain (edge 7); >1 → ambiguous (which list does the store build
+        # from?) → abstain rather than guess the first.
         return None
-    return drain.group("field")
+    return next(iter(fields))
+
+
+# Sentinel: multiple distinct public appenders bind to the drain field, so no
+# single ingress can be chosen unambiguously → the caller abstains loud.
+_AMBIGUOUS_APPENDER = "\x00<ambiguous-appender>"
 
 
 def _derive_appender_name(db_luau_source: str, drain_field: str) -> str | None:
-    """Find a PUBLIC appender fn on the DB module whose ``table.insert`` targets
+    """Find THE PUBLIC appender fn on the DB module whose ``table.insert`` targets
     ``drain_field`` — the BIND that proves the surface feeds the same list
     ``LoadDatabase`` drains (D16). Returns the appender fn name, or ``None`` when
     no public appender binds to ``drain_field`` (the shim then seeds the drain
@@ -187,8 +243,16 @@ def _derive_appender_name(db_luau_source: str, drain_field: str) -> str | None:
     A name match alone is NEVER sufficient: a candidate is kept ONLY when its
     ``table.insert`` target field == ``drain_field`` (rejects edge 8's
     mismatched appender that feeds a different list).
+
+    Returns ``_AMBIGUOUS_APPENDER`` when MULTIPLE distinct public fns bind to
+    ``drain_field`` — picking the first could select a ``SeedDefaults()``-style
+    helper over the real consumer ingress; the caller then abstains loud rather
+    than seeding through an arbitrarily-chosen surface (abstain > mis-bind, codex
+    P1). Returns ``None`` when ZERO public fns bind (the shim then seeds the drain
+    table directly, since the drain field IS the proven surface).
     """
     # Each ``function <Module>.<name>(arg) ... table.insert(<Module>.<field>, …)``.
+    binders: set[str] = set()
     for fm in re.finditer(r"function\s+[\w.]+\.(?P<name>[A-Za-z_]\w*)\s*\(", db_luau_source):
         name = fm.group("name")
         body = db_luau_source[fm.end():]
@@ -199,8 +263,13 @@ def _derive_appender_name(db_luau_source: str, drain_field: str) -> str | None:
             r"table\.insert\s*\(\s*(?:[\w.]*\.)?(?P<field>[A-Za-z_]\w*)\s*,", body,
         ):
             if ins.group("field") == drain_field:
-                return name
-    return None
+                binders.add(name)
+                break
+    if not binders:
+        return None
+    if len(binders) > 1:
+        return _AMBIGUOUS_APPENDER
+    return next(iter(binders))
 
 
 def _drain_field_is_writable_table(db_luau_source: str, drain_field: str) -> bool:
@@ -7132,6 +7201,12 @@ script.Disabled = true
         ``materialize_and_classify`` rehydrates), so the seed is NOT
         transpile-gated.
         """
+        # Recompute is AUTHORITATIVE each run: clear any seed left on the dict by
+        # a prior run BEFORE any early-return/abstain, so every abstain path
+        # results in NO seed (loud, not a STALE record onto a now-wrong/dead
+        # registry). Without this, an abstain on a re-run keeps a stale seed and
+        # defeats the D16 fail-loud guarantee (codex P1).
+        scene_runtime.pop("addressable_db_seeds", None)
         project_root = getattr(self, "unity_project_path", None)
         if project_root is None:
             return
@@ -7205,6 +7280,16 @@ script.Disabled = true
                 )
                 continue
             appender = _derive_appender_name(db_luau, drain_field)
+            if appender is _AMBIGUOUS_APPENDER:
+                # Multiple distinct public appenders feed the drained field — no
+                # single ingress can be chosen without guessing. Abstain loud
+                # rather than seed through an arbitrary surface (D16).
+                log.warning(
+                    "[seed] multiple appenders bind to the %s drain on %s; "
+                    "abstaining — registry will be empty",
+                    ownership.load_method_name, db_name,
+                )
+                continue
             if appender is None and not _drain_field_is_writable_table(db_luau, drain_field):
                 log.warning(
                     "[seed] could not bind write surface to %s drain on %s; "

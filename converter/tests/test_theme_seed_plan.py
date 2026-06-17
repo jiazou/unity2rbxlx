@@ -113,6 +113,45 @@ class TestCsOwnershipDerivation:
         assert own is not None
         assert own.key_field is None  # seed still supplies instances; abstain off
 
+    def test_key_field_scoped_to_callback_not_later_unrelated_add(self):
+        """codex P1.3: when the ``LoadAssetsAsync<T>(...)`` callback indexes by an
+        EXPRESSION (no ``.Add(op.F, op)`` inside the callback span) and a LATER
+        unrelated ``.Add(op.otherKey, op)`` exists elsewhere in the method, the
+        key field must NOT be mis-derived from that unrelated Add — it must stay
+        ``None`` (the callback span has no ``op.F`` Add).
+
+        Pre-fix (whole-file ``.search(cs_source, m.end())``) mis-derives
+        ``key_field='otherKey'`` from the unrelated Add; post-fix the bounded
+        callback-span search finds none → ``None``.
+        """
+        cs = """\
+public class ThemeDatabase {
+    static protected Dictionary<string, ThemeData> themeDataList;
+    static Dictionary<string, ThemeData> _legacy = new Dictionary<string, ThemeData>();
+    static public void LoadDatabase() {
+        if (themeDataList == null) {
+            themeDataList = new Dictionary<string, ThemeData>();
+            Addressables.LoadAssetsAsync<ThemeData>("themeData", op => {
+                themeDataList[op.themeName] = op;
+            });
+        }
+        // an UNRELATED later Add in the SAME method, OUTSIDE the callback span:
+        _legacy.Add(op.otherKey, op);
+    }
+}
+"""
+        own = _derive_cs_load_ownership(cs)
+        assert own is not None
+        assert own.label == "themeData"
+        assert own.key_field is None   # NOT 'otherKey' from the unrelated Add
+
+    def test_bare_load_assets_async_without_type_arg_not_matched(self):
+        """The ``<T>`` type arg is load-bearing for the match: a bare
+        ``LoadAssetsAsync("themeData", …)`` without ``<T>`` is not the typed SO
+        load and is not derived as ownership."""
+        cs = THEME_DB_CS.replace("LoadAssetsAsync<ThemeData>", "LoadAssetsAsync")
+        assert _derive_cs_load_ownership(cs) is None
+
 
 # ---------------------------------------------------------------------------
 # Pure helpers: drain-bind detector (D16)
@@ -149,6 +188,76 @@ class TestDrainBindDetector:
     def test_drain_field_writable_table_detected(self):
         assert _drain_field_is_writable_table(THEME_DB_LUAU, "_pendingThemeData")
         assert not _drain_field_is_writable_table(THEME_DB_LUAU, "_nope")
+
+    def test_drain_field_ambiguous_when_two_distinct_loops_abstains(self):
+        """codex P1.2: LoadDatabase iterates an EARLIER unrelated list and the
+        real pending list. Two distinct candidates → abstain (None), never
+        silently bind the FIRST ipairs.
+
+        Pre-fix (``re.search`` returns the first match) binds ``_warmup`` (the
+        wrong surface); post-fix it abstains.
+        """
+        src = THEME_DB_LUAU.replace(
+            "function ThemeDatabase.LoadDatabase()\n"
+            "\tif themeDataList == nil then\n"
+            "\t\tthemeDataList = {}\n",
+            "function ThemeDatabase.LoadDatabase()\n"
+            "\tif themeDataList == nil then\n"
+            "\t\tthemeDataList = {}\n"
+            "\t\tfor _, w in ipairs(ThemeDatabase._warmup) do\n"
+            "\t\t\tlocal _ = w\n"
+            "\t\tend\n",
+        )
+        assert _derive_drain_field(src, "LoadDatabase") is None
+
+    def test_single_drain_loop_still_binds(self):
+        """A lone ipairs(<field>) loop (the real shape) still binds — the
+        ambiguity guard does not regress the unambiguous case."""
+        assert _derive_drain_field(THEME_DB_LUAU, "LoadDatabase") == "_pendingThemeData"
+
+    def test_multiple_appenders_to_drain_field_ambiguous(self):
+        """codex P1.2: TWO public fns insert into the drained field (e.g. the
+        real ``Register`` PLUS a ``SeedDefaults`` helper) → ambiguous, no single
+        ingress can be chosen → returns the ambiguity sentinel (NOT the first).
+
+        Pre-fix (return first match) silently picks ``Register``; post-fix it
+        signals ambiguity so the pipeline abstains loud.
+        """
+        from converter.pipeline import _AMBIGUOUS_APPENDER
+        src = THEME_DB_LUAU.replace(
+            "function ThemeDatabase.Register(themeData)\n"
+            "\ttable.insert(ThemeDatabase._pendingThemeData, themeData)\n"
+            "end",
+            "function ThemeDatabase.Register(themeData)\n"
+            "\ttable.insert(ThemeDatabase._pendingThemeData, themeData)\n"
+            "end\n"
+            "function ThemeDatabase.SeedDefaults(themeData)\n"
+            "\ttable.insert(ThemeDatabase._pendingThemeData, themeData)\n"
+            "end",
+        )
+        assert _derive_appender_name(src, "_pendingThemeData") is _AMBIGUOUS_APPENDER
+
+    def test_single_appender_still_binds(self):
+        """The lone-appender case still returns the name — ambiguity guard does
+        not regress the unambiguous bind."""
+        assert _derive_appender_name(THEME_DB_LUAU, "_pendingThemeData") == "Register"
+
+    def test_seed_defaults_helper_to_other_list_not_bound(self):
+        """A ``SeedDefaults``-style helper that inserts into a DIFFERENT list than
+        the drain field is ignored; the real ``Register`` (bound to the drain
+        field) is selected unambiguously."""
+        src = THEME_DB_LUAU.replace(
+            "function ThemeDatabase.Register(themeData)\n"
+            "\ttable.insert(ThemeDatabase._pendingThemeData, themeData)\n"
+            "end",
+            "function ThemeDatabase.SeedDefaults(themeData)\n"
+            "\ttable.insert(ThemeDatabase._scratch, themeData)\n"
+            "end\n"
+            "function ThemeDatabase.Register(themeData)\n"
+            "\ttable.insert(ThemeDatabase._pendingThemeData, themeData)\n"
+            "end",
+        )
+        assert _derive_appender_name(src, "_pendingThemeData") == "Register"
 
 
 # ---------------------------------------------------------------------------
@@ -336,6 +445,97 @@ class TestBuildThemeSeedPlanIntegration:
             i_seed = src.index("SceneRuntime.seedAddressableDatabases(Plan, services)")
             i_start = src.index(f'engine:start("{domain}")')
             assert i_new < i_seed < i_start
+
+    def test_stale_seed_cleared_on_abstain(self, tmp_path, caplog):
+        """codex P1.1: a scene_runtime that ALREADY carries a seed from a prior
+        run must have it CLEARED when this run abstains — never leave a STALE
+        record seeding a now-wrong/dead registry. Recompute is authoritative.
+
+        Pre-fix (set only when seeds truthy) leaves the stale value in place;
+        post-fix the entry-reset clears it before any abstain.
+        """
+        broken = THEME_DB_LUAU.replace("ipairs(ThemeDatabase._pendingThemeData)",
+                                       "pairs(mystery())")
+        root = _make_project(tmp_path)
+        pipe = _pipeline_with_state(root, tmp_path, db_luau=broken)
+        sr = _scene_runtime_with_so_map()
+        # A STALE seed from a prior run (a now-wrong record).
+        sr["addressable_db_seeds"] = [{
+            "db_module_path": "ReplicatedStorage.StaleDB",
+            "load_method_name": "LoadDatabase",
+            "drain_field": "_stale",
+            "appender_name": "StaleAppend",
+            "key_field": "staleKey",
+            "so_module_paths": ["ReplicatedStorage.Stale_SO"],
+        }]
+        with caplog.at_level("WARNING"):
+            pipe._build_theme_seed_plan(sr)
+        # The abstain path cleared the stale key entirely — no silent dead seed.
+        assert "addressable_db_seeds" not in sr
+        assert any("abstaining" in r.message for r in caplog.records)
+
+    def test_stale_seed_overwritten_on_successful_rebuild(self, tmp_path):
+        """A successful recompute REPLACES a prior stale seed (does not append to
+        or leave it). Authoritative recompute each run."""
+        root = _make_project(tmp_path)
+        pipe = _pipeline_with_state(root, tmp_path)
+        sr = _scene_runtime_with_so_map()
+        sr["addressable_db_seeds"] = [{
+            "db_module_path": "ReplicatedStorage.StaleDB",
+            "load_method_name": "X", "drain_field": "_stale",
+            "appender_name": None, "key_field": None,
+            "so_module_paths": ["ReplicatedStorage.Stale_SO"],
+        }]
+        pipe._build_theme_seed_plan(sr)
+        seeds = sr["addressable_db_seeds"]
+        assert len(seeds) == 1
+        assert seeds[0]["db_module_path"] == "ReplicatedStorage.ThemeDatabase"
+
+    def test_multiple_appenders_abstains_loud(self, tmp_path, caplog):
+        """codex P1.2 (integration): two public fns insert into the drained
+        field → ambiguous → the pipeline abstains loud (warn + NO record), never
+        seeds through an arbitrarily-chosen surface."""
+        src = THEME_DB_LUAU.replace(
+            "function ThemeDatabase.Register(themeData)\n"
+            "\ttable.insert(ThemeDatabase._pendingThemeData, themeData)\n"
+            "end",
+            "function ThemeDatabase.Register(themeData)\n"
+            "\ttable.insert(ThemeDatabase._pendingThemeData, themeData)\n"
+            "end\n"
+            "function ThemeDatabase.SeedDefaults(themeData)\n"
+            "\ttable.insert(ThemeDatabase._pendingThemeData, themeData)\n"
+            "end",
+        )
+        root = _make_project(tmp_path)
+        pipe = _pipeline_with_state(root, tmp_path, db_luau=src)
+        sr = _scene_runtime_with_so_map()
+        with caplog.at_level("WARNING"):
+            pipe._build_theme_seed_plan(sr)
+        assert "addressable_db_seeds" not in sr
+        assert any("abstaining" in r.message for r in caplog.records)
+
+    def test_earlier_unrelated_drain_loop_abstains_loud(self, tmp_path, caplog):
+        """codex P1.2 (integration): LoadDatabase iterates an earlier unrelated
+        list AND the real pending list → ambiguous drain → abstain loud rather
+        than silently bind the FIRST loop."""
+        src = THEME_DB_LUAU.replace(
+            "function ThemeDatabase.LoadDatabase()\n"
+            "\tif themeDataList == nil then\n"
+            "\t\tthemeDataList = {}\n",
+            "function ThemeDatabase.LoadDatabase()\n"
+            "\tif themeDataList == nil then\n"
+            "\t\tthemeDataList = {}\n"
+            "\t\tfor _, w in ipairs(ThemeDatabase._warmup) do\n"
+            "\t\t\tlocal _ = w\n"
+            "\t\tend\n",
+        )
+        root = _make_project(tmp_path)
+        pipe = _pipeline_with_state(root, tmp_path, db_luau=src)
+        sr = _scene_runtime_with_so_map()
+        with caplog.at_level("WARNING"):
+            pipe._build_theme_seed_plan(sr)
+        assert "addressable_db_seeds" not in sr
+        assert any("abstaining" in r.message for r in caplog.records)
 
     def test_keyless_so_still_emits_record(self, tmp_path):
         """A missing key_field (DB indexes by non-op.field) still seeds; the
