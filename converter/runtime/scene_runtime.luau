@@ -1646,8 +1646,8 @@ end
 -- Player logic GameObject (``Workspace.DynamicObjects.Player``, carrying
 -- ``GetItem``/``GetRifle``) -- so a player-alias receiver must route to the
 -- LATTER, not to whatever the alias literally points at. The ``IsA("Player")``
--- guard is EXPLICIT (per design: a duck-typed/field-sniff check leaves the live
--- ``plr`` symptom intact); ``pcall``-wrapped because ``recv`` may be a plain
+-- guard is EXPLICIT (an inferred/duck-typed check would not match a real
+-- ``Players``-service object); ``pcall``-wrapped because ``recv`` may be a plain
 -- component table without ``IsA``.
 function SceneRuntime:_isPlayerAlias(recv)
 	if recv == nil then return false end
@@ -1689,7 +1689,7 @@ end
 -- dispatch ``name`` to every implementing component on the resolved
 -- GameObject (active only).
 function SceneRuntime:sendMessage(recv, name, ...)
-	-- Player-FIRST branch (D-P2-1): a player alias maps to a LIST of
+	-- Player-FIRST branch: a player alias maps to a LIST of
 	-- embodiment goIds, which does not fit the single-id resolver. Check it
 	-- BEFORE ``_resolveReceiverGoId`` so a player alias never falls into the
 	-- ancestor-Model walk that mis-resolved the literal character.
@@ -1707,7 +1707,7 @@ function SceneRuntime:sendMessage(recv, name, ...)
 		end
 		return
 	end
-	-- Phase-1 non-player path (UNCHANGED).
+	-- Non-player path.
 	local goId = self:_resolveReceiverGoId(recv)
 	if goId == nil then
 		self._warn(string.format(
@@ -1722,7 +1722,7 @@ end
 -- ``recv.BroadcastMessage("name", ...)``: dispatch to the GameObject AND
 -- every descendant GameObject (via the planner parent map walked DOWN).
 function SceneRuntime:broadcastMessage(recv, name, ...)
-	-- Player-FIRST branch (D-P2-1 / BC-1): a player-alias receiver dispatches
+	-- Player-FIRST branch: a player-alias receiver dispatches
 	-- FLAT to each player-embodiment goId WITHOUT the descendant walk -- the
 	-- embodiment is a logic singleton (no Unity child GameObjects carrying
 	-- broadcast-target components; the rig's children are character limbs, not
@@ -1742,7 +1742,7 @@ function SceneRuntime:broadcastMessage(recv, name, ...)
 		end
 		return
 	end
-	-- Phase-1 non-player path (UNCHANGED).
+	-- Non-player path.
 	local goId = self:_resolveReceiverGoId(recv)
 	if goId == nil then
 		self._warn(string.format(
