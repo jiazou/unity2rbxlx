@@ -245,6 +245,82 @@ def test_dispatch_outside_overlap_foreach_body_still_emits():
     assert _shapes(src) == [(SEND, "GetItem", ("name",))]
 
 
+# --- scope/position-aware exclusion (finding 1.2 fixes) --------------------
+
+
+def test_overlap_loop_and_unrelated_direct_dispatch_both_kept():
+    # (a) An OverlapSphere damage loop AND a SEPARATE direct dispatch whose
+    # receiver is NOT the foreach var -> the loop is excluded, the direct
+    # dispatch IS emitted (the file-global exclusion must not suppress it).
+    src = (
+        "void F(){\n"
+        "  Collider[] cols = Physics.OverlapSphere(p, 2);\n"
+        "  foreach (Collider col in cols) { col.SendMessage(\"TakeDamage\", d); }\n"
+        "  manager.SendMessage(\"Foo\", arg);\n"
+        "}"
+    )
+    assert _shapes(src) == [(SEND, "Foo", ("arg",))]
+
+
+def test_unrelated_overlap_in_other_method_does_not_suppress_real_dispatch():
+    # (b) An unrelated ``cols = OverlapSphere()`` lives in one method; a DIFFERENT
+    # method has its own ``cols`` (a non-OverlapSphere collection) iterated by a
+    # foreach. The exclusion must be per-scope: the second method's dispatch is
+    # NOT suppressed by the first method's same-named OverlapSphere local.
+    src = (
+        "class C {\n"
+        "  void A() {\n"
+        "    var cols = Physics.OverlapSphere(p, 2);\n"
+        "    foreach (var col in cols) { col.SendMessage(\"TakeDamage\", d); }\n"
+        "  }\n"
+        "  void B() {\n"
+        "    var cols = targets;\n"
+        "    foreach (var col in cols) { col.SendMessage(\"Ping\", 1); }\n"
+        "  }\n"
+        "}"
+    )
+    # A's loop excluded (real OverlapSphere); B's loop kept (cols is targets).
+    assert _shapes(src) == [(SEND, "Ping", ("1",))]
+
+
+def test_overlap_in_sibling_block_does_not_suppress_later_foreach():
+    # An OverlapSphere ``cols`` declared in an already-CLOSED sibling block must
+    # not reach a later foreach over a different ``cols`` in an enclosing scope.
+    src = (
+        "void F(){\n"
+        "  { var cols = Physics.OverlapSphere(p, 2); }\n"
+        "  var cols = targets;\n"
+        "  foreach (var col in cols) { col.SendMessage(\"Ping\", 1); }\n"
+        "}"
+    )
+    assert _shapes(src) == [(SEND, "Ping", ("1",))]
+
+
+def test_rebind_to_non_overlap_nearer_foreach_keeps_dispatch():
+    # The NEAREST-PRECEDING in-scope binding wins: a re-assignment to a
+    # non-OverlapSphere value after an earlier OverlapSphere decl -> KEEP.
+    src = (
+        "void F(){\n"
+        "  var cols = Physics.OverlapSphere(p, 2);\n"
+        "  cols = targets;\n"
+        "  foreach (var col in cols) { col.SendMessage(\"Ping\", 1); }\n"
+        "}"
+    )
+    assert _shapes(src) == [(SEND, "Ping", ("1",))]
+
+
+def test_corpus_aliased_shape_still_excluded_with_neighbors():
+    # (c) Confirm the real corpus shape is STILL excluded when it is the
+    # nearest-preceding in-scope binding (no neighbor masks it).
+    src = (
+        "void F(){\n"
+        "  var cols = Physics.OverlapSphere(transform.position, 2);\n"
+        "  foreach (var col in cols) { col.SendMessage(\"TakeDamage\", d); }\n"
+        "}"
+    )
+    assert _facts(src) == ()
+
+
 # --- build_send_message_map (path keying + presence) ----------------------
 
 

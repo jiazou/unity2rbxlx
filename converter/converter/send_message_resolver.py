@@ -401,11 +401,14 @@ def _receiver_before(source: str, dot_or_call_pos: int) -> str | None:
 @dataclass(frozen=True, slots=True)
 class _ForeachBinding:
     """One ``foreach`` loop binding parsed from source: the iteration VARIABLE,
-    the COLLECTION expression, and the source span ``[body_start, body_end)`` of
-    the loop body within which the variable is in scope."""
+    the COLLECTION expression, the ``header_start`` index of the ``foreach``
+    keyword (the upper bound for an in-scope collection declaration), and the
+    source span ``[body_start, body_end)`` of the loop body within which the
+    variable is in scope."""
 
     var: str
     collection: str
+    header_start: int
     body_start: int
     body_end: int
 
@@ -447,7 +450,9 @@ def _foreach_bindings(source: str) -> list[_ForeachBinding]:
             # braceless single statement -> body runs to the next ``;`` (or EOF).
             semi = source.find(";", i)
             body_start, body_end = i, (semi + 1 if semi != -1 else n)
-        out.append(_ForeachBinding(var, collection, body_start, body_end))
+        out.append(
+            _ForeachBinding(var, collection, m.start(), body_start, body_end)
+        )
     return out
 
 
@@ -477,30 +482,82 @@ def _matching_brace(source: str, open_idx: int) -> int | None:
     return None
 
 
-def _collection_is_overlap_sphere(source: str, collection: str) -> bool:
+def _encloses(source: str, decl_pos: int, foreach_pos: int) -> bool:
+    """True iff the block that lexically contains ``decl_pos`` still encloses
+    ``foreach_pos`` — i.e. no ``}`` between the two positions closes a block that
+    was open at ``decl_pos``. This makes "in scope for the foreach" precise: a
+    declaration inside an already-closed SIBLING block (a different method or an
+    earlier ``{ ... }``) does NOT reach the foreach. Counts only ``}`` at code
+    positions (string/comment braces are ignored via ``_cs_pos_is_code``).
+
+    Requires ``decl_pos < foreach_pos`` (declared before the foreach)."""
+    if decl_pos >= foreach_pos:
+        return False
+    net_close = 0  # how many enclosing-at-decl blocks have closed before foreach
+    i = decl_pos
+    while i < foreach_pos:
+        ch = source[i]
+        if ch == "{":
+            if _cs_pos_is_code(source, i):
+                net_close -= 1  # a block opened AFTER decl; its close is balanced
+        elif ch == "}":
+            if _cs_pos_is_code(source, i):
+                net_close += 1
+                if net_close > 0:
+                    return False  # closed a block that enclosed decl_pos
+        i += 1
+    return True
+
+
+def _collection_is_overlap_sphere(
+    source: str, collection: str, foreach_pos: int
+) -> bool:
     """True iff ``collection`` is (or aliases, in <=1 local hop, a local whose
-    initializer is) a ``Physics.OverlapSphere(...)`` result.
+    nearest-preceding in-scope declaration initializes it from) a
+    ``Physics.OverlapSphere(...)`` result, FOR the ``foreach`` at ``foreach_pos``.
 
     Direct: the collection text itself contains ``Physics.OverlapSphere(`` (the
-    inline form ``foreach (var c in Physics.OverlapSphere(...))``). Aliased (the
-    real corpus shape): the collection is a bare local symbol whose declaration
-    ``<Type|var> <collection> = Physics.OverlapSphere(...)`` appears at a code
-    position. Only a SINGLE alias hop is followed (keys the semantic shape, not a
-    deep dataflow)."""
+    inline form ``foreach (var c in Physics.OverlapSphere(...))``).
+
+    Aliased (the real corpus shape): the collection is a bare local symbol whose
+    NEAREST-PRECEDING in-scope binding is ``<Type|var> <collection> =
+    Physics.OverlapSphere(...)``. "In scope" = declared before the foreach AND in
+    a block that still encloses it (``_encloses``) — so an unrelated same-named
+    ``cols = OverlapSphere(...)`` in a different method/sibling block does NOT
+    suppress this dispatch. Only a SINGLE alias hop is followed.
+
+    Conservative bias: a later re-binding of ``collection`` to a NON-OverlapSphere
+    value (e.g. ``cols = targets``) that sits nearer the foreach wins, so we KEEP
+    (emit the fact) rather than exclude on a stale earlier OverlapSphere decl. We
+    exclude only when the confirmed nearest-preceding in-scope binding is an
+    OverlapSphere initializer."""
     if _OVERLAP_SPHERE_RE.search(collection) is not None:
         return True
     if not re.fullmatch(r"[A-Za-z_]\w*", collection):
         return False  # not a bare symbol -> no alias to trace
-    # ``<Type|var> <collection> = Physics.OverlapSphere(`` declaration.
-    decl_re = re.compile(
-        r"\b(?:var|[\w.<>\[\],\s]*?[\w>\]])\s+"
+    # Find the NEAREST-PRECEDING in-scope binding of ``collection`` (a declaration
+    # ``<Type|var> collection = ...`` or a plain assignment ``collection = ...``),
+    # then check whether that one binding's initializer is Physics.OverlapSphere.
+    bind_re = re.compile(
+        r"(?:\b(?:var|[\w.<>\[\],\s]*?[\w>\]])\s+)?"
         + re.escape(collection)
-        + r"\s*=\s*Physics\s*\.\s*OverlapSphere\s*\("
+        + r"\s*=\s*(?!=)"
     )
-    for m in decl_re.finditer(source):
-        if _cs_pos_is_code(source, m.start()):
-            return True
-    return False
+    nearest_start = -1
+    nearest_init_at = -1  # index just past the matched ``=`` of the nearest binding
+    for m in bind_re.finditer(source):
+        if m.end() > foreach_pos:
+            break  # bindings are ordered; nothing after the foreach is preceding
+        if not _cs_pos_is_code(source, m.start()):
+            continue
+        if not _encloses(source, m.start(), foreach_pos):
+            continue  # in a closed sibling block / different method
+        if m.start() > nearest_start:
+            nearest_start = m.start()
+            nearest_init_at = m.end()
+    if nearest_start == -1:
+        return False  # no in-scope binding -> cannot confirm the OverlapSphere link
+    return _OVERLAP_SPHERE_RE.match(source, nearest_init_at) is not None
 
 
 def _is_overlap_sphere_iter_receiver(
@@ -517,7 +574,7 @@ def _is_overlap_sphere_iter_receiver(
             continue
         if not (b.body_start <= call_pos < b.body_end):
             continue  # the dispatch is outside this loop's body
-        if _collection_is_overlap_sphere(source, b.collection):
+        if _collection_is_overlap_sphere(source, b.collection, b.header_start):
             return True
     return False
 
