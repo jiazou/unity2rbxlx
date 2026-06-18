@@ -664,6 +664,12 @@ _PLAN_KEYS_FOR_HOST: tuple[str, ...] = (
     # allowlist entry the recomputed key is elided from the emitted plan and the
     # shim sees ``{}`` (the OnEnable crash this phase fixes persists).
     "consumable_db_seeds",
+    # Phase 2 lazy-singleton boot-instantiation: per-class seed records the boot
+    # shim replays to construct + Awake one instance of each lazily-created
+    # singleton MonoBehaviour before any consumer uses it. LOAD-BEARING — without
+    # the allowlist entry the recomputed key is elided from the emitted plan and
+    # the shim sees ``{}`` (the singleton never awakes; getInstance() stays nil).
+    "lazy_singletons",
 )
 
 

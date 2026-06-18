@@ -3474,6 +3474,12 @@ return table.concat(allData, "\\n")'''
         # same deterministic builder write_output runs), mirroring roster_binding.
         # Exempted in BOTH the fresh-transpile and resume branches below.
         consumable_live = self._consumable_seed_live_module_names()
+        # Lazy-singleton boot-shim live-set (Phase 2): a lazy singleton's body is
+        # output-inert, so it would classify Roblox-dead → reroute to a
+        # ``.new``-less stub → the shim cannot construct it. The shim instantiates
+        # it at boot, so it is LIVE BY CONSTRUCTION. Exempted in BOTH branches
+        # below, mirroring ``consumable_live``.
+        lazy_singleton_live = self._lazy_singleton_live_module_names()
         # The input-side prior needs the original C# source. It only exists on
         # a fresh transpile (``transpilation_result``); a resume rehydrates
         # Luau from disk without the C#. On resume, reuse the persisted verdict
@@ -3520,6 +3526,15 @@ return table.concat(allData, "\\n")'''
                     # seed plan is recomputed from disk-resident inputs (the
                     # .asset/.prefab/.cs + the SO map), so the exemption survives a
                     # no-retranspile rehydrated assemble. Mirrors roster_binding.
+                    dropped.append(s.name)
+                    continue
+                if s.name in lazy_singleton_live:
+                    # Lazy-singleton boot-instantiation (Phase 2): the boot shim
+                    # constructs + Awakes this singleton at boot, so it is live by
+                    # construction even with an inert canonical body. Recomputed
+                    # from disk-resident inputs (the .cs via the GuidIndex +
+                    # scene_runtime["modules"]), so the exemption survives a
+                    # no-retranspile rehydrated assemble. Mirrors consumable_live.
                     dropped.append(s.name)
                     continue
                 if is_output_inert(s.source) and not has_genuine_roblox_effect(
@@ -3591,6 +3606,15 @@ return table.concat(allData, "\\n")'''
                 # inert ``.new``-less stub (which would drop every consumable
                 # element and silently no-op the feature). Pure exemption --
                 # does not touch ``strategy``. Mirrors roster_binding.
+                continue
+            if s.name in lazy_singleton_live:
+                # Lazy-singleton boot-instantiation (Phase 2): the boot shim
+                # constructs + Awakes this singleton at boot, so it is LIVE BY
+                # CONSTRUCTION even though its canonical body is output-inert.
+                # Exempt BEFORE the strategy gate so the storage classifier never
+                # reroutes it to a ``.new``-less inert stub (which the shim's
+                # resolveModule could not construct). Pure exemption -- does not
+                # touch ``strategy``. Mirrors consumable_live.
                 continue
             if strategy_by_name.get(s.name) not in _DECISIVE_STRATEGIES:
                 # Non-deterministic fallback body -- inertness is unreliable.
@@ -3668,6 +3692,46 @@ return table.concat(allData, "\\n")'''
                 mod_path = element.get("module_path")
                 if isinstance(mod_path, str) and mod_path:
                     live.add(mod_path.rsplit(".", 1)[-1])
+        return frozenset(live)
+
+    def _lazy_singleton_live_module_names(self) -> frozenset[str]:
+        """The set of RbxScript names that are LIVE BY CONSTRUCTION because the
+        lazy-singleton boot shim (slice 2.2) constructs + Awakes them at boot.
+
+        Mirrors ``_consumable_seed_live_module_names``: the live identity is
+        carried by the SEED PLAN (``scene_runtime["lazy_singletons"]``), not a
+        per-script attribute. A lazy singleton's transpiled body is output-inert
+        (it has no dotted Roblox-instance writes), so ``_subphase_analyze_dead_modules``
+        would flag it Roblox-dead → reroute it to a ``.new``-less inert stub → the
+        shim's ``resolveModule`` gets a stub with no ``Cls.new`` → silently dead.
+        The module is LIVE because the shim instantiates it at boot.
+
+        The seed plan is RECOMPUTED in ``write_output`` (after this phase), so it
+        is not yet on ``ctx.scene_runtime`` here. Recompute it against a private
+        COPY using the SAME deterministic builder. Returns ``frozenset()`` when no
+        seed resolves (a non-singleton scene exempts nothing).
+
+        The names are RbxScript stems: each seed's ``class_stem`` and its
+        ``module_path`` leaf (both == the singleton's output filename stem).
+        """
+        scene_runtime_src = getattr(self.ctx, "scene_runtime", None)
+        if not isinstance(scene_runtime_src, dict) or not scene_runtime_src:
+            return frozenset()
+        scene_runtime = dict(scene_runtime_src)
+        self._build_lazy_singleton_seeds(scene_runtime)
+        seeds_obj = scene_runtime.get("lazy_singletons")
+        if not isinstance(seeds_obj, list):
+            return frozenset()
+        live: set[str] = set()
+        for seed in seeds_obj:
+            if not isinstance(seed, dict):
+                continue
+            stem = seed.get("class_stem")
+            if isinstance(stem, str) and stem:
+                live.add(stem)
+            mod_path = seed.get("module_path")
+            if isinstance(mod_path, str) and mod_path:
+                live.add(mod_path.rsplit(".", 1)[-1])
         return frozenset(live)
 
     def _subphase_prune_dead_module_closures(self) -> None:
@@ -7176,6 +7240,12 @@ script.Disabled = true
         # the allowlisted ``consumable_db_seeds`` key is on the dict). NOT
         # transpile-gated; pop-first authoritative recompute (D17).
         self._build_consumable_db_seeds(scene_runtime)
+        # Phase 2 (lazy-singleton boot-instantiation): RECOMPUTE the
+        # lazy-singleton seed onto scene_runtime in THIS window — same property as
+        # the consumable seed (after the modules map exists, before the plan
+        # module emits, so the allowlisted ``lazy_singletons`` key is on the dict).
+        # NOT transpile-gated; pop-first authoritative recompute (D17).
+        self._build_lazy_singleton_seeds(scene_runtime)
 
         _replace_or_add(generate_scene_runtime_plan_module(
             cast("dict", scene_runtime),
@@ -7576,6 +7646,61 @@ script.Disabled = true
                 "[write_output] scene-runtime generic: built %d consumable db "
                 "seed(s) (%d element(s) total)",
                 len(seeds), sum(len(s["elements"]) for s in seeds),
+            )
+
+    def _build_lazy_singleton_seeds(self, scene_runtime: dict[str, object]) -> None:
+        """RECOMPUTE ``scene_runtime["lazy_singletons"]`` — the per-class seed
+        records the boot shim (slice 2.2) replays to CONSTRUCT + AWAKE exactly one
+        instance of each lazily-created singleton MonoBehaviour before any consumer
+        uses it (design-phase2 §1.2).
+
+        A lazy singleton is a component class with a static self-typed backing
+        field + a static ``instance``/``Instance`` getter that self-instantiates
+        (``new GameObject`` + ``AddComponent<Self>`` + cache) and whose whole
+        eager-boot lifecycle surface is side-effect-free (§1.1a). The detection is
+        STRUCTURAL (the C# shape + the component class graph), never the
+        ``CoroutineHandler`` literal and never the AI-emitted Luau.
+
+        RECOMPUTED every ``write_output`` — NOT persisted, NOT transpile-gated.
+        Inputs rehydrated by ESSENTIAL phases on a no-retranspile resume (the
+        ``.cs`` re-read off disk via the GuidIndex; ``scene_runtime["modules"]``
+        for the resolved ``script_guid``/``module_path``/``domain``). Pop-first
+        AUTHORITATIVE: clear any stale seed BEFORE any abstain (D17).
+        """
+        from converter.consumable_db_seed import build_base_by_class
+        from converter.lazy_singleton_seed import (
+            LazySingletonSeed,
+            resolve_lazy_singletons,
+        )
+
+        scene_runtime.pop("lazy_singletons", None)
+        modules_obj = scene_runtime.get("modules")
+        if not isinstance(modules_obj, dict) or not modules_obj:
+            return
+        guid_index = getattr(self.state, "guid_index", None)
+        if guid_index is None:
+            return
+
+        base_by_class = build_base_by_class(guid_index)
+        # Same build-time collision-exclusion resolver Phase 1 uses to join a
+        # class stem to its emitted module_path (a colliding stem returns None →
+        # the class is DROPPED fail-closed).
+        module_path_for_stem = self._build_subclass_module_path_resolver(
+            scene_runtime,
+        )
+
+        seeds: list[LazySingletonSeed] = resolve_lazy_singletons(
+            modules=cast("dict[str, object]", modules_obj),
+            guid_index=guid_index,
+            base_by_class=base_by_class,
+            module_path_for_stem=module_path_for_stem,
+        )
+        if seeds:
+            scene_runtime["lazy_singletons"] = seeds
+            log.info(
+                "[write_output] scene-runtime generic: built %d lazy-singleton "
+                "seed(s): %s",
+                len(seeds), ", ".join(s["class_stem"] for s in seeds),
             )
 
     def _build_subclass_module_path_resolver(
