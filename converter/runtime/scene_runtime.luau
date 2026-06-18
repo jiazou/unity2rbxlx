@@ -1638,10 +1638,76 @@ function SceneRuntime:_dispatchToGameObject(goId, name, ...)
 	end
 end
 
+-- ``_isPlayerAlias(recv) -> boolean`` -- TRUE iff ``recv`` is a player alias:
+-- a ``Players``-service ``Player`` object, OR a character/limb ``BasePart``
+-- that ``playerFromTouch`` resolves to a Player. The converter decouples the
+-- player into TWO entities -- the Roblox character (what the touch handler /
+-- ``Players`` service points at, carrying no Unity component) and the Unity
+-- Player logic GameObject (``Workspace.DynamicObjects.Player``, carrying
+-- ``GetItem``/``GetRifle``) -- so a player-alias receiver must route to the
+-- LATTER, not to whatever the alias literally points at. The ``IsA("Player")``
+-- guard is EXPLICIT (per design: a duck-typed/field-sniff check leaves the live
+-- ``plr`` symptom intact); ``pcall``-wrapped because ``recv`` may be a plain
+-- component table without ``IsA``.
+function SceneRuntime:_isPlayerAlias(recv)
+	if recv == nil then return false end
+	-- (a) Players-service Player object: explicit IsA guard, pcall-wrapped.
+	if type(recv.IsA) == "function" then
+		local ok, isPlayer = pcall(function() return recv:IsA("Player") end)
+		if ok and isPlayer then return true end
+	end
+	-- (b) character/limb BasePart -> owning Player via the existing walk.
+	return self:playerFromTouch(recv) ~= nil
+end
+
+-- ``_playerGoIds() -> {gameObjectId}`` -- the LIST of DISTINCT internal
+-- ``gameObjectId``(s) of the player-embodiment component(s), keyed on the
+-- deterministic ``_player._playerScriptId`` (rung-3 upstream identity, NOT an
+-- AI fingerprint). Mirrors ``_playerRigInstances``'s walk but collects
+-- ``meta.gameObjectId`` (what ``_dispatchToGameObject`` keys on) instead of
+-- ``meta.gameObjectInstance``. Returns ``{}`` when no player authority is
+-- bound (0/>1 character-controller modules -> nil ``_player``) or the rig
+-- isn't built yet -- the caller treats empty as no-route (fail-closed, no
+-- error). Guards nil ``_player`` FIRST so it never indexes a nil ``_player``.
+function SceneRuntime:_playerGoIds()
+	local p = self._player
+	if not p or not p._playerScriptId then return {} end
+	local out, seen = {}, {}
+	for _, m in pairs(self._meta) do
+		if m.scriptId == p._playerScriptId then
+			local goId = m.gameObjectId
+			if goId ~= nil and not seen[goId] then
+				seen[goId] = true
+				table.insert(out, goId)
+			end
+		end
+	end
+	return out
+end
+
 -- ``sendMessage(recv, name, ...)`` -- Unity ``recv.SendMessage("name", ...)``:
 -- dispatch ``name`` to every implementing component on the resolved
 -- GameObject (active only).
 function SceneRuntime:sendMessage(recv, name, ...)
+	-- Player-FIRST branch (D-P2-1): a player alias maps to a LIST of
+	-- embodiment goIds, which does not fit the single-id resolver. Check it
+	-- BEFORE ``_resolveReceiverGoId`` so a player alias never falls into the
+	-- ancestor-Model walk that mis-resolved the literal character.
+	if self:_isPlayerAlias(recv) then
+		local goIds = self:_playerGoIds()
+		if #goIds == 0 then
+			self._warn(string.format(
+				"[scene_runtime] sendMessage(%q): player-alias receiver but no "
+				.. "player-embodiment GameObject bound (0/>1 character "
+				.. "controllers, or rig not built)", tostring(name)))
+			return
+		end
+		for _, goId in ipairs(goIds) do
+			self:_dispatchToGameObject(goId, name, ...)
+		end
+		return
+	end
+	-- Phase-1 non-player path (UNCHANGED).
 	local goId = self:_resolveReceiverGoId(recv)
 	if goId == nil then
 		self._warn(string.format(
@@ -1656,6 +1722,27 @@ end
 -- ``recv.BroadcastMessage("name", ...)``: dispatch to the GameObject AND
 -- every descendant GameObject (via the planner parent map walked DOWN).
 function SceneRuntime:broadcastMessage(recv, name, ...)
+	-- Player-FIRST branch (D-P2-1 / BC-1): a player-alias receiver dispatches
+	-- FLAT to each player-embodiment goId WITHOUT the descendant walk -- the
+	-- embodiment is a logic singleton (no Unity child GameObjects carrying
+	-- broadcast-target components; the rig's children are character limbs, not
+	-- registered GameObjects), so the walk would only re-hit the same set.
+	-- Same delivery as sendMessage for a player alias.
+	if self:_isPlayerAlias(recv) then
+		local goIds = self:_playerGoIds()
+		if #goIds == 0 then
+			self._warn(string.format(
+				"[scene_runtime] broadcastMessage(%q): player-alias receiver but "
+				.. "no player-embodiment GameObject bound (0/>1 character "
+				.. "controllers, or rig not built)", tostring(name)))
+			return
+		end
+		for _, goId in ipairs(goIds) do
+			self:_dispatchToGameObject(goId, name, ...)
+		end
+		return
+	end
+	-- Phase-1 non-player path (UNCHANGED).
 	local goId = self:_resolveReceiverGoId(recv)
 	if goId == nil then
 		self._warn(string.format(

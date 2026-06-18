@@ -1,4 +1,4 @@
-"""Slice 1.1: behavioral tests for the SendMessage / BroadcastMessage
+"""Slices 1.1 + 2.1: behavioral tests for the SendMessage / BroadcastMessage
 host primitives in ``converter/runtime/scene_runtime.luau``.
 
 These drive the production host runtime through the standalone ``luau``
@@ -15,6 +15,15 @@ Covered (per design-phase1.md Slice 1.1 test matrix):
   * broadcastMessage descends to a child GameObject;
   * both the colon (``host:sendMessage``) and dotted
     (``host.sendMessage``) call forms.
+
+Phase 2 (Slice 2.1) player-alias receiver routing (``TestPlayerAliasDispatch``):
+  * AC-1 Player-object alias (``IsA("Player")``) -> embodiment GameObject;
+  * AC-2 character-limb BasePart alias (via ``playerFromTouch``);
+  * AC-3 non-player receiver takes the UNCHANGED Phase-1 path;
+  * AC-4 fail-closed when ``_player`` is nil (warn + no dispatch, no throw);
+  * AC-5 player module on >1 GameObjects -> dispatch to each (dedupe);
+  * D-P2-9 dispatch count == ``#_playerGoIds()`` (== 1 single-embodiment);
+  * AC-6 broadcastMessage to a player alias = flat per-goId dispatch.
 """
 
 from __future__ import annotations
@@ -596,3 +605,322 @@ class TestSendMessageDispatch:
         lines = out.strip().splitlines()
         assert "Foo.GetItem(Direct)" in lines, out
         assert "Bar.GetItem(Direct)" in lines, out
+
+
+# ---------------------------------------------------------------------------
+# Slice 2.1 -- player-alias receiver routing.
+#
+# The converter decouples the player into TWO entities: the Roblox character
+# (what ``Players``/the touch handler points at -- carries NO Unity component)
+# and the Unity Player-logic GameObject (carries ``GetItem``). A player-alias
+# receiver (``Players``-service Player object, or a character limb) must route
+# to the embodiment GameObject, NOT to whatever the alias literally points at.
+#
+# The flagship scene: one MODULE row ``player`` carries
+# ``has_character_controller=true`` (the deterministic upstream signal that
+# ``_initPlayerAuthority`` keys ``_player._playerScriptId`` on), placed on the
+# embodiment GameObject ``gPlayer`` whose component ``Player`` implements
+# ``GetItem``. Plus a NON-player door GameObject ``gDoor`` (component ``Door``,
+# ``GetItem``) to prove the unchanged path. Services are extended with
+# ``isClient=true`` and a mock ``players`` service whose
+# ``GetPlayerFromCharacter`` maps a registered character Model to a Player
+# object. The Player object's ``IsA("Player")`` returns true (the explicit
+# guard ``_isPlayerAlias`` keys branch (a) on).
+#
+# RED-then-GREEN (AC-1): a ``Players``-service Player object hits NONE of
+# ``_resolveReceiverGoId``'s cases (no ``_meta`` row, no stamped id with a
+# component bucket, no ancestor Model in the scene graph), so PRE-fix it
+# resolves to nil -> warn + no dispatch -> ``Player.GetItem`` never runs (the
+# live ``hasRifle=nil`` symptom). POST-fix the player-FIRST branch routes it to
+# the embodiment goId. The harness asserts ``Player.GetItem(Rifle)`` is
+# recorded; against the Phase-1 tip ``a3451a4`` (no ``_isPlayerAlias`` branch)
+# this assertion FAILS (CALLS=0 / warn emitted).
+# ---------------------------------------------------------------------------
+
+_PLAYER_SCENE_SETUP = """\
+local calls = {}
+local function record(tag, ...)
+    local args = {...}
+    for i, v in ipairs(args) do args[i] = tostring(v) end
+    table.insert(calls, tag .. "(" .. table.concat(args, ",") .. ")")
+end
+
+-- Player-embodiment component (the Unity Player-logic GameObject's behaviour).
+local Player = {} ; Player.__index = Player
+function Player.new(_) return setmetatable({}, Player) end
+function Player:GetItem(name) record("Player.GetItem", name) end
+function Player:M(name) record("Player.M", name) end
+
+-- A NON-player component (a door) -- proves the unchanged Phase-1 path.
+local Door = {} ; Door.__index = Door
+function Door.new(_) return setmetatable({}, Door) end
+function Door:GetItem(name) record("Door.GetItem", name) end
+
+local plan = {
+    modules = {
+        player = {stem = "Player", runtime_bearing = true, module_path = "p",
+                  has_character_controller = true},
+        door   = {stem = "Door",   runtime_bearing = true, module_path = "d"},
+    },
+    scenes = {
+        A = {
+            instances = {
+                {instance_id = "A:1", script_id = "player",
+                 game_object_id = "gPlayer", active = true, enabled = true,
+                 config = {}},
+                {instance_id = "A:2", script_id = "door",
+                 game_object_id = "gDoor", active = true, enabled = true,
+                 config = {}},
+            },
+            references = {},
+            lifecycle_order = {"A:1", "A:2"},
+        },
+    },
+    prefabs = {}, domain_overrides = {},
+}
+local playerGo = {Name = "PlayerLogic", _sceneRuntimeId = "gPlayer", _children = {}}
+local doorGo   = {Name = "Door", _sceneRuntimeId = "gDoor", _children = {}}
+
+-- The decoupled Roblox character + its owning Players-service Player object.
+-- The character Model carries a Humanoid so ``playerFromTouch``'s ancestor
+-- walk recognises it; it is NOT in the scene graph (no _SceneRuntimeId).
+local plrObj = {Name = "Plr"}
+function plrObj:IsA(class) return class == "Player" end
+local charModel = {Name = "PlrChar"}
+function charModel:IsA(class) return class == "Model" end
+function charModel:FindFirstChildWhichIsA(class)
+    if class == "Humanoid" then return {Name = "Humanoid"} end
+    return nil
+end
+-- A character limb whose ancestor IS the character Model (for AC-2).
+local limb = {Name = "RightHand", Parent = charModel}
+
+local players = {}
+function players:GetPlayerFromCharacter(model)
+    if model == charModel then return plrObj end
+    return nil
+end
+
+local services = servicesFor(plan, {player = Player, door = Door}, {
+    gPlayer = playerGo, gDoor = doorGo,
+})
+services.players = players
+services.isClient = true
+local engine = SceneRuntime.new(services, plan)
+engine:start(nil)
+runDeferred()
+-- A live door component gives us a host surface + a non-player component handle.
+local doorComp
+for comp, m in pairs(engine._meta) do
+    if m.gameObjectId == "gDoor" then doorComp = comp end
+end
+local host = doorComp.host
+"""
+
+
+class TestPlayerAliasDispatch:
+
+    def test_player_object_alias_routes_to_embodiment(self):
+        # AC-1 (RED-then-GREEN). A Players-service Player object
+        # (``IsA("Player")==true``) routes GetItem to the embodiment
+        # GameObject's Player component -- NOT to the literal alias (which has
+        # no component). Pre-fix (no _isPlayerAlias branch) this resolved to
+        # nil -> the live ``hasRifle=nil`` symptom; the assertion below FAILS
+        # against a3451a4. Also asserts dispatch count == #_playerGoIds() == 1
+        # (D-P2-9: a double-registered rig -> >1 goId -> >1 dispatch -> a
+        # duplicate rifle, caught here).
+        scenario = _PLAYER_SCENE_SETUP + textwrap.dedent("""\
+            host:sendMessage(plrObj, "GetItem", "Rifle")
+            print("GOIDS=" .. #engine:_playerGoIds())
+            for _, c in ipairs(calls) do print(c) end
+            print("DONE")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        lines = out.strip().splitlines()
+        assert "Player.GetItem(Rifle)" in lines, out
+        # Single-embodiment: exactly one goId, exactly one dispatch.
+        assert "GOIDS=1" in lines, out
+        assert lines.count("Player.GetItem(Rifle)") == 1, out
+        # Must NOT leak to the door (unrelated GameObject).
+        assert "Door.GetItem(Rifle)" not in lines, out
+
+    def test_character_limb_alias_routes_to_embodiment(self):
+        # AC-2. A character limb BasePart whose ancestor character Model is
+        # registered with players:GetPlayerFromCharacter routes via
+        # playerFromTouch -> the embodiment, NOT the limb's own ancestor Model.
+        # (Fails pre-fix: no player-alias branch.)
+        scenario = _PLAYER_SCENE_SETUP + textwrap.dedent("""\
+            host:sendMessage(limb, "GetItem", "Rifle")
+            for _, c in ipairs(calls) do print(c) end
+            print("DONE")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        lines = out.strip().splitlines()
+        assert "Player.GetItem(Rifle)" in lines, out
+        assert lines.count("Player.GetItem(Rifle)") == 1, out
+
+    def test_non_player_receiver_takes_unchanged_path(self):
+        # AC-3. A non-player component-table receiver (the door) is NOT a
+        # player alias (no IsA; playerFromTouch -> nil) -> falls through to the
+        # UNCHANGED Phase-1 _resolveReceiverGoId path -> dispatches to its OWN
+        # GameObject (gDoor), never the player embodiment.
+        scenario = _PLAYER_SCENE_SETUP + textwrap.dedent("""\
+            host:sendMessage(doorComp, "GetItem", "Key")
+            for _, c in ipairs(calls) do print(c) end
+            print("DONE")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        lines = out.strip().splitlines()
+        assert "Door.GetItem(Key)" in lines, out
+        assert "Player.GetItem(Key)" not in lines, out
+
+    def test_non_player_basepart_takes_unchanged_path(self):
+        # AC-3 (BasePart variant). A loose BasePart whose ancestor Model is the
+        # door GameObject (NOT a player character) is not a player alias ->
+        # unchanged ancestor-Model walk dispatches to gDoor.
+        scenario = _PLAYER_SCENE_SETUP + textwrap.dedent("""\
+            local part = {Name = "Knob", _sceneRuntimeId = "loose"}
+            part.FindFirstAncestorWhichIsA = function(self, class)
+                if class == "Model" then return doorGo end
+                return nil
+            end
+            -- No player-character ancestor: playerFromTouch must return nil.
+            part.Parent = nil
+            host:sendMessage(part, "GetItem", "Knob")
+            for _, c in ipairs(calls) do print(c) end
+            print("DONE")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        lines = out.strip().splitlines()
+        assert "Door.GetItem(Knob)" in lines, out
+        assert "Player.GetItem(Knob)" not in lines, out
+
+    def test_fail_closed_when_no_player_bound(self):
+        # AC-4. With isClient=false (-> _player == nil), a Player-object
+        # receiver makes _isPlayerAlias true (branch (a)), but _playerGoIds()
+        # returns {} -> the branch warns "no player-embodiment GameObject
+        # bound" and dispatches NOTHING, without erroring.
+        scenario = _PLAYER_SCENE_SETUP.replace(
+            "services.isClient = true", "services.isClient = false"
+        ) + textwrap.dedent("""\
+            print("GOIDS=" .. #engine:_playerGoIds())
+            host:sendMessage(plrObj, "GetItem", "Rifle")
+            print("CALLS=" .. #calls)
+            print("DONE")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        lines = out.strip().splitlines()
+        assert "GOIDS=0" in lines, out
+        assert "CALLS=0" in lines, out
+        assert "DONE" in lines, out
+        # The fail-closed warn is emitted (logs print to the proc via logWarn,
+        # captured in stderr only when the runtime warns; assert no dispatch is
+        # the load-bearing check). No throw: rc == 0 + DONE printed above.
+
+    def test_multiple_rig_instances_each_dispatch(self):
+        # AC-5 / D-P2-9. The player MODULE placed on TWO GameObjects
+        # (gP1/gP2), each with a GetItem-implementing component, yields TWO
+        # distinct goIds after dedupe -> BOTH record GetItem(Rifle), and the
+        # dispatch count == #_playerGoIds() == 2.
+        scenario = textwrap.dedent("""\
+            local calls = {}
+            local function record(tag, ...)
+                local args = {...}
+                for i, v in ipairs(args) do args[i] = tostring(v) end
+                table.insert(calls, tag .. "(" .. table.concat(args, ",") .. ")")
+            end
+            local P1 = {} ; P1.__index = P1
+            function P1.new(_) return setmetatable({}, P1) end
+            function P1:GetItem(name) record("P1.GetItem", name) end
+            local P2 = {} ; P2.__index = P2
+            function P2.new(_) return setmetatable({}, P2) end
+            function P2:GetItem(name) record("P2.GetItem", name) end
+            local plan = {
+                modules = {
+                    -- ONE module row carries has_character_controller; it is
+                    -- placed on TWO GameObjects (P2-F multi-instance). The
+                    -- second component uses a distinct class table but the
+                    -- SAME script_id so _playerGoIds collects both goIds.
+                    player = {stem = "P1", runtime_bearing = true,
+                              module_path = "p", has_character_controller = true},
+                },
+                scenes = {
+                    A = {
+                        instances = {
+                            {instance_id = "A:1", script_id = "player",
+                             game_object_id = "gP1", active = true,
+                             enabled = true, config = {}},
+                            {instance_id = "A:2", script_id = "player",
+                             game_object_id = "gP2", active = true,
+                             enabled = true, config = {}},
+                        },
+                        references = {},
+                        lifecycle_order = {"A:1", "A:2"},
+                    },
+                },
+                prefabs = {}, domain_overrides = {},
+            }
+            local g1 = {Name = "P1", _sceneRuntimeId = "gP1", _children = {}}
+            local g2 = {Name = "P2", _sceneRuntimeId = "gP2", _children = {}}
+            local plrObj = {Name = "Plr"}
+            function plrObj:IsA(class) return class == "Player" end
+            local players = {}
+            function players:GetPlayerFromCharacter(model) return nil end
+            local services = servicesFor(plan, {player = P1}, {gP1 = g1, gP2 = g2})
+            services.players = players
+            services.isClient = true
+            local engine = SceneRuntime.new(services, plan)
+            engine:start(nil)
+            runDeferred()
+            local host
+            for comp, m in pairs(engine._meta) do host = comp.host end
+            print("GOIDS=" .. #engine:_playerGoIds())
+            host:sendMessage(plrObj, "GetItem", "Rifle")
+            for _, c in ipairs(calls) do print(c) end
+            print("DONE")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        lines = out.strip().splitlines()
+        assert "GOIDS=2" in lines, out
+        assert "P1.GetItem(Rifle)" in lines, out
+        assert "P1.GetItem(Rifle)" in lines, out
+        # Both goIds dispatched; the module's component (P1) on each GO.
+        assert lines.count("P1.GetItem(Rifle)") == 2, out
+
+    def test_broadcast_to_player_alias_flat_per_goid(self):
+        # AC-6. broadcastMessage to a player alias dispatches FLAT to the same
+        # player goId set as sendMessage (BC-1: no subtree descent). Single
+        # embodiment -> exactly one dispatch.
+        scenario = _PLAYER_SCENE_SETUP + textwrap.dedent("""\
+            host:broadcastMessage(plrObj, "M", "Reload")
+            print("GOIDS=" .. #engine:_playerGoIds())
+            for _, c in ipairs(calls) do print(c) end
+            print("DONE")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        lines = out.strip().splitlines()
+        assert "Player.M(Reload)" in lines, out
+        assert "GOIDS=1" in lines, out
+        assert lines.count("Player.M(Reload)") == 1, out
+
+    def test_broadcast_non_player_keeps_phase1_descent(self):
+        # AC-6 (control). A non-player broadcastMessage still runs the Phase-1
+        # descendant walk unchanged (reuses the Phase-1 child fixture).
+        scenario = _SCENE_SETUP + textwrap.dedent("""\
+            host:broadcastMessage(fooComp, "GetItem", "Ammo")
+            for _, c in ipairs(calls) do print(c) end
+            print("DONE")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        lines = out.strip().splitlines()
+        assert "Foo.GetItem(Ammo)" in lines, out
+        assert "Bar.GetItem(Ammo)" in lines, out
+        assert "Baz.GetItem(Ammo)" in lines, out  # descended to child
