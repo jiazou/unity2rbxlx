@@ -1,0 +1,477 @@
+"""Phase 2 lazy-singleton boot-instantiation — host-level behavioral tests for
+``SceneRuntime.seedLazySingletons`` in ``runtime/scene_runtime.luau`` plus the
+autogen entrypoint wiring (slice 2.2).
+
+The shim half drives the REAL host runtime under standalone ``luau``: it builds a
+real ``SceneRuntime.new(services, plan)`` engine with a ``plan.modules`` table
+GUID-keyed by the seed's ``script_guid`` and seeds through the REAL
+``engine:addComponent`` -> ``_buildComponent`` -> ``plan.modules[script_guid]``
+-> ``Cls.new`` -> ``_runAwakeEnableStart`` path. This is the load-bearing
+acceptance (design §5, codex's lesson): it proves the LIFECYCLE, not existence —
+a fake engine that stubs the module lookup would be a green-test-for-wrong-reason
+since the BLOCKING bug is precisely the ``plan.modules[scriptId]`` GUID-vs-stem
+mismatch.
+
+The CoroutineHandler-shaped module mirrors the REAL converter output: a
+SYNTHESIZED ``Awake`` that caches ``Cls.m_Instance = self`` (the backing field),
+a static ``getInstance()`` returning that field, and a static
+``StartStaticCoroutine(fn)`` that resolves ``getInstance()`` and runs the
+coroutine off the seeded instance's ``self.host:startCoroutine`` — i.e. the
+generic host scheduler, not a Roblox default.
+
+Covers (slice 2.2 acceptance):
+  * a lazy_singletons seed whose module is CoroutineHandler-shaped -> after the
+    shim, ``Cls[backing_field]`` (getInstance()) is non-nil (constructed +
+    Awoke once through the real addComponent path);
+  * the idempotency guard makes a SECOND shim call a no-op (the carried
+    backing_field is the canonical guard — same instance, no re-construct);
+  * an unresolvable script_guid (or a module without ``.new``) -> warn + skip,
+    no crash;
+  * the domain filter: a client-domain seed is skipped when the entrypoint side
+    is ``"server"``;
+  * the DECISIVE criterion (design §5.2): a ``StartStaticCoroutine``-style static
+    coroutine SCHEDULES + ADVANCES (observably ticks) after seeding — proving the
+    synthetic-host wiring drives the engine's coroutine scheduler deeply enough
+    to fix the real bug (``getInstance() ~= nil`` alone is NOT sufficient).
+
+The autogen half asserts the entrypoint emission: both client + server
+entrypoints call ``seedLazySingletons`` AFTER the consumable seed and BEFORE
+``engine:start`` (the singleton must be Awoken before any consumer's deferred
+Start/coroutine use).
+"""
+
+from __future__ import annotations
+
+import shutil
+import subprocess
+import tempfile
+import textwrap
+from pathlib import Path
+
+import pytest
+
+HOST_RUNTIME_PATH = Path(__file__).parent.parent / "runtime" / "scene_runtime.luau"
+
+
+def _luau_available() -> bool:
+    return shutil.which("luau") is not None
+
+
+_luau_marker = pytest.mark.skipif(
+    not _luau_available() or not HOST_RUNTIME_PATH.exists(),
+    reason="needs standalone luau interpreter + host runtime file",
+)
+
+
+def _run(scenario: str) -> str:
+    host_source = HOST_RUNTIME_PATH.read_text(encoding="utf-8")
+    delim = "==="
+    while f"]{delim}]" in host_source or f"[{delim}[" in host_source:
+        delim += "="
+    embedded = f"[{delim}[\n{host_source}\n]{delim}]"
+    preamble = textwrap.dedent(f"""\
+        local HOST_RUNTIME_SOURCE = {embedded}
+        local SceneRuntime
+        do
+            local chunk, err = loadstring(HOST_RUNTIME_SOURCE, "scene_runtime")
+            assert(chunk, "load host runtime failed: " .. tostring(err))
+            SceneRuntime = chunk()
+        end
+
+        local logs = {{}}
+        local function logWarn(...)
+            local parts = {{...}}
+            for i, p in ipairs(parts) do parts[i] = tostring(p) end
+            table.insert(logs, table.concat(parts, " "))
+        end
+
+        -- A controllable task scheduler so coroutines can be ADVANCED on a
+        -- later "frame" — the decisive lifecycle proof. ``task.spawn`` runs the
+        -- function as a coroutine and resumes it once (to its first yield);
+        -- ``task.defer`` queues a thunk drained by ``runDeferred()``;
+        -- ``tick()`` resumes every spawned coroutine still suspended (a later
+        -- frame). This is the minimal real-shaped surface the engine's
+        -- ``startCoroutine`` (task.spawn) and ``_scheduleStartIfPending``
+        -- (task.defer) need.
+        local spawnedThreads = {{}}
+        local deferredThunks = {{}}
+        local task = {{}}
+        function task.spawn(fn, ...)
+            local co = coroutine.create(fn)
+            table.insert(spawnedThreads, co)
+            coroutine.resume(co, ...)
+            return co
+        end
+        function task.defer(fn, ...)
+            table.insert(deferredThunks, {{ fn = fn, args = {{...}} }})
+        end
+        function task.delay(_sec, fn, ...) table.insert(deferredThunks, {{ fn = fn, args = {{...}} }}) end
+        function task.wait(_sec) coroutine.yield() return 0 end
+        local function runDeferred()
+            local pending = deferredThunks
+            deferredThunks = {{}}
+            for _, t in ipairs(pending) do t.fn(table.unpack(t.args)) end
+        end
+        local function tick()
+            for _, co in ipairs(spawnedThreads) do
+                if coroutine.status(co) == "suspended" then
+                    coroutine.resume(co)
+                end
+            end
+        end
+
+        -- A minimal but REAL services surface for ``SceneRuntime.new``. The
+        -- shim resolves modules by GUID-keyed path; ``getInstanceId`` is never
+        -- reached because the shim passes a synthetic STRING ``go`` (addComponent
+        -- sets goId = go directly for a string).
+        local function servicesFor(modulesByPath)
+            return {{
+                warn = logWarn,
+                task = task,
+                resolveModule = function(_id, path) return modulesByPath[path] end,
+                getInstanceId = function(_inst) return nil end,
+                findFirstChildWhichIsA = function(_inst, _cls) return nil end,
+                workspaceFind = function(_id) return nil end,
+                heartbeat = {{ Connect = function() return {{ Disconnect = function() end }} end }},
+                fixedStep = 0.02,
+                now = function() return 0 end,
+            }}
+        end
+
+        -- A CoroutineHandler-SHAPED module mirroring the REAL converter output:
+        --   * an empty ``.new(config)`` constructor,
+        --   * a SYNTHESIZED ``Awake`` that caches ``Cls[backingField] = self``
+        --     (CoroutineHandler.luau:11 writes ``CoroutineHandler.m_Instance = self``),
+        --   * a static ``getInstance()`` returning the backing field,
+        --   * a static ``StartStaticCoroutine(fn)`` that resolves getInstance()
+        --     and runs the coroutine via the seeded instance's
+        --     ``self.host:startCoroutine`` (the generic host scheduler).
+        -- ``backingField`` is a parameter so the test proves the shim reads the
+        -- CARRIED field name, not a hardcoded ``m_Instance``.
+        local function makeCoroutineHandler(backingField)
+            local Cls = {{}}
+            Cls.__index = Cls
+            Cls.awakeCount = 0
+            function Cls.new(_config)
+                return setmetatable({{}}, Cls)
+            end
+            function Cls:Awake()
+                Cls.awakeCount = Cls.awakeCount + 1
+                Cls[backingField] = self   -- the synthesized cache (gap #2 fix)
+            end
+            function Cls.getInstance()
+                return Cls[backingField]
+            end
+            -- Static entrypoint: resolves the cached instance and runs the
+            -- coroutine off ITS host (the seeded instance must carry a live
+            -- host surface for this to advance — the decisive wiring proof).
+            function Cls.StartStaticCoroutine(fn)
+                local inst = Cls.getInstance()
+                if inst == nil then return nil end
+                return inst.host:startCoroutine(fn)
+            end
+            return Cls
+        end
+
+        local function dumpLogs()
+            for _, msg in ipairs(logs) do print("WARN_LINE=" .. msg) end
+            print("WARN_COUNT=" .. tostring(#logs))
+        end
+    """)
+    src = preamble + "\n" + scenario
+    with tempfile.NamedTemporaryFile("w", suffix=".luau", delete=False) as fh:
+        fh.write(src)
+        path = fh.name
+    try:
+        proc = subprocess.run(
+            [shutil.which("luau") or "luau", path],
+            capture_output=True, text=True, timeout=30,
+        )
+    finally:
+        Path(path).unlink(missing_ok=True)
+    assert proc.returncode == 0, f"luau failed:\n{proc.stdout}\n{proc.stderr}"
+    return proc.stdout
+
+
+# A plan with ONE CoroutineHandler seed. ``plan.modules`` is GUID-keyed (the
+# real planner shape, scene_runtime.luau:1127 looks up plan.modules[scriptId]),
+# each row carrying ``module_path``/``stem``/``domain``. The seed's
+# ``script_guid`` IS that GUID key — the load-bearing GUID-vs-stem fix: a
+# stem/path key would MISS in _buildComponent and nothing would build.
+_ONE_SEED_PLAN = """\
+local GUID = "abc-coroutine-handler-guid"
+local Cls = makeCoroutineHandler("m_Instance")
+local modulesByPath = {
+    ["ReplicatedStorage.CoroutineHandler"] = Cls,
+}
+local plan = {
+    modules = {
+        [GUID] = {
+            module_path = "ReplicatedStorage.CoroutineHandler",
+            stem = "CoroutineHandler",
+            domain = "client",
+            runtime_bearing = false,
+        },
+    },
+    lazy_singletons = {
+        {
+            module_path = "ReplicatedStorage.CoroutineHandler",
+            class_stem = "CoroutineHandler",
+            domain = "client",
+            script_guid = GUID,
+            backing_field = "m_Instance",
+        },
+    },
+}
+local services = servicesFor(modulesByPath)
+local engine = SceneRuntime.new(services, plan)
+"""
+
+
+@_luau_marker
+def test_seed_constructs_and_awakes_one_instance_backing_field_live():
+    """After the shim, the carried ``backing_field`` (getInstance()) is non-nil:
+    the singleton was constructed + Awoke ONCE through the REAL addComponent ->
+    _buildComponent -> plan.modules[script_guid] -> Cls.new -> Awake path."""
+    out = _run(_ONE_SEED_PLAN + """
+print("BEFORE_NIL=" .. tostring(Cls.getInstance() == nil))
+SceneRuntime.seedLazySingletons(plan, services, engine, nil)
+print("AFTER_NONNIL=" .. tostring(Cls.getInstance() ~= nil))
+print("AWAKE_COUNT=" .. tostring(Cls.awakeCount))
+-- the cached instance carries a live host surface (Awake ran AFTER injectHostSurface):
+print("HAS_HOST=" .. tostring(type(Cls.getInstance().host) == "table"))
+dumpLogs()
+""")
+    assert "BEFORE_NIL=true" in out      # nil before seeding (the bug state)
+    assert "AFTER_NONNIL=true" in out    # getInstance() live after seeding
+    assert "AWAKE_COUNT=1" in out        # exactly one Awake (one instance)
+    assert "HAS_HOST=true" in out
+    assert "WARN_COUNT=0" in out
+
+
+@_luau_marker
+def test_static_coroutine_schedules_and_advances_after_seeding():
+    """DECISIVE criterion (design §5.2): a StartStaticCoroutine-launched coroutine
+    SCHEDULES (reaches its first yield) AND ADVANCES (ticks on a later frame) via
+    the REAL path after seeding. getInstance() non-nil alone is NOT sufficient —
+    this proves the synthetic-host wiring drives the engine's coroutine scheduler,
+    fixing the real ``StartStaticCoroutine`` no-op bug."""
+    out = _run(_ONE_SEED_PLAN + """
+SceneRuntime.seedLazySingletons(plan, services, engine, nil)
+-- A coroutine that records reaching its first yield, then advancing past it.
+local reachedFirstYield = false
+local advanced = false
+CoroutineHandler_probe = function()
+    reachedFirstYield = true
+    coroutine.yield()        -- first yield: simulates a frame wait
+    advanced = true          -- only set when resumed on a LATER frame
+end
+local handle = Cls.StartStaticCoroutine(CoroutineHandler_probe)
+print("SCHEDULED=" .. tostring(handle ~= nil))
+print("REACHED_FIRST_YIELD=" .. tostring(reachedFirstYield))
+print("ADVANCED_BEFORE_TICK=" .. tostring(advanced))   -- must still be false
+tick()                                                  -- a later frame resumes it
+print("ADVANCED_AFTER_TICK=" .. tostring(advanced))     -- now true
+dumpLogs()
+""")
+    assert "SCHEDULED=true" in out               # getInstance().host scheduled it
+    assert "REACHED_FIRST_YIELD=true" in out     # the coroutine body ran to yield
+    assert "ADVANCED_BEFORE_TICK=false" in out   # genuinely suspended, not run-to-completion
+    assert "ADVANCED_AFTER_TICK=true" in out     # resumed on a later frame -> the bug is fixed
+    assert "WARN_COUNT=0" in out
+
+
+@_luau_marker
+def test_idempotency_second_call_is_a_noop_via_backing_field_guard():
+    """The ``Cls[backing_field] ~= nil`` guard makes a SECOND shim call a no-op:
+    the cached instance identity is unchanged and Awake does not run again (the
+    backing field is the canonical guard — no separate bool needed)."""
+    out = _run(_ONE_SEED_PLAN + """
+SceneRuntime.seedLazySingletons(plan, services, engine, nil)
+local first = Cls.getInstance()
+SceneRuntime.seedLazySingletons(plan, services, engine, nil)   -- second call
+print("SAME_INSTANCE=" .. tostring(Cls.getInstance() == first))
+print("AWAKE_COUNT=" .. tostring(Cls.awakeCount))   -- still 1, not 2
+dumpLogs()
+""")
+    assert "SAME_INSTANCE=true" in out
+    assert "AWAKE_COUNT=1" in out       # no double-construct
+    assert "WARN_COUNT=0" in out
+
+
+@_luau_marker
+def test_idempotency_skips_when_scene_instance_already_cached():
+    """If a scene-placed instance already Awoke (backing field pre-set), the shim
+    SKIPS — never double-constructs the "exactly one instance" singleton."""
+    out = _run(_ONE_SEED_PLAN + """
+-- Simulate a scene-placed instance having already Awoke + cached itself.
+local preexisting = Cls.new({})
+Cls.m_Instance = preexisting
+SceneRuntime.seedLazySingletons(plan, services, engine, nil)
+print("UNCHANGED=" .. tostring(Cls.getInstance() == preexisting))
+print("AWAKE_COUNT=" .. tostring(Cls.awakeCount))   -- 0: shim never ran Awake
+dumpLogs()
+""")
+    assert "UNCHANGED=true" in out
+    assert "AWAKE_COUNT=0" in out
+    assert "WARN_COUNT=0" in out
+
+
+@_luau_marker
+def test_unresolvable_script_guid_warns_and_skips_no_crash():
+    """A seed whose module path does not resolve to a constructable class is
+    warned + skipped — boot does not crash (fail-soft, mirrors the consumable
+    shim's drop+warn)."""
+    out = _run(_ONE_SEED_PLAN.replace(
+        '["ReplicatedStorage.CoroutineHandler"] = Cls,',
+        '["ReplicatedStorage.CoroutineHandler"] = nil,  -- resolve miss',
+    ) + """
+SceneRuntime.seedLazySingletons(plan, services, engine, nil)
+print("NO_CRASH=true")
+dumpLogs()
+""")
+    assert "NO_CRASH=true" in out
+    assert any(
+        line.startswith("WARN_LINE=[lazy-singleton] module did not resolve")
+        for line in out.splitlines()
+    ), out
+
+
+@_luau_marker
+def test_module_without_new_warns_and_skips():
+    """A resolved module that lacks ``.new`` (e.g. a dead-module inert stub) is
+    warned + skipped, not constructed."""
+    out = _run(_ONE_SEED_PLAN.replace(
+        'local Cls = makeCoroutineHandler("m_Instance")',
+        'local Cls = { getInstance = function() return nil end }  -- no .new',
+    ) + """
+SceneRuntime.seedLazySingletons(plan, services, engine, nil)
+print("STILL_NIL=" .. tostring(Cls.getInstance() == nil))
+dumpLogs()
+""")
+    assert "STILL_NIL=true" in out
+    assert any(
+        line.startswith("WARN_LINE=[lazy-singleton] module did not resolve")
+        for line in out.splitlines()
+    ), out
+
+
+@_luau_marker
+def test_domain_filter_skips_other_side():
+    """With the entrypoint side ``"server"``, a client-domain seed is SKIPPED (not
+    constructed) — mirroring engine:start's domain filter. With matching side or
+    nil filter, it IS seeded."""
+    out = _run(_ONE_SEED_PLAN + """
+-- server side, client seed -> skipped
+SceneRuntime.seedLazySingletons(plan, services, engine, "server")
+print("SERVER_SKIPPED=" .. tostring(Cls.getInstance() == nil))
+-- matching side -> seeded
+SceneRuntime.seedLazySingletons(plan, services, engine, "client")
+print("CLIENT_SEEDED=" .. tostring(Cls.getInstance() ~= nil))
+dumpLogs()
+""")
+    assert "SERVER_SKIPPED=true" in out
+    assert "CLIENT_SEEDED=true" in out
+    assert "WARN_COUNT=0" in out
+
+
+@_luau_marker
+def test_reads_carried_backing_field_not_hardcoded():
+    """The shim reads the CARRIED ``backing_field`` (the name varies across
+    projects), never a hardcoded ``m_Instance``. A seed using ``_instance``
+    constructs + caches under that field, and getInstance() (which reads the
+    same field) is live."""
+    out = _run("""
+local GUID = "guid-underscore-instance"
+local Cls = makeCoroutineHandler("_instance")   -- non-default field name
+local modulesByPath = { ["ReplicatedStorage.Other"] = Cls }
+local plan = {
+    modules = {
+        [GUID] = { module_path = "ReplicatedStorage.Other", stem = "Other",
+                   domain = "client", runtime_bearing = false },
+    },
+    lazy_singletons = {
+        { module_path = "ReplicatedStorage.Other", class_stem = "Other",
+          domain = "client", script_guid = GUID, backing_field = "_instance" },
+    },
+}
+local services = servicesFor(modulesByPath)
+local engine = SceneRuntime.new(services, plan)
+SceneRuntime.seedLazySingletons(plan, services, engine, nil)
+print("UNDERSCORE_LIVE=" .. tostring(Cls._instance ~= nil))
+print("GETINSTANCE_LIVE=" .. tostring(Cls.getInstance() ~= nil))
+-- a hardcoded m_Instance read would be nil here (the field is _instance):
+print("MINSTANCE_NIL=" .. tostring(Cls.m_Instance == nil))
+dumpLogs()
+""")
+    assert "UNDERSCORE_LIVE=true" in out
+    assert "GETINSTANCE_LIVE=true" in out
+    assert "MINSTANCE_NIL=true" in out
+    assert "WARN_COUNT=0" in out
+
+
+@_luau_marker
+def test_generic_noop_when_no_seeds():
+    """An absent or empty ``lazy_singletons`` is a clean generic no-op."""
+    out = _run("""
+local services = servicesFor({})
+local engine = SceneRuntime.new(services, { modules = {} })
+SceneRuntime.seedLazySingletons({ modules = {} }, services, engine, nil)
+SceneRuntime.seedLazySingletons({ modules = {}, lazy_singletons = {} }, services, engine, nil)
+print("NOOP_OK=true")
+""")
+    assert "NOOP_OK=true" in out
+
+
+@_luau_marker
+def test_missing_resolve_module_service_is_noop():
+    """No ``resolveModule`` service -> the shim returns early (no crash), like the
+    sibling seed shims."""
+    out = _run(_ONE_SEED_PLAN.replace(
+        "local services = servicesFor(modulesByPath)",
+        "local services = { warn = logWarn, task = task }  -- no resolveModule",
+    ) + """
+SceneRuntime.seedLazySingletons(plan, services, engine, nil)
+print("EARLY_RETURN_OK=true")
+""")
+    assert "EARLY_RETURN_OK=true" in out
+
+
+# ---------------------------------------------------------------------------
+# Autogen entrypoint wiring (Python-side; no luau needed).
+# ---------------------------------------------------------------------------
+
+def _entrypoint_sources() -> tuple[str, str]:
+    from converter import autogen
+
+    client = autogen.generate_scene_runtime_client_entrypoint().source
+    server = autogen.generate_scene_runtime_server_entrypoint().source
+    return client, server
+
+
+def test_both_entrypoints_call_seed_lazy_singletons_with_engine_and_side():
+    client, server = _entrypoint_sources()
+    assert 'SceneRuntime.seedLazySingletons(Plan, services, engine, "client")' in client
+    assert 'SceneRuntime.seedLazySingletons(Plan, services, engine, "server")' in server
+
+
+def test_lazy_singleton_seed_emitted_after_consumable_and_before_engine_start():
+    """The load-bearing boot order: ``seedLazySingletons`` runs AFTER the
+    consumable seed and BEFORE ``engine:start`` (the singleton must be Awoken
+    before any consumer's deferred Start/coroutine use)."""
+    for domain, source in zip(("client", "server"), _entrypoint_sources()):
+        i_cons = source.index("SceneRuntime.seedConsumableDatabases(Plan, services)")
+        i_lazy = source.index("SceneRuntime.seedLazySingletons(Plan, services, engine")
+        i_start = source.index(f'engine:start("{domain}")')
+        assert i_cons < i_lazy < i_start, (
+            f"{domain} entrypoint boot order wrong: "
+            f"consumable={i_cons} lazy={i_lazy} start={i_start}"
+        )
+
+
+def test_lazy_singletons_in_plan_key_allowlist():
+    """The plan key must be allowlisted (slice 2.1's edit) or the recomputed seed
+    is elided from the emitted plan and the shim sees ``{}``."""
+    from converter import autogen
+
+    assert "lazy_singletons" in autogen._PLAN_KEYS_FOR_HOST

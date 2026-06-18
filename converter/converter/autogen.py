@@ -1050,6 +1050,7 @@ local services = {
 local engine = SceneRuntime.new(services, Plan)
 SceneRuntime.seedAddressableDatabases(Plan, services)
 SceneRuntime.seedConsumableDatabases(Plan, services)
+SceneRuntime.seedLazySingletons(Plan, services, engine, "client")
 engine:start("client")
 '''
 
@@ -1252,6 +1253,7 @@ local services = {
 local engine = SceneRuntime.new(services, Plan)
 SceneRuntime.seedAddressableDatabases(Plan, services)
 SceneRuntime.seedConsumableDatabases(Plan, services)
+SceneRuntime.seedLazySingletons(Plan, services, engine, "server")
 engine:start("server")
 '''
 

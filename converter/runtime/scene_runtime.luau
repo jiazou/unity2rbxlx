@@ -327,6 +327,109 @@ function SceneRuntime.seedConsumableDatabases(plan, services)
 end
 
 -- ---------------------------------------------------------------------
+-- Lazy-singleton boot-instantiation (Phase 2, gap #2)
+-- ---------------------------------------------------------------------
+--
+-- A converter-owned boot shim, sibling to ``seedConsumableDatabases``. Some
+-- Unity ``MonoBehaviour``s lazily self-instantiate through a static
+-- ``Instance`` getter (``new GameObject(...) + AddComponent<Self>()``) and
+-- cache themselves in a static backing field, then expose
+-- ``getInstance()``/``StartStaticCoroutine`` off that field. The generic host
+-- has no scene/prefab placement for them, so the field stays ``nil`` and every
+-- static call is a no-op (e.g. ``CoroutineHandler.m_Instance`` nil ->
+-- ``StartStaticCoroutine`` dead). This shim constructs + Awakes EXACTLY ONE
+-- instance of each such singleton at boot — before any consumer uses it — so
+-- the converter-synthesized ``Awake`` runs ``<backing_field> = self`` and the
+-- field is live.
+--
+-- Each ``plan.lazy_singletons`` seed is the build-time record (design-phase2
+-- §1.2):
+--   ``{ module_path, class_stem, domain, script_guid, backing_field }``
+-- The shim is class-agnostic — it loops the plan and uses the generic
+-- ``engine:addComponent`` + ``Cls[seed.backing_field]`` reflection. Nothing is
+-- keyed on a literal class name or field name.
+--
+-- Unlike the other two seed shims, this one needs the LIVE engine to construct
+-- + Awake the instance, so the entrypoint passes the constructed ``engine`` in.
+-- ``domainFilter`` (``"client"``/``"server"``) restricts seeding to the
+-- entrypoint's side; ``nil`` (harness) seeds every seed — mirroring
+-- ``engine:start``'s filter.
+--
+-- Per seed:
+--   1. Resolve the module by ``script_guid`` (the GUID-keyed ``plan.modules``
+--      key ``_buildComponent`` looks up). Warn + skip on a non-table / no
+--      ``.new`` (fail-soft, mirroring ``seedConsumableDatabases``).
+--   2. IDEMPOTENCY GUARD: if ``Cls[seed.backing_field] ~= nil`` an instance is
+--      already cached (a scene-placed instance Awoke, or a prior shim call /
+--      entrypoint), so SKIP — the singleton contract is "exactly one
+--      instance". The guard reads the CARRIED ``backing_field`` (name varies
+--      across projects: ``m_Instance``/``_instance``/``s_Instance``), never a
+--      hardcoded literal.
+--   3. Otherwise construct via ``engine:addComponent(go, seed.script_guid,
+--      {})`` against a synthetic host-container id — that fires the lifecycle
+--      (Awake -> OnEnable -> deferred Start) synchronously through Awake, so
+--      the synthesized ``Awake`` caches ``<backing_field> = self`` and
+--      ``getInstance()`` is live for every later consumer.
+--
+-- Boot order is load-bearing: the entrypoint runs this AFTER ``SceneRuntime.new``
+-- + the other seeds and BEFORE ``engine:start`` — so the backing field is live
+-- before any scene/prefab Awake/OnEnable/Start (or the deferred Start tick)
+-- calls ``getInstance()``/``StartStaticCoroutine``. Generic no-op on an empty plan.
+function SceneRuntime.seedLazySingletons(plan, services, engine, domainFilter)
+	assert(type(plan) == "table", "seedLazySingletons: plan required")
+	assert(type(services) == "table", "seedLazySingletons: services required")
+	assert(type(engine) == "table", "seedLazySingletons: engine required")
+	local warn = services.warn or function(...) end
+	local resolveModule = services.resolveModule
+	if type(resolveModule) ~= "function" then
+		return
+	end
+
+	local seeds = plan.lazy_singletons or {}
+	for _, seed in ipairs(seeds) do
+		-- Side filter: skip a seed whose classified domain is not this
+		-- entrypoint's side. ``nil`` filter (harness) seeds everything.
+		if domainFilter ~= nil and seed.domain ~= domainFilter then
+			-- not this side
+		else
+			-- (1) Resolve the singleton module by its GUID-keyed module path.
+			local Cls = resolveModule(seed.script_guid, seed.module_path)
+			if type(Cls) ~= "table" or type(Cls.new) ~= "function" then
+				warn("[lazy-singleton] module did not resolve to a constructable "
+					.. "class: " .. tostring(seed.module_path or seed.class_stem)
+					.. "; skipping seed")
+			else
+				local backingField = seed.backing_field
+				if type(backingField) ~= "string" or backingField == "" then
+					warn("[lazy-singleton] seed missing backing_field on "
+						.. tostring(seed.module_path or seed.class_stem)
+						.. "; skipping seed")
+				elseif Cls[backingField] ~= nil then
+					-- (2) Idempotency guard: an instance is already cached (a
+					-- scene-placed instance Awoke, or a prior shim call). The
+					-- singleton is live; do NOT double-construct.
+				else
+					-- (3) Construct + Awake one instance. The synthetic host
+					-- container id is the faithful analog of Unity's bare
+					-- ``new GameObject(...)`` (a non-rendered, host-owned
+					-- container). ``addComponent`` accepts a string ``go`` as
+					-- the goId directly, so no Instance creation is needed; the
+					-- id is stable + unique per class. ``addComponent`` ->
+					-- ``_buildComponent`` looks up ``plan.modules[script_guid]``
+					-- (GUID-keyed), constructs ``Cls.new``, injects the host
+					-- surface, then runs Awake (which caches
+					-- ``Cls[backing_field] = self``). ``_buildComponent`` wraps
+					-- ``.new`` in pcall, so a throwing constructor drops just
+					-- this singleton + warns, never crashing boot.
+					local hostId = "_lazysingleton:" .. tostring(seed.class_stem)
+					engine:addComponent(hostId, seed.script_guid, {})
+				end
+			end
+		end
+	end
+end
+
+-- ---------------------------------------------------------------------
 -- Constructor
 -- ---------------------------------------------------------------------
 
