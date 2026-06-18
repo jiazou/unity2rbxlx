@@ -1663,23 +1663,34 @@ function SceneRuntime:broadcastMessage(recv, name, ...)
 			tostring(name)))
 		return
 	end
-	self:_dispatchToGameObject(goId, name, ...)
-	-- Descend: every GameObject whose ancestor chain (``_goParentId``
-	-- walked UP) reaches ``goId`` is a descendant. Bounded by a depth
+	-- Collect the COMPLETE target set FIRST -- the root goId plus every
+	-- GameObject whose ancestor chain (``_goParentId`` walked UP) reaches
+	-- ``goId`` -- WITHOUT dispatching. A dispatched handler may destroy or
+	-- add GameObjects/components (e.g. an Extinguish handler tearing down a
+	-- sibling), and ``pairs`` over a table being mutated mid-walk skips or
+	-- duplicates entries. Snapshotting the target ids before any dispatch
+	-- makes the descendant walk immune to that mutation. Bounded by a depth
 	-- budget per node so an accidental cycle can't loop forever.
+	local targets = {goId}
 	for childId in pairs(self._componentsByGameObject) do
 		if childId ~= goId then
 			local cur = self._goParentId[childId]
 			local depth = 0
 			while cur ~= nil and depth < 1024 do
 				if cur == goId then
-					self:_dispatchToGameObject(childId, name, ...)
+					targets[#targets + 1] = childId
 					break
 				end
 				cur = self._goParentId[cur]
 				depth = depth + 1
 			end
 		end
+	end
+	-- THEN dispatch to each captured target. ``_dispatchToGameObject``
+	-- already snapshots its per-GameObject bucket, so a handler mutating
+	-- that bucket can't disturb delivery either.
+	for _, targetId in ipairs(targets) do
+		self:_dispatchToGameObject(targetId, name, ...)
 	end
 end
 

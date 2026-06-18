@@ -406,6 +406,183 @@ class TestSendMessageDispatch:
         assert "Bar.GetItem(Colon)" in lines, out
         assert "Bar.GetItem(Dotted)" in lines, out
 
+    def test_broadcast_descends_multiple_levels(self):
+        # broadcastMessage must reach a GRANDCHILD GameObject, not just a
+        # direct child: the descendant walk follows the parent chain UP
+        # from every GameObject, so a multi-level chain g -> gChild ->
+        # gGrand must all receive. Builds a fresh 3-level scene.
+        scenario = textwrap.dedent("""\
+            local calls = {}
+            local function record(tag, ...)
+                local args = {...}
+                for i, v in ipairs(args) do args[i] = tostring(v) end
+                table.insert(calls, tag .. "(" .. table.concat(args, ",") .. ")")
+            end
+            local function mk(stem)
+                local M = {} ; M.__index = M
+                function M.new(_) return setmetatable({}, M) end
+                function M:GetItem(name) record(stem .. ".GetItem", name) end
+                return M
+            end
+            local Root, Mid, Leaf = mk("Root"), mk("Mid"), mk("Leaf")
+            local plan = {
+                modules = {
+                    root = {stem = "Root", runtime_bearing = true, module_path = "x"},
+                    mid  = {stem = "Mid",  runtime_bearing = true, module_path = "y"},
+                    leaf = {stem = "Leaf", runtime_bearing = true, module_path = "z"},
+                },
+                scenes = {
+                    A = {
+                        instances = {
+                            {instance_id = "A:1", script_id = "root",
+                             game_object_id = "g", active = true, enabled = true,
+                             config = {}},
+                            {instance_id = "A:2", script_id = "mid",
+                             game_object_id = "gChild", active = true, enabled = true,
+                             config = {}, parent_game_object_id = "g"},
+                            {instance_id = "A:3", script_id = "leaf",
+                             game_object_id = "gGrand", active = true, enabled = true,
+                             config = {}, parent_game_object_id = "gChild"},
+                        },
+                        references = {},
+                        lifecycle_order = {"A:1", "A:2", "A:3"},
+                    },
+                },
+                prefabs = {}, domain_overrides = {},
+            }
+            local grandGo = {Name = "Grand", _sceneRuntimeId = "gGrand", _children = {}}
+            local childGo = {Name = "Child", _sceneRuntimeId = "gChild",
+                             _children = {gGrand = grandGo}}
+            local parentGo = {Name = "Parent", _sceneRuntimeId = "g",
+                              _children = {gChild = childGo}}
+            local services = servicesFor(plan, {root = Root, mid = Mid, leaf = Leaf}, {
+                g = parentGo, gChild = childGo, gGrand = grandGo,
+            })
+            local engine = SceneRuntime.new(services, plan)
+            engine:start(nil)
+            runDeferred()
+            local rootComp
+            for comp, m in pairs(engine._meta) do
+                if m.gameObjectId == "g" then rootComp = comp end
+            end
+            local host = rootComp.host
+            host:broadcastMessage(rootComp, "GetItem", "Ammo")
+            for _, c in ipairs(calls) do print(c) end
+            print("DONE")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        lines = out.strip().splitlines()
+        assert "Root.GetItem(Ammo)" in lines, out
+        assert "Mid.GetItem(Ammo)" in lines, out
+        assert "Leaf.GetItem(Ammo)" in lines, out
+
+    def test_broadcast_handler_mutating_set_does_not_skip_targets(self):
+        # The snapshot-before-dispatch guarantee: a handler that MUTATES
+        # the GameObject/component set during dispatch (here, an Extinguish
+        # handler destroying another target's GameObject) must NOT skip a
+        # pre-existing surviving sibling, must not throw, and must not
+        # deliver to the destroyed target. The fix collects the complete
+        # target id list FIRST (no dispatch), THEN iterates that captured
+        # array -- so no handler runs while ``_componentsByGameObject`` /
+        # the parent map is being traversed by ``pairs``.
+        #
+        # (The reference-Lua hazard the fix removes -- ``pairs`` over a
+        # table mutated mid-walk skipping/duplicating a DIFFERENT still-live
+        # key -- is undefined behaviour; the standalone ``luau`` interpreter
+        # happens to localise key removal to the removed key, so this guard
+        # is a forward-looking invariant rather than a pre-fix-failing
+        # repro. It still catches a regression that throws on mid-dispatch
+        # mutation or delivers to the torn-down target.)
+        scenario = textwrap.dedent("""\
+            local calls = {}
+            local function record(tag, ...)
+                local args = {...}
+                for i, v in ipairs(args) do args[i] = tostring(v) end
+                table.insert(calls, tag .. "(" .. table.concat(args, ",") .. ")")
+            end
+            -- The first child's handler destroys the OTHER child's
+            -- GameObject (mutating ``_componentsByGameObject`` mid-broadcast).
+            local engineRef
+            local victimGo
+            local Killer = {} ; Killer.__index = Killer
+            function Killer.new(_) return setmetatable({}, Killer) end
+            function Killer:Extinguish(name)
+                record("Killer.Extinguish", name)
+                engineRef:destroy(victimGo)
+            end
+            -- Two more pre-existing children whose handlers must still fire.
+            local function mk(stem)
+                local M = {} ; M.__index = M
+                function M.new(_) return setmetatable({}, M) end
+                function M:Extinguish(name) record(stem .. ".Extinguish", name) end
+                return M
+            end
+            local Root, Other, Victim = mk("Root"), mk("Other"), mk("Victim")
+            local plan = {
+                modules = {
+                    root   = {stem = "Root",   runtime_bearing = true, module_path = "w"},
+                    killer = {stem = "Killer", runtime_bearing = true, module_path = "x"},
+                    other  = {stem = "Other",  runtime_bearing = true, module_path = "y"},
+                    victim = {stem = "Victim", runtime_bearing = true, module_path = "z"},
+                },
+                scenes = {
+                    A = {
+                        instances = {
+                            {instance_id = "A:1", script_id = "root",
+                             game_object_id = "g", active = true, enabled = true,
+                             config = {}},
+                            {instance_id = "A:2", script_id = "killer",
+                             game_object_id = "gK", active = true, enabled = true,
+                             config = {}, parent_game_object_id = "g"},
+                            {instance_id = "A:3", script_id = "other",
+                             game_object_id = "gO", active = true, enabled = true,
+                             config = {}, parent_game_object_id = "g"},
+                            {instance_id = "A:4", script_id = "victim",
+                             game_object_id = "gV", active = true, enabled = true,
+                             config = {}, parent_game_object_id = "g"},
+                        },
+                        references = {},
+                        lifecycle_order = {"A:1", "A:2", "A:3", "A:4"},
+                    },
+                },
+                prefabs = {}, domain_overrides = {},
+            }
+            local kGo = {Name = "Killer", _sceneRuntimeId = "gK", _children = {}}
+            local oGo = {Name = "Other",  _sceneRuntimeId = "gO", _children = {}}
+            local vGo = {Name = "Victim", _sceneRuntimeId = "gV", _children = {}}
+            local parentGo = {Name = "Parent", _sceneRuntimeId = "g",
+                              _children = {gK = kGo, gO = oGo, gV = vGo}}
+            local services = servicesFor(plan,
+                {root = Root, killer = Killer, other = Other, victim = Victim},
+                {g = parentGo, gK = kGo, gO = oGo, gV = vGo})
+            local engine = SceneRuntime.new(services, plan)
+            engineRef = engine
+            victimGo = vGo
+            engine:start(nil)
+            runDeferred()
+            local rootComp
+            for comp, m in pairs(engine._meta) do
+                if m.gameObjectId == "g" then rootComp = comp end
+            end
+            local host = rootComp.host
+            host:broadcastMessage(rootComp, "Extinguish", "Fire")
+            for _, c in ipairs(calls) do print(c) end
+            print("DONE")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        lines = out.strip().splitlines()
+        # No throw; the broadcast completes (DONE printed).
+        assert "DONE" in lines, out
+        # The root and BOTH surviving pre-existing targets must fire even
+        # though the Killer handler tore down a sibling mid-broadcast.
+        assert "Root.Extinguish(Fire)" in lines, out
+        assert "Killer.Extinguish(Fire)" in lines, out
+        assert "Other.Extinguish(Fire)" in lines, out
+        # The destroyed target must NOT receive (its bucket was torn down).
+        assert "Victim.Extinguish(Fire)" not in lines, out
+
     def test_game_object_instance_receiver(self):
         # A Model/GameObject instance receiver resolves via getInstanceId
         # directly (no ancestor walk needed).
