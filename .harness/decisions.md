@@ -3546,3 +3546,59 @@ the same single name. Classification: Mechanical (no-regression hardening).
 ## D12 — AC12 covers test_generate_rotation_tween (phase-design round 1, Claude MAJOR)
 test_generate_rotation_tween:1054 asserts the removed `while true do`; AC12 now requires updating EVERY
 test asserting the removed shape (grep `while true do`/`_targets`/`_ownerIsContainer`). Classification: Mechanical.
+
+<!-- ===== /drive run rifle-mount-diag-20260617T215229 (2026-06-18) ===== -->
+# Decisions — rifle-mount-diag run
+
+## Phase 2 (design-phase2.md) — player-alias receiver routing
+
+- **D-P2-1 (interface placement).** Player-alias branch lives in `sendMessage`/`broadcastMessage`
+  BEFORE `_resolveReceiverGoId`; the resolver stays single-id and byte-for-byte unchanged. Rationale:
+  player alias maps to a LIST of goIds (single-return resolver is the wrong shape) + zero-diff
+  guarantee for the Phase-1 non-player path (doors/fires/turrets). Classification: workflow/domain.
+- **D-P2-2 (explicit IsA guard).** `_isPlayerAlias` uses an explicit `pcall`-wrapped
+  `recv:IsA("Player")` plus `playerFromTouch(recv)`, never a duck-typed/field-sniff check — else the
+  live `plr` (`Players`-service object) symptom persists. Classification: universal-candidate.
+- **D-P2-3 (player goIds, not instances).** `_playerGoIds` mirrors `_playerRigInstances`'s walk
+  (`meta.scriptId == _player._playerScriptId`, dedupe) but collects `meta.gameObjectId` (what
+  `_dispatchToGameObject` keys on), NOT `meta.gameObjectInstance`. Classification: workflow/domain.
+- **D-P2-4 (broadcast = flat per-goId, no subtree descent for a player alias).** A player-alias
+  `broadcastMessage` dispatches to each player goId WITHOUT the descendant walk (logic singleton, no
+  corpus player-rooted broadcast, walk would only re-hit the same components). Non-player broadcast
+  keeps the Phase-1 descendant walk. Classification: workflow/domain.
+- **D-P2-5 (>1 character-controller MODULES fail-close to no-route).** `_player == nil` →
+  `_playerGoIds` returns {} → warn + no dispatch (= current `_initPlayerAuthority` behavior; one camera
+  per client). Distinct from >1 rig INSTANCES of one module, which all dispatch (P2-F). Classification:
+  workflow/domain.
+- **D-P2-6 (live test is the gate).** Cold `/convert-unity` SimpleFPS + Studio Play (rifle mounts on
+  camera WeaponSlot AND fires) is the acceptance authority — NOT the seeded `luau` unit tests
+  (green-test-can-pass-for-the-wrong-reason). Classification: universal (already canonical).
+
+## Phase 2 — round-1 dual-voice review fold-ins
+
+- **D-P2-7 (nil-`_player` fail-closed — refutes codex round-1 BLOCKING).** `_isPlayerAlias` may match a
+  live `Player` object while `self._player` is nil. This is SAFE at the doc level: `_playerGoIds()`
+  guards `if not p or not p._playerScriptId then return {} end`, so it NEVER indexes
+  `_player._playerScriptId` on a nil `_player` — it returns `{}`, and the caller treats empty as
+  warn + no-route. A Player-object receiver under 0/>1-character-controller (nil `_player`) fail-closes
+  to a no-op, never a runtime error. The BLOCKING is refuted in design (Interfaces section + edge case 4).
+  Classification: workflow/domain.
+- **D-P2-8 (`playerFromTouch` breadth — codex MAJOR #3).** Branch (b) `playerFromTouch(recv)` runs for
+  non-player receivers too; it resolves ONLY a character/limb belonging to a player's character model
+  and returns nil otherwise, so doors/fires/turrets (never parented under a player character) take the
+  unchanged Phase-1 path. Boundary/documented limit: a non-player object deliberately parented inside a
+  player character WOULD be treated as a player alias — not exercised by any corpus site. New edge case
+  8. Classification: workflow/domain.
+- **D-P2-9 (multi-goId fan-out / "multiple rifles" — codex MAJOR #4).** `>1` distinct goId →
+  dispatch to each (intended Unity multi-GameObject semantics); single-embodiment (one Player module on
+  one GameObject) → exactly one goId → exactly one dispatch (no duplicate rifle). New edge case 9 + an
+  AC-1 assertion that dispatch count == `#_playerGoIds()` (== 1 in the single-embodiment fixture), so a
+  double-registered player rig is caught. Classification: workflow/domain.
+
+## D-FIN2 (finalize scope after v4 redesign) — Classification: workflow/domain
+The v3 finalize CONVERGED at a3451a4 (de-slopped phase 1). The v4 redesign added phase 2 on top
+(now drive tip 364699d). Re-running finalize's de-slop/logic lenses over the WHOLE c30c259..364699d
+diff would re-audit already-finalized clean phase-1 code (review-churn). Scope this finalize's
+code lenses to the NEW work since the converged v3 finalize: a3451a4..364699d (the phase-2 delta);
+whole-run read context retained for aggregate awareness. The terminal review-finalize-2.md still
+binds the full featureBranch tip 364699d (ship-gate R==tip holds).
