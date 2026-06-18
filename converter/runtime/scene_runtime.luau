@@ -393,8 +393,16 @@ function SceneRuntime.seedLazySingletons(plan, services, engine, domainFilter)
 			-- not this side
 		else
 			-- (1) Resolve the singleton module by its GUID-keyed module path.
-			local Cls = resolveModule(seed.script_guid, seed.module_path)
-			if type(Cls) ~= "table" or type(Cls.new) ~= "function" then
+			-- ``resolveModule`` may THROW on an unresolvable module (not just
+			-- return nil), so pcall it — a throwing resolver must warn + skip
+			-- this seed, never crash boot.
+			local ok, Cls = pcall(resolveModule, seed.script_guid, seed.module_path)
+			if not ok then
+				warn("[lazy-singleton] resolveModule errored for "
+					.. tostring(seed.module_path or seed.class_stem)
+					.. " (guid " .. tostring(seed.script_guid) .. "): "
+					.. tostring(Cls) .. "; skipping seed")
+			elseif type(Cls) ~= "table" or type(Cls.new) ~= "function" then
 				warn("[lazy-singleton] module did not resolve to a constructable "
 					.. "class: " .. tostring(seed.module_path or seed.class_stem)
 					.. "; skipping seed")
@@ -422,7 +430,27 @@ function SceneRuntime.seedLazySingletons(plan, services, engine, domainFilter)
 					-- ``.new`` in pcall, so a throwing constructor drops just
 					-- this singleton + warns, never crashing boot.
 					local hostId = "_lazysingleton:" .. tostring(seed.class_stem)
-					engine:addComponent(hostId, seed.script_guid, {})
+					-- ``_buildComponent`` indexes ``plan.modules[script_guid]``
+					-- (GUID-keyed) — a stale/missing GUID would explode inside
+					-- it before any warn path. Check presence first, then pcall
+					-- the construct so a throwing build (or any addComponent
+					-- error) warns + skips THIS seed, never crashing boot.
+					local plan_modules = plan.modules or {}
+					if plan_modules[seed.script_guid] == nil then
+						warn("[lazy-singleton] script_guid not present in "
+							.. "plan.modules: " .. tostring(seed.script_guid)
+							.. " (" .. tostring(seed.class_stem)
+							.. "); skipping seed")
+					else
+						local buildOk, buildErr =
+							pcall(engine.addComponent, engine, hostId, seed.script_guid, {})
+						if not buildOk then
+							warn("[lazy-singleton] addComponent errored for "
+								.. tostring(seed.class_stem) .. " (guid "
+								.. tostring(seed.script_guid) .. "): "
+								.. tostring(buildErr) .. "; skipping seed")
+						end
+					end
 				end
 			end
 		end

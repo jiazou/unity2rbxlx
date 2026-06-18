@@ -338,6 +338,84 @@ dumpLogs()
 
 
 @_luau_marker
+def test_script_guid_absent_from_plan_modules_warns_and_skips_no_crash():
+    """The REAL GUID-keyed failure mode (BLOCKING #1): a seed whose ``script_guid``
+    is NOT a key in ``plan.modules``. ``resolveModule`` returns a constructable
+    class (so the resolve gate passes), but ``addComponent`` -> ``_buildComponent``
+    would index ``plan.modules[script_guid]`` and explode. The shim must check
+    presence first -> warn + skip, never crash boot; OTHER seeds still process.
+
+    FAILS against the pre-fix shim (unguarded ``engine:addComponent`` indexes a
+    nil ``plan.modules[script_guid]`` and errors -> luau returncode != 0)."""
+    out = _run("""
+local GUID_GOOD = "guid-good"
+local GUID_STALE = "guid-stale-not-in-modules"
+local ClsGood = makeCoroutineHandler("m_Instance")
+-- A second class whose path resolves, but whose GUID is absent from plan.modules.
+local ClsStale = makeCoroutineHandler("_instance")
+local modulesByPath = {
+    ["ReplicatedStorage.Good"] = ClsGood,
+    ["ReplicatedStorage.Stale"] = ClsStale,
+}
+local plan = {
+    modules = {
+        [GUID_GOOD] = { module_path = "ReplicatedStorage.Good", stem = "Good",
+                        domain = "client", runtime_bearing = false },
+        -- NOTE: GUID_STALE intentionally absent from plan.modules.
+    },
+    lazy_singletons = {
+        -- stale seed first so an unguarded crash would skip the good seed:
+        { module_path = "ReplicatedStorage.Stale", class_stem = "Stale",
+          domain = "client", script_guid = GUID_STALE, backing_field = "_instance" },
+        { module_path = "ReplicatedStorage.Good", class_stem = "Good",
+          domain = "client", script_guid = GUID_GOOD, backing_field = "m_Instance" },
+    },
+}
+local services = servicesFor(modulesByPath)
+local engine = SceneRuntime.new(services, plan)
+SceneRuntime.seedLazySingletons(plan, services, engine, nil)
+print("NO_CRASH=true")
+print("STALE_SKIPPED=" .. tostring(ClsStale.getInstance() == nil))
+print("GOOD_STILL_SEEDED=" .. tostring(ClsGood.getInstance() ~= nil))
+dumpLogs()
+""")
+    assert "NO_CRASH=true" in out
+    assert "STALE_SKIPPED=true" in out
+    assert "GOOD_STILL_SEEDED=true" in out      # other seeds still process
+    assert any(
+        line.startswith("WARN_LINE=[lazy-singleton] script_guid not present in plan.modules")
+        for line in out.splitlines()
+    ), out
+
+
+@_luau_marker
+def test_throwing_resolve_module_warns_and_skips_no_crash():
+    """BLOCKING #2: a ``resolveModule`` that THROWS (not returns nil) on an
+    unresolvable module. The shim pcall-wraps the resolve -> warn + skip, no crash.
+
+    FAILS against the pre-fix shim (the bare ``resolveModule(...)`` call propagates
+    the throw -> luau returncode != 0)."""
+    out = _run(_ONE_SEED_PLAN.replace(
+        "local services = servicesFor(modulesByPath)",
+        "local services = servicesFor(modulesByPath)\n"
+        "services.resolveModule = function(_id, _path)\n"
+        "    error(\"resolver blew up\")\n"
+        "end",
+    ) + """
+SceneRuntime.seedLazySingletons(plan, services, engine, nil)
+print("NO_CRASH=true")
+print("STILL_NIL=" .. tostring(Cls.getInstance() == nil))
+dumpLogs()
+""")
+    assert "NO_CRASH=true" in out
+    assert "STILL_NIL=true" in out
+    assert any(
+        line.startswith("WARN_LINE=[lazy-singleton] resolveModule errored")
+        for line in out.splitlines()
+    ), out
+
+
+@_luau_marker
 def test_module_without_new_warns_and_skips():
     """A resolved module that lacks ``.new`` (e.g. a dead-module inert stub) is
     warned + skipped, not constructed."""
