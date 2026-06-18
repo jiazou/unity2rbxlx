@@ -961,6 +961,24 @@ function SceneRuntime:_makeHostSurface(owner)
 			end
 			return engine:playersInRadius(arg1, arg2)
 		end,
+		sendMessage = function(arg1, arg2, arg3, ...)
+			-- Colon: host:sendMessage(recv, name, ...) -> arg1=host,
+			--   arg2=recv, arg3=name, ...=gameplay args.
+			-- Dotted: host.sendMessage(recv, name, ...) -> arg1=recv,
+			--   arg2=name, arg3..=gameplay args.
+			if arg1 == host then
+				return engine:sendMessage(arg2, arg3, ...)
+			end
+			return engine:sendMessage(arg1, arg2, arg3, ...)
+		end,
+		broadcastMessage = function(arg1, arg2, arg3, ...)
+			-- Colon: host:broadcastMessage(recv, name, ...) -> arg1=host.
+			-- Dotted: host.broadcastMessage(recv, name, ...) -> arg1=recv.
+			if arg1 == host then
+				return engine:broadcastMessage(arg2, arg3, ...)
+			end
+			return engine:broadcastMessage(arg1, arg2, arg3, ...)
+		end,
 		-- Public per-player read surface (P1-4/P2-G). A NARROW table closing
 		-- over ``engine`` — exposes ONLY the public ``getLookCFrame`` read so
 		-- Phase 3's Shoot raycast can reach ``self.host.player:getLookCFrame()``
@@ -1535,6 +1553,269 @@ function SceneRuntime:_callMethod(instance, name, ...)
 				"[scene_runtime] %s.%s threw: %s",
 				tostring(self._meta[instance].scriptId), name, tostring(err)))
 		end
+	end
+end
+
+-- ---------------------------------------------------------------------
+-- SendMessage / BroadcastMessage host primitives (Unity engine ops)
+-- ---------------------------------------------------------------------
+-- Unity's ``recv.SendMessage("M", arg)`` invokes ``M`` on EVERY component
+-- on ``recv``'s GameObject that implements it, but only while the
+-- GameObject is ``activeInHierarchy``. ``BroadcastMessage`` additionally
+-- descends to every child GameObject. Resolution is at RUNTIME because the
+-- receiver expression (a component, a Model/GameObject, or a touched
+-- BasePart) only resolves to a live GameObject id once instances exist.
+
+-- ``_resolveReceiverGoId(recv) -> gameObjectId?`` -- best-effort map of a
+-- SendMessage receiver onto an internal ``gameObjectId``:
+--   * a component table -> ``_meta[recv].gameObjectId``
+--   * a Model / GameObject instance -> ``getInstanceId(recv)``
+--   * a BasePart -> ``getInstanceId(part)`` else its ancestor Model's id
+--     (mirrors the ``playerFromTouch`` ancestor walk for touched parts)
+-- Returns nil (with a warn) when nothing resolves -- best-effort, matching
+-- Unity's ``SendMessageOptions.DontRequireReceiver`` (Roblox has no
+-- missing-handler error analog).
+function SceneRuntime:_resolveReceiverGoId(recv)
+	if recv == nil then return nil end
+	-- Component table: registered in ``_meta`` with its gameObjectId.
+	local meta = self._meta[recv]
+	if meta ~= nil then
+		return meta.gameObjectId
+	end
+	-- Roblox Instance (Model / GameObject / BasePart): resolve its own
+	-- stamped id first; a GameObject whose components are registered will
+	-- have a bucket under that id.
+	local getInstanceId = self._services.getInstanceId
+	if getInstanceId == nil then return nil end
+	local ownId = getInstanceId(recv)
+	if ownId ~= nil and self._componentsByGameObject[ownId] ~= nil then
+		return ownId
+	end
+	-- BasePart (or any descendant Instance) whose own id carries no
+	-- components: climb to the owning Model and resolve that.
+	if type(recv.FindFirstAncestorWhichIsA) == "function" then
+		local ok, ancestor = pcall(function()
+			return recv:FindFirstAncestorWhichIsA("Model")
+		end)
+		if ok and ancestor ~= nil then
+			local ancId = getInstanceId(ancestor)
+			if ancId ~= nil then
+				return ancId
+			end
+		end
+	end
+	-- Fall back to the receiver's own id even without a component bucket
+	-- so the caller can still attempt dispatch (no-op if empty).
+	return ownId
+end
+
+-- ``_dispatchToGameObject(goId, name, ...)`` -- invoke ``name`` on every
+-- component registered at ``goId`` that implements it, gated on the
+-- GameObject being ``activeInHierarchy`` (Unity targets only active
+-- GameObjects). Each call goes through ``_callMethod`` (pcall-wrapped).
+function SceneRuntime:_dispatchToGameObject(goId, name, ...)
+	if goId == nil then return end
+	-- Active gate: reuse the lifecycle's computed ``activeInHierarchy``.
+	-- A goId never seeded into the cache defaults to the parent-map
+	-- computation (absence == active, matching ``_injectHostSurface``).
+	local active = self._goActiveInHierarchy[goId]
+	if active == nil then
+		active = self:_computeActiveInHierarchyViaParentMap(goId)
+	end
+	if not active then return end
+	local bucket = self._componentsByGameObject[goId]
+	if bucket == nil then return end
+	-- Snapshot so a handler that mutates the bucket (adds/destroys a
+	-- component) does not disturb iteration.
+	local snap = {}
+	for i, comp in ipairs(bucket) do snap[i] = comp end
+	for _, comp in ipairs(snap) do
+		local meta = self._meta[comp]
+		local class = meta and meta.classTable
+		if class and type(class[name]) == "function" then
+			self:_callMethod(comp, name, ...)
+		end
+	end
+end
+
+-- ``_playerFromAlias(recv) -> Player?`` -- resolve ANY handle that denotes the
+-- local player's embodiment to its ``Players``-service ``Player``:
+--   * a ``Player`` object (explicit ``IsA("Player")`` guard, pcall-wrapped
+--     because ``recv`` may be a plain component table without ``IsA``);
+--   * the character ``Model`` ITSELF (``plr.Character`` -- what Pickup passes),
+--     a limb/``BasePart`` under it, its ``HumanoidRootPart``, or its
+--     ``Humanoid`` -- via an INCLUSIVE ancestor walk (start at ``recv`` itself,
+--     not ``recv.Parent``) for the first Humanoid-bearing ``Model``, then
+--     ``GetPlayerFromCharacter``.
+-- Inclusive so the character Model matches as the FIRST node -- the touch-only
+-- ``playerFromTouch`` starts at ``recv.Parent``, which misses the Model itself.
+-- Returns nil for non-player receivers (no Humanoid-bearing Model ancestor) and
+-- for NPCs (a Humanoid Model ``GetPlayerFromCharacter`` does not resolve), so
+-- both fall through to the non-player ``_resolveReceiverGoId`` path.
+function SceneRuntime:_playerFromAlias(recv)
+	if recv == nil then return nil end
+	local players = self._services.players
+	if players == nil then return nil end
+	-- (a) Players-service Player object.
+	if type(recv.IsA) == "function" then
+		local ok, isPlayer = pcall(function() return recv:IsA("Player") end)
+		if ok and isPlayer then return recv end
+	end
+	-- (b) any embodiment handle -> owning Player via an INCLUSIVE ancestor walk
+	-- (``recv`` itself + ancestors) for a Humanoid-bearing character Model.
+	local node = recv
+	local guard = 0
+	while node ~= nil and guard < 16 do
+		guard += 1
+		-- pcall the ``IsA`` probe so a component table with an erroring ``IsA``
+		-- can't throw mid-dispatch.
+		local okModel, isModel = false, false
+		if type(node.IsA) == "function" then
+			okModel, isModel = pcall(function() return node:IsA("Model") end)
+		end
+		if okModel and isModel
+			and type(node.FindFirstChildWhichIsA) == "function"
+			and node:FindFirstChildWhichIsA("Humanoid")
+		then
+			-- Keep climbing past an inner Humanoid Model that maps to no player
+			-- (a nested rig); the player's character may be an OUTER ancestor.
+			local p = players:GetPlayerFromCharacter(node)
+			if p ~= nil then return p end
+		end
+		node = node.Parent
+	end
+	return nil
+end
+
+-- ``_isPlayerAlias(recv) -> boolean`` -- TRUE iff ``recv`` denotes the local
+-- player's embodiment (any handle ``_playerFromAlias`` resolves). The converter
+-- decouples the player into the Roblox character (what the receiver points at,
+-- carrying no Unity component) and the Unity Player logic GameObject
+-- (``Workspace.DynamicObjects.Player``, carrying ``GetItem``/``GetRifle``) -- so
+-- a player-alias receiver must route to the LATTER, not whatever the alias
+-- literally points at.
+function SceneRuntime:_isPlayerAlias(recv)
+	return self:_playerFromAlias(recv) ~= nil
+end
+
+-- ``_playerGoIds() -> {gameObjectId}`` -- the LIST of DISTINCT internal
+-- ``gameObjectId``(s) of the player-embodiment component(s), keyed on the
+-- deterministic ``_player._playerScriptId`` (rung-3 upstream identity, NOT an
+-- AI fingerprint). Mirrors ``_playerRigInstances``'s walk but collects
+-- ``meta.gameObjectId`` (what ``_dispatchToGameObject`` keys on) instead of
+-- ``meta.gameObjectInstance``. Returns ``{}`` when no player authority is
+-- bound (0/>1 character-controller modules -> nil ``_player``) or the rig
+-- isn't built yet -- the caller treats empty as no-route (fail-closed, no
+-- error). Guards nil ``_player`` FIRST so it never indexes a nil ``_player``.
+function SceneRuntime:_playerGoIds()
+	local p = self._player
+	if not p or not p._playerScriptId then return {} end
+	local out, seen = {}, {}
+	for _, m in pairs(self._meta) do
+		if m.scriptId == p._playerScriptId then
+			local goId = m.gameObjectId
+			if goId ~= nil and not seen[goId] then
+				seen[goId] = true
+				table.insert(out, goId)
+			end
+		end
+	end
+	return out
+end
+
+-- ``sendMessage(recv, name, ...)`` -- Unity ``recv.SendMessage("name", ...)``:
+-- dispatch ``name`` to every implementing component on the resolved
+-- GameObject (active only).
+function SceneRuntime:sendMessage(recv, name, ...)
+	-- Player-FIRST branch: a player alias maps to a LIST of
+	-- embodiment goIds, which does not fit the single-id resolver. Check it
+	-- BEFORE ``_resolveReceiverGoId`` so a player alias never falls into the
+	-- ancestor-Model walk that mis-resolved the literal character.
+	if self:_isPlayerAlias(recv) then
+		local goIds = self:_playerGoIds()
+		if #goIds == 0 then
+			self._warn(string.format(
+				"[scene_runtime] sendMessage(%q): player-alias receiver but no "
+				.. "player-embodiment GameObject bound (0/>1 character "
+				.. "controllers, or rig not built)", tostring(name)))
+			return
+		end
+		for _, goId in ipairs(goIds) do
+			self:_dispatchToGameObject(goId, name, ...)
+		end
+		return
+	end
+	-- Non-player path.
+	local goId = self:_resolveReceiverGoId(recv)
+	if goId == nil then
+		self._warn(string.format(
+			"[scene_runtime] sendMessage(%q): no GameObject for receiver",
+			tostring(name)))
+		return
+	end
+	self:_dispatchToGameObject(goId, name, ...)
+end
+
+-- ``broadcastMessage(recv, name, ...)`` -- Unity
+-- ``recv.BroadcastMessage("name", ...)``: dispatch to the GameObject AND
+-- every descendant GameObject (via the planner parent map walked DOWN).
+function SceneRuntime:broadcastMessage(recv, name, ...)
+	-- Player-FIRST branch: a player-alias receiver dispatches
+	-- FLAT to each player-embodiment goId WITHOUT the descendant walk -- the
+	-- embodiment is a logic singleton (no Unity child GameObjects carrying
+	-- broadcast-target components; the rig's children are character limbs, not
+	-- registered GameObjects), so the walk would only re-hit the same set.
+	-- Same delivery as sendMessage for a player alias.
+	if self:_isPlayerAlias(recv) then
+		local goIds = self:_playerGoIds()
+		if #goIds == 0 then
+			self._warn(string.format(
+				"[scene_runtime] broadcastMessage(%q): player-alias receiver but "
+				.. "no player-embodiment GameObject bound (0/>1 character "
+				.. "controllers, or rig not built)", tostring(name)))
+			return
+		end
+		for _, goId in ipairs(goIds) do
+			self:_dispatchToGameObject(goId, name, ...)
+		end
+		return
+	end
+	-- Non-player path.
+	local goId = self:_resolveReceiverGoId(recv)
+	if goId == nil then
+		self._warn(string.format(
+			"[scene_runtime] broadcastMessage(%q): no GameObject for receiver",
+			tostring(name)))
+		return
+	end
+	-- Collect the COMPLETE target set FIRST -- the root goId plus every
+	-- GameObject whose ancestor chain (``_goParentId`` walked UP) reaches
+	-- ``goId`` -- WITHOUT dispatching. A dispatched handler may destroy or
+	-- add GameObjects/components (e.g. an Extinguish handler tearing down a
+	-- sibling), and ``pairs`` over a table being mutated mid-walk skips or
+	-- duplicates entries. Snapshotting the target ids before any dispatch
+	-- makes the descendant walk immune to that mutation. Bounded by a depth
+	-- budget per node so an accidental cycle can't loop forever.
+	local targets = {goId}
+	for childId in pairs(self._componentsByGameObject) do
+		if childId ~= goId then
+			local cur = self._goParentId[childId]
+			local depth = 0
+			while cur ~= nil and depth < 1024 do
+				if cur == goId then
+					targets[#targets + 1] = childId
+					break
+				end
+				cur = self._goParentId[cur]
+				depth = depth + 1
+			end
+		end
+	end
+	-- THEN dispatch to each captured target. ``_dispatchToGameObject``
+	-- already snapshots its per-GameObject bucket, so a handler mutating
+	-- that bucket can't disturb delivery either.
+	for _, targetId in ipairs(targets) do
+		self:_dispatchToGameObject(targetId, name, ...)
 	end
 end
 
