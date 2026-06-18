@@ -538,8 +538,13 @@ def _collection_is_overlap_sphere(
     # Find the NEAREST-PRECEDING in-scope binding of ``collection`` (a declaration
     # ``<Type|var> collection = ...`` or a plain assignment ``collection = ...``),
     # then check whether that one binding's initializer is Physics.OverlapSphere.
+    # The LHS must be the BARE local identifier: a member/field assignment such as
+    # ``this.cols = ...`` or ``obj.cols = ...`` is a DIFFERENT lvalue and must not
+    # be mistaken for the foreach collection's binding (a leading ``.`` or word
+    # char before the identifier rejects the member-access and partial-name cases).
     bind_re = re.compile(
-        r"(?:\b(?:var|[\w.<>\[\],\s]*?[\w>\]])\s+)?"
+        r"(?<![\w.])"
+        + r"(?:\b(?:var|[\w.<>\[\],\s]*?[\w>\]])\s+)?"
         + re.escape(collection)
         + r"\s*=\s*(?!=)"
     )

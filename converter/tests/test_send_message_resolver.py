@@ -321,6 +321,35 @@ def test_corpus_aliased_shape_still_excluded_with_neighbors():
     assert _facts(src) == ()
 
 
+def test_member_field_assignment_not_treated_as_bare_local_binding():
+    # A FIELD assignment ``this.cols = Physics.OverlapSphere(...)`` is a different
+    # lvalue from the bare local ``cols`` the foreach iterates: it must NOT be
+    # taken as the collection's binding. The foreach here is over a bare local
+    # ``cols`` with NO in-scope bare binding, so no OverlapSphere link is
+    # confirmed -> the dispatch is KEPT (not falsely suppressed).
+    src = (
+        "void F(){\n"
+        "  this.cols = Physics.OverlapSphere(p, 2);\n"
+        "  foreach (var col in cols) { col.SendMessage(\"TakeDamage\", d); }\n"
+        "}"
+    )
+    assert _shapes(src) == [(SEND, "TakeDamage", ("d",))]
+
+
+def test_member_field_assignment_does_not_mask_real_bare_binding():
+    # An UNRELATED field assignment ``obj.cols = ...`` must not shadow the REAL
+    # nearest-preceding BARE-local OverlapSphere binding of ``cols``; the loop is
+    # still correctly excluded.
+    src = (
+        "void F(){\n"
+        "  Collider[] cols = Physics.OverlapSphere(p, 2);\n"
+        "  obj.cols = somethingElse;\n"
+        "  foreach (var col in cols) { col.SendMessage(\"TakeDamage\", d); }\n"
+        "}"
+    )
+    assert _facts(src) == ()
+
+
 # --- build_send_message_map (path keying + presence) ----------------------
 
 
