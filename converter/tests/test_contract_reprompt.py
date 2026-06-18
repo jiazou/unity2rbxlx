@@ -347,7 +347,7 @@ UNPARSEABLE_PROSE = (
 )
 
 
-class TestReprompgtStructuralGuard:
+class TestRepromptStructuralGuard:
 
     def test_fragment_rejected(self):
         # Criterion 1: a good module degraded into a ``...`` fragment is
@@ -395,7 +395,7 @@ class TestReprompgtStructuralGuard:
         assert _reprompt_is_structurally_safe(GOOD_MODULE, gutted) is False
 
 
-class TestReprompgtGuardWiring:
+class TestRepromptGuardWiring:
 
     def test_fragment_reprompt_keeps_original_and_surfaces_survivor(self):
         # Criterion 5: ``_verify_and_reprompt`` with a reprompt closure that
