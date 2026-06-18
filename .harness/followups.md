@@ -1099,3 +1099,25 @@ Start a fresh /drive run on this scope; multi-subsystem → expect multiple phas
 - `_has_top_level_return` keys on a column-0 `return`; an unconventionally-indented module-level return
   would be missed. Idiomatic transpiled modules emit column-0 `return ClassName`. Cheap future hardening:
   reuse runtime_contract's top-level-statement iteration. (codex finalize MINOR.)
+## Run door-binding-race (2026-06-17)
+
+# Followups — door-binding-race run
+
+- A STATIC scene-baked copy of a runtime-placed prefab may also exist in workspace (a HostilePlane
+  Name tag appears under both Workspace and ReplicatedStorage in the converted rbxlx). Placement-dedup
+  concern, separate from this binding fix — the fix makes binding robust regardless, but the static
+  copy may cause a duplicate/ghost instance. Investigate whether generic mode should suppress the
+  static copy when a runtime placement exists.
+- Respawn/teardown rebind of the `workspace.DescendantAdded` listener: not added. LocalScript/Script
+  lifetime matches the place session; no explicit `:Disconnect()` lifecycle. Detailed design confirms no
+  leak (single connection per global driver, gated on `not _ownerIsContainer`). Revisit only if a
+  teardown/respawn flow is added that destroys+recreates the driver script.
+- The DescendantAdded child-BasePart fallback (decisions.md D3) relies on the child BasePart sharing a
+  matched name OR the Model resolving on its own event. For a generic Model whose root name differs from
+  its only BasePart child name and which is parented incrementally (not one-shot like autogen.py:951-959),
+  binding could miss until a same-named descendant arrives. Not reachable for the door/plane primary
+  cases (one-shot parent). Generic hardening follow-up if a real game exhibits incremental Model assembly.
+
+## slop (deferred to finalize)
+- converter/converter/animation_converter.py:29 — `Any` co-imported with `Literal` (Any pre-existing for parser sigs, not in this diff)
+- converter/converter/animation_converter.py:1305-1311 — "Runtime placement gate" rationale duplicated as Python `#` comment + emitted Luau `--` comments
