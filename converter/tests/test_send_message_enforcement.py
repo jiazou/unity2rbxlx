@@ -5,9 +5,13 @@ Covers ``runtime_contract.verify_module``'s fact-keyed ``sm`` rule:
     (which drives a reprompt in ``_verify_and_reprompt``);
   * a module that emits every required ``host:sendMessage`` / ``broadcastMessage``
     call produces NO ``sm`` violation;
-  * MULTISET counting (2 same-method dispatches need 2 emitted calls);
-  * RECEIVER best-effort (an aliased receiver still passes; a bare ``self:``
-    self-dispatch is flagged, not credited);
+  * PRESENCE per distinct ``(kind, method, gameplay_arity)`` key (each distinct
+    key needs >=1 call; 2 same-key facts + 1 covering call do NOT fire; a key
+    dropped entirely DOES fire);
+  * DOTTED host-dispatch form (``self.host.sendMessage(...)``) covers, like colon;
+  * RECEIVER best-effort (an aliased receiver still passes; a bare
+    ``self:``/``self.`` self-dispatch is flagged, not credited);
+  * comments / long-strings are not scanned (no false credit, no false fire);
   * arity + kind strict matching (wrong arity / send-vs-broadcast does not cover);
   * the threading param reaches the verify path (the facts a module's C# produced
     flow through ``_verify_and_reprompt`` into the ``sm`` reject + reprompt).
@@ -103,25 +107,97 @@ def test_broadcast_dispatch_present():
     assert _sm_rules(src, (_fact("Extinguish", (), BROADCAST),)) == []
 
 
-# --- multiset counting -----------------------------------------------------
+# --- dotted host-dispatch form ---------------------------------------------
 
 
-def test_two_dispatches_need_two_calls():
-    # Two ``ToggleDoor`` facts but only ONE emitted call -> shortfall.
-    src = _module('    self.host:sendMessage(doors[1], "ToggleDoor", true)')
+def test_dotted_host_sendmessage_covers_fact():
+    # The AI emits the DOTTED ``self.host.sendMessage(recv, name, ...)`` form
+    # (every sibling generic-prompt directive is dotted) -- runtime-correct via
+    # the host wrapper's ``arg1 == host`` discriminator, so it must cover the
+    # fact. Arity for dotted matches colon: ``(recv, name, gameplay)`` -> 1.
+    src = _module('    self.host.sendMessage(other, "GetItem", self.itemName)')
+    assert _sm_rules(src, (_fact("GetItem", ("itemName",)),)) == []
+
+
+def test_dotted_broadcast_covers_fact():
+    src = _module('    self.host.broadcastMessage(self.gameObject, "Extinguish")')
+    assert _sm_rules(src, (_fact("Extinguish", (), BROADCAST),)) == []
+
+
+def test_dotted_bare_self_dispatch_is_flagged():
+    # ``self.sendMessage(...)`` (dotted bare self) dropped the receiver, exactly
+    # like the colon ``self:sendMessage`` -> NOT credited; fact uncovered.
+    src = _module('    self.sendMessage("GetItem", name)')
+    msgs = _sm_rules(src, (_fact("GetItem", ("itemName",)),))
+    assert len(msgs) == 1
+    assert "receiver" in msgs[0]
+
+
+# --- presence per distinct key (NOT strict multiset count) -----------------
+
+
+def test_two_facts_same_key_need_at_least_one_call():
+    # Two ``ToggleDoor`` facts of the SAME key and ZERO emitted calls -> the key
+    # is entirely dropped -> shortfall (the real bug a presence check still
+    # catches: method goes 1->0).
+    src = _module('    other:SetAttribute("doorOpen", true)')
     facts = (_fact("ToggleDoor", ("true",)), _fact("ToggleDoor", ("true",)))
     msgs = _sm_rules(src, facts)
     assert len(msgs) == 1
     assert "ToggleDoor" in msgs[0]
 
 
-def test_two_dispatches_two_calls_ok():
+def test_two_facts_one_covering_call_does_not_fire():
+    # PRESENCE, not count: the producer counted TWO same-key facts (e.g. a loop
+    # the resolver saw as two dispatches) but a SINGLE emitted call legitimately
+    # covers them -> must NOT fail-close.
+    src = _module('    self.host:sendMessage(doors[i], "ToggleDoor", true)')
+    facts = (_fact("ToggleDoor", ("true",)), _fact("ToggleDoor", ("true",)))
+    assert _sm_rules(src, facts) == []
+
+
+def test_distinct_keys_each_need_a_call():
+    # Two facts of DIFFERENT keys (different arity) -> each distinct key still
+    # needs >=1 covering call; only one is emitted -> the other fires.
+    src = _module('    self.host:sendMessage(doors[1], "ToggleDoor", true)')
+    facts = (_fact("ToggleDoor", ("true",)), _fact("ToggleDoor", ()))
+    msgs = _sm_rules(src, facts)
+    assert len(msgs) == 1
+    assert "ToggleDoor" in msgs[0]
+
+
+def test_two_distinct_keys_two_calls_ok():
     src = _module(
         '    self.host:sendMessage(doors[1], "ToggleDoor", true)\n'
-        '    self.host:sendMessage(doors[2], "ToggleDoor", false)'
+        '    self.host:sendMessage(doors[2], "ToggleDoor")'
     )
-    facts = (_fact("ToggleDoor", ("true",)), _fact("ToggleDoor", ("false",)))
+    facts = (_fact("ToggleDoor", ("true",)), _fact("ToggleDoor", ()))
     assert _sm_rules(src, facts) == []
+
+
+# --- comments / long-strings are not scanned -------------------------------
+
+
+def test_sendmessage_in_comment_not_counted():
+    # A ``host:sendMessage`` inside a ``--`` comment must NOT be credited as a
+    # covering call (the scan runs over the comment-blanked source).
+    src = _module(
+        '    -- self.host:sendMessage(other, "GetItem", name)\n'
+        '    other:SetAttribute("hasRifle", true)'
+    )
+    msgs = _sm_rules(src, (_fact("GetItem", ("itemName",)),))
+    assert len(msgs) == 1
+    assert "GetItem" in msgs[0]
+
+
+def test_sendmessage_in_long_string_not_counted():
+    src = _module(
+        '    local doc = [[ self.host:sendMessage(other, "GetItem", name) ]]\n'
+        '    other:SetAttribute("hasRifle", true)'
+    )
+    msgs = _sm_rules(src, (_fact("GetItem", ("itemName",)),))
+    assert len(msgs) == 1
+    assert "GetItem" in msgs[0]
 
 
 # --- receiver best-effort --------------------------------------------------

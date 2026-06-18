@@ -17,7 +17,6 @@ clean ``legacy`` per the design doc's ``auto`` semantics (wired in PR3b).
 from __future__ import annotations
 
 import re
-from collections import Counter
 from dataclasses import dataclass
 
 from converter.send_message_resolver import (
@@ -111,10 +110,12 @@ def verify_module(
         send_message_facts: The per-module ``SendMessageDispatchFact`` tuple
             this module's C# source produced (slice 1.2's
             ``build_send_message_map`` value for this script). When non-empty,
-            rule ``sm`` runs: the emitted Luau must contain at least as many
-            ``self.host:sendMessage(...)`` / ``:broadcastMessage(...)`` calls
-            as the facts require, counted per ``(kind, method, gameplay_arity)``
-            multiset. A shortfall is a LOAD-BEARING contract violation (it
+            rule ``sm`` runs: for each DISTINCT ``(kind, method,
+            gameplay_arity)`` key the facts contain, the emitted Luau must
+            contain at least one matching ``self.host:sendMessage(...)`` /
+            ``.sendMessage(...)`` / ``:broadcastMessage(...)`` call (PRESENCE,
+            not multiset count -- one call may cover several facts of the same
+            key, e.g. a loop). A shortfall is a LOAD-BEARING contract violation (it
             keeps the fail-closed ``contract-verifier `` tag, like rules
             (a)-(h)), so a dropped dispatch drives a reprompt and -- if still
             absent after the bound -- fails the build closed rather than
@@ -1285,24 +1286,41 @@ def _check_player_humanoid_move(stripped: str, source: str) -> list[Violation]:
 # ``BroadcastMessage`` into ``SendMessageDispatchFact`` records (the OverlapSphere
 # players-in-radius shape is already excluded there -- ``playersInRadius`` owns
 # that, #201). This check asserts the emitted Luau actually dispatched each one:
-# the per-module multiset keyed by ``(kind, method, gameplay_arity)`` (arity =
+# every DISTINCT key ``(kind, method, gameplay_arity)`` the facts contain (arity =
 # ``len(fact.gameplay_args)``, slice 1.2's shared normalization -- never
-# re-derived here) must be COVERED by matching ``self.host:sendMessage(...)`` /
-# ``:broadcastMessage(...)`` calls in the output.
+# re-derived here) must be COVERED by at least one matching
+# ``self.host:sendMessage(...)`` / ``.sendMessage(...)`` /
+# ``:broadcastMessage(...)`` call in the output (PRESENCE, not multiset count:
+# one emitted call may cover multiple same-key facts, e.g. a loop dispatch).
 #
 # The receiver operand is BEST-EFFORT (the design's "Match key" minor): there is
 # no C#->Luau symbol map, so the AI may alias the receiver. The check therefore
-# does NOT strict-compare the receiver token; it only rejects a bare ``self:...``
-# self-dispatch (``self:sendMessage`` with no host hop), which signals the AI
-# dropped the receiver argument entirely. Method + kind + gameplay arity ARE
-# strict-matched (a collapsed/wrong-arity dispatch must not satisfy a fact).
+# does NOT strict-compare the receiver token; it only rejects a bare ``self``
+# self-dispatch (``self:sendMessage`` / ``self.sendMessage`` with no host hop),
+# which signals the AI dropped the receiver argument entirely. Method + kind +
+# gameplay arity ARE strict-matched (a collapsed/wrong-arity dispatch must not
+# satisfy a fact). The scan runs over the string/comment-blanked ``stripped``
+# source, so a ``sendMessage`` inside a ``--`` comment, a ``--[[ ]]`` block
+# comment, or a ``[[ ]]`` long string is already invisible and never counted.
 # ---------------------------------------------------------------------------
 
-# Match a host dispatch call's METHOD-NAME token: ``:sendMessage`` /
-# ``:broadcastMessage`` followed by ``(``. Whitespace-tolerant around the ``:``
-# and before ``(``. Captures the call name so kind is derived from it.
+# Match a host dispatch call's METHOD-NAME token: ``sendMessage`` /
+# ``broadcastMessage`` reached via either ``:`` (colon) or ``.`` (dotted)
+# followed by ``(``. Whitespace-tolerant around the separator and before ``(``.
+# Captures the call name so kind is derived from it.
+#
+# BOTH separators are accepted because slice 1.1's host wrapper
+# (``scene_runtime.luau``) deliberately serves ``host:sendMessage(recv, name,
+# ...)`` (colon) AND ``host.sendMessage(recv, name, ...)`` (dotted) via the
+# ``arg1 == host`` discriminator -- and every sibling generic-prompt directive
+# (``self.host.playersInRadius``, ``self.host.instantiatePrefab``,
+# ``self.host.destroy``) is DOTTED, so the AI very plausibly emits the dotted
+# form. Arity is identical for both forms: the positional args inside the parens
+# are ``(recv, name, ...gameplay)`` in EITHER case (in the colon form the
+# implicit ``self`` is ``host`` and ``recv`` is still an explicit positional
+# arg), so gameplay arity = total positional args - 2 regardless of separator.
 _RE_HOST_DISPATCH = re.compile(
-    r"(?P<recv>[\w.]*)\s*:\s*(?P<call>sendMessage|broadcastMessage)\s*\(",
+    r"(?P<recv>[\w.]*)\s*[:.]\s*(?P<call>sendMessage|broadcastMessage)\s*\(",
 )
 
 _HOST_DISPATCH_KIND: dict[str, str] = {
@@ -1411,22 +1429,32 @@ def _check_send_message_dispatch(
     stripped: str,
     source: str,
 ) -> list[Violation]:
-    """Rule ``sm``: every dispatch fact must be covered by a matching emitted
-    ``host:sendMessage`` / ``broadcastMessage`` call.
+    """Rule ``sm``: every DISTINCT dispatch-fact key must be covered by at least
+    one matching emitted ``host:sendMessage`` / ``broadcastMessage`` call.
 
     ``facts`` is the module's slice-1.2 fact tuple; ``stripped`` is the
     string/comment-blanked source (used to LOCATE call tokens without matching
     inside a comment/string); ``source`` is the ORIGINAL (used to read the method
-    string literal + count line numbers). The emitted multiset is keyed
-    ``(kind, method, gameplay_arity)`` and must cover the required multiset.
-    """
-    required: Counter[tuple[str, str, int]] = Counter(
-        (f.kind, f.method, len(f.gameplay_args)) for f in facts
-    )
+    string literal + count line numbers).
 
-    emitted: Counter[tuple[str, str, int]] = Counter()
-    # A bare self-dispatch (``self:sendMessage(...)`` with no host hop) is a
-    # dropped-receiver signal -- track separately so we can phrase the message.
+    PRESENCE, not multiset count: for each DISTINCT
+    ``(kind, method, gameplay_arity)`` key in the facts, require >=1 matching
+    emitted call. A strict count (>=N emitted for N facts of the same key) would
+    fail-close on a legitimate emission where one call covers what the producer
+    counted as 2 facts (e.g. a loop that dispatches once per element). For a
+    fail-closed gate presence is safe and sufficient: it still catches the actual
+    bug (a dispatch ENTIRELY dropped -- the key's emitted count goes 1->0, the
+    rifle bug) while eliminating the count-mismatch false positive.
+    """
+    required: set[tuple[str, str, int]] = {
+        (f.kind, f.method, len(f.gameplay_args)) for f in facts
+    }
+
+    emitted: set[tuple[str, str, int]] = set()
+    # A bare self-dispatch (``self:sendMessage(...)`` / ``self.sendMessage(...)``
+    # with no host hop) is a dropped-receiver signal -- track separately so we can
+    # phrase the message. The ``recv == "self"`` guard below catches BOTH
+    # separators: ``[\w.]*`` backtracks to ``self`` before the ``:``/``.``.
     bare_self_seen = False
     for m in _RE_HOST_DISPATCH.finditer(stripped):
         # Locate the same call in the ORIGINAL source (the stripper preserves
@@ -1450,14 +1478,13 @@ def _check_send_message_dispatch(
         if method is None:
             continue  # dynamic method name -> cannot key it to a fact
         gameplay_arity = len(args) - 2  # drop receiver + method-name args
-        emitted[(kind, method, gameplay_arity)] += 1
+        emitted.add((kind, method, gameplay_arity))
 
     out: list[Violation] = []
     line = source.count("\n") + 1  # whole-module obligation -> last line
-    for key, need in required.items():
+    for key in required:
         kind, method, arity = key
-        have = emitted.get(key, 0)
-        if have >= need:
+        if key in emitted:
             continue
         call = "broadcastMessage" if kind == BROADCAST else "sendMessage"
         cs_call = "BroadcastMessage" if kind == BROADCAST else "SendMessage"
@@ -1472,10 +1499,10 @@ def _check_send_message_dispatch(
             line=line,
             message=(
                 f"Unity dispatch of ``{method}`` (gameplay arity {arity}) is not "
-                f"emitted: the C# source dispatches it {need}x but the Luau has "
-                f"only {have} matching ``self.host:{call}(recv, \"{method}\", "
-                f"<{arity} args>)`` call(s){hint}. Emit "
-                f"``self.host:{call}(recv, \"{method}\", ...)`` for each Unity "
+                f"emitted: the C# source dispatches it but the Luau has no "
+                f"matching ``self.host:{call}(recv, \"{method}\", "
+                f"<{arity} args>)`` call{hint}. Emit "
+                f"``self.host:{call}(recv, \"{method}\", ...)`` for the Unity "
                 f"``recv.{cs_call}(\"{method}\", ...)``; never collapse it to a "
                 f"flag-only :SetAttribute write."
             ),
