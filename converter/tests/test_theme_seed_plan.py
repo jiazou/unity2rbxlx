@@ -767,3 +767,126 @@ class TestBuildThemeSeedPlanIntegration:
         pipe._build_theme_seed_plan(sr)
         seed = sr["addressable_db_seeds"][0]
         assert seed["key_field"] is None
+
+
+# ---------------------------------------------------------------------------
+# Pipeline orchestration: _lower_so_db_consumers (drive REAL wiring end-to-end)
+# ---------------------------------------------------------------------------
+# These drive the production write_output method on a real Pipeline against the
+# tmp Unity project — exercising the input derivation it owns (parse_addressables
+# -> resolve_scriptable_object_addressables; the per-module .cs re-read +
+# _derive_cs_load_ownership -> load_method_by_path; the read-only roster
+# re-derivation -> roster_claimed_paths) AND the fail-closed re-raise — NOT just
+# the pure module functions in test_so_db_consumer_lowering.py.
+
+# The REAL closure-private keyed-dict transpiled shape (a ``local <dict> = nil``
+# upvalue + a never-called ``addTheme`` closure; no ipairs/table.insert). This is
+# the shape the SO-DB lowering supersedes — distinct from the list-store
+# THEME_DB_LUAU above that the seed path drains.
+_KEYED_DICT_LUAU = """\
+local ThemeDatabase = {}
+local themeDataList = nil
+local m_Loaded = false
+function ThemeDatabase.dictionnary()
+	return themeDataList
+end
+function ThemeDatabase.loaded()
+	return m_Loaded
+end
+function ThemeDatabase.GetThemeData(type)
+	if themeDataList == nil then return nil end
+	return themeDataList[type]
+end
+function ThemeDatabase.LoadDatabase()
+	-- If not nil the dictionary was already loaded.
+	if themeDataList == nil then
+		themeDataList = {}
+		local function addTheme(op)
+			if op ~= nil then
+				themeDataList[op.themeName] = op
+			end
+		end
+		local _ = addTheme
+		m_Loaded = true
+	end
+end
+return ThemeDatabase
+"""
+
+
+def _lower_pipeline(tmp_path: Path, *, cs: str = THEME_DB_CS_REAL_SHAPE,
+                    db_luau: str = _KEYED_DICT_LUAU,
+                    source_path: str | None = "ThemeDatabase.luau"):
+    """Build a real Pipeline whose ThemeDatabase RbxScript carries the keyed-dict
+    body + a ``source_path`` (production stamps this at pipeline.py:3334), then run
+    the production orchestration. Returns (pipe, scene_runtime, db_script)."""
+    root = _make_project(tmp_path, cs=cs)
+    pipe = _pipeline_with_state(root, tmp_path)
+    pipe.state.rbx_place.scripts = [
+        RbxScript(name="ThemeDatabase", source=db_luau,
+                  script_type="ModuleScript", parent_path="ReplicatedStorage",
+                  source_path=source_path),
+    ]
+    sr = _scene_runtime_with_so_map()
+    pipe._lower_so_db_consumers(sr)
+    return pipe, sr, pipe.state.rbx_place.scripts[0]
+
+
+class TestLowerSoDbConsumersOrchestration:
+    def test_orchestration_lowers_keyed_dict_db(self, tmp_path):
+        """The production method derives the SO surface + C# ownership + facts and
+        rewrites the placed RbxScript.source to the canonical keyed-dict body that
+        requires both SO modules and writes ``_so_db_dict[so['themeName']]``."""
+        _, _, db = _lower_pipeline(tmp_path)
+        assert "ReplicatedStorage.ThemeData_Day" in db.source
+        assert "ReplicatedStorage.ThemeData_Night" in db.source
+        assert "_so_db_dict[_key] = so" in db.source
+        assert "so['themeName']" in db.source or 'so["themeName"]' in db.source
+        # getters re-emitted under their LOCATED game-specific names
+        assert "function ThemeDatabase.GetThemeData(type)" in db.source
+        assert "return _so_db_dict[type]" in db.source
+
+    def test_orchestration_noop_without_source_path(self, tmp_path):
+        """The orchestration keys csharp_by_path by RbxScript.source_path (the same
+        key the locator uses). A placed script with no source_path is skipped — so
+        the test_orchestration_lowers_keyed_dict_db pass above is attributable to the
+        production source_path keying, NOT a green-for-wrong-reason. (Production sets
+        source_path at pipeline.py:3334; this guards that contract.)"""
+        _, _, db = _lower_pipeline(tmp_path, source_path=None)
+        assert "_so_db_dict" not in db.source
+        assert db.source == _KEYED_DICT_LUAU
+
+    def test_orchestration_idempotent(self, tmp_path):
+        """Re-running the orchestration on its own lowered output is byte-identical
+        (edge 8) — the region walk-back absorbs the pass-owned state decls."""
+        pipe, sr, db = _lower_pipeline(tmp_path)
+        first = db.source
+        pipe._lower_so_db_consumers(sr)
+        assert db.source == first
+
+    def test_orchestration_fail_closed_on_unlocatable_body(self, tmp_path):
+        """A module whose C# is a located SO-DB consumer but whose transpiled body
+        lacks the C#-derived load method (AI emitted an unrecognizable shape) must
+        re-raise SoDbUnresolved through the orchestration (never a silent empty DB)."""
+        from converter.so_db_consumer_lowering import SoDbUnresolved
+        broken = _KEYED_DICT_LUAU.replace(
+            "function ThemeDatabase.LoadDatabase()",
+            "function ThemeDatabase.SomethingElse()",
+        )
+        with pytest.raises(SoDbUnresolved):
+            _lower_pipeline(tmp_path, db_luau=broken)
+
+    def test_orchestration_noop_on_non_db_module(self, tmp_path):
+        """A module whose C# issues no LoadAssetsAsync<T>(literal) yields no fact;
+        the orchestration leaves its source untouched."""
+        cs = "public class Foo { void Bar() {} }"
+        plain = "local Foo = {}\nreturn Foo\n"
+        root = _make_project(tmp_path, cs=cs)
+        pipe = _pipeline_with_state(root, tmp_path)
+        pipe.state.rbx_place.scripts = [
+            RbxScript(name="Foo", source=plain, script_type="ModuleScript",
+                      parent_path="ReplicatedStorage", source_path="Foo.luau"),
+        ]
+        sr = _scene_runtime_with_so_map()
+        pipe._lower_so_db_consumers(sr)
+        assert pipe.state.rbx_place.scripts[0].source == plain
