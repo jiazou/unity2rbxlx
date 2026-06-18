@@ -232,14 +232,24 @@ def _getter_body_is_side_effect_free(
     body: str, class_name: str, backing_field: str,
 ) -> bool:
     """True when the static-instance getter body contains ONLY the allowed
-    lazy-create statements (§1.1a) AND carries the lazy ``if (<field> == null)``
-    null-guard a lazy singleton always has: the guard, a ``new GameObject(...)``
-    local/assign, an ``AddComponent<class>()`` cache assignment to the backing
-    field (or to a local later cached into it), a benign ``DontDestroyOnLoad(...)``,
-    and ``return <field>``. ANY other statement — including a backing-field
-    assignment whose RHS WRAPS the ``AddComponent`` in another call
-    (``= Register(o.AddComponent<Foo>())``) — → False (ABSTAIN). ``body`` includes
-    the surrounding braces; it is de-commented. Bias to abstain.
+    lazy-create statements (§1.1a) AND carries the lazy null-guard a lazy singleton
+    always has: the guard, a ``new GameObject(...)`` local/assign, an
+    ``AddComponent<class>()`` cache assignment to the backing field (or to a local
+    that was itself bound to that ``AddComponent`` call), a benign
+    ``DontDestroyOnLoad(...)``, and ``return <field>``. ANY other statement —
+    including a backing-field assignment whose RHS WRAPS the ``AddComponent`` in
+    another call (``= Register(o.AddComponent<Foo>())``), or whose RHS is a bare
+    identifier/property NOT bound to the tracked ``AddComponent`` local
+    (``Foo tmp = Instance; <field> = tmp;`` — a property access with side
+    effects) — → False (ABSTAIN). ``body`` includes the surrounding braces; it is
+    de-commented. Bias to abstain.
+
+    Null-guard shapes accepted: ``if (<field> == null)`` and the yoda
+    ``if (null == <field>)``. Other lawful guards (``??=``, ``ReferenceEquals``,
+    an early-return ``if (<field> != null) return <field>``) intentionally ABSTAIN
+    — false-abstain is SAFE (the field stays nil, the pre-Phase-2 behaviour), and
+    chasing them is unwarranted complexity. ``GameObject`` may be qualified
+    (``UnityEngine.GameObject`` / a namespaced type), handled in ``_stmt_is_allowed``.
     """
     inner = body.strip()
     if inner.startswith("{") and inner.endswith("}"):
@@ -251,19 +261,25 @@ def _getter_body_is_side_effect_free(
         get_span = _matching_brace_span(inner, get_m.end())
         if get_span is not None:
             inner = inner[get_span[0] + 1 : get_span[1]]
-    # A lazy singleton ALWAYS guards on ``if (<field> == null)`` before creating;
-    # require that shape (in the de-commented body, before flattening).
+    # A lazy singleton ALWAYS guards before creating; require the canonical
+    # ``if (<field> == null)`` or its yoda ``if (null == <field>)`` form.
     fld = re.escape(backing_field)
     cls = re.escape(class_name)
-    if not re.search(rf"\bif\s*\(\s*{fld}\s*==\s*null\s*\)", inner):
+    if not re.search(
+        rf"\bif\s*\(\s*(?:{fld}\s*==\s*null|null\s*==\s*{fld})\s*\)", inner
+    ):
         return False
-    # Remove the ``if (<field> == null) { ... }`` guard braces but KEEP its body
-    # statements (they are the real work we vet). We do this by stripping ``if``
-    # and matching parens/braces structurally, then flattening.
+    # Remove the ``if (...) { ... }`` guard braces but KEEP its body statements
+    # (they are the real work we vet). We do this by stripping ``if`` and matching
+    # parens/braces structurally, then flattening.
     flattened = _flatten_control_braces(inner)
     statements = [s.strip() for s in flattened.split(";") if s.strip()]
+    # Track the locals bound to the ``AddComponent<Self>()`` result, so the
+    # cache-through ``<field> = <local>`` is allowed ONLY for that exact local and
+    # not for an arbitrary identifier (which could be a side-effecting property).
+    addcomponent_locals: set[str] = set()
     for stmt in statements:
-        if _stmt_is_allowed(stmt, fld, cls):
+        if _stmt_is_allowed(stmt, fld, cls, addcomponent_locals):
             continue
         return False
     return True
@@ -283,6 +299,10 @@ def _flatten_control_braces(src: str) -> str:
 
 # A bare C# identifier (a local var name, e.g. the ``o`` in ``GameObject o``).
 _IDENT = r"[A-Za-z_]\w*"
+# An optionally namespace-qualified type name (``GameObject`` /
+# ``UnityEngine.GameObject``). The receiver in an ``AddComponent`` RHS reuses the
+# bare ``_IDENT`` (a local var, not a dotted type).
+_QUALIFIED = rf"(?:{_IDENT}\s*\.\s*)*{_IDENT}"
 # An ``AddComponent<cls>(...)`` call, optionally with a single receiver prefix
 # (``o.AddComponent<cls>()`` / ``AddComponent<cls>()``). The receiver is a bare
 # identifier — NOT another call — so a WRAPPED form (``Register(o.AddComponent…)``)
@@ -290,16 +310,27 @@ _IDENT = r"[A-Za-z_]\w*"
 _RE_ADDCOMPONENT_RHS = (
     rf"(?:{_IDENT}\s*\.\s*)?AddComponent\s*<\s*{{cls}}\s*>\s*\(\s*\)"
 )
-# A ``new GameObject(...)`` constructor RHS (the lazy host object).
-_RE_NEW_GAMEOBJECT_RHS = r"new\s+GameObject\s*\([^;]*\)"
+# A ``new GameObject(...)`` constructor RHS (the lazy host object). ``GameObject``
+# may be namespace-qualified (``new UnityEngine.GameObject(...)``).
+_RE_NEW_GAMEOBJECT_RHS = rf"new\s+(?:{_IDENT}\s*\.\s*)*GameObject\s*\([^;]*\)"
 
 
-def _stmt_is_allowed(stmt: str, fld: str, cls: str) -> bool:
+def _stmt_is_allowed(
+    stmt: str, fld: str, cls: str, addcomponent_locals: set[str],
+) -> bool:
     """True when a single getter statement matches one of the allowed lazy-create
     forms EXACTLY (structural, not substring). ``fld``/``cls`` are
-    ``re.escape``-d field/class names. ABSTAINS (returns False) on anything else —
-    notably a backing-field assignment whose RHS WRAPS the ``AddComponent`` in
-    another call (``= Register(o.AddComponent<Foo>())``), which is a side effect.
+    ``re.escape``-d field/class names; ``addcomponent_locals`` is the (mutated in
+    place) set of local names already bound to the ``AddComponent<cls>()`` result —
+    a ``<field> = <local>`` cache-through is allowed ONLY for one of those locals.
+
+    ABSTAINS (returns False) on anything else — notably a backing-field assignment
+    whose RHS WRAPS the ``AddComponent`` in another call
+    (``= Register(o.AddComponent<Foo>())``), and a cache whose RHS is a bare
+    identifier/property NOT bound to the tracked ``AddComponent`` local
+    (``Foo tmp = Instance; <field> = tmp;`` — a property access with side
+    effects). A local declaration whose RHS is a bare identifier/property is itself
+    not an allowed statement → ABSTAIN.
     """
     s = stmt.strip()
     if s == "":
@@ -308,30 +339,48 @@ def _stmt_is_allowed(stmt: str, fld: str, cls: str) -> bool:
     # ``return <field>`` (with or without ``return`` keyword after flatten).
     if re.fullmatch(rf"(?:return\s+)?{fld}", s):
         return True
-    # ``GameObject <local> = new GameObject(...)`` or a bare ``new GameObject(...)``.
+    # ``[<Type>] <local> = new GameObject(...)`` or a bare ``new GameObject(...)``.
     if re.fullmatch(
-        rf"(?:{_IDENT}\s+{_IDENT}\s*=\s*)?{_RE_NEW_GAMEOBJECT_RHS}", s
+        rf"(?:{_QUALIFIED}\s+{_IDENT}\s*=\s*)?{_RE_NEW_GAMEOBJECT_RHS}", s
     ):
         return True
     # ``DontDestroyOnLoad(...)`` — BENIGN (§1.1b).
     if re.fullmatch(r"DontDestroyOnLoad\s*\([^;]*\)", s):
         return True
-    # The cache assignment ``<lvalue> = <rhs>`` where the lvalue is the backing
-    # field or a local, and the RHS is one of the allowed construction expressions
-    # EXACTLY (the AddComponent call, a new GameObject, or a bare local that held
-    # one) — NOT a wrapped call. We match the lvalue + RHS as a whole so a wrapped
-    # RHS (``= Register(o.AddComponent<…>())``) fails (its outermost call differs).
-    m = re.fullmatch(rf"(?:{_IDENT}\s+)?({_IDENT}(?:\s*\.\s*{_IDENT})*)\s*=\s*(.+)", s)
+    # An assignment ``[<Type>] <lvalue> = <rhs>``. The lvalue is the backing field
+    # or a local; the RHS must be one of the allowed construction expressions
+    # EXACTLY — NOT a wrapped/extra call, NOT an arbitrary identifier/property. We
+    # match the lvalue + RHS as a whole so a wrapped RHS
+    # (``= Register(o.AddComponent<…>())``) fails (its outermost call differs).
+    m = re.fullmatch(
+        rf"(?:{_QUALIFIED}\s+)?({_IDENT})((?:\s*\.\s*{_IDENT})*)\s*=\s*(.+)", s
+    )
     if m is not None:
-        rhs = m.group(2).strip()
+        lvalue_head = m.group(1)
+        rhs = m.group(3).strip()
+        is_decl = re.match(rf"{_QUALIFIED}\s+{_IDENT}\s*=", s) is not None
+        if re.fullmatch(add_rhs, rhs):
+            # The result of ``AddComponent<cls>()`` — track the local it binds to
+            # (a simple ``<local> = ...`` lvalue, no member chain) so a later
+            # ``<field> = <local>`` cache-through is recognised as benign.
+            if m.group(2) == "":
+                addcomponent_locals.add(lvalue_head)
+            return True
+        if re.fullmatch(_RE_NEW_GAMEOBJECT_RHS, rhs):
+            return True
+        # ``<field> = <local>`` cache-through — allowed ONLY when <local> was bound
+        # to the ``AddComponent`` result above. A bare identifier that is NOT a
+        # tracked AddComponent-local could be a side-effecting property access
+        # (``<field> = Instance;``) → ABSTAIN. A local DECLARATION whose RHS is a
+        # bare identifier (``Foo tmp = Instance;``) is likewise not allowed.
         if (
-            re.fullmatch(add_rhs, rhs)
-            or re.fullmatch(_RE_NEW_GAMEOBJECT_RHS, rhs)
-            or re.fullmatch(_IDENT, rhs)  # ``<field> = <local>`` cache-through.
+            not is_decl
+            and re.fullmatch(_IDENT, rhs)
+            and rhs in addcomponent_locals
         ):
             return True
     # Anything else (a wrapped/extra-call assignment, an ``.Init()`` call, naming,
-    # event subscription, parentage moves) → ABSTAIN.
+    # event subscription, parentage moves, a property-access local) → ABSTAIN.
     return False
 
 

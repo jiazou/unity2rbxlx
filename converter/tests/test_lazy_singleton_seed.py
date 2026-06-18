@@ -689,6 +689,217 @@ def test_fact3_assignment_not_matched_by_guard_comparison(tmp_path: Path) -> Non
 
 
 # --------------------------------------------------------------------------- #
+# Adversarial precision cases (review round 2 — false-accept fixes).
+# --------------------------------------------------------------------------- #
+
+def test_abstain_eager_new_static_self_field(tmp_path: Path) -> None:
+    """[R2-F1] A static self-typed field with an EAGER ``= new Foo()`` initializer
+    is NOT the lazy backing field (a class that eager-constructs its own instance
+    is not the lazy-getter pattern, and boot-constructing it double-runs). The
+    detector must not bind it as the lazy backing field → ABSTAIN."""
+    from unity.script_analyzer import (
+        _find_lazy_singleton_field,
+        _strip_comments_and_strings,
+    )
+    src = """\
+        using UnityEngine;
+        public class EagerNewSingleton : MonoBehaviour
+        {
+            private static EagerNewSingleton _instance = new EagerNewSingleton();
+            static public EagerNewSingleton Instance
+            {
+                get
+                {
+                    if(_instance == null)
+                    {
+                        GameObject o = new GameObject("Eager");
+                        _instance = o.AddComponent<EagerNewSingleton>();
+                    }
+                    return _instance;
+                }
+            }
+        }
+    """
+    dec = _strip_comments_and_strings(textwrap.dedent(src))
+    assert _find_lazy_singleton_field(dec, "EagerNewSingleton") == ""
+    seeds, _ = _resolve(
+        tmp_path,
+        {"EagerNewSingleton": (_g("eager"), src)},
+        {"EagerNewSingleton": dict(
+            stem="EagerNewSingleton", class_name="EagerNewSingleton",
+        )},
+    )
+    assert seeds == []
+
+
+def test_abstain_eager_factory_static_self_field(tmp_path: Path) -> None:
+    """[R2-F1] A static self-typed field with an EAGER factory-call initializer
+    (``= Build<Foo>()``) is not the lazy backing field → ABSTAIN."""
+    from unity.script_analyzer import (
+        _find_lazy_singleton_field,
+        _strip_comments_and_strings,
+    )
+    src = """\
+        using UnityEngine;
+        public class EagerFactorySingleton : MonoBehaviour
+        {
+            private static EagerFactorySingleton _instance = Build<EagerFactorySingleton>();
+            static public EagerFactorySingleton Instance
+            {
+                get
+                {
+                    if(_instance == null)
+                    {
+                        GameObject o = new GameObject("EagerFac");
+                        _instance = o.AddComponent<EagerFactorySingleton>();
+                    }
+                    return _instance;
+                }
+            }
+            static EagerFactorySingleton Build<T>() { return null; }
+        }
+    """
+    dec = _strip_comments_and_strings(textwrap.dedent(src))
+    assert _find_lazy_singleton_field(dec, "EagerFactorySingleton") == ""
+    seeds, _ = _resolve(
+        tmp_path,
+        {"EagerFactorySingleton": (_g("eagerfac"), src)},
+        {"EagerFactorySingleton": dict(
+            stem="EagerFactorySingleton", class_name="EagerFactorySingleton",
+        )},
+    )
+    assert seeds == []
+
+
+def test_detect_default_initialized_static_self_field(tmp_path: Path) -> None:
+    """[R2-F1] The benign ``= default`` / ``= default(T)`` initializer on a static
+    self-typed backing field is still recognised (like ``= null``) — these are not
+    eager construction."""
+    from unity.script_analyzer import (
+        _find_lazy_singleton_field,
+        _strip_comments_and_strings,
+    )
+    for init in ("= default", "= default(DefaultSingleton)"):
+        src = """\
+            using UnityEngine;
+            public class DefaultSingleton : MonoBehaviour
+            {{
+                private static DefaultSingleton _instance {init};
+                static public DefaultSingleton Instance
+                {{
+                    get
+                    {{
+                        if(_instance == null)
+                        {{
+                            GameObject o = new GameObject("Default");
+                            _instance = o.AddComponent<DefaultSingleton>();
+                        }}
+                        return _instance;
+                    }}
+                }}
+            }}
+        """.format(init=init)
+        dec = _strip_comments_and_strings(textwrap.dedent(src))
+        assert _find_lazy_singleton_field(dec, "DefaultSingleton") == "_instance"
+
+
+def test_abstain_cache_rhs_property_access(tmp_path: Path) -> None:
+    """[R2-F2] The field-cache RHS must be the tracked ``AddComponent<Self>()``
+    local — a bare identifier can be a C# property access with side effects
+    (``Foo tmp = Instance; _instance = tmp;``). The getter that reads the
+    ``Instance`` property into a local and caches THAT must ABSTAIN."""
+    src = """\
+        using UnityEngine;
+        public class PropCacheSingleton : MonoBehaviour
+        {
+            static private PropCacheSingleton _instance;
+            static public PropCacheSingleton Instance
+            {
+                get
+                {
+                    if(_instance == null)
+                    {
+                        GameObject o = new GameObject("PropCache");
+                        PropCacheSingleton tmp = Instance;
+                        _instance = tmp;
+                    }
+                    return _instance;
+                }
+            }
+        }
+    """
+    assert not passes_boot_safety_gate(src, "PropCacheSingleton", "_instance")
+    seeds, _ = _resolve(
+        tmp_path,
+        {"PropCacheSingleton": (_g("propcache"), src)},
+        {"PropCacheSingleton": dict(
+            stem="PropCacheSingleton", class_name="PropCacheSingleton",
+        )},
+    )
+    assert seeds == []
+
+
+def test_qualify_cache_through_tracked_addcomponent_local(tmp_path: Path) -> None:
+    """[R2-F2] The lawful cache-through — bind a local to ``AddComponent<Self>()``
+    then assign the backing field FROM that local — still qualifies (the local is
+    tracked)."""
+    src = """\
+        using UnityEngine;
+        public class CacheThroughSingleton : MonoBehaviour
+        {
+            static private CacheThroughSingleton _instance;
+            static public CacheThroughSingleton Instance
+            {
+                get
+                {
+                    if(_instance == null)
+                    {
+                        GameObject o = new GameObject("CacheThrough");
+                        CacheThroughSingleton c = o.AddComponent<CacheThroughSingleton>();
+                        _instance = c;
+                    }
+                    return _instance;
+                }
+            }
+        }
+    """
+    assert passes_boot_safety_gate(src, "CacheThroughSingleton", "_instance")
+    seeds, _ = _resolve(
+        tmp_path,
+        {"CacheThroughSingleton": (_g("cachethrough"), src)},
+        {"CacheThroughSingleton": dict(
+            stem="CacheThroughSingleton", class_name="CacheThroughSingleton",
+        )},
+    )
+    assert len(seeds) == 1
+
+
+def test_qualify_yoda_guard_and_qualified_gameobject(tmp_path: Path) -> None:
+    """[R2-F3] Relaxed common lawful variants: the yoda null-guard
+    (``if (null == <field>)``) and a namespace-qualified ``UnityEngine.GameObject``
+    type still qualify."""
+    src = """\
+        public class YodaSingleton : MonoBehaviour
+        {
+            static private YodaSingleton _instance;
+            static public YodaSingleton Instance
+            {
+                get
+                {
+                    if(null == _instance)
+                    {
+                        UnityEngine.GameObject o = new UnityEngine.GameObject("Yoda");
+                        _instance = o.AddComponent<YodaSingleton>();
+                    }
+                    return _instance;
+                }
+            }
+        }
+    """
+    assert passes_boot_safety_gate(src, "YodaSingleton", "_instance")
+
+
+# --------------------------------------------------------------------------- #
 # Determinism + dedup.
 # --------------------------------------------------------------------------- #
 

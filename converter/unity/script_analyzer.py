@@ -106,16 +106,20 @@ _RE_DECLARATOR = re.compile(r"\b\w+\b")
 # in C# (``static protected`` / ``protected static``), so ``static`` is anchored
 # anywhere in the modifier list and the type/name pair follows. Group ``type`` is
 # the declared type, ``name`` the field name.
+#
+# The OPTIONAL initializer accepts ONLY a BENIGN value — ``= null`` /
+# ``= default`` / ``= default(<Type>)`` — so the common lazy declaration
+# ``private static Foo _instance = null;`` is still recognised as the backing
+# field, but a field that EAGER-constructs itself (``= new Foo()`` /
+# ``= Build<Foo>()``) does NOT match: that is not the lazy-getter pattern Phase 2
+# targets, and boot-constructing it would double-run. A non-benign initializer
+# makes ``\s*;`` unreachable (the ``=`` is not consumed) → no match → ABSTAIN.
 _RE_STATIC_SELF_FIELD = re.compile(
     r"\bstatic\b"
     r"(?:\s+(?:public|private|protected|internal|readonly|new))*"
     r"\s+(?P<type>[A-Za-z_]\w*)"
     r"\s+(?P<name>[A-Za-z_]\w*)"
-    r"\s*(?:=\s*[^;]+?)?"   # OPTIONAL initializer (``= null`` / ``= default`` /
-                            # ``= default(T)``) — the common lazy declaration
-                            # ``private static Foo _instance = null;`` is still a
-                            # static self-typed backing field; the getter, not the
-                            # declaration, decides lazy-singleton-ness.
+    r"\s*(?:=\s*(?:null|default(?:\s*\(\s*[\w.<>\[\]?,\s]+\s*\))?))?"
     r"\s*;",
 )
 # A static ``instance``/``Instance`` property getter declaration head. The getter
