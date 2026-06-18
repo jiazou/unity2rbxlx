@@ -761,6 +761,77 @@ class TestPlayerAliasDispatch:
         assert "Player.GetItem(Rifle)" in lines, out
         assert lines.count("Player.GetItem(Rifle)") == 1, out
 
+    def test_character_model_alias_routes_to_embodiment(self):
+        # AC-1b (the live rifle-mount bug). Pickup passes ``plr.Character`` --
+        # the character Model ITSELF -- as the sendMessage receiver. The Model
+        # is Humanoid-bearing and resolves via players:GetPlayerFromCharacter,
+        # so _playerFromAlias's INCLUSIVE ancestor walk (start at recv itself)
+        # matches it as the FIRST node and routes GetItem to the embodiment.
+        # FAILS against the pre-fix _isPlayerAlias (playerFromTouch(recv), which
+        # starts at recv.Parent and structurally misses the Model itself).
+        scenario = _PLAYER_SCENE_SETUP + textwrap.dedent("""\
+            host:sendMessage(charModel, "GetItem", "Rifle")
+            print("GOIDS=" .. #engine:_playerGoIds())
+            for _, c in ipairs(calls) do print(c) end
+            print("DONE")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        lines = out.strip().splitlines()
+        assert "Player.GetItem(Rifle)" in lines, out
+        assert "GOIDS=1" in lines, out
+        assert lines.count("Player.GetItem(Rifle)") == 1, out
+        assert "Door.GetItem(Rifle)" not in lines, out
+
+    def test_npc_humanoid_model_not_player_alias(self):
+        # Over-match boundary. A Model that HAS a Humanoid but for which
+        # players:GetPlayerFromCharacter returns nil (an NPC) is NOT a player
+        # alias -> _playerFromAlias returns nil -> the receiver takes the
+        # UNCHANGED non-player _resolveReceiverGoId path. Here the NPC Model has
+        # no scene-runtime id and no registered component, so it resolves to no
+        # GameObject (warn + no dispatch) -- it must NOT route to the player
+        # embodiment.
+        scenario = _PLAYER_SCENE_SETUP + textwrap.dedent("""\
+            -- An NPC: Humanoid-bearing Model that GetPlayerFromCharacter does
+            -- NOT resolve to a Player (players:GetPlayerFromCharacter returns
+            -- nil for any model != charModel).
+            local npc = {Name = "NpcChar"}
+            function npc:IsA(class) return class == "Model" end
+            function npc:FindFirstChildWhichIsA(class)
+                if class == "Humanoid" then return {Name = "Humanoid"} end
+                return nil
+            end
+            print("ALIAS=" .. tostring(engine:_isPlayerAlias(npc)))
+            host:sendMessage(npc, "GetItem", "Rifle")
+            for _, c in ipairs(calls) do print(c) end
+            print("DONE")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        lines = out.strip().splitlines()
+        # The NPC is NOT a player alias (the inclusive walk must not over-match).
+        assert "ALIAS=false" in lines, out
+        # And it must NOT route to the player embodiment.
+        assert "Player.GetItem(Rifle)" not in lines, out
+
+    def test_humanoid_handle_routes_to_embodiment(self):
+        # Handle variant: a Humanoid instance whose .Parent is the character
+        # Model. The inclusive walk climbs Humanoid -> charModel (Humanoid-
+        # bearing Model) -> GetPlayerFromCharacter -> the embodiment. Confirms
+        # the resolver covers the Humanoid/HRP-handle shape (the limb test,
+        # AC-2, covers a plain descendant BasePart).
+        scenario = _PLAYER_SCENE_SETUP + textwrap.dedent("""\
+            local hum = {Name = "Humanoid", Parent = charModel}
+            host:sendMessage(hum, "GetItem", "Rifle")
+            for _, c in ipairs(calls) do print(c) end
+            print("DONE")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        lines = out.strip().splitlines()
+        assert "Player.GetItem(Rifle)" in lines, out
+        assert lines.count("Player.GetItem(Rifle)") == 1, out
+
     def test_non_player_receiver_takes_unchanged_path(self):
         # AC-3. A non-player component-table receiver (the door) is NOT a
         # player alias (no IsA; playerFromTouch -> nil) -> falls through to the

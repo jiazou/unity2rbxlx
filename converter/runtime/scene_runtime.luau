@@ -1638,26 +1638,56 @@ function SceneRuntime:_dispatchToGameObject(goId, name, ...)
 	end
 end
 
--- ``_isPlayerAlias(recv) -> boolean`` -- TRUE iff ``recv`` is a player alias:
--- a ``Players``-service ``Player`` object, OR a character/limb ``BasePart``
--- that ``playerFromTouch`` resolves to a Player. The converter decouples the
--- player into TWO entities -- the Roblox character (what the touch handler /
--- ``Players`` service points at, carrying no Unity component) and the Unity
--- Player logic GameObject (``Workspace.DynamicObjects.Player``, carrying
--- ``GetItem``/``GetRifle``) -- so a player-alias receiver must route to the
--- LATTER, not to whatever the alias literally points at. The ``IsA("Player")``
--- guard is EXPLICIT (an inferred/duck-typed check would not match a real
--- ``Players``-service object); ``pcall``-wrapped because ``recv`` may be a plain
--- component table without ``IsA``.
-function SceneRuntime:_isPlayerAlias(recv)
-	if recv == nil then return false end
-	-- (a) Players-service Player object: explicit IsA guard, pcall-wrapped.
+-- ``_playerFromAlias(recv) -> Player?`` -- resolve ANY handle that denotes the
+-- local player's embodiment to its ``Players``-service ``Player``:
+--   * a ``Player`` object (explicit ``IsA("Player")`` guard, pcall-wrapped
+--     because ``recv`` may be a plain component table without ``IsA``);
+--   * the character ``Model`` ITSELF (``plr.Character`` -- what Pickup passes),
+--     a limb/``BasePart`` under it, its ``HumanoidRootPart``, or its
+--     ``Humanoid`` -- via an INCLUSIVE ancestor walk (start at ``recv`` itself,
+--     not ``recv.Parent``) for the first Humanoid-bearing ``Model``, then
+--     ``GetPlayerFromCharacter``.
+-- Inclusive so the character Model matches as the FIRST node -- the touch-only
+-- ``playerFromTouch`` starts at ``recv.Parent`` (correct for a touch part, but
+-- structurally misses the Model itself, the live rifle-mount bug). Returns nil
+-- for non-player receivers (no Humanoid-bearing Model ancestor) AND for NPCs (a
+-- Humanoid Model that ``GetPlayerFromCharacter`` does not resolve to a Player),
+-- so both correctly fall through to the non-player ``_resolveReceiverGoId`` path.
+function SceneRuntime:_playerFromAlias(recv)
+	if recv == nil then return nil end
+	local players = self._services.players
+	if players == nil then return nil end
+	-- (a) Players-service Player object.
 	if type(recv.IsA) == "function" then
 		local ok, isPlayer = pcall(function() return recv:IsA("Player") end)
-		if ok and isPlayer then return true end
+		if ok and isPlayer then return recv end
 	end
-	-- (b) character/limb BasePart -> owning Player via the existing walk.
-	return self:playerFromTouch(recv) ~= nil
+	-- (b) any embodiment handle -> owning Player via an INCLUSIVE ancestor walk
+	-- (``recv`` itself + ancestors) for a Humanoid-bearing character Model.
+	local node = recv
+	local guard = 0
+	while node ~= nil and guard < 16 do
+		guard += 1
+		if type(node.IsA) == "function" and node:IsA("Model")
+			and type(node.FindFirstChildWhichIsA) == "function"
+			and node:FindFirstChildWhichIsA("Humanoid")
+		then
+			return players:GetPlayerFromCharacter(node)
+		end
+		node = node.Parent
+	end
+	return nil
+end
+
+-- ``_isPlayerAlias(recv) -> boolean`` -- TRUE iff ``recv`` denotes the local
+-- player's embodiment (any handle ``_playerFromAlias`` resolves). The converter
+-- decouples the player into the Roblox character (what the receiver points at,
+-- carrying no Unity component) and the Unity Player logic GameObject
+-- (``Workspace.DynamicObjects.Player``, carrying ``GetItem``/``GetRifle``) -- so
+-- a player-alias receiver must route to the LATTER, not whatever the alias
+-- literally points at.
+function SceneRuntime:_isPlayerAlias(recv)
+	return self:_playerFromAlias(recv) ~= nil
 end
 
 -- ``_playerGoIds() -> {gameObjectId}`` -- the LIST of DISTINCT internal
