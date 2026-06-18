@@ -289,9 +289,16 @@ function SceneRuntime.seedConsumableDatabases(plan, services)
 						-- ``ctor_config`` / ``post_fields`` are REAL Luau tables in
 						-- the plan (no loadstring). Pass scalars THROUGH ``.new``;
 						-- assign ONLY the asset-ref ``post_fields`` afterwards.
+						-- Guard ``.new`` in pcall (mirror ``instantiateComponent``): a
+						-- throwing transpiled constructor must DROP only that element +
+						-- warn, never crash the whole boot shim (and every later DB
+						-- seed) — same fail-closed contract as the non-table cases.
 						local ctorConfig = element.ctor_config or {}
-						local c = Cls.new(ctorConfig)
-						if type(c) ~= "table" then
+						local ok, c = pcall(Cls.new, ctorConfig)
+						if not ok then
+							warn("[consumable-seed] " .. tostring(element.class_stem)
+								.. ".new threw: " .. tostring(c) .. "; dropping element")
+						elseif type(c) ~= "table" then
 							warn("[consumable-seed] " .. tostring(element.class_stem)
 								.. ".new did not return an instance; dropping element")
 						else

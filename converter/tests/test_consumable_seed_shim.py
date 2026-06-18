@@ -335,6 +335,32 @@ dumpLogs()
 
 
 @_luau_marker
+def test_new_that_throws_drops_only_that_element_not_whole_shim():
+    """A subclass whose ``.new`` THROWS drops only THAT element + warns — the boot
+    shim must not crash (which would lose every later DB seed and the boot). Mirrors
+    the engine's ``instantiateComponent`` pcall-on-throw fail-closed contract."""
+    scenario = _TWO_ELEMENT_PLAN.replace(
+        'local ExtraLife = makeSubclass("EXTRALIFE", 2000)',
+        'local ExtraLife = { new = function(_) error("ctor boom") end }  -- .new throws',
+    ) + """
+SceneRuntime.seedConsumableDatabases(plan, servicesFor(modules))
+print("LEN=" .. tostring(#db.consumbales))
+print("ONLY_CM=" .. tostring(db.consumbales[1]:GetConsumableType()))
+db.Load()   -- must not crash; the throwing element never reached the array
+print("SEEDED=" .. tostring(db._consumablesSeeded))
+dumpLogs()
+"""
+    out = _run(scenario)
+    assert "LEN=1" in out                       # throwing element dropped
+    assert "ONLY_CM=COIN_MAG" in out
+    assert "SEEDED=true" in out                 # shim completed, did not crash
+    assert any(
+        line.startswith("WARN_LINE=[consumable-seed] ExtraLife.new threw")
+        for line in out.splitlines()
+    ), out
+
+
+@_luau_marker
 def test_no_new_method_drops_element():
     """A resolved subclass module that lacks ``.new`` (not constructable) is
     dropped + warned (the ``Cls.new`` function-type guard)."""
@@ -584,3 +610,96 @@ print("CM_GO=" .. tostring(cm and cm.gameObject))
     assert "CM_SPAWN_VAL=false" in out
     assert "CM_ICON=rbxassetid://111" in out   # asset-ref post-injected
     assert "CM_GO=g1:Assets/CoinMagnet.prefab" in out
+
+
+@_luau_marker
+def test_full_materialization_round_trip_from_real_fixtures():
+    """FULL path, no hand-built seed: a realistic Unity project (CoinMagnet +
+    ExtraLife in-prefab components, drained-as-objects DB) → ``resolve_db_seed``
+    builds the seed → the REAL plan encoder renders it → the REAL shim materializes
+    it → the DB's once-only ``Load()`` builds ``_consumablesDict`` →
+    ``GetConsumableType()``/``GetPrice()`` answer for BOTH elements AND ExtraLife's
+    serialized ``canBeSpawned: 0`` arrives as a real Lua BOOLEAN ``false`` (NOT
+    numeric 0, which is truthy in Luau).
+
+    The existing round-trip test hand-builds the ``scene_runtime`` dict and uses a
+    single element; this one joins ALL THREE legs (resolver → encoder → shim) so
+    the ExtraLife bool coercion is proven to flow from a real prefab field through
+    the whole chain, and GetPrice round-trips for two distinct subclasses."""
+    from converter.autogen import generate_scene_runtime_plan_module
+    from converter.consumable_db_seed import build_base_by_class, resolve_db_seed
+    from unity.guid_resolver import build_guid_index
+
+    from tests.test_consumable_db_seed import (
+        _DB_CS_DRAINS_OBJECTS,
+        _asset_body,
+        _build_trash_dash_like,
+        _module_path_for_stem,
+    )
+
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        root = _build_trash_dash_like(tmp)
+        guid_index = build_guid_index(root)
+        base_by_class = build_base_by_class(guid_index)
+        body = _asset_body(root, "Prefabs/Consumables.asset")
+        seed = resolve_db_seed(
+            db_module_path="ServerStorage.ConsumableDatabase",
+            db_cs_source=_DB_CS_DRAINS_OBJECTS,
+            asset_body=body,
+            guid_index=guid_index,
+            base_by_class=base_by_class,
+            module_path_for_stem=_module_path_for_stem,
+        )
+        assert seed is not None
+        assert [e["class_stem"] for e in seed["elements"]] == ["CoinMagnet", "ExtraLife"]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # Render the resolver's seed through the REAL encoder (no hand-built dict).
+    plan_source = generate_scene_runtime_plan_module(
+        {"consumable_db_seeds": [seed]},
+    ).source
+
+    delim = "===="
+    while f"]{delim}]" in plan_source or f"[{delim}[" in plan_source:
+        delim += "="
+    embedded_plan = f"[{delim}[\n{plan_source}\n]{delim}]"
+    scenario = f"""
+local PLAN_SOURCE = {embedded_plan}
+local plan = assert(loadstring(PLAN_SOURCE, "SceneRuntimePlan"))()
+
+local db = makeConsumableDatabase()
+local CoinMagnet = makeSubclass("COIN_MAG", 750)
+local ExtraLife = makeSubclass("EXTRALIFE", 2000)
+local modules = {{
+    ["ServerStorage.ConsumableDatabase"] = db,
+    ["ServerStorage.CoinMagnet"] = CoinMagnet,
+    ["ServerStorage.ExtraLife"] = ExtraLife,
+}}
+SceneRuntime.seedConsumableDatabases(plan, servicesFor(modules))
+print("LEN=" .. tostring(#db.consumbales))
+db.Load()   -- builds _consumablesDict; crashes if any slot is a string
+local cm = db.GetConsumableType("COIN_MAG")
+local xl = db.GetConsumableType("EXTRALIFE")
+print("CM_PRESENT=" .. tostring(cm ~= nil))
+print("XL_PRESENT=" .. tostring(xl ~= nil))
+print("CM_PRICE=" .. tostring(cm and cm:GetPrice()))
+print("XL_PRICE=" .. tostring(xl and xl:GetPrice()))
+-- ExtraLife's serialized canBeSpawned: 0 must be a BOOLEAN false end-to-end.
+print("XL_SPAWN_TYPE=" .. type(xl.ctorSawCanBeSpawned))
+print("XL_SPAWN_VAL=" .. tostring(xl.ctorSawCanBeSpawned))
+print("XL_GATE=" .. tostring(xl.ctorSawCanBeSpawned and true or false))
+print("CM_SPAWN_VAL=" .. tostring(cm.ctorSawCanBeSpawned))
+"""
+    out = _run(scenario)
+    assert "LEN=2" in out
+    assert "CM_PRESENT=true" in out
+    assert "XL_PRESENT=true" in out
+    assert "CM_PRICE=750" in out
+    assert "XL_PRICE=2000" in out
+    # The load-bearing P1-2 coercion, proven from the real prefab field:
+    assert "XL_SPAWN_TYPE=boolean" in out      # NOT "number"
+    assert "XL_SPAWN_VAL=false" in out
+    assert "XL_GATE=false" in out              # ``if canBeSpawned then`` is FALSE
+    assert "CM_SPAWN_VAL=true" in out          # CoinMagnet's 1 -> true
