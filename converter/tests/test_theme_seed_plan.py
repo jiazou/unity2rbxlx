@@ -11,6 +11,7 @@ Unity project and call the production ``_build_theme_seed_plan`` + the real
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,8 @@ from converter.autogen import (
     generate_scene_runtime_plan_module,
 )
 from converter.pipeline import (
+    _CS_LOAD_ASSETS_ASYNC,
+    _CS_METHOD_HEADER,
     Pipeline,
     _derive_appender_name,
     _derive_cs_load_ownership,
@@ -151,6 +154,105 @@ public class ThemeDatabase {
         load and is not derived as ownership."""
         cs = THEME_DB_CS.replace("LoadAssetsAsync<ThemeData>", "LoadAssetsAsync")
         assert _derive_cs_load_ownership(cs) is None
+
+
+# The REAL Trash-Dash ThemeDatabase.cs shape: a COMMENT precedes the control-flow
+# ``if (themeDataList == null) {`` inside the load method. The comment's trailing
+# word satisfies the OLD ``[\w.]+`` "return-type" slot so the OLD regex mis-captures
+# ``if`` as a method header (gate (b) — design-phase3 §1). The unit fixture above
+# (THEME_DB_CS) lacks the comment, so its ``if`` never matched and the bug went
+# undetected (a green-test-for-wrong-reason). This fixture has the comment.
+THEME_DB_CS_REAL_SHAPE = """\
+public class ThemeDatabase {
+    static protected Dictionary<string, ThemeData> themeDataList;
+    static public IEnumerator LoadDatabase() {
+        // If not null the dictionary was already loaded.
+        if (themeDataList == null) {
+            themeDataList = new Dictionary<string, ThemeData>();
+            yield return Addressables.LoadAssetsAsync<ThemeData>("themeData", op => {
+                if (!themeDataList.ContainsKey(op.themeName))
+                    themeDataList.Add(op.themeName, op);
+            });
+            m_Loaded = true;
+        }
+    }
+}
+"""
+
+
+class TestGateBMethodHeaderRegex:
+    """Gate (b) — a control-flow ``if (...) {`` preceded by a comment must NOT be
+    mis-captured as the enclosing method name; ``LoadDatabase`` must win."""
+
+    # The PRE-FIX regex (no control-keyword negative lookahead) — reconstructed
+    # here to prove the bug it had and that THIS fixture exercises it.
+    _OLD_HEADER = re.compile(
+        r"(?:public|private|protected|internal|static|virtual|override|async|\s)+"
+        r"[\w<>,.\[\]]+\s+(?P<name>[A-Za-z_]\w*)\s*\([^;{]*\)\s*\{"
+    )
+
+    def _old_enclosing(self, src, pos):
+        name = None
+        for hm in self._OLD_HEADER.finditer(src):
+            if hm.start() > pos:
+                break
+            name = hm.group("name")
+        return name
+
+    def test_old_regex_miscaptures_if(self):
+        """Documents the bug: the OLD regex derives ``if`` on the real shape."""
+        m = _CS_LOAD_ASSETS_ASYNC.search(THEME_DB_CS_REAL_SHAPE)
+        assert m is not None
+        assert self._old_enclosing(THEME_DB_CS_REAL_SHAPE, m.start()) == "if"
+
+    def test_new_regex_derives_loaddatabase(self):
+        """AC1: the FIXED derivation returns ``LoadDatabase`` on the real shape."""
+        own = _derive_cs_load_ownership(THEME_DB_CS_REAL_SHAPE)
+        assert own is not None
+        assert own.load_method_name == "LoadDatabase"
+        assert own.label == "themeData"
+        assert own.key_field == "themeName"
+
+    def test_new_regex_keeps_identifier_starting_with_keyword(self):
+        """``\\b`` anchoring: an identifier that merely STARTS with a control
+        keyword (``ifMatched`` / ``forEachItem``) is a real method, NOT excluded."""
+        src = (
+            "public class C {\n"
+            "  public void ifMatched(int x) { }\n"
+            "  public void forEachItem() { }\n"
+            "}\n"
+        )
+        names = [m.group("name") for m in _CS_METHOD_HEADER.finditer(src)]
+        assert "ifMatched" in names
+        assert "forEachItem" in names
+
+    def test_real_themedatabase_cs_on_disk(self):
+        """AC1 against the REAL on-disk Trash-Dash ThemeDatabase.cs (skipped when
+        the source tree is not present)."""
+        cs = Path(
+            "/Users/jiazou/workspace/trash-dash/Assets/Scripts/Themes/"
+            "ThemeDatabase.cs"
+        )
+        if not cs.exists():
+            pytest.skip("trash-dash source tree not present")
+        own = _derive_cs_load_ownership(cs.read_text(encoding="utf-8"))
+        assert own is not None
+        assert own.load_method_name == "LoadDatabase"
+        assert own.label == "themeData"
+        assert own.key_field == "themeName"
+
+    def test_real_characterdatabase_cs_load_method(self):
+        """AC2 (generality): CharacterDatabase.cs (a ``<GameObject>`` roster DB)
+        also derives ``LoadDatabase``, not ``if``."""
+        cs = Path(
+            "/Users/jiazou/workspace/trash-dash/Assets/Scripts/Characters/"
+            "CharacterDatabase.cs"
+        )
+        if not cs.exists():
+            pytest.skip("trash-dash source tree not present")
+        own = _derive_cs_load_ownership(cs.read_text(encoding="utf-8"))
+        assert own is not None
+        assert own.load_method_name == "LoadDatabase"
 
 
 # ---------------------------------------------------------------------------

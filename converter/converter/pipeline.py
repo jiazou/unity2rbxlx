@@ -94,12 +94,23 @@ _CS_DICT_ADD_KEY = re.compile(
 )
 
 
+# C# control-flow / non-method statements whose ``<kw> ( … ) {`` shape would
+# otherwise be mis-captured as a method header (e.g. ``if (x == null) {`` when a
+# preceding comment supplies the ``[\w.]+`` "return-type" slot). Excluded from the
+# ``name`` capture via a ``\b``-anchored negative lookahead so a real identifier
+# that merely STARTS with a keyword (``ifMatched`` / ``forEachItem``) is kept.
+_CS_CONTROL_KEYWORDS = (
+    "if", "for", "foreach", "while", "switch", "using", "lock",
+    "catch", "fixed", "do", "else", "return",
+)
 # A C# method header: ``<modifiers> <ret> <Name>(`` — used to name the load
 # method (the method enclosing the ``LoadAssetsAsync`` call) so the transpiled
 # counterpart's drain body can be isolated by the SAME name.
 _CS_METHOD_HEADER = re.compile(
     r"(?:public|private|protected|internal|static|virtual|override|async|\s)+"
-    r"[\w<>,.\[\]]+\s+(?P<name>[A-Za-z_]\w*)\s*\([^;{]*\)\s*\{",
+    r"[\w<>,.\[\]]+\s+"
+    r"(?!(?:" + "|".join(_CS_CONTROL_KEYWORDS) + r")\b)"
+    r"(?P<name>[A-Za-z_]\w*)\s*\([^;{]*\)\s*\{",
 )
 
 
@@ -7234,6 +7245,14 @@ script.Disabled = true
         # on the dict when generate_scene_runtime_plan_module runs. NOT persisted
         # through conversion_plan.json; recomputed every write_output (D17).
         self._build_theme_seed_plan(scene_runtime)
+        # Phase 3 (SO-store DB consumer-lowering): rewrite each keyed-dictionary
+        # SO-DB module's transpiled LoadDatabase body to drain its owned emitted SO
+        # modules into its local keyed dict — the list-store seed above cannot reach
+        # a closure-private local upvalue (D-P3-1/D-P3-3). Runs in THIS window after
+        # the SO map exists (so so_addr resolves) and BEFORE the plan/entrypoints
+        # emit (so the rewritten RbxScript.source is what gets written). Supersedes
+        # the list-store seed only for the keyed-dictionary shape.
+        self._lower_so_db_consumers(scene_runtime)
         # Phase 1 (consumable prototype materialization): RECOMPUTE the
         # consumable-db seed onto scene_runtime in THIS window — same property
         # as the theme seed (after the SO map, before the plan module emits, so
@@ -7536,6 +7555,116 @@ script.Disabled = true
                 "[write_output] scene-runtime generic: built %d addressable "
                 "db seed(s) (%d SO module(s) total)",
                 len(seeds), sum(len(s["so_module_paths"]) for s in seeds),
+            )
+
+    def _lower_so_db_consumers(self, scene_runtime: dict[str, object]) -> None:
+        """Rewrite each dict-store SO-DB module's transpiled ``LoadDatabase`` body
+        to drain its owned emitted SO modules into its local keyed dict.
+
+        Runs in the SAME ``write_output`` window as ``_build_theme_seed_plan`` —
+        after the SO map exists (so the SO addressables surface resolves) and
+        before the plan/entrypoints emit (so the rewritten ``RbxScript.source`` is
+        what gets written). Supersedes the list-store seed for the keyed-dictionary
+        shape (D-P3-3): the store is a closure-private local upvalue no external
+        shim can reach, so the DB module must own its own keyed write.
+
+        Keyed on the DETERMINISTIC C# ``LoadAssetsAsync<SOType>("<label>")``
+        ownership + the SO-seed surface — never an AI-output fingerprint or a
+        per-game string (D-P3-2). Fail-closed (``SoDbUnresolved``) when the rewrite
+        target cannot be located in the AI output. Disjoint from the roster
+        lowering by two layers (§3f): the ``<SOType>``-resolves-to-SO gate in
+        ``find_so_db_consumers`` (primary) and a ``roster_claimed_paths`` exclusion
+        (belt-and-suspenders).
+        """
+        from converter.so_db_consumer_lowering import (
+            SoDbUnresolved,
+            find_so_db_consumers,
+            lower_so_db_consumers,
+        )
+
+        project_root = getattr(self, "unity_project_path", None)
+        if project_root is None:
+            return
+        if self.state.rbx_place is None:
+            return
+        so_map_obj = scene_runtime.get("scriptable_objects")
+        if not isinstance(so_map_obj, dict) or not so_map_obj:
+            return
+        so_map: dict[str, str] = {
+            g: p for g, p in so_map_obj.items()
+            if isinstance(g, str) and isinstance(p, str)
+        }
+        if not so_map:
+            return
+        guid_index = getattr(self.state, "guid_index", None)
+        if guid_index is None:
+            return
+
+        # The SO-addressables surface (label/address -> emitted-SO guids), re-parsed
+        # off-disk exactly as _build_theme_seed_plan derives it (the persisted
+        # ``addressables`` block is prefab-narrowed and has dropped the SO guids).
+        from unity.addressables_resolver import (
+            parse_addressables,
+            resolve_prefab_addressables,
+            resolve_scriptable_object_addressables,
+        )
+        index = parse_addressables(project_root)
+        so_addr = resolve_scriptable_object_addressables(
+            index, guid_index, set(so_map.keys()),
+        )
+        if not so_addr.by_label and not so_addr.by_address:
+            return
+
+        # C# source per placed module, keyed by the script's source_path so the
+        # finder and the locator share one key space (resume-safe off-disk re-read).
+        scripts = list(getattr(self.state.rbx_place, "scripts", []) or [])
+        csharp_by_path: dict[str, str] = {}
+        load_method_by_path: dict[str, str] = {}
+        for script in scripts:
+            name = getattr(script, "name", None)
+            sp = getattr(script, "source_path", None)
+            if not isinstance(name, str) or not isinstance(sp, str):
+                continue
+            if sp in csharp_by_path:
+                continue
+            cs_source = self._find_cs_source_for_module(name)
+            if cs_source is None:
+                continue
+            csharp_by_path[sp] = cs_source
+            ownership = _derive_cs_load_ownership(cs_source)
+            if ownership is not None:
+                load_method_by_path[sp] = ownership.load_method_name
+
+        # Layer (a) disjointness: exclude any module the roster lowering already
+        # rewrote this run. Re-derive its claimed set read-only via
+        # find_roster_consumers over the prefab-narrowed by_label (touches no roster
+        # code, runs no second rewrite). The roster lowering ran earlier (in
+        # transpile_with_contract), so this set is final.
+        from converter.roster_consumer_lowering import find_roster_consumers
+        prefab_addr = resolve_prefab_addressables(index, guid_index)
+        roster_facts = find_roster_consumers(csharp_by_path, prefab_addr.by_label)
+        roster_claimed_paths = frozenset(roster_facts.keys())
+
+        so_facts = find_so_db_consumers(
+            csharp_by_path,
+            so_addr.by_label,
+            so_addr.by_address,
+            so_map,
+            roster_claimed_paths,
+        )
+        if not so_facts:
+            return
+        try:
+            lowered = lower_so_db_consumers(
+                scripts, so_facts, load_method_by_path,
+            )
+        except SoDbUnresolved as exc:
+            log.warning("[so-db] fail-closed: %s", exc)
+            raise
+        if lowered:
+            log.info(
+                "[write_output] scene-runtime generic: SO-DB consumer-lowering "
+                "rewrote %d keyed-dictionary database(s)", lowered,
             )
 
     def _build_consumable_db_seeds(self, scene_runtime: dict[str, object]) -> None:
