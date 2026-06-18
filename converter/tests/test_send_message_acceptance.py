@@ -316,9 +316,18 @@ def test_no_facts_means_no_sm_check():
 
 def test_producer_facts_drive_verifier_per_kind(tmp_path: Path):
     """End to end on every corpus kind: the producer's REAL facts, fed to the
-    REAL verifier, FIRE on a flag-only Luau (no dispatch) and PASS once the
-    matching ``host:sendMessage``/``broadcastMessage`` is present. This proves the
-    guarantee holds per-receiver-kind + per-arg-shape, not just for Pickup."""
+    REAL verifier, FIRE pre-fix and PASS once the matching
+    ``host:sendMessage``/``broadcastMessage`` is present. This proves the
+    guarantee holds per-receiver-kind + per-arg-shape, not just for Pickup.
+
+    Per kind the pre-fix is checked TWO ways: (a) the dispatch WHOLLY absent (an
+    empty module body -- the original guarantee, kept); and (b) a REALISTIC
+    collapsed/wrong dispatch -- the kind's plausible failure mode: a flag-only
+    ``SetAttribute`` mirror (the shipped rifle bug), a dropped-receiver bare
+    ``self:sendMessage`` (the receiver-argument drop), a wrong-arity dispatch
+    (gameplay arg lost), or a wrong-kind ``send`` standing in for a
+    ``broadcast``. Both must fire the load-bearing ``sm`` rule -- (b) proves the
+    catch on the actual collapse shapes, not merely on an empty body."""
     paths = _write_corpus(tmp_path)
     result = build_send_message_map([_FakeInfo(p) for p in paths.values()])
 
@@ -333,13 +342,46 @@ def test_producer_facts_drive_verifier_per_kind(tmp_path: Path):
         "WaterHoseParticles": 'self.host:broadcastMessage(fire, "Extinguish")',
     }
 
+    # (script name, the REALISTIC collapsed/wrong shape that must STILL fire sm).
+    # Each line is a plausible failure mode -- not an empty body:
+    #   Pickup           -- flag-only SetAttribute mirror (the shipped rifle bug)
+    #   Explosive        -- flag-only mirror, 0-arg send dropped
+    #   ObjectResetter   -- flag-only mirror, 0-arg send dropped
+    #   Plane            -- wrong arity: the gameplay arg ``5`` dropped (arity 1->0)
+    #   Machine          -- dropped receiver: bare ``self:sendMessage`` self-dispatch
+    #   Player           -- flag-only mirror, 0-arg send dropped
+    #   WaterHoseParticles -- wrong kind: ``send`` emitted for a ``broadcast`` fact
+    collapsed_pre_fix = {
+        "Pickup": 'plr:SetAttribute("hasRifle", true)',
+        "Explosive": 'self.gameObject:SetAttribute("immobilized", true)',
+        "ObjectResetter": 'self.gameObject:SetAttribute("needsReset", true)',
+        "Plane": 'self.host:sendMessage(gm, "RestartGame")',
+        "Machine": 'self:sendMessage("ToggleDoor", true)',
+        "Player": 'hitPart:SetAttribute("damaged", true)',
+        "WaterHoseParticles": 'self.host:sendMessage(fire, "Extinguish")',
+    }
+    assert set(collapsed_pre_fix) == set(correct_call)  # every kind covered
+
     for name, call in correct_call.items():
         facts = result[str(paths[name].resolve())]
-        flag_only = "function M:run() end\nreturn M\n"
-        # Pre-fix: dispatch absent -> the verifier fires.
-        pre = [v for v in verify_module(flag_only, send_message_facts=facts).violations
+        method = call.split('"')[1]
+        # Pre-fix (a): the dispatch WHOLLY absent (empty body) -> sm fires. Kept
+        # from the original so the "dropped entirely" guarantee stays per-kind.
+        empty = "function M:run() end\nreturn M\n"
+        pre_empty = [v for v in verify_module(empty, send_message_facts=facts).violations
+                     if v.rule == "sm"]
+        assert len(pre_empty) == 1, f"{name}: expected sm violation on empty body"
+        # Pre-fix (b): a REALISTIC collapsed/wrong dispatch -> the verifier STILL
+        # fires the sm rule (proves the catch on the actual failure modes, not
+        # merely on a wholly-empty body).
+        broken = f"function M:run()\n\t{collapsed_pre_fix[name]}\nend\nreturn M\n"
+        pre = [v for v in verify_module(broken, send_message_facts=facts).violations
                if v.rule == "sm"]
-        assert len(pre) == 1, f"{name}: expected sm violation pre-fix"
+        assert len(pre) == 1, (
+            f"{name}: expected sm violation on the collapsed/wrong shape"
+        )
+        # The finding names the dropped method so the reprompt is actionable.
+        assert method in pre[0].message, f"{name}: sm message must name {method}"
         # Post-fix: the matching host call present -> no sm violation.
         fixed = f"function M:run()\n\t{call}\nend\nreturn M\n"
         post = [v for v in verify_module(fixed, send_message_facts=facts).violations

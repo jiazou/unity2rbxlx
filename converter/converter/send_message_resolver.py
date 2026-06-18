@@ -9,10 +9,23 @@ DIRECT ``SendMessage``/``BroadcastMessage`` call site is parsed into a
 reprompt loop and the verifier, which assert each fact has a matching
 ``host:sendMessage``/``host:broadcastMessage`` call in the produced Luau.
 
-The classifier/normalizer (`classify_dispatch`) is the SINGLE source of truth for
-"given a SendMessage/BroadcastMessage call, what is its ``(kind, method,
-gameplay_args)``" — slice 1.3's prompt directive + verifier import it, never
-re-implement it, so the producer and the checker can never diverge.
+The classifier/normalizer (`classify_dispatch`) is this module's SINGLE source of
+truth for "given a SendMessage/BroadcastMessage call, what is its ``(kind, method,
+gameplay_args)``": ``_resolve_script`` runs it on every call site, so every fact
+this producer emits carries that one normalization. The downstream consumers do
+NOT re-classify the C#; they bind to the FACTS instead:
+
+  - the verifier (``runtime_contract``) consumes the ``SendMessageDispatchFact``
+    tuple and shares the ``SEND``/``BROADCAST`` kind constants, deriving each
+    emitted Luau call's gameplay arity as ``len(luau_args) - 2`` (drop the
+    receiver + method-name positionals) — algebraically the same value
+    ``classify_dispatch`` records as ``len(gameplay_args)``;
+  - the slice 1.3 prompt directive (in ``code_transpiler``) restates the same
+    normalization (preserve receiver first, method-name string second, strip a
+    trailing ``SendMessageOptions.*``) as prose.
+
+So producer, prompt, and checker stay aligned on what a dispatch means via the
+shared constants + the fact contract, never a duplicated re-implementation.
 
 OverlapSphere exclusion (alias-traced): the existing ``playersInRadius`` prompt
 directive (the #201 mine-instakill fix) authoritatively handles the
@@ -193,8 +206,10 @@ def classify_dispatch(call_name: str, raw_args: str) -> tuple[str, str, tuple[st
     argument that is not a plain string literal — a dynamic method name the
     verifier cannot key on).
 
-    Pure; no side effects. Slice 1.3 imports THIS function for the prompt
-    directive + verifier so the producer and the checker share one normalization.
+    Pure; no side effects. ``_resolve_script`` calls THIS function for every
+    dispatch, so the facts it emits carry one normalization; the verifier then
+    consumes those ``SendMessageDispatchFact`` records (and the shared
+    ``SEND``/``BROADCAST`` constants) rather than re-classifying the C# itself.
     """
     kind = _CALL_KIND.get(call_name)
     if kind is None:
