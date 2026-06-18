@@ -814,6 +814,41 @@ class TestPlayerAliasDispatch:
         # And it must NOT route to the player embodiment.
         assert "Player.GetItem(Rifle)" not in lines, out
 
+    def test_nested_humanoid_model_climbs_to_outer_player(self):
+        # Robustness guard. The receiver is a NESTED non-player Humanoid Model
+        # (an inner NPC/rig) whose ``players:GetPlayerFromCharacter`` returns
+        # nil, but whose .Parent ancestor chain reaches the REAL player's
+        # character Model (charModel, for which GetPlayerFromCharacter -> plrObj).
+        # Branch (b)'s inclusive walk hits the inner Humanoid Model FIRST (resolves
+        # nil) and must KEEP CLIMBING past it to find the outer player character
+        # Model -> the embodiment. RED if branch (b) returns at the first Humanoid
+        # Model (``return players:GetPlayerFromCharacter(node)`` without the
+        # ``if p ~= nil then return p end`` climb-past): the inner nil short-circuits
+        # the walk -> no route -> Player.GetItem never fires.
+        scenario = _PLAYER_SCENE_SETUP + textwrap.dedent("""\
+            -- An inner NPC rig Model parented UNDER the real player character.
+            -- It is Humanoid-bearing but GetPlayerFromCharacter(innerNpc) == nil.
+            local innerNpc = {Name = "InnerRig", Parent = charModel}
+            function innerNpc:IsA(class) return class == "Model" end
+            function innerNpc:FindFirstChildWhichIsA(class)
+                if class == "Humanoid" then return {Name = "Humanoid"} end
+                return nil
+            end
+            host:sendMessage(innerNpc, "GetItem", "Rifle")
+            print("GOIDS=" .. #engine:_playerGoIds())
+            for _, c in ipairs(calls) do print(c) end
+            print("DONE")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        lines = out.strip().splitlines()
+        # The walk climbed past the inner nil-resolving Humanoid Model to the
+        # outer player character -> routed to the embodiment.
+        assert "Player.GetItem(Rifle)" in lines, out
+        assert "GOIDS=1" in lines, out
+        assert lines.count("Player.GetItem(Rifle)") == 1, out
+        assert "Door.GetItem(Rifle)" not in lines, out
+
     def test_humanoid_handle_routes_to_embodiment(self):
         # Handle variant: a Humanoid instance whose .Parent is the character
         # Model. The inclusive walk climbs Humanoid -> charModel (Humanoid-

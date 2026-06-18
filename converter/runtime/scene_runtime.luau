@@ -1668,11 +1668,23 @@ function SceneRuntime:_playerFromAlias(recv)
 	local guard = 0
 	while node ~= nil and guard < 16 do
 		guard += 1
-		if type(node.IsA) == "function" and node:IsA("Model")
+		-- pcall the ``IsA`` probe (mirrors branch (a)) so a component table with an
+		-- erroring ``IsA`` can't throw mid-dispatch.
+		local okModel, isModel = false, false
+		if type(node.IsA) == "function" then
+			okModel, isModel = pcall(function() return node:IsA("Model") end)
+		end
+		if okModel and isModel
 			and type(node.FindFirstChildWhichIsA) == "function"
 			and node:FindFirstChildWhichIsA("Humanoid")
 		then
-			return players:GetPlayerFromCharacter(node)
+			local p = players:GetPlayerFromCharacter(node)
+			-- A Humanoid Model that is NOT a registered player character (a
+			-- standalone NPC, or a nested Humanoid rig INSIDE the real character)
+			-- resolves nil: keep climbing rather than returning early, so the
+			-- player's character as an OUTER ancestor is still found. A standalone
+			-- NPC simply exhausts the walk -> nil (falls through to non-player).
+			if p ~= nil then return p end
 		end
 		node = node.Parent
 	end
