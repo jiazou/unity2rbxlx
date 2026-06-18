@@ -753,6 +753,68 @@ def test_bool_field_not_coerced_without_declared_type(tmp_path):
     assert ctor["duration"] == 2.0
 
 
+# A class whose serialized fields use the idiomatic ``[SerializeField]`` form
+# with NO access modifier (defaults to private but IS serialized). Pre-fix the
+# type reader required an explicit access modifier, so these matched nothing and
+# a serialized ``0``/``1`` stayed numeric (an inverted bool gate). Also carries
+# exclusions that must NOT be typed as coercible fields: ``const``, an
+# auto-property, an expression-bodied property, and a method.
+_SERIALIZEFIELD_CS = """\
+    public class SerializedItem : MonoBehaviour
+    {
+        [SerializeField] bool canBeSpawned;
+        [SerializeField] private bool privateFlag;
+        [SerializeField] protected bool protectedFlag;
+        public bool publicFlag;
+        const bool ALWAYS = true;
+        static bool shared;
+        public bool active { get; set; }
+        public bool IsReady => publicFlag;
+        public bool Compute() { return true; }
+    }
+"""
+
+G_SERIALIZED_CS = _g("serialized_cs")
+
+
+def test_field_types_reads_serializefield_without_access_modifier(tmp_path):
+    """``[SerializeField] bool canBeSpawned;`` (NO access modifier) is typed
+    ``bool`` — the idiomatic Unity serialized form. The access-modifier and
+    ``[SerializeField]`` forms BOTH type-match; the public form keeps working."""
+    root = tmp_path / "proj"
+    _cs(root, "Scripts/SerializedItem.cs", G_SERIALIZED_CS, _SERIALIZEFIELD_CS)
+    guid_index = build_guid_index(root)
+    base_by_class = build_base_by_class(guid_index)
+    types = field_types_for_class("SerializedItem", base_by_class, guid_index)
+
+    # All four serialized forms (3x SerializeField + 1x public) type as bool.
+    assert types["canBeSpawned"] == "bool"   # [SerializeField], no access mod
+    assert types["privateFlag"] == "bool"    # [SerializeField] private
+    assert types["protectedFlag"] == "bool"  # [SerializeField] protected
+    assert types["publicFlag"] == "bool"     # plain public (still works)
+
+    # const / static / auto-property / expression-bodied property / method are
+    # NOT coercible fields and must not appear.
+    for non_field in ("ALWAYS", "shared", "active", "IsReady", "Compute"):
+        assert non_field not in types
+
+
+def test_serializefield_bool_coerces_zero_to_false(tmp_path):
+    """End-to-end: a serialized ``0`` on a ``[SerializeField] bool`` field coerces
+    to Python ``False`` (NOT numeric 0, which Luau treats as truthy). Pre-fix the
+    field had no resolvable type, so the ``0`` stayed numeric."""
+    root = tmp_path / "proj"
+    _cs(root, "Scripts/SerializedItem.cs", G_SERIALIZED_CS, _SERIALIZEFIELD_CS)
+    guid_index = build_guid_index(root)
+    base_by_class = build_base_by_class(guid_index)
+    types = field_types_for_class("SerializedItem", base_by_class, guid_index)
+
+    comp = {"canBeSpawned": 0, "publicFlag": 1}
+    ctor, post = split_component_fields(comp, types, guid_index)
+    assert ctor["canBeSpawned"] is False     # 0 -> False, not numeric 0
+    assert ctor["publicFlag"] is True        # 1 -> True
+
+
 # --------------------------------------------------------------------------- #
 # P2 — colliding subclass stem fails closed (element dropped)
 # --------------------------------------------------------------------------- #

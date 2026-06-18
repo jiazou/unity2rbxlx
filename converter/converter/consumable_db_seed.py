@@ -547,13 +547,28 @@ def resolve_db_seed(
 # the type — the resolver keys on the DECLARED TYPE (``bool`` -> coerce 0/1),
 # never a field-name literal. ``static``/``const`` fields are not Unity-serialized
 # instance fields, so they are excluded.
+#
+# A field is type-readable when it is serialized: EITHER it carries an access
+# modifier (``public``/``private``/``protected``/``internal``) OR it is
+# ``[SerializeField]``-attributed. The idiomatic Unity form
+# ``[SerializeField] bool canBeSpawned;`` has NO access modifier (defaults to
+# private) yet IS serialized — without the ``[SerializeField]`` arm it would not
+# match, leaving a serialized ``0``/``1`` numeric and inverting a bool gate. The
+# access modifier after ``[SerializeField]`` is optional; ``static``/``const``
+# remain excluded (they land in the ``type`` slot and break the ``;``/``=``
+# anchor, and are also rejected by ``_RE_CS_STATIC_OR_CONST`` below). Mirrors
+# ``unity/script_analyzer.py``'s ``_RE_SERIALIZED_FIELD`` convention.
 _RE_CS_FIELD = re.compile(
+    r"(?:"
+    r"\[SerializeField\]\s*(?:(?:public|private|protected|internal)\b)?"
+    r"|"
     r"\b(?:public|private|protected|internal)\b"
+    r")"
     r"(?P<mods>(?:\s+(?:readonly|new|volatile))*)"
     r"\s+(?P<type>[\w.<>\[\]?]+)"
     r"\s+(?P<name>[A-Za-z_]\w*)"
-    r"\s*(?:=|;)",
-)
+    r"\s*(?:=(?!>)|;)",  # ``=`` (assignment) or ``;`` — but NOT ``=>`` (an
+)                       # expression-bodied property, which is not a field).
 _RE_CS_STATIC_OR_CONST = re.compile(r"\b(?:static|const)\b")
 
 
