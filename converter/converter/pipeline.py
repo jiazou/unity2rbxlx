@@ -3468,6 +3468,12 @@ return table.concat(allData, "\\n")'''
         self.state.dead_modules = frozenset()
         if self.state.rbx_place is None or not self.state.rbx_place.scripts:
             return
+        # Consumable-db boot-shim live-set: modules the shim materializes at boot
+        # (the subclass ``<class_stem>.new`` + the DB module written onto) are LIVE
+        # BY CONSTRUCTION even when output-inert. Computed from the seed plan (the
+        # same deterministic builder write_output runs), mirroring roster_binding.
+        # Exempted in BOTH the fresh-transpile and resume branches below.
+        consumable_live = self._consumable_seed_live_module_names()
         # The input-side prior needs the original C# source. It only exists on
         # a fresh transpile (``transpilation_result``); a resume rehydrates
         # Luau from disk without the C#. On resume, reuse the persisted verdict
@@ -3505,6 +3511,15 @@ return table.concat(allData, "\\n")'''
                     # though its canonical body is output-inert -- never re-add it
                     # to the dead set on resume (it would otherwise be re-flagged
                     # and rerouted to an inert stub, clobbering the re-lowering).
+                    dropped.append(s.name)
+                    continue
+                if s.name in consumable_live:
+                    # Consumable-db materialization: the boot shim instantiates
+                    # this subclass / writes onto this DB module at boot, so it is
+                    # live by construction even with an inert canonical body. The
+                    # seed plan is recomputed from disk-resident inputs (the
+                    # .asset/.prefab/.cs + the SO map), so the exemption survives a
+                    # no-retranspile rehydrated assemble. Mirrors roster_binding.
                     dropped.append(s.name)
                     continue
                 if is_output_inert(s.source) and not has_genuine_roblox_effect(
@@ -3567,6 +3582,16 @@ return table.concat(allData, "\\n")'''
                 # not reroute it to an inert stub and clobber the re-lowering. Pure
                 # exemption -- does not touch ``strategy`` (D-P2-8).
                 continue
+            if s.name in consumable_live:
+                # Consumable-db materialization: the boot shim instantiates this
+                # subclass (``<class_stem>.new``) and/or writes the materialized
+                # array onto this DB module at boot, so it is LIVE BY CONSTRUCTION
+                # even when its canonical body is output-inert. Exempt BEFORE the
+                # strategy gate so the storage classifier never reroutes it to an
+                # inert ``.new``-less stub (which would drop every consumable
+                # element and silently no-op the feature). Pure exemption --
+                # does not touch ``strategy``. Mirrors roster_binding.
+                continue
             if strategy_by_name.get(s.name) not in _DECISIVE_STRATEGIES:
                 # Non-deterministic fallback body -- inertness is unreliable.
                 continue
@@ -3588,6 +3613,62 @@ return table.concat(allData, "\\n")'''
                 "[dead-modules] %d Roblox-dead module(s): %s",
                 len(dead), ", ".join(sorted(dead)),
             )
+
+    def _consumable_seed_live_module_names(self) -> frozenset[str]:
+        """The set of RbxScript names that are LIVE BY CONSTRUCTION because the
+        consumable-db boot shim materializes them.
+
+        Mirrors the ``roster_binding`` dead-module exemption, but the live
+        identity is carried by the SEED PLAN (``scene_runtime["consumable_db_seeds"]``)
+        rather than a per-script attribute: the boot shim instantiates each
+        element's subclass (``<class_stem>.new``) and assigns the array onto the
+        DB module at boot, so neither the subclass module nor the DB module is
+        Roblox-dead even when its canonical body is output-inert.
+
+        The seed plan is RECOMPUTED in ``write_output`` (after this phase), so it
+        is not yet on ``ctx.scene_runtime`` here. Recompute it against a private
+        COPY using the SAME deterministic builder (no game-specific literal), so
+        the exemption sees exactly the modules the shim will materialize. Returns
+        ``frozenset()`` whenever no seed resolves (the generic, fail-quiet
+        default — a non-consumable scene exempts nothing).
+
+        The names are the RbxScript stems: each element's ``class_stem`` (== the
+        subclass output filename stem == ``RbxScript.name``) and each seed's
+        ``db_module_path`` leaf (the DB module the shim writes onto).
+        """
+        scene_runtime_src = getattr(self.ctx, "scene_runtime", None)
+        if not isinstance(scene_runtime_src, dict) or not scene_runtime_src:
+            return frozenset()
+        # Private working copy: the builders below pop/set keys, and
+        # _build_scriptable_object_module_map writes the guid->path map the seed
+        # builder consumes (write_output builds it earlier in its own window; at
+        # this phase it is not yet on the dict). Never mutate ctx.scene_runtime.
+        scene_runtime = dict(scene_runtime_src)
+        self._build_scriptable_object_module_map(scene_runtime)
+        self._build_consumable_db_seeds(scene_runtime)
+        seeds_obj = scene_runtime.get("consumable_db_seeds")
+        if not isinstance(seeds_obj, list):
+            return frozenset()
+        live: set[str] = set()
+        for seed in seeds_obj:
+            if not isinstance(seed, dict):
+                continue
+            db_path = seed.get("db_module_path")
+            if isinstance(db_path, str) and db_path:
+                live.add(db_path.rsplit(".", 1)[-1])
+            elements = seed.get("elements")
+            if not isinstance(elements, list):
+                continue
+            for element in elements:
+                if not isinstance(element, dict):
+                    continue
+                stem = element.get("class_stem")
+                if isinstance(stem, str) and stem:
+                    live.add(stem)
+                mod_path = element.get("module_path")
+                if isinstance(mod_path, str) and mod_path:
+                    live.add(mod_path.rsplit(".", 1)[-1])
+        return frozenset(live)
 
     def _subphase_prune_dead_module_closures(self) -> None:
         """TODO #8: DROP dead modules whose ENTIRE require-closure is dead.
