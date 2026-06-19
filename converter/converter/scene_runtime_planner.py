@@ -443,6 +443,15 @@ class SceneRuntimeArtifact(TypedDict, total=False):
     # scripts never ran). YAML scenes only: binary scenes don't populate
     # ``transform_fid_to_go_fid`` so they emit no placements (tracked gap).
     scene_prefab_placements: list[SceneRuntimeScenePrefabPlacement]
+    # Phase 2 (camera-mount -> player-mount equip, D13): the conversion-time
+    # ``{field_name: prefab_id}`` bridge the server EquipWeapon handler consults
+    # (``SceneRuntime:resolveEquipPrefabId``). The PLANNER does NOT populate this
+    # — it is built by a post-transpile pipeline step (``transpile_scripts``)
+    # that joins the equip-emitting scripts' ``equip_binding`` field with the
+    # per-component prefab reference rows already in ``scene_runtime``, AFTER the
+    # equip facts exist. TYPE declared here so the host-allowlist emit path
+    # (``_PLAN_KEYS_FOR_HOST``) and the resume round-trip carry it through.
+    equip_prefabs: dict[str, str]
 
 
 # ---------------------------------------------------------------------------
