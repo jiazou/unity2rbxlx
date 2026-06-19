@@ -362,6 +362,70 @@ def test_p1_real_contiguous_block_still_discharges() -> None:
     ) is True
 
 
+# === Round-4 P1-B: verifier span is SYMMETRIC with the producer on duplicates ===
+# The producer (`camera_mount_equip_lowering._method_body_span`) fails closed
+# (returns None) on >1 same-named `function …:<method>(` declaration, so the lowering
+# refuses to pick an ambiguous rewrite site. The verifier's `_equip_method_body_span`
+# must do the SAME — otherwise it could discharge against the FIRST body of a
+# duplicated `GetRifle` (a fail-closed gate weaker than its producer). These tests
+# drive the VERIFIER path (`_equip_method_body_span` / `_equip_request_discharged` /
+# `_check_equip_present`), not the producer helper directly.
+
+
+def _duplicate_getrifle(src: str) -> str:
+    # Append a SECOND `function Player:GetRifle(...)` so two same-named methods exist.
+    # The first body is the genuine discharged one; the second is an inert stub. A
+    # pre-fix verifier that returns the FIRST span would still discharge -> the test
+    # only goes RED once the span fails closed on the duplicate.
+    return src.replace(
+        "return Player\n",
+        "function Player:GetRifle()\n"
+        "    self.gotWeapon = true\n"
+        "end\n"
+        "return Player\n",
+    )
+
+
+def test_p1b_verifier_span_none_on_duplicate_method() -> None:
+    # The verifier's own span helper must return None on a duplicated method.
+    s = _lowered_player()
+    dup = _duplicate_getrifle(s.luau_source)
+    assert dup.count("function Player:GetRifle") == 2
+    assert contract_verifier._equip_method_body_span(dup, "GetRifle") is None
+    # Single-method source still spans (the producer admits exactly one).
+    assert contract_verifier._equip_method_body_span(s.luau_source, "GetRifle") is not None
+
+
+def test_p1b_discharge_false_on_duplicate_even_if_first_body_discharged() -> None:
+    # The genuine discharged body is FIRST; pre-fix the verifier would discharge
+    # against it. With the symmetric fail-closed span, the duplicate -> None span ->
+    # NOT discharged.
+    s = _lowered_player()
+    dup = _duplicate_getrifle(s.luau_source)
+    # Sanity: the single-method form genuinely discharges (so the duplicate is the
+    # ONLY thing turning discharge off).
+    assert _equip_request_discharged(
+        s.luau_source, "riflePrefab", "equipWeaponRemote", "GetRifle"
+    ) is True
+    assert _equip_request_discharged(
+        dup, "riflePrefab", "equipWeaponRemote", "GetRifle"
+    ) is False
+
+
+def test_p1b_verifier_fails_closed_on_duplicate_method_carrier_present() -> None:
+    # Full verifier path: a present=True carrier whose method is duplicated must FIRE
+    # the fail-closed violation (ambiguous method = NOT discharged), not silently pass
+    # against the first body.
+    s = _lowered_player()
+    dup = _duplicate_getrifle(s.luau_source)
+    script = _rbx("Player", dup, _carrier(present=True))
+    rows = _equip_rows([script])
+    assert len(rows) == 1
+    assert "discharged=False" in rows[0].detail
+    res = verify_contract(_TOPOLOGY, [script])
+    assert any("equip_present" in e for e in fail_closed_errors(res))
+
+
 # === P2 — equip_binding carrier load/serialize round-trip (resume path) ======
 # ``_load_equip_binding_for_rehydration`` (pipeline.py) + the serialize-save have
 # zero coverage while rig_binding/roster_binding both have loader tests. Mirrors

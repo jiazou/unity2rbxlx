@@ -2413,18 +2413,18 @@ def _rig_code_contains(source: str, token: str) -> bool:
 
 
 def _equip_method_body_span(source: str, method: str) -> tuple[int, int] | None:
-    """The (body_start, body_end) char span of the Luau method ``method``'s body —
-    from just past its ``function <Class>:<method>(…)`` header through the char just
-    past its matching closing ``end``. None if the method is not found. Reuses the
-    rig method-body-span machinery (``_rig_method_body_end``) so the equip checker
-    scopes IDENTICALLY to the lowering's producer."""
-    for m in _RIG_FUNCTION_METHOD_RE.finditer(source):
-        if not _rig_pos_is_real_code(source, m.start()):
-            continue
-        if m.group(2) != method:
-            continue
-        return (m.end(), _rig_method_body_end(source, m.start()))
-    return None
+    """The (body_start, body_end) char span of the Luau method ``method``'s body.
+    None if the method is not found OR if ``>1`` same-named ``function …:<method>(``
+    declaration exists (FAIL CLOSED on a duplicated/overloaded method — symmetric
+    with the producer, so the verifier can never discharge against the FIRST body of
+    an ambiguous method).
+
+    Delegates to the producer's shared ``_method_body_span`` (the same helper the
+    lowering uses to pick its rewrite site) so producer + checker can never drift on
+    the span boundaries or the duplicate-method fail-closed rule."""
+    from converter.camera_mount_equip_lowering import _method_body_span
+
+    return _method_body_span(source, method)
 
 
 def _equip_request_discharged(
