@@ -1187,3 +1187,30 @@ Acceptance "mounts on the camera WeaponSlot" not met by placement, though routin
 See DESIGN-camera-mount-to-player-mount.md + finalize-todo.md. The rifle now picks up + GetRifle runs
 (routing fix), but mounts at head (camera viewmodel intent) not a replicated character mount. Product
 decision: build the Roblox-idiomatic server-replicated character-attached weapon equip as its own run.
+
+## ---- /drive run mesh-fidelity-20260619T232452 (promoted 2026-06-19T16:22:45Z) ----
+
+# Follow-ups — mesh-fidelity-20260619T232452
+
+
+## Phase-1 detailed-design pins (from design review r2 — non-blocking)
+- Bug-2 pop must cover `_embedded_key_candidates` slash variants of the offending key in `uploaded_assets` (cross-OS cached ctx); add that case to the quarantine test.
+- Bug-2: discover offending keys via `mesh_hierarchies.items()` + `is_embedded_mesh_key`, pop those keys from the POST-merge ctx dicts; test the pre-seeded-in-ctx force-rerun case.
+
+## Latent edge (codex, slice-1 review — non-blocking)
+`_quarantine_bad_embedded_meshes` uses `partition("#")` (splits on FIRST '#'). If an embedded prefab/asset
+path itself contained a '#', the slash-variant reconstruction could mis-target. Not an established real
+case (asset paths with '#' aren't known to occur), and `is_embedded_mesh_key` already constrains the shape.
+Revisit only if such paths appear.
+
+## Decimation except-fallback can exceed cap (codex finalize r2 — non-blocking, latent path)
+`decimate_mesh`'s `except Exception` exports the UN-decimated original on ANY backend failure, so output is
+strictly ≤ cap only when decimation succeeds. Acceptable today (no production caller; backend often absent),
+but when decimate_mesh is wired, consider failing loud / quarantining the mesh instead of shipping an
+oversized original on a true decimation failure.
+
+## Real-upload 20k-acceptance verification (deferred from VERIFY — now low-yield)
+The Gate-A open question deferred proving Roblox accepts a >10k–≤20k-face mesh to VERIFY. Finalize revealed
+decimate_mesh has NO production caller AND the converter env lacks a decimation backend, so a live conversion
+would not exercise the clamp at all. Defer the real-upload acceptance check until decimate_mesh is wired into
+the upload path; bug-2 quarantine is covered by the call-site + helper tests.
