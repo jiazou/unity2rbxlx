@@ -124,6 +124,23 @@ local function mockInst(name, className)
         end
         return nil
     end
+    -- Mock WaitForChild: returns a present child immediately. A child can be
+    -- registered to "arrive late" via ``inst._pendingChildren[name] = part`` --
+    -- the first WaitForChild for that name parents it (modelling the limb landing
+    -- a frame later) and returns it; a name with no present/pending child and a
+    -- finite timeout returns nil (the bounded-wait miss). No real yielding.
+    function inst:WaitForChild(n, timeout)
+        local existing = self:FindFirstChild(n)
+        if existing then return existing end
+        local pending = self._pendingChildren and self._pendingChildren[n]
+        if pending then
+            self._pendingChildren[n] = nil
+            pending.Parent = self
+            table.insert(self._childList, pending)
+            return pending
+        end
+        return nil
+    end
     function inst:GetDescendants()
         return self._descendants
     end
@@ -491,5 +508,77 @@ class TestRightHandFallback:
             assert(#createdWelds() == before, "no weld created on a hard no-op")
             assert(char:FindFirstChild("_EquippedWeapon") == nil,
                 "no weapon parented on a hard no-op")
+            print("OK")
+        """))
+
+
+# ---------------------------------------------------------------------------
+# Criterion 15 — survives respawn (P1: late-arriving R15 limb)
+# ---------------------------------------------------------------------------
+
+class TestReequipOnRespawn:
+
+    def test_reequip_waits_for_late_arriving_right_hand(self):
+        # P1 (round 3): on respawn CharacterAdded fires BEFORE the R15 RightHand
+        # is parented. reequipLastWeapon must resolve the hand with a bounded
+        # WaitForChild so the just-spawned Character (RightHand ABSENT at call
+        # time, arriving shortly after) still gets the weapon re-equipped.
+        # FAILS against the pre-fix one-shot FindFirstChild (resolves nil ->
+        # no weld, no _EquippedWeapon).
+        _assert_ok(textwrap.dedent("""\
+            local player = {}  -- opaque per-player key
+            local character = mockInst("Character", "Model")
+            -- RightHand is NOT a child yet; it "arrives late" on the first
+            -- WaitForChild (modelling the limb landing a frame after spawn).
+            local rightHand = mockInst("RightHand", "Part")
+            rightHand.CFrame = "handCF"
+            character._pendingChildren = {RightHand = rightHand}
+            assert(character:FindFirstChild("RightHand") == nil,
+                "precondition: RightHand absent at reequip-call time")
+
+            local muzzle
+            local function cloneFactory(_)
+                local m = mockInst("RiflePrefabClone", "Model")
+                muzzle = mockInst("Muzzle", "Part")
+                m.PrimaryPart = muzzle
+                m._descendants = {muzzle}
+                return m
+            end
+            local engine = SceneRuntime.new(equipServices(cloneFactory),
+                {equip_prefabs = {riflePrefab = "prefab_rifle"}})
+
+            -- Remember the last equip, then respawn-re-equip.
+            engine:rememberEquip(player, "prefab_rifle")
+            engine:reequipLastWeapon(player, character)
+
+            -- The weapon was equipped despite the late-arriving hand.
+            local welded = character:FindFirstChild("_EquippedWeapon")
+            assert(welded ~= nil, "weapon re-equipped after late RightHand arrival")
+            local welds = createdWelds()
+            local handWeld
+            for _, w in ipairs(welds) do
+                if w.Part0 == rightHand then handWeld = w end
+            end
+            assert(handWeld ~= nil, "weld Part0 == the late-arrived RightHand")
+            assert(handWeld.Part1 == muzzle, "weld Part1 == the weapon anchor")
+            print("OK")
+        """))
+
+    def test_reequip_no_op_when_hand_never_arrives(self):
+        # Bounded wait MISS: a Character whose RightHand never arrives (and no
+        # Right Arm) must end in a clean no-op (nil resolve), not an unbounded
+        # stall or a spurious weld.
+        _assert_ok(textwrap.dedent("""\
+            local player = {}
+            local character = mockInst("Character", "Model")  -- no hand ever
+            local engine = SceneRuntime.new(
+                equipServices(function() return mockInst("g", "Part") end),
+                {equip_prefabs = {riflePrefab = "p"}})
+            engine:rememberEquip(player, "p")
+            local before = #createdWelds()
+            engine:reequipLastWeapon(player, character)
+            assert(#createdWelds() == before, "no weld when the hand never arrives")
+            assert(character:FindFirstChild("_EquippedWeapon") == nil,
+                "no weapon parented when the hand never arrives")
             print("OK")
         """))

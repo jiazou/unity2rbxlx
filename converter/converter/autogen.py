@@ -1336,14 +1336,21 @@ end)
 equipWeaponRemote.Parent = RS
 -- 6. Re-equip on respawn: a NEW Character has no welded weapon, so re-run the
 --    last successful equip (remembered per-Player in step 5).
+--    The respawn re-equip resolves the hand with a BOUNDED WaitForChild (the
+--    R15 limbs land a frame or two AFTER CharacterAdded fires), so it is run in
+--    a task.spawn so a slow wait never stalls the CharacterAdded signal.
 Players.PlayerAdded:Connect(function(p)
     p.CharacterAdded:Connect(function(char)
-        engine:reequipLastWeapon(p, char)
+        task.spawn(function() engine:reequipLastWeapon(p, char) end)
     end)
 end)
 for _, p in Players:GetPlayers() do
-    if p.Character then engine:reequipLastWeapon(p, p.Character) end
-    p.CharacterAdded:Connect(function(char) engine:reequipLastWeapon(p, char) end)
+    if p.Character then
+        task.spawn(function() engine:reequipLastWeapon(p, p.Character) end)
+    end
+    p.CharacterAdded:Connect(function(char)
+        task.spawn(function() engine:reequipLastWeapon(p, char) end)
+    end)
 end'''
 
 

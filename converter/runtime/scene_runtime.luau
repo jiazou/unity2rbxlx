@@ -2937,6 +2937,11 @@ function SceneRuntime:resolveEquipPrefabId(fieldName)
 	return prefabId
 end
 
+-- Bounded wait (seconds) for a respawned Character's hand limb to be parented
+-- before the re-equip gives up (P1). Generous enough to absorb the normal
+-- one-/two-frame R15 limb-parenting delay without an unbounded stall.
+local EQUIP_HAND_WAIT_TIMEOUT = 5
+
 -- R15 right-hand resolver with ONE documented fallback (D15). R15 has a
 -- dedicated ``RightHand`` part; R6 has none, so ``"Right Arm"`` is the closest
 -- grip analog. The full rig-variant matrix is OUT OF SCOPE -- this single
@@ -2945,6 +2950,23 @@ end
 function SceneRuntime:_resolveRightHand(character)
 	if not character then return nil end
 	local hand = character:FindFirstChild("RightHand")
+	if hand and hand:IsA("BasePart") then return hand end
+	hand = character:FindFirstChild("Right Arm")
+	if hand and hand:IsA("BasePart") then return hand end
+	return nil
+end
+
+-- Respawn-tolerant hand resolver (P1: CharacterAdded fires BEFORE the R15 limbs
+-- are parented, so a one-shot ``FindFirstChild`` no-ops on respawn). Uses a
+-- BOUNDED ``WaitForChild`` -- a limb already present resolves instantly, a
+-- late-arriving one is awaited up to ``timeout`` seconds, and a real miss (R6,
+-- or never arrives) still ends in nil so the caller no-ops (no unbounded wait).
+-- The "Right Arm" fallback is a final one-shot FindFirstChild: an R6 rig has its
+-- limbs by the time RightHand's wait elapses, and a second bounded wait would
+-- double the worst-case stall on every nil resolve.
+function SceneRuntime:_resolveRightHandBounded(character, timeout)
+	if not character then return nil end
+	local hand = character:WaitForChild("RightHand", timeout)
 	if hand and hand:IsA("BasePart") then return hand end
 	hand = character:FindFirstChild("Right Arm")
 	if hand and hand:IsA("BasePart") then return hand end
@@ -2960,8 +2982,17 @@ end
 -- physics. Double-equip safety (Edge d): a prior ``_EquippedWeapon`` under THIS
 -- character is removed before welding the new one. Returns the clone, or nil on
 -- any safe no-op (no hand / clone failed / no weldable part).
-function SceneRuntime:equipWeaponOnCharacter(character, prefabId)
-	local hand = self:_resolveRightHand(character)
+-- ``waitForHand`` (respawn path): when true, the hand is resolved with a BOUNDED
+-- WaitForChild so a just-spawned Character whose limbs land a frame later still
+-- equips; the already-spawned OnServerEvent path passes nil/false for the fast
+-- one-shot resolve.
+function SceneRuntime:equipWeaponOnCharacter(character, prefabId, waitForHand)
+	local hand
+	if waitForHand then
+		hand = self:_resolveRightHandBounded(character, EQUIP_HAND_WAIT_TIMEOUT)
+	else
+		hand = self:_resolveRightHand(character)
+	end
 	if not hand then return nil end
 	-- Double-equip safety: remove any existing equipped weapon first.
 	local existing = character:FindFirstChild("_EquippedWeapon")
@@ -3041,7 +3072,8 @@ end
 function SceneRuntime:reequipLastWeapon(player, character)
 	local prefabId = self._lastEquip and self._lastEquip[player]
 	if not prefabId or not character then return end
-	self:equipWeaponOnCharacter(character, prefabId)
+	-- Respawn path: the limbs may not be parented yet -> bounded WaitForChild.
+	self:equipWeaponOnCharacter(character, prefabId, true)
 end
 
 -- ---------------------------------------------------------------------
