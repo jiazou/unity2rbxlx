@@ -304,6 +304,75 @@ class TestCollisionFailClose:
         )
         assert equip_prefabs == {"riflePrefab": "prefab_same"}
 
+    def test_same_script_multi_instance_different_prefab_fails_closed(self):
+        # P1-B: ONE script class with TWO authored instances sharing the equip
+        # field name but referencing DIFFERENT prefabs. The pre-fix code took the
+        # first matching row and never raised (silent misbinding); the bridge
+        # must now collect ALL target_refs for (script_id, field) and fail CLOSED
+        # because the resolved set has size > 1.
+        scene_runtime: dict[str, object] = {
+            "scenes": {
+                "Game.unity": {
+                    "instances": [
+                        {"instance_id": "G:1", "script_id": _PLAYER_SCRIPT_ID,
+                         "game_object_id": "G:91", "active": True,
+                         "enabled": True, "config": {}},
+                        {"instance_id": "G:2", "script_id": _PLAYER_SCRIPT_ID,
+                         "game_object_id": "G:92", "active": True,
+                         "enabled": True, "config": {}},
+                    ],
+                    "references": [
+                        {"from": "G:1", "field": "riflePrefab", "index": None,
+                         "target_kind": "prefab", "target_ref": "prefab_one",
+                         "target_is_ui": False},
+                        {"from": "G:2", "field": "riflePrefab", "index": None,
+                         "target_kind": "prefab", "target_ref": "prefab_two",
+                         "target_is_ui": False},
+                    ],
+                    "lifecycle_order": ["G:1", "G:2"],
+                },
+            },
+            "prefabs": {},
+        }
+        gi = _guid_index({_PLAYER_CS: _PLAYER_SCRIPT_ID})
+        with pytest.raises(
+            RuntimeError, match="maps to multiple different prefabs",
+        ):
+            build_equip_prefabs_bridge([_equip_script()], scene_runtime, gi)
+
+    def test_same_script_multi_instance_same_prefab_is_fine(self):
+        # The benign mirror: ONE script class, two instances, same field AND the
+        # SAME prefab -> the resolved set collapses to one entry, no raise.
+        scene_runtime: dict[str, object] = {
+            "scenes": {
+                "Game.unity": {
+                    "instances": [
+                        {"instance_id": "G:1", "script_id": _PLAYER_SCRIPT_ID,
+                         "game_object_id": "G:91", "active": True,
+                         "enabled": True, "config": {}},
+                        {"instance_id": "G:2", "script_id": _PLAYER_SCRIPT_ID,
+                         "game_object_id": "G:92", "active": True,
+                         "enabled": True, "config": {}},
+                    ],
+                    "references": [
+                        {"from": "G:1", "field": "riflePrefab", "index": None,
+                         "target_kind": "prefab", "target_ref": _RIFLE_PREFAB_ID,
+                         "target_is_ui": False},
+                        {"from": "G:2", "field": "riflePrefab", "index": None,
+                         "target_kind": "prefab", "target_ref": _RIFLE_PREFAB_ID,
+                         "target_is_ui": False},
+                    ],
+                    "lifecycle_order": ["G:1", "G:2"],
+                },
+            },
+            "prefabs": {},
+        }
+        gi = _guid_index({_PLAYER_CS: _PLAYER_SCRIPT_ID})
+        equip_prefabs = build_equip_prefabs_bridge(
+            [_equip_script()], scene_runtime, gi,
+        )
+        assert equip_prefabs == {"riflePrefab": _RIFLE_PREFAB_ID}
+
 
 # ---------------------------------------------------------------------------
 # Criterion 11 — Plan serialize/rehydrate round-trip preserves equip_prefabs

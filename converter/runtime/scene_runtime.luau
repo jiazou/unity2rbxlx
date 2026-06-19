@@ -2980,24 +2980,46 @@ function SceneRuntime:equipWeaponOnCharacter(character, prefabId)
 	elseif not clone:IsA("BasePart") then
 		clone:Destroy(); return nil
 	end
-	-- Position the weapon at the hand, then weld. (First-person muzzle offset is
-	-- a DEFERRED live-tune, D4 -- a zero offset lands the gun ON the hand.)
-	weldPart.CFrame = hand.CFrame
+	-- Reset EVERY BasePart in the clone so the live weapon is VISIBLE
+	-- (templates are emitted Transparency=1.0 / hidden) and moves as one rigid
+	-- body welded to the hand (parts default Anchored=true; an anchored part
+	-- ignores its WeldConstraint and stays pinned in world space). CanCollide
+	-- /Massless keep the gun from blocking or dragging the humanoid's physics.
+	local function normalizePart(p)
+		p.Transparency = 0
+		p.Anchored = false
+		p.CanCollide = false
+		p.Massless = true
+	end
+	for _, d in clone:GetDescendants() do
+		if d:IsA("BasePart") then normalizePart(d) end
+	end
+	if clone:IsA("BasePart") then normalizePart(clone) end
+	-- Relocate the WHOLE clone to the hand as a unit (a multi-part Model keeps
+	-- its internal offsets), then weld. (First-person muzzle offset is a
+	-- DEFERRED live-tune, D4 -- a zero offset lands the gun ON the hand.)
+	if clone:IsA("Model") then
+		clone:PivotTo(hand.CFrame)
+	else
+		weldPart.CFrame = hand.CFrame
+	end
+	-- For a multi-part Model, weld every OTHER descendant BasePart to the chosen
+	-- primary anchor first so the model is internally rigid, then weld the
+	-- anchor to the hand.
+	if clone:IsA("Model") then
+		for _, d in clone:GetDescendants() do
+			if d:IsA("BasePart") and d ~= weldPart then
+				local inner = Instance.new("WeldConstraint")
+				inner.Part0 = weldPart
+				inner.Part1 = d
+				inner.Parent = weldPart
+			end
+		end
+	end
 	local weld = Instance.new("WeldConstraint")
 	weld.Part0 = hand
 	weld.Part1 = weldPart
 	weld.Parent = weldPart
-	-- Weapon parts must not collide with / shove the body.
-	for _, d in clone:GetDescendants() do
-		if d:IsA("BasePart") then
-			d.CanCollide = false
-			d.Massless = true
-		end
-	end
-	if weldPart:IsA("BasePart") then
-		weldPart.CanCollide = false
-		weldPart.Massless = true
-	end
 	return clone
 end
 

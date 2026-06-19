@@ -98,8 +98,14 @@ local function mockInst(name, className)
         Parent = nil,
         CanCollide = true,
         Massless = false,
+        -- Real prefab-field templates are emitted HIDDEN (transparency=1.0) and
+        -- parts default Anchored=true. Default the mock to that pinned/hidden
+        -- shape so the equip path must reset it (P1-A).
+        Transparency = 1,
+        Anchored = true,
         CFrame = "cf0",
         PrimaryPart = nil,
+        _pivotedTo = nil,
     }
     function inst:IsA(c)
         if c == self.ClassName then return true end
@@ -130,6 +136,10 @@ local function mockInst(name, className)
     function inst:Destroy()
         self._destroyed = true
         self.Parent = nil
+    end
+    -- A Model relocates as a unit via PivotTo; record the target for assertions.
+    function inst:PivotTo(cf)
+        self._pivotedTo = cf
     end
     return inst
 end
@@ -251,11 +261,70 @@ class TestEquipWeaponOnCharacter:
             assert(#welds == 1, "exactly one WeldConstraint created, got " .. #welds)
             assert(welds[1].Part0 == rightHand, "weld Part0 == RightHand")
             assert(welds[1].Part1 == muzzle, "weld Part1 == the weldable anchor")
-            -- weldPart positioned at the hand CFrame.
-            assert(muzzle.CFrame == "handCF", "weldPart moved to the hand CFrame")
-            -- (iii) clone BaseParts CanCollide=false, Massless=true.
+            -- A Model relocates as a unit via PivotTo(hand.CFrame).
+            assert(clone._pivotedTo == "handCF", "model pivoted to the hand CFrame")
+            -- (iii) clone BaseParts CanCollide=false, Massless=true, and the
+            -- live weapon is VISIBLE + un-anchored (P1-A).
             assert(muzzle.CanCollide == false, "muzzle CanCollide disabled")
             assert(muzzle.Massless == true, "muzzle Massless enabled")
+            assert(muzzle.Transparency == 0, "muzzle un-hidden")
+            assert(muzzle.Anchored == false, "muzzle un-anchored")
+            print("OK")
+        """))
+
+    def test_multipart_hidden_anchored_model_is_unhidden_unanchored_and_rigid(self):
+        # P1-A: a real prefab template is HIDDEN (Transparency=1) and ANCHORED.
+        # A ge-2-part Model must come back fully visible, un-anchored, pivoted to
+        # the hand, with every descendant welded to the anchor and the anchor
+        # welded to the hand. This FAILS against the pre-fix code (which left
+        # Transparency=1 / Anchored=true and created only the hand weld).
+        _assert_ok(textwrap.dedent("""\
+            local character = mockInst("Character", "Model")
+            local rightHand = mockInst("RightHand", "Part")
+            rightHand.CFrame = "handCF"
+            addChild(character, rightHand)
+
+            -- Two-part rifle: a Body anchor (PrimaryPart) + a Barrel descendant.
+            local body, barrel
+            local function cloneFactory(_)
+                local m = mockInst("Rifle", "Model")
+                body = mockInst("Body", "Part")
+                barrel = mockInst("Barrel", "Part")
+                m.PrimaryPart = body
+                m._descendants = {body, barrel}
+                return m
+            end
+            local engine = SceneRuntime.new(equipServices(cloneFactory),
+                {equip_prefabs = {riflePrefab = "p"}})
+
+            -- Sanity: the template starts hidden + anchored.
+            local clone = engine:equipWeaponOnCharacter(character, "p")
+            assert(clone ~= nil, "equip returns the clone")
+
+            -- Every part visible + un-anchored + collision/mass off.
+            for _, part in ipairs({body, barrel}) do
+                assert(part.Transparency == 0, part.Name .. " un-hidden")
+                assert(part.Anchored == false, part.Name .. " un-anchored")
+                assert(part.CanCollide == false, part.Name .. " CanCollide off")
+                assert(part.Massless == true, part.Name .. " Massless on")
+            end
+
+            -- The whole model relocates as a unit.
+            assert(clone._pivotedTo == "handCF", "model pivoted to the hand")
+
+            -- Welds: one barrel->body (rigid), one body->hand (mount). Order is
+            -- descendant-welds-first then the hand weld.
+            local welds = createdWelds()
+            assert(#welds == 2, "two WeldConstraints, got " .. #welds)
+            -- Find the inner (anchor<->descendant) and the hand weld.
+            local innerWeld, handWeld
+            for _, w in ipairs(welds) do
+                if w.Part0 == rightHand then handWeld = w
+                elseif w.Part0 == body and w.Part1 == barrel then innerWeld = w end
+            end
+            assert(innerWeld ~= nil, "barrel welded to the body anchor")
+            assert(handWeld ~= nil and handWeld.Part1 == body,
+                "body anchor welded to the hand")
             print("OK")
         """))
 

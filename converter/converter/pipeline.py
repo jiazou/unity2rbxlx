@@ -158,7 +158,12 @@ def build_equip_prefabs_bridge(
             # collision, so no fail-close.
             continue
         # Resolve the field's prefab_id from THIS script's prefab reference rows.
-        resolved: str | None = None
+        # Collect ALL target_refs across EVERY matching row (across all authored
+        # instances of this script class) — a single instance taking the first
+        # row would silently misbind when two instances of the SAME script class
+        # share the field name but reference DIFFERENT prefabs (same-script
+        # multi-instance collision). The resolved set must be exactly one.
+        resolved_set: set[str] = set()
         for row in prefab_rows:
             if row.get("field") != field_name:
                 continue
@@ -169,10 +174,21 @@ def build_equip_prefabs_bridge(
                 continue
             target_ref = row.get("target_ref")
             if isinstance(target_ref, str) and target_ref:
-                resolved = target_ref
-                break
-        if resolved is None:
+                resolved_set.add(target_ref)
+        if not resolved_set:
             continue
+        if len(resolved_set) > 1:
+            refs = ", ".join(repr(r) for r in sorted(resolved_set))
+            raise RuntimeError(
+                "[contract] camera-mount equip bridge: field name "
+                f"{field_name!r} on script {script_id!r} maps to multiple "
+                f"different prefabs across that script's instances ({refs}) — "
+                "refusing to ship a flat field->prefab_id map that would "
+                "silently misbind one of them (D13b build-time collision "
+                "fail-close). File D13a (scriptId-scoped resolution) to support "
+                "this game."
+            )
+        resolved = next(iter(resolved_set))
         prior = field_provenance.get(field_name)
         if prior is not None and prior[0] != resolved:
             raise RuntimeError(
