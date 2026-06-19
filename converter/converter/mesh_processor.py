@@ -169,8 +169,14 @@ def decimate_mesh(
                            MESH_ROBLOX_MAX_FACES)
 
     try:
-        # Primary: quadric decimation (requires scipy/quadric extension).
-        decimated = mesh.simplify_quadric_decimation(target_faces)
+        # Primary: quadric decimation (requires the fast_simplification backend).
+        # Pass target_faces as the `face_count` keyword -- the trimesh 4.x
+        # signature is simplify_quadric_decimation(percent=None, face_count=None,
+        # ...), so a positional argument binds to `percent` (a 0..1 reduction
+        # fraction) and a face *count* raises ValueError, silently falling back
+        # to exporting the un-decimated original (an oversized mesh that fails
+        # the Roblox upload bug-1 is meant to prevent).
+        decimated = mesh.simplify_quadric_decimation(face_count=target_faces)
         decimated.export(str(out))
         final_faces = int(len(decimated.faces))
         log.info(

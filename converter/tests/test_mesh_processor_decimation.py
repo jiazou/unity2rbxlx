@@ -82,8 +82,11 @@ class TestRobloxFaceCap:
 
         captured: dict[str, int] = {}
 
-        def _spy(self: "trimesh.Trimesh", target: int) -> "trimesh.Trimesh":
-            captured["target"] = target
+        def _spy(self: "trimesh.Trimesh", face_count: int) -> "trimesh.Trimesh":
+            # Mirror the production keyword call simplify_quadric_decimation(
+            # face_count=...). A positional-only spy would mask a regression to
+            # the broken positional call (which binds to `percent` and raises).
+            captured["target"] = face_count
             raise RuntimeError("backend disabled for spy")
 
         monkeypatch.setattr(trimesh.Trimesh, "simplify_quadric_decimation", _spy)
@@ -262,8 +265,11 @@ class TestDecimateMeshWithBackend:
         # target tiny -> ratio below floor -> floor branch fires -> clamp to cap.
         out = decimate_mesh(src, target_faces=10)
         decimated = trimesh.load(str(out), force="mesh")
-        # Decimator may slightly overshoot its target; allow the usual 10% slack.
-        assert len(decimated.faces) <= cap * 1.1
+        # The fast_simplification backend honors face_count exactly (it is a
+        # reduction, never adds faces), so the clamped request bounds the output
+        # strictly at the cap -- no overshoot slack. A positional-arg regression
+        # (which raises and exports the oversized original) fails this.
+        assert len(decimated.faces) <= cap
         assert len(decimated.faces) < floored
 
     def test_no_inverted_normals_post_decimate(self, tmp_path: Path) -> None:
