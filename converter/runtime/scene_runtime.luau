@@ -2998,7 +2998,12 @@ function SceneRuntime:equipWeaponOnCharacter(character, prefabId)
 	-- Relocate the WHOLE clone to the hand as a unit (a multi-part Model keeps
 	-- its internal offsets), then weld. (First-person muzzle offset is a
 	-- DEFERRED live-tune, D4 -- a zero offset lands the gun ON the hand.)
+	-- For a Model, pin PrimaryPart to the chosen anchor BEFORE PivotTo so the
+	-- ANCHOR lands exactly at hand.CFrame. Without this pin PivotTo uses the
+	-- bounding-box pivot, leaving the anchor at an arbitrary offset that the
+	-- subsequent hand WeldConstraint would freeze (gun floats off the hand).
 	if clone:IsA("Model") then
+		clone.PrimaryPart = weldPart
 		clone:PivotTo(hand.CFrame)
 	else
 		weldPart.CFrame = hand.CFrame

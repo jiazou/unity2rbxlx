@@ -138,8 +138,23 @@ local function mockInst(name, className)
         self.Parent = nil
     end
     -- A Model relocates as a unit via PivotTo; record the target for assertions.
+    -- Model the Roblox PrimaryPart semantics so anchor-placement is testable:
+    -- with a PrimaryPart set, the PrimaryPart's CFrame becomes ``cf`` exactly;
+    -- with NO PrimaryPart, PivotTo uses the bounding-box pivot, so the parts'
+    -- own CFrames do NOT all land on ``cf`` (the bbox center does). We emulate
+    -- the no-PrimaryPart case by stamping a distinct sentinel onto each part so
+    -- an assertion of ``part.CFrame == cf`` fails (as it does in real Roblox).
     function inst:PivotTo(cf)
         self._pivotedTo = cf
+        if self.PrimaryPart ~= nil then
+            self.PrimaryPart.CFrame = cf
+        else
+            for _, d in ipairs(self._descendants or {}) do
+                if d:IsA("BasePart") then
+                    d.CFrame = "bbox_pivot_offset"
+                end
+            end
+        end
     end
     return inst
 end
@@ -325,6 +340,57 @@ class TestEquipWeaponOnCharacter:
             assert(innerWeld ~= nil, "barrel welded to the body anchor")
             assert(handWeld ~= nil and handWeld.Part1 == body,
                 "body anchor welded to the hand")
+            print("OK")
+        """))
+
+    def test_no_primarypart_model_anchor_lands_on_hand(self):
+        # P1 (round 2): a multi-part Model clone with NO PrimaryPart set. The
+        # equip path picks the first BasePart as the anchor; it MUST pin that as
+        # PrimaryPart before PivotTo so the ANCHOR lands exactly at hand.CFrame.
+        # Without the pin, PivotTo uses the bounding-box pivot, leaving the anchor
+        # at an arbitrary offset that the hand weld freezes (gun floats off). The
+        # parts start at distinct non-origin CFrames so a bbox pivot != anchor.
+        # FAILS against the pre-fix code (no PrimaryPart pin before PivotTo).
+        _assert_ok(textwrap.dedent("""\
+            local character = mockInst("Character", "Model")
+            local rightHand = mockInst("RightHand", "Part")
+            rightHand.CFrame = "handCF"
+            addChild(character, rightHand)
+
+            -- Two-part rifle with NO PrimaryPart and parts at non-origin CFrames.
+            local body, barrel
+            local function cloneFactory(_)
+                local m = mockInst("Rifle", "Model")
+                body = mockInst("Body", "Part")
+                body.CFrame = "bodyCF_nonorigin"
+                barrel = mockInst("Barrel", "Part")
+                barrel.CFrame = "barrelCF_nonorigin"
+                m.PrimaryPart = nil  -- no PrimaryPart: bbox pivot unless pinned
+                m._descendants = {body, barrel}
+                return m
+            end
+            local engine = SceneRuntime.new(equipServices(cloneFactory),
+                {equip_prefabs = {riflePrefab = "p"}})
+
+            local clone = engine:equipWeaponOnCharacter(character, "p")
+            assert(clone ~= nil, "equip returns the clone")
+
+            -- The chosen anchor is the first BasePart (body). It must have been
+            -- pinned as PrimaryPart and thus pivoted exactly onto the hand.
+            local welds = createdWelds()
+            local handWeld
+            for _, w in ipairs(welds) do
+                if w.Part0 == rightHand then handWeld = w end
+            end
+            assert(handWeld ~= nil, "a hand weld was created")
+            local anchor = handWeld.Part1
+            assert(anchor == body, "anchor is the first BasePart (body)")
+            -- THE LOAD-BEARING ASSERT: the anchor landed ON the hand (zero
+            -- offset), not at the bounding-box pivot.
+            assert(anchor.CFrame == "handCF",
+                "anchor must land on hand.CFrame, got " .. tostring(anchor.CFrame))
+            assert(clone.PrimaryPart == body,
+                "the chosen anchor was pinned as PrimaryPart before PivotTo")
             print("OK")
         """))
 
