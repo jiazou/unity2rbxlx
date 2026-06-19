@@ -72,6 +72,14 @@ class RigRootedRetargetFact:
     child_name: str  # resolved authored child name under the MainCamera node ("WeaponSlot"), E1-E3 guarded
     cam_receiver: str = ""  # the C# group-2 camera receiver text (the lowering's RECEIVER ANCHOR)
     ordinal: int = 0  # the n in the credited GetChild(n); -> carrier cam_ordinal
+    # --- NEW equip obligation (Phase 1) — populated ONLY on the unambiguous
+    #     held-prefab-equip shape (Instantiate(prefab)+SetParent(field) in ONE C#
+    #     method). Default "" means "no equip obligation" (ABSTAIN — D8/D11): the
+    #     equip lowering/verifier do not fire for that script and the existing
+    #     rig-retarget path is untouched. The discriminator is
+    #     ``equip_method != "" and prefab_field != ""``.
+    equip_method: str = ""  # C# method hosting Instantiate(prefab)+SetParent(slot)
+    prefab_field: str = ""  # the C# prefab field instantiated (e.g. "riflePrefab")
 
 
 # Per-script resolution outcome, keyed on the canonical .cs path key. Carries
@@ -134,6 +142,41 @@ _CS_CAM_GETCHILD_RE = re.compile(
     r"([A-Za-z_][\w.]*)\s*=\s*"
     r"([A-Za-z_][\w.]*)\.GetChild\(\s*(\d+)\s*\)"
 )
+
+
+# --- Equip-obligation matchers (Phase 1) ----------------------------------
+# An ``Instantiate(<prefab>, …)`` call whose FIRST argument is a bare or
+# ``this.``-qualified field identifier (the prefab to spawn). Group 1 is the
+# optional ``this.`` qualifier; group 2 is the bare field name. A first arg that
+# is a literal / call / foreign member access (``Instantiate(new GameObject())``,
+# ``Instantiate(a.b)``) does NOT match group 2 as a lone field -> ABSTAIN (D11).
+_CS_INSTANTIATE_PREFAB_RE = re.compile(
+    r"\bInstantiate\s*\(\s*(this\.)?([A-Za-z_]\w*)\s*(?:[,)])"
+)
+
+# A ``<x>.SetParent(<slot>)`` / ``<x>.transform.SetParent(<slot>)`` call. Group 1
+# is the ``<slot>`` argument text — a bare field, a ``this.``-qualified field, or
+# a dotted access; the resolver compares it against the recognized rig ``field``.
+_CS_SETPARENT_RE = re.compile(
+    r"\.SetParent\s*\(\s*([A-Za-z_][\w.]*)\s*\)"
+)
+
+# A C# method declaration header ``<modifiers/ret> <Name>(…)`` immediately
+# followed (modulo whitespace/comments) by an opening ``{``. Used to locate the
+# nearest enclosing method body for a code position. The method NAME is group 1.
+# The pattern is intentionally permissive on the return-type/modifier prefix (it
+# only needs the ``<Name>(`` then a ``{`` body) — a control-flow head
+# (``if (…) {``) is excluded because its keyword is not captured as a method name
+# (we reject C# keywords in ``_enclosing_cs_method``).
+_CS_METHOD_DECL_RE = re.compile(r"\b([A-Za-z_]\w*)\s*\([^;{}]*\)\s*\{")
+
+# C# control-flow / statement keywords that the method-decl regex could match as a
+# "method name" (``if (cond) {``). Rejected so a method scope never resolves to a
+# control-flow block.
+_CS_NOT_A_METHOD_NAME: frozenset[str] = frozenset({
+    "if", "for", "foreach", "while", "switch", "do", "else", "lock", "using",
+    "fixed", "catch", "try", "return", "in", "is", "as", "new",
+})
 
 
 # Host-self aliases: in Unity C#, ``transform``, ``this.transform``,
@@ -848,6 +891,127 @@ def _lhs_is_bare_field(source: str, field_start: int, full_lhs: str) -> str | No
     return None  # any leading token (a type, a control-flow head) -> abstain
 
 
+def _enclosing_cs_method(source: str, pos: int) -> tuple[str, int, int] | None:
+    """The nearest enclosing C# method ``<name>(…) { … }`` that CONTAINS ``pos``.
+
+    Returns ``(method_name, body_open_idx, body_close_idx)`` where ``body_open_idx``
+    is the index of the method's opening ``{`` and ``body_close_idx`` is the index
+    just past its matching ``}`` (brace-balanced over code positions). Returns None
+    if ``pos`` is not inside any method body.
+
+    Code-position-aware (comments/strings skipped). A control-flow head
+    (``if (cond) {``) is excluded — its keyword is rejected as a method name.
+    Picks the INNERMOST method whose ``{ … }`` body brackets ``pos`` (so a nested
+    local-function body wins over the outer method), which is what binds the equip
+    obligation to one rewrite site."""
+    best: tuple[str, int, int] | None = None
+    for m in _CS_METHOD_DECL_RE.finditer(source):
+        if not _cs_pos_is_code(source, m.start()):
+            continue
+        name = m.group(1)
+        if name in _CS_NOT_A_METHOD_NAME:
+            continue
+        brace_open = source.index("{", m.end() - 1)
+        body_end = _cs_block_end(source, brace_open)
+        if body_end is None:
+            continue
+        if brace_open < pos < body_end:
+            # Innermost wins: a later (textually-deeper) match that still brackets
+            # ``pos`` is nested inside, so prefer the one with the LATEST open brace.
+            if best is None or brace_open > best[1]:
+                best = (name, brace_open, body_end)
+    return best
+
+
+def _cs_block_end(source: str, open_brace_idx: int) -> int | None:
+    """The index just past the ``}`` matching the ``{`` at ``open_brace_idx``,
+    brace-balanced over code positions only (strings/comments skipped). None if
+    unbalanced (runs off the end)."""
+    depth = 0
+    i = open_brace_idx
+    n = len(source)
+    while i < n:
+        if not _cs_pos_is_code(source, i):
+            i += 1
+            continue
+        ch = source[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return None
+
+
+def _resolve_equip_obligation(source: str, field: str) -> tuple[str, str] | None:
+    """For an admitted rig fact on C# field ``field``, return
+    ``(equip_method, prefab_field)`` iff the script contains the UNAMBIGUOUS
+    held-prefab-equip shape — else None (ABSTAIN, D8/D11).
+
+    Unambiguous shape (ALL required, code-position-aware, in the SAME C# method):
+      1. an ``Instantiate(<prefabField>, …)`` whose first arg is a bare /
+         ``this.``-field identifier (the prefab), AND
+      2. a ``<x>.SetParent(<slot>)`` whose ``<slot>`` is EXACTLY the recognized rig
+         ``field`` (bare or ``this.``-qualified), AND
+      3. both calls in the SAME enclosing method ``M``.
+
+    ABSTAIN (None) on: no qualifying Instantiate; a SetParent whose slot is not
+    ``field``; the two calls in DIFFERENT methods; ``>1`` distinct qualifying
+    method (ambiguous — §Edge f); an unresolvable prefab arg (literal/call/foreign
+    member access — D11). Pure; code-position-aware; keyed entirely on the C#
+    ``field`` already proven to be the MainCamera-child slot."""
+    # Find every SetParent(slot) whose slot is EXACTLY ``field`` (the rig slot),
+    # bucketed by enclosing method.
+    setparent_methods: dict[str, tuple[int, int]] = {}
+    for m in _CS_SETPARENT_RE.finditer(source):
+        if not _cs_pos_is_code(source, m.start()):
+            continue
+        slot = m.group(1)
+        if slot != field and slot != f"this.{field}":
+            continue  # SetParent onto a different slot -> not this obligation
+        enc = _enclosing_cs_method(source, m.start())
+        if enc is None:
+            continue
+        setparent_methods[enc[0]] = (enc[1], enc[2])
+    if not setparent_methods:
+        return None  # no SetParent onto the rig slot -> abstain
+
+    # For each such method, find a qualifying Instantiate(<prefabField>) within the
+    # SAME method body. Collect the (method, prefab_field) candidates.
+    candidates: list[tuple[str, str]] = []
+    for method, (body_open, body_close) in setparent_methods.items():
+        prefab = _instantiate_prefab_in_span(source, body_open, body_close)
+        if prefab is None:
+            continue  # no resolvable held-prefab Instantiate in this method -> skip
+        candidates.append((method, prefab))
+
+    # >1 distinct qualifying (method, prefab) -> ambiguous obligation -> ABSTAIN
+    # (the single carrier holds one obligation; bias to the recognizer's abstain).
+    distinct = set(candidates)
+    if len(distinct) != 1:
+        return None
+    return candidates[0]
+
+
+def _instantiate_prefab_in_span(
+    source: str, span_start: int, span_end: int
+) -> str | None:
+    """The bare prefab-field name of the UNIQUE ``Instantiate(<prefabField>, …)``
+    whose first arg is a resolvable bare/``this.`` field, within
+    ``source[span_start:span_end]`` (code positions only). None if there is no such
+    call, or MORE THAN ONE distinct prefab field (ambiguous within the method)."""
+    prefabs: set[str] = set()
+    for m in _CS_INSTANTIATE_PREFAB_RE.finditer(source, span_start, span_end):
+        if not _cs_pos_is_code(source, m.start()):
+            continue
+        prefabs.add(m.group(2))
+    if len(prefabs) != 1:
+        return None  # zero (abstain) or ambiguous (multiple distinct prefab fields)
+    return next(iter(prefabs))
+
+
 def _resolve_rig_facts(
     source: str,
     host_node: HostNode,
@@ -881,12 +1045,21 @@ def _resolve_rig_facts(
         if child is None:
             continue  # E1–E3 -> abstain
         name = getattr(child, "name", "") or ""
+        # NEW (Phase 1): does this rig fact ALSO carry an equip obligation? The
+        # recognizer keys on the SAME proven slot ``field`` (receiver-agnostic, so
+        # the seeded one-hop and direct forms behave identically). Abstain -> empty
+        # equip fields -> the equip lowering/verifier do not fire (D8/D11).
+        equip = _resolve_equip_obligation(source, field)
+        equip_method = equip[0] if equip is not None else ""
+        prefab_field = equip[1] if equip is not None else ""
         rig_facts.append(
             RigRootedRetargetFact(
                 field_name=field,
                 child_name=name,
                 cam_receiver=m.group(2),
                 ordinal=ordinal,  # credited GetChild(n) -> carrier cam_ordinal
+                equip_method=equip_method,
+                prefab_field=prefab_field,
             )
         )
     return rig_facts
