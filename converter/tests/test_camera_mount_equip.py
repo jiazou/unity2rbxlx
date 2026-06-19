@@ -424,10 +424,12 @@ def test_c2_lowering_on_verbatim_fixture_body() -> None:
     assert "if self.riflePrefab then" in src
     assert "self.gotWeapon = true" in src
     assert "self:TakeAmmo(20)" in src
-    # (e) the carrier
+    # (e) the carrier (scale None = the synthetic fact carries no captured localScale,
+    # distinct from an explicit 1.0; the C#-side scale capture is exercised in
+    # test_equip_scale_capture below)
     assert s.equip_binding == {
         "prefab": "riflePrefab", "method": "GetRifle",
-        "remote": "equipWeaponRemote", "present": True,
+        "remote": "equipWeaponRemote", "present": True, "scale": None,
     }
 
 
@@ -717,3 +719,85 @@ def test_committed_fixture_player_is_real_lowering_fixed_point() -> None:
     assert s.equip_binding["prefab"] == committed_eb["prefab"]
     assert s.equip_binding["method"] == committed_eb["method"]
     assert s.equip_binding["remote"] == committed_eb["remote"]
+
+
+# === D17/Bug-2 — UNIFORM localScale capture from the C# equip method ==========
+#
+# The fix captures the C# ``<prefab>.transform.localScale`` the equip method
+# applies to the instantiated prefab, carrying it to the runtime weld-time ScaleTo
+# (NOT hardcoded). ``equip_scale`` is the captured uniform factor, or ``None`` (the
+# no-capture sentinel, distinct from an explicit 1.0) when nothing was captured.
+
+
+def _equip_cs(scale_stmt: str) -> str:
+    """A minimal FIRE-shaped equip class with ``scale_stmt`` inserted into the
+    GetRifle body between the Instantiate and the SetParent onto the rig slot."""
+    return (
+        "using UnityEngine;\n"
+        "public class Player : MonoBehaviour {\n"
+        "  Transform cam; public Transform weaponSlot; public GameObject riflePrefab;\n"
+        "  void Awake() { cam = Camera.main.transform; weaponSlot = cam.GetChild(0); }\n"
+        "  void GetRifle() {\n"
+        "    var r = Instantiate(riflePrefab);\n"
+        f"    {scale_stmt}\n"
+        "    r.transform.SetParent(weaponSlot);\n"
+        "  }\n"
+        "}\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "scale_stmt, expected",
+    [
+        ("r.transform.localScale = Vector3.one * 0.2f;", 0.2),
+        ("r.transform.localScale = 0.2f * Vector3.one;", 0.2),
+        ("r.transform.localScale = Vector3.one * 0.2F;", 0.2),   # capital F suffix
+        ("r.transform.localScale = Vector3.one * .25f;", 0.25),  # no leading digit
+        ("r.transform.localScale = Vector3.one * 2;", 2.0),      # bare int, no suffix
+        ("r.transform.localScale = new Vector3(0.2f, 0.2f, 0.2f);", 0.2),  # uniform new
+        ("r.localScale = Vector3.one * 0.5f;", 0.5),             # receiver w/o .transform
+    ],
+)
+def test_bug2_captures_uniform_scale(
+    tmp_path: Path, scale_stmt: str, expected: float
+) -> None:
+    entry = _build(tmp_path, _equip_cs(scale_stmt))
+    assert entry is not None and len(entry.rig_facts) == 1
+    assert entry.rig_facts[0].equip_scale == expected
+
+
+@pytest.mark.parametrize(
+    "scale_stmt",
+    [
+        "",                                                       # no localScale at all
+        "r.transform.localScale = new Vector3(0.2f, 0.3f, 0.2f);",  # NON-uniform -> abstain
+        "r.transform.localScale = Vector3.one * -0.2f;",          # non-positive -> abstain
+        "r.transform.localScale = someVar;",                      # identifier -> abstain
+        "other.transform.localScale = Vector3.one * 0.2f;",       # DIFFERENT object -> abstain
+    ],
+)
+def test_bug2_abstains_to_none_sentinel(tmp_path: Path, scale_stmt: str) -> None:
+    entry = _build(tmp_path, _equip_cs(scale_stmt))
+    assert entry is not None and len(entry.rig_facts) == 1
+    # None (no capture), NEVER a silent 1.0 that the bridge could not distinguish
+    # from an explicit 1.0 (the codex P1 the sentinel fixes).
+    assert entry.rig_facts[0].equip_scale is None
+
+
+def test_bug2_explicit_one_is_captured_not_none(tmp_path: Path) -> None:
+    # An EXPLICIT Vector3.one (== 1.0) IS a real capture -> 1.0, NOT the None
+    # sentinel: the bridge must be able to collide it against a conflicting 0.2.
+    entry = _build(tmp_path, _equip_cs("r.transform.localScale = Vector3.one * 1f;"))
+    assert entry is not None and len(entry.rig_facts) == 1
+    assert entry.rig_facts[0].equip_scale == 1.0
+
+
+def test_bug2_last_uniform_write_wins(tmp_path: Path) -> None:
+    # Two sequential uniform localScale writes on the prefab -> the LAST wins.
+    src = _equip_cs(
+        "r.transform.localScale = Vector3.one * 0.5f;\n"
+        "    r.transform.localScale = Vector3.one * 0.2f;"
+    )
+    entry = _build(tmp_path, src)
+    assert entry is not None and len(entry.rig_facts) == 1
+    assert entry.rig_facts[0].equip_scale == 0.2

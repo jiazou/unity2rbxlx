@@ -110,6 +110,9 @@ local function mockInst(name, className)
         Transparency = 1,
         Anchored = true,
         CFrame = "cf0",
+        -- A numeric stand-in for a BasePart.Size Vector3 so the single-BasePart
+        -- scale path (``clone.Size = clone.Size * equipScale``) is assertable.
+        Size = 4,
         PrimaryPart = nil,
         _pivotedTo = nil,
     }
@@ -149,6 +152,8 @@ local function mockInst(name, className)
     function inst:GetDescendants()
         return self._descendants
     end
+    -- A Model uniform-scales via ScaleTo; record the factor for assertions.
+    function inst:ScaleTo(s) self._scaledTo = s end
     function inst:FindFirstChildWhichIsA(c, recurse)
         for _, d in ipairs(self._descendants) do
             if d:IsA(c) then return d end
@@ -637,5 +642,112 @@ class TestReequipOnRespawn:
             assert(#createdWelds() == before, "no weld when the hand never arrives")
             assert(character:FindFirstChild("_EquippedWeapon") == nil,
                 "no weapon parented when the hand never arrives")
+            print("OK")
+        """))
+
+
+# ---------------------------------------------------------------------------
+# D17/Bug-2 — resolveEquipScale + weld-time ScaleTo apply
+# ---------------------------------------------------------------------------
+
+class TestResolveEquipScale:
+
+    def test_resolve_scale_map_lookup_and_no_op_defaults(self):
+        _assert_ok(textwrap.dedent("""\
+            local plan = {equip_scales = {prefab_rifle = 0.2}}
+            local engine = SceneRuntime.new({warn = function() end}, plan)
+            assert(engine:resolveEquipScale("prefab_rifle") == 0.2,
+                "known prefab_id -> its captured scale")
+            assert(engine:resolveEquipScale("unknown") == 1,
+                "unknown prefab_id -> 1 (no-op)")
+            -- No equip_scales map at all -> 1 (the common no-scale game).
+            local engine2 = SceneRuntime.new({warn = function() end}, {})
+            assert(engine2:resolveEquipScale("prefab_rifle") == 1,
+                "missing equip_scales map -> 1")
+            -- A non-positive / non-number entry is defensively dropped to 1.
+            local engine3 = SceneRuntime.new({warn = function() end},
+                {equip_scales = {p = -0.5, q = "x"}})
+            assert(engine3:resolveEquipScale("p") == 1, "non-positive scale -> 1")
+            assert(engine3:resolveEquipScale("q") == 1, "non-number scale -> 1")
+            print("OK")
+        """))
+
+
+class TestEquipScaleApply:
+
+    def test_model_clone_scaled_before_weld(self):
+        # A Model clone for a prefab with a captured scale must be ScaleTo'd
+        # (uniform) AND still welded to the hand (scale does not break the mount).
+        _assert_ok(textwrap.dedent("""\
+            local character = mockInst("Character", "Model")
+            local rightHand = mockInst("RightHand", "Part")
+            rightHand.CFrame = "handCF"
+            addChild(character, rightHand)
+
+            local body
+            local function cloneFactory(_)
+                local m = mockInst("Rifle", "Model")
+                body = mockInst("Body", "Part")
+                m.PrimaryPart = body
+                m._descendants = {body}
+                return m
+            end
+            local engine = SceneRuntime.new(equipServices(cloneFactory),
+                {equip_prefabs = {riflePrefab = "p"},
+                 equip_scales = {p = 0.2}})
+            local clone = engine:equipWeaponOnCharacter(character, "p")
+            assert(clone ~= nil, "equip returns the clone")
+            assert(clone._scaledTo == 0.2, "Model clone ScaleTo(0.2) applied")
+            assert(clone._pivotedTo == "handCF", "scaled clone still mounts on hand")
+            -- Exactly one hand weld (Part0 = the hand).
+            local welds = createdWelds()
+            local handWeld
+            for _, w in ipairs(welds) do
+                if w.Part0 == rightHand then handWeld = w end
+            end
+            assert(handWeld ~= nil and handWeld.Part1 == body,
+                "scaled model anchor welded to the hand")
+            print("OK")
+        """))
+
+    def test_no_scale_entry_leaves_model_unscaled(self):
+        # A prefab with NO equip_scales entry must NOT be ScaleTo'd (native size).
+        _assert_ok(textwrap.dedent("""\
+            local character = mockInst("Character", "Model")
+            local rightHand = mockInst("RightHand", "Part")
+            addChild(character, rightHand)
+            local body
+            local function cloneFactory(_)
+                local m = mockInst("Rifle", "Model")
+                body = mockInst("Body", "Part")
+                m.PrimaryPart = body
+                m._descendants = {body}
+                return m
+            end
+            local engine = SceneRuntime.new(equipServices(cloneFactory),
+                {equip_prefabs = {riflePrefab = "p"}})  -- no equip_scales
+            local clone = engine:equipWeaponOnCharacter(character, "p")
+            assert(clone._scaledTo == nil, "no scale entry -> ScaleTo not called")
+            print("OK")
+        """))
+
+    def test_single_basepart_clone_scales_size(self):
+        # A bare BasePart clone scales its Size (Size * scale), no ScaleTo.
+        _assert_ok(textwrap.dedent("""\
+            local character = mockInst("Character", "Model")
+            local rightHand = mockInst("RightHand", "Part")
+            addChild(character, rightHand)
+            local function cloneFactory(_)
+                local p = mockInst("Rifle", "Part")  -- bare BasePart, Size = 4
+                p._descendants = {}
+                return p
+            end
+            local engine = SceneRuntime.new(equipServices(cloneFactory),
+                {equip_prefabs = {riflePrefab = "p"},
+                 equip_scales = {p = 0.5}})
+            local clone = engine:equipWeaponOnCharacter(character, "p")
+            assert(clone ~= nil, "equip returns the bare-part clone")
+            assert(clone.Size == 2, "BasePart Size scaled 4 * 0.5 = 2, got "
+                .. tostring(clone.Size))
             print("OK")
         """))

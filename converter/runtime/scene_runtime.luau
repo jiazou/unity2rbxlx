@@ -2937,6 +2937,20 @@ function SceneRuntime:resolveEquipPrefabId(fieldName)
 	return prefabId
 end
 
+-- D17/Bug-2: the uniform display scale for a weapon prefab, from the Plan's
+-- ``equip_prefabs`` sibling ``equip_scales`` map (keyed by prefab_id, captured from
+-- the C# ``localScale = Vector3.one * f``). Returns 1 (no-op) when absent / invalid
+-- so the common no-scale game welds at native template size. Keyed by prefab_id so
+-- BOTH the manual equip and the respawn re-equip (which hold prefab_id, not the
+-- field name) resolve the same scale.
+function SceneRuntime:resolveEquipScale(prefabId)
+	local map = self._plan and self._plan.equip_scales
+	if type(map) ~= "table" then return 1 end
+	local s = map[prefabId]
+	if type(s) == "number" and s > 0 then return s end
+	return 1
+end
+
 -- Bounded wait (seconds) for a respawned Character's hand limb to be parented
 -- before the re-equip gives up. Generous enough to absorb the normal
 -- one-/two-frame R15 limb-parenting delay without an unbounded stall.
@@ -3026,6 +3040,19 @@ function SceneRuntime:equipWeaponOnCharacter(character, prefabId, waitForHand)
 	local clone = self._services.clonePrefabTemplate(prefabId, character, nil)
 	if not clone then return nil end
 	clone.Name = "_EquippedWeapon"
+	-- D17/Bug-2: apply the captured uniform display scale BEFORE positioning/welding
+	-- (the C# equip set ``localScale = Vector3.one * f``; the converted template is
+	-- at native size). ScaleTo scales geometry about the model pivot; doing it before
+	-- PivotTo/weld means the subsequent placement lands the scaled weapon on the hand.
+	-- Model -> ScaleTo (uniform); single BasePart -> scale Size. No-op when scale == 1.
+	local equipScale = self:resolveEquipScale(prefabId)
+	if equipScale ~= 1 then
+		if clone:IsA("Model") then
+			clone:ScaleTo(equipScale)
+		elseif clone:IsA("BasePart") then
+			clone.Size = clone.Size * equipScale
+		end
+	end
 	-- Normalize Model -> a weldable BasePart anchor (PrimaryPart or first
 	-- BasePart). A non-Model non-BasePart clone is unweldable -> drop it.
 	local weldPart = clone

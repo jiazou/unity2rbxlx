@@ -80,6 +80,15 @@ class RigRootedRetargetFact:
     #     ``equip_method != "" and prefab_field != ""``.
     equip_method: str = ""  # C# method hosting Instantiate(prefab)+SetParent(slot)
     prefab_field: str = ""  # the C# prefab field instantiated (e.g. "riflePrefab")
+    # The UNIFORM display scale the C# equip method applies to the instantiated
+    # prefab (``rifle.transform.localScale = Vector3.one * 0.2f`` -> 0.2). ``None``
+    # means "no scale CAPTURED" — distinct from an explicit ``1.0`` — so the bridge
+    # can collision-check a real explicit 1.0 against a conflicting capture instead
+    # of silently dropping it: the script set no localScale on the equip object, or
+    # set a NON-uniform / non-positive scale (deliberately not lowered, since the
+    # runtime Model:ScaleTo is uniform-only). Carried to runtime so the welded weapon
+    # is sized as the source game displayed it (NOT hardcoded).
+    equip_scale: float | None = None
 
 
 # Per-script resolution outcome, keyed on the canonical .cs path key. Carries
@@ -180,6 +189,58 @@ _CS_INSTANTIATE_BIND_RE = re.compile(
     r"(this\.[A-Za-z_]\w*|[A-Za-z_]\w*)\s*=\s*"
     r"Instantiate\s*\(\s*(this\.)?([A-Za-z_]\w*)\s*(?:[,)])"
 )
+
+# A ``<recv>.transform.localScale = <rhs>;`` assignment on the instantiated
+# prefab object inside the equip method (e.g. ``rifle.transform.localScale =
+# Vector3.one * 0.2f;``). Group 1 = the receiver chain preceding ``.localScale``
+# (``rifle``, ``rifle.transform``, ``this.rifle.transform``); group 2 = the RHS
+# expression up to the statement terminator. The resolver matches the receiver
+# BASE symbol against the proven Instantiate result symbol and parses the RHS as a
+# UNIFORM scale (Unity Vector3) — a non-uniform / unparseable RHS yields no factor
+# (scale stays the None "no-capture" sentinel), since the runtime ScaleTo is uniform-only.
+_CS_LOCALSCALE_RE = re.compile(
+    r"\b((?:this\.)?[A-Za-z_][\w.]*?)\.localScale\s*=\s*([^;]+);"
+)
+# A C# float literal: optional sign, integer/fraction/exponent forms (``0.2``,
+# ``.2``, ``2``, ``2e-1``). The numeric VALUE is captured WITHOUT the trailing
+# ``f``/``F`` suffix (matched separately, outside the group) so ``float()`` parses
+# the captured text directly.
+_CS_FLOAT = r"[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?"
+# RHS uniform-scale forms: ``Vector3.one * f`` / ``f * Vector3.one`` /
+# ``new Vector3(f, f, f)`` (uniform only). A trailing ``f``/``F`` float suffix and
+# an optional sign are tolerated. Anchored to the whole RHS (after strip) so a
+# partial/compound expression does not falsely match.
+_CS_SCALE_ONE_MUL_RE = re.compile(
+    r"\A(?:Vector3\.one\s*\*\s*(" + _CS_FLOAT + r")[fF]?"
+    r"|(" + _CS_FLOAT + r")[fF]?\s*\*\s*Vector3\.one)\Z"
+)
+_CS_SCALE_NEW_VECTOR3_RE = re.compile(
+    r"\Anew\s+Vector3\s*\(\s*(" + _CS_FLOAT + r")[fF]?\s*,\s*"
+    r"(" + _CS_FLOAT + r")[fF]?\s*,\s*(" + _CS_FLOAT + r")[fF]?\s*\)\Z"
+)
+
+
+def _parse_uniform_scale_rhs(rhs: str) -> float | None:
+    """Parse a C# ``localScale`` RHS as a POSITIVE UNIFORM scale factor, else None.
+
+    Recognizes ``Vector3.one * f``, ``f * Vector3.one`` and a ``new Vector3(f,f,f)``
+    whose three components are EQUAL. Returns None (ABSTAIN) for a non-uniform
+    ``new Vector3(x,y,z)`` (the runtime ``Model:ScaleTo`` is uniform-only, so we do
+    not distort), any other/identifier expression, AND a NON-POSITIVE factor
+    (``<= 0`` — a pathological scale ScaleTo would reject; abstain rather than ship a
+    Plan entry that is dead on arrival)."""
+    expr = rhs.strip()
+    m = _CS_SCALE_ONE_MUL_RE.match(expr)
+    if m is not None:
+        factor = float(m.group(1) if m.group(1) is not None else m.group(2))
+        return factor if factor > 0 else None
+    m = _CS_SCALE_NEW_VECTOR3_RE.match(expr)
+    if m is not None:
+        x, y, z = float(m.group(1)), float(m.group(2)), float(m.group(3))
+        if x == y == z and x > 0:
+            return x
+        return None  # non-uniform / non-positive -> abstain
+    return None
 
 # A C# method declaration header ``<modifiers/ret> <Name>(…)`` immediately
 # followed (modulo whitespace/comments) by an opening ``{``. Used to locate the
@@ -978,10 +1039,15 @@ def _setparent_receiver_base(receiver: str) -> str:
     return base
 
 
-def _resolve_equip_obligation(source: str, field: str) -> tuple[str, str] | None:
+def _resolve_equip_obligation(
+    source: str, field: str
+) -> tuple[str, str, float | None] | None:
     """For an admitted rig fact on C# field ``field``, return
-    ``(equip_method, prefab_field)`` iff the script contains the UNAMBIGUOUS
-    held-prefab-equip shape — else None (ABSTAIN, D8/D11).
+    ``(equip_method, prefab_field, equip_scale)`` iff the script contains the
+    UNAMBIGUOUS held-prefab-equip shape — else None (ABSTAIN, D8/D11).
+    ``equip_scale`` is the UNIFORM ``localScale`` the method applies to the
+    instantiated prefab (``Vector3.one * 0.2f`` -> 0.2), or ``None`` when no uniform
+    positive scale was captured (no localScale / non-uniform / non-positive).
 
     Unambiguous shape (ALL required, code-position-aware, in the SAME C# method):
       1. an ``Instantiate(<prefabField>, …)`` whose first arg is a bare /
@@ -1019,6 +1085,7 @@ def _resolve_equip_obligation(source: str, field: str) -> tuple[str, str] | None
         return None  # no SetParent onto the rig slot -> abstain
 
     candidates: list[tuple[str, str]] = []
+    scale_by_candidate: dict[tuple[str, str], float | None] = {}
     for method, hits in setparent_hits.items():
         body_open, body_close = hits[0][1], hits[0][2]
         # (A) Directly-chained Instantiate(prefab)[.transform].SetParent(field) —
@@ -1049,7 +1116,25 @@ def _resolve_equip_obligation(source: str, field: str) -> tuple[str, str] | None
             # zero -> the parented object isn't a proven Instantiate result (the
             # over-broad false-positive this strictness avoids); >1 -> ambiguous. Abstain.
             continue
-        candidates.append((method, next(iter(method_prefabs))))
+        prefab = next(iter(method_prefabs))
+        # Uniform display scale (D17/Bug-2): the C# method may set the spawned
+        # object's ``localScale`` (``rifle.transform.localScale = Vector3.one *
+        # 0.2f``). Capture it from a localScale assignment in THIS method whose
+        # receiver base IS the instantiate result symbol; UNIFORM only (ScaleTo is
+        # uniform). Multiple uniform localScale writes on the object -> the LAST
+        # wins (C# sequential assignment); none / non-uniform / non-positive ->
+        # None (no capture — distinct from an explicit 1.0).
+        scale: float | None = None
+        for sm in _CS_LOCALSCALE_RE.finditer(source, body_open, body_close):
+            if not _cs_pos_is_code(source, sm.start()):
+                continue
+            if _setparent_receiver_base(sm.group(1)) not in receiver_bases:
+                continue  # localScale on a DIFFERENT object -> not the equip prefab
+            parsed = _parse_uniform_scale_rhs(sm.group(2))
+            if parsed is not None:
+                scale = parsed
+        candidates.append((method, prefab))
+        scale_by_candidate[(method, prefab)] = scale
 
     # >1 distinct qualifying (method, prefab) -> ambiguous obligation -> ABSTAIN
     # (the single carrier holds one obligation; bias to the recognizer's abstain).
@@ -1064,7 +1149,8 @@ def _resolve_equip_obligation(source: str, field: str) -> tuple[str, str] | None
     # rewrite site, so ABSTAIN rather than bind one arbitrary obligation.
     if _count_cs_methods_named(source, method_name) > 1:
         return None
-    return candidates[0]
+    method, prefab = candidates[0]
+    return (method, prefab, scale_by_candidate[(method, prefab)])
 
 
 def _count_cs_methods_named(source: str, name: str) -> int:
@@ -1122,6 +1208,7 @@ def _resolve_rig_facts(
         equip = _resolve_equip_obligation(source, field)
         equip_method = equip[0] if equip is not None else ""
         prefab_field = equip[1] if equip is not None else ""
+        equip_scale = equip[2] if equip is not None else None
         rig_facts.append(
             RigRootedRetargetFact(
                 field_name=field,
@@ -1130,6 +1217,7 @@ def _resolve_rig_facts(
                 ordinal=ordinal,  # credited GetChild(n) -> carrier cam_ordinal
                 equip_method=equip_method,
                 prefab_field=prefab_field,
+                equip_scale=equip_scale,
             )
         )
     return rig_facts

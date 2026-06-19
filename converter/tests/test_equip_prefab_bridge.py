@@ -31,7 +31,10 @@ from converter.autogen import (  # noqa: E402
     generate_scene_runtime_plan_module,
 )
 from converter.code_transpiler import TranspiledScript  # noqa: E402
-from converter.pipeline import build_equip_prefabs_bridge  # noqa: E402
+from converter.pipeline import (  # noqa: E402
+    build_equip_prefabs_bridge,
+    build_equip_scales_bridge,
+)
 from core.unity_types import GuidIndex  # noqa: E402
 
 
@@ -54,6 +57,7 @@ def _guid_index(paths_to_ids: dict[str, str]) -> GuidIndex:
 def _equip_script(
     source_path: str = _PLAYER_CS,
     prefab_field: str = "riflePrefab",
+    scale: float | None = None,
 ) -> TranspiledScript:
     return TranspiledScript(
         source_path=source_path,
@@ -67,6 +71,7 @@ def _equip_script(
             "method": "GetRifle",
             "remote": "equipWeaponRemote",
             "present": True,
+            "scale": scale,
         },
     )
 
@@ -494,3 +499,61 @@ class TestPipelineCallsBridge:
             "call was not invoked on the real pipeline path."
         )
         assert captured["guid_index"] is pipeline.state.guid_index
+
+
+# ---------------------------------------------------------------------------
+# D17/Bug-2 — the {prefab_id: uniform_scale} bridge + its collision fail-close
+# ---------------------------------------------------------------------------
+
+_EP = {"riflePrefab": _RIFLE_PREFAB_ID}  # field -> prefab_id (the resolved map)
+
+
+class TestEquipScalesBridge:
+
+    def test_captured_non_one_scale_keyed_by_prefab_id(self):
+        scales = build_equip_scales_bridge([_equip_script(scale=0.2)], _EP)
+        assert scales == {_RIFLE_PREFAB_ID: 0.2}
+
+    def test_no_capture_sentinel_yields_no_entry(self):
+        # scale=None (nothing captured) -> the prefab gets NO scale opinion.
+        scales = build_equip_scales_bridge([_equip_script(scale=None)], _EP)
+        assert scales == {}
+
+    def test_explicit_one_is_omitted_but_not_an_error(self):
+        # An explicit captured 1.0 is the runtime no-op -> omitted from the Plan.
+        scales = build_equip_scales_bridge([_equip_script(scale=1.0)], _EP)
+        assert scales == {}
+
+    def test_unresolved_field_skipped(self):
+        # A field absent from equip_prefabs (runtime abstains) -> no scale entry.
+        scales = build_equip_scales_bridge([_equip_script(scale=0.2)], {})
+        assert scales == {}
+
+    def test_same_scale_across_carriers_is_fine(self):
+        a = _equip_script(source_path="/proj/A.cs", scale=0.2)
+        b = _equip_script(source_path="/proj/B.cs", scale=0.2)
+        scales = build_equip_scales_bridge([a, b], _EP)
+        assert scales == {_RIFLE_PREFAB_ID: 0.2}
+
+    def test_conflicting_non_one_scales_fail_closed(self):
+        a = _equip_script(source_path="/proj/A.cs", scale=0.2)
+        b = _equip_script(source_path="/proj/B.cs", scale=0.3)
+        with pytest.raises(RuntimeError, match="two different scales"):
+            build_equip_scales_bridge([a, b], _EP)
+
+    def test_explicit_one_vs_capture_fails_closed(self):
+        # The codex P1 the None sentinel fixes: an EXPLICIT 1.0 on one carrier and
+        # a 0.2 on another for the SAME prefab_id is a genuine conflict -> fail
+        # closed, NOT a silent 0.2 (the old 1.0-overload dropped the 1.0).
+        a = _equip_script(source_path="/proj/A.cs", scale=1.0)
+        b = _equip_script(source_path="/proj/B.cs", scale=0.2)
+        with pytest.raises(RuntimeError, match="two different scales"):
+            build_equip_scales_bridge([a, b], _EP)
+
+    def test_no_capture_does_not_collide_with_a_real_capture(self):
+        # scale=None must NOT participate in the collision check (it is "no
+        # opinion", not an explicit 1.0) -> the real 0.2 capture wins cleanly.
+        a = _equip_script(source_path="/proj/A.cs", scale=None)
+        b = _equip_script(source_path="/proj/B.cs", scale=0.2)
+        scales = build_equip_scales_bridge([a, b], _EP)
+        assert scales == {_RIFLE_PREFAB_ID: 0.2}

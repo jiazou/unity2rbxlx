@@ -138,6 +138,11 @@ def lower_camera_mount_equip(
             "method": method,
             "remote": EQUIP_REMOTE_SERVICE,
             "present": final_present,
+            # D17/Bug-2: uniform display scale captured from the C# equip method
+            # (``localScale = Vector3.one * 0.2f`` -> 0.2; ``None`` = nothing captured,
+            # distinct from an explicit 1.0). The bridge keys it by prefab_id for the
+            # runtime weld-time ScaleTo and collision-checks across carriers.
+            "scale": fact.equip_scale,
         }
         # Carry the fail-closed sub-flags so the verifier detail / a resume carrier
         # records WHY the obligation was not discharged.

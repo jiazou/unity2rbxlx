@@ -677,6 +677,11 @@ _PLAN_KEYS_FOR_HOST: tuple[str, ...] = (
     # LOAD-BEARING — without the allowlist entry the recomputed key is elided
     # from the emitted plan and the live handler reads ``nil`` (dead equip).
     "equip_prefabs",
+    # D17/Bug-2: the ``{prefab_id: uniform_scale}`` map the runtime weld applies
+    # (``Model:ScaleTo``) so the held weapon is sized as the source game showed it.
+    # Same allowlist requirement as ``equip_prefabs`` — elided if absent; an absent
+    # prefab_id entry is a runtime no-op (scale 1.0).
+    "equip_scales",
 )
 
 
@@ -1336,20 +1341,41 @@ end)
 equipWeaponRemote.Parent = RS
 -- 6. Re-equip on respawn: a NEW Character has no welded weapon, so re-run the
 --    last successful equip (remembered per-Player in step 5).
---    The respawn re-equip resolves the hand with a BOUNDED WaitForChild (the
---    R15 limbs land a frame or two AFTER CharacterAdded fires), so it is run in
---    a task.spawn so a slow wait never stalls the CharacterAdded signal.
+--    RIG-STABLE GATE: CharacterAdded fires while the R15 avatar is still
+--    streaming, and the FIRST RightHand to appear is a TRANSIENT limb that the
+--    HumanoidDescription/appearance load REPLACES a moment later. Welding to that
+--    transient limb means the replacement destroys the limb -> the WeldConstraint
+--    (Part0 = that limb) is destroyed -> the un-anchored weapon detaches,
+--    free-falls, and is destroyed at workspace.FallenPartsDestroyHeight. So the
+--    respawn re-equip waits for the appearance to finish (Player:HasAppearanceLoaded,
+--    generic across R6/R15) before welding, with a BOUNDED fallback because the
+--    appearance signal can be slow or absent. Run in a task.spawn so the wait never
+--    stalls the CharacterAdded signal. The manual (gameplay) equip path is
+--    unaffected -- it fires on a stable, already-loaded Character.
+local function reequipWhenRigStable(p, char)
+    task.spawn(function()
+        -- Bounded wait for the avatar appearance/rig to finish so the resolved
+        -- hand is the FINAL limb (not a transient one that gets replaced).
+        local waited = 0
+        while not p:HasAppearanceLoaded() and waited < 5 and char.Parent ~= nil do
+            task.wait(0.1)
+            waited = waited + 0.1
+        end
+        if char.Parent == nil then return end  -- char despawned while waiting
+        engine:reequipLastWeapon(p, char)
+    end)
+end
 Players.PlayerAdded:Connect(function(p)
     p.CharacterAdded:Connect(function(char)
-        task.spawn(function() engine:reequipLastWeapon(p, char) end)
+        reequipWhenRigStable(p, char)
     end)
 end)
 for _, p in Players:GetPlayers() do
     if p.Character then
-        task.spawn(function() engine:reequipLastWeapon(p, p.Character) end)
+        reequipWhenRigStable(p, p.Character)
     end
     p.CharacterAdded:Connect(function(char)
-        task.spawn(function() engine:reequipLastWeapon(p, char) end)
+        reequipWhenRigStable(p, char)
     end)
 end'''
 

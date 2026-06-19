@@ -206,6 +206,58 @@ def build_equip_prefabs_bridge(
     return equip_prefabs
 
 
+def build_equip_scales_bridge(
+    scripts: "list[TranspiledScript]",
+    equip_prefabs: Mapping[str, str],
+) -> dict[str, float]:
+    """Build the D17/Bug-2 ``{prefab_id: uniform_scale}`` map for the runtime weld.
+
+    Keyed by PREFAB_ID (not field name) because the runtime equip path
+    (``equipWeaponOnCharacter`` / the respawn ``reequipLastWeapon``) holds the
+    resolved prefab_id, not the C# field name. Reuses the field->prefab_id
+    resolution already computed in ``equip_prefabs`` (the single source of truth +
+    its collision fail-close), so this adds NO second resolution path: for each
+    equip carrier it looks up the carrier's field in ``equip_prefabs`` and records
+    the carrier's ``scale`` under that prefab_id.
+
+    Collision fail-close is computed over EVERY CAPTURED scale (an explicit ``1.0``
+    included), so a carrier that explicitly captured ``1.0`` for a prefab that
+    another carrier captured at ``0.2`` is a genuine contract conflict -> RuntimeError
+    (mirrors the field->prefab_id collision fail-close). The carrier's ``scale`` is
+    ``None`` when NOTHING was captured (no localScale / non-uniform / non-positive) —
+    that is NOT a captured ``1.0`` and is skipped without entering the collision check.
+
+    Only NON-1.0 captured scales are EMITTED — 1.0 is the runtime no-op default, so an
+    absent entry means "no scaling" (keeps the Plan minimal for the common game with
+    no captured localScale)."""
+    captured: dict[str, float] = {}  # prefab_id -> captured scale (incl explicit 1.0)
+    for ts in scripts:
+        eb = ts.equip_binding
+        if not eb:
+            continue
+        field_name = str(eb.get("prefab") or "")
+        if not field_name:
+            continue
+        prefab_id = equip_prefabs.get(field_name)
+        if not prefab_id:
+            continue  # field unresolved (runtime abstains) -> no scale entry
+        scale = eb.get("scale")
+        if scale is None or not isinstance(scale, (int, float)):
+            continue  # nothing captured (None sentinel) -> no opinion on scale
+        scale = float(scale)
+        prior = captured.get(prefab_id)
+        if prior is not None and prior != scale:
+            raise RuntimeError(
+                "[contract] camera-mount equip scale bridge: prefab_id "
+                f"{prefab_id!r} maps to two different scales ({prior} vs {scale}) "
+                "across equip carriers — refusing to ship an ambiguous scale."
+            )
+        captured[prefab_id] = scale
+    # Emit only the runtime-meaningful (non-1.0) scales; an explicit 1.0 participated
+    # in the collision check above but needs no Plan entry (runtime ScaleTo no-op).
+    return {pid: s for pid, s in captured.items() if s != 1.0}
+
+
 def _script_id_for_source_path(
     source_path: str,
     guid_index: object | None,
@@ -2683,6 +2735,13 @@ class Pipeline:
                 contract_result.transpilation.scripts,
                 self.ctx.scene_runtime,
                 self.state.guid_index,
+            )
+            # D17/Bug-2: the prefab_id -> uniform display scale map, reusing the
+            # field->prefab_id resolution above. Reaches the runtime weld via the
+            # ``equip_scales`` Plan key; absent prefab_id -> runtime ScaleTo no-op.
+            self.ctx.scene_runtime["equip_scales"] = build_equip_scales_bridge(
+                contract_result.transpilation.scripts,
+                self.ctx.scene_runtime["equip_prefabs"],
             )
         else:
             # Legacy path -- must stay byte-identical. Do NOT thread

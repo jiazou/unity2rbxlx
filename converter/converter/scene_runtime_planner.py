@@ -452,6 +452,11 @@ class SceneRuntimeArtifact(TypedDict, total=False):
     # equip facts exist. TYPE declared here so the host-allowlist emit path
     # (``_PLAN_KEYS_FOR_HOST``) and the resume round-trip carry it through.
     equip_prefabs: dict[str, str]
+    # D17/Bug-2: the ``{prefab_id: uniform_scale}`` map applied at weld time
+    # (``Model:ScaleTo``) so the held weapon matches the source game's display
+    # size. Built by the same post-transpile bridge step as ``equip_prefabs``; an
+    # absent prefab_id means scale 1.0 (runtime no-op).
+    equip_scales: dict[str, float]
 
 
 # ---------------------------------------------------------------------------
