@@ -2957,19 +2957,43 @@ function SceneRuntime:_resolveRightHand(character)
 end
 
 -- Respawn-tolerant hand resolver (P1: CharacterAdded fires BEFORE the R15 limbs
--- are parented, so a one-shot ``FindFirstChild`` no-ops on respawn). Uses a
--- BOUNDED ``WaitForChild`` -- a limb already present resolves instantly, a
--- late-arriving one is awaited up to ``timeout`` seconds, and a real miss (R6,
--- or never arrives) still ends in nil so the caller no-ops (no unbounded wait).
--- The "Right Arm" fallback is a final one-shot FindFirstChild: an R6 rig has its
--- limbs by the time RightHand's wait elapses, and a second bounded wait would
--- double the worst-case stall on every nil resolve.
+-- are parented, so a one-shot ``FindFirstChild`` no-ops on respawn). A BOUNDED
+-- POLL that checks BOTH limb names every tick and returns whichever appears
+-- first, so:
+--   * R6 (has "Right Arm", never "RightHand") resolves on the FIRST check -- no
+--     stall (an earlier ``WaitForChild("RightHand", timeout)``-then-fallback
+--     spent the FULL timeout unarmed every respawn, since R6 never grows a
+--     "RightHand").
+--   * R15 with a late-arriving "RightHand" resolves the tick it lands.
+--   * neither present within the bounded deadline -> nil so the caller no-ops
+--     (no unbounded wait).
+-- "RightHand" is checked first so R15 prefers its dedicated grip part. The
+-- deadline is a fixed iteration cap over the engine's ``task.wait`` yield floor
+-- (no os.clock/tick dependency); ``timeout`` seconds / the per-frame wait gives
+-- the ~5s cap. The yield floor matches the rest of the runtime
+-- (``self._services.task.wait``).
 function SceneRuntime:_resolveRightHandBounded(character, timeout)
 	if not character then return nil end
-	local hand = character:WaitForChild("RightHand", timeout)
-	if hand and hand:IsA("BasePart") then return hand end
-	hand = character:FindFirstChild("Right Arm")
-	if hand and hand:IsA("BasePart") then return hand end
+	local function pick()
+		local hand = character:FindFirstChild("RightHand")
+		if hand and hand:IsA("BasePart") then return hand end
+		hand = character:FindFirstChild("Right Arm")
+		if hand and hand:IsA("BasePart") then return hand end
+		return nil
+	end
+	-- First check before any yield: a limb already present (R6 / fast R15)
+	-- resolves immediately.
+	local hand = pick()
+	if hand then return hand end
+	-- Bounded poll: ~one check per engine frame, capped at ``timeout`` seconds'
+	-- worth of frames (60 fps assumed -> a fixed iteration count, no real clock).
+	local waitFn = self._services and self._services.task and self._services.task.wait
+	local maxIters = math.max(1, math.floor((timeout or EQUIP_HAND_WAIT_TIMEOUT) * 60))
+	for _ = 1, maxIters do
+		if waitFn then waitFn() end
+		hand = pick()
+		if hand then return hand end
+	end
 	return nil
 end
 

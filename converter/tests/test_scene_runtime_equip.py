@@ -65,6 +65,12 @@ def _harness_preamble() -> str:
 # do NOT stash anything there). ``Instance`` is a real GLOBAL because the host
 # runtime chunk (loaded via loadstring) reads it as a global.
 _HARNESS_BODY = r"""
+-- A global frame counter advanced by the stub ``task.wait`` (the poll loop's
+-- yield floor). A mock can register children that "arrive" once the counter
+-- reaches a target tick (see ``mockInst._arriveChildAtTick``), modelling an R15
+-- limb landing K frames after the respawn poll begins.
+local _tick = 0
+
 -- ``Instance.new`` only needs to mint a WeldConstraint for the weld core.
 local _createdWelds = {}
 Instance = {}
@@ -117,6 +123,17 @@ local function mockInst(name, className)
         return false
     end
     function inst:FindFirstChild(n)
+        -- Promote any late-arriving child whose target tick has been reached
+        -- (the bounded poll advances ``_tick`` via the stub ``task.wait``).
+        if self._lateArrivals then
+            for name, entry in pairs(self._lateArrivals) do
+                if _tick >= entry.tick then
+                    entry.part.Parent = self
+                    table.insert(self._childList, entry.part)
+                    self._lateArrivals[name] = nil
+                end
+            end
+        end
         for _, child in ipairs(self._childList) do
             if not child._destroyed and child.Name == n then
                 return child
@@ -124,11 +141,19 @@ local function mockInst(name, className)
         end
         return nil
     end
+    -- Register a child that becomes findable once ``_tick`` reaches ``atTick``.
+    function inst:_arriveChildAtTick(part, atTick)
+        self._lateArrivals = self._lateArrivals or {}
+        self._lateArrivals[part.Name] = {part = part, tick = atTick}
+    end
     -- Mock WaitForChild: returns a present child immediately. A child can be
     -- registered to "arrive late" via ``inst._pendingChildren[name] = part`` --
     -- the first WaitForChild for that name parents it (modelling the limb landing
-    -- a frame later) and returns it; a name with no present/pending child and a
-    -- finite timeout returns nil (the bounded-wait miss). No real yielding.
+    -- a frame later) and returns it. A name with no present/pending child and a
+    -- finite timeout returns nil AFTER advancing ``_tick`` by the timeout's worth
+    -- of frames -- modelling the REAL blocking stall (the round-3 fix that did
+    -- ``WaitForChild("RightHand", 5)`` first burned this full stall on every R6
+    -- respawn, which the R6 test detects via ``_tick``).
     function inst:WaitForChild(n, timeout)
         local existing = self:FindFirstChild(n)
         if existing then return existing end
@@ -138,6 +163,9 @@ local function mockInst(name, className)
             pending.Parent = self
             table.insert(self._childList, pending)
             return pending
+        end
+        if timeout then
+            _tick = _tick + math.floor(timeout * 60)
         end
         return nil
     end
@@ -186,6 +214,11 @@ end
 local function equipServices(cloneFactory)
     return {
         warn = function() end,
+        -- The bounded-poll yield floor. Each call advances the global frame
+        -- counter so a registered late-arrival becomes findable at its tick.
+        task = {
+            wait = function() _tick = _tick + 1 end,
+        },
         clonePrefabTemplate = function(prefabId, parent, cframe)
             local clone = cloneFactory(prefabId)
             if clone and parent then
@@ -518,21 +551,70 @@ class TestRightHandFallback:
 
 class TestReequipOnRespawn:
 
+    def test_reequip_r6_resolves_immediately_no_timeout_stall(self):
+        # P1 (round 4): an R6 avatar has "Right Arm" and NEVER grows a
+        # "RightHand". The round-3 fix did WaitForChild("RightHand", 5) FIRST,
+        # so every R6 respawn stalled the FULL 5s before falling back to
+        # "Right Arm" -- unarmed for 5s every respawn. The bounded POLL must
+        # check BOTH names each tick and resolve on the FIRST iteration when
+        # "Right Arm" is already present (no yield consumed). FAILS against the
+        # round-3 WaitForChild("RightHand")-first code (which advances the tick
+        # counter the full timeout before resolving "Right Arm").
+        _assert_ok(textwrap.dedent("""\
+            local player = {}
+            local character = mockInst("Character", "Model")
+            -- R6: "Right Arm" present now, no "RightHand", and none will arrive.
+            local rightArm = mockInst("Right Arm", "Part")
+            rightArm.CFrame = "armCF"
+            addChild(character, rightArm)
+
+            local muzzle
+            local function cloneFactory(_)
+                local m = mockInst("RiflePrefabClone", "Model")
+                muzzle = mockInst("Muzzle", "Part")
+                m.PrimaryPart = muzzle
+                m._descendants = {muzzle}
+                return m
+            end
+            local engine = SceneRuntime.new(equipServices(cloneFactory),
+                {equip_prefabs = {riflePrefab = "prefab_rifle"}})
+
+            engine:rememberEquip(player, "prefab_rifle")
+            assert(_tick == 0, "precondition: no yields yet")
+            engine:reequipLastWeapon(player, character)
+
+            -- LOAD-BEARING: resolved on the first check, consuming ZERO poll
+            -- yields (no 5s unarmed stall).
+            assert(_tick == 0,
+                "R6 must resolve immediately without consuming any poll tick, "
+                .. "consumed " .. _tick)
+
+            local welded = character:FindFirstChild("_EquippedWeapon")
+            assert(welded ~= nil, "R6 weapon re-equipped immediately")
+            local welds = createdWelds()
+            local handWeld
+            for _, w in ipairs(welds) do
+                if w.Part0 == rightArm then handWeld = w end
+            end
+            assert(handWeld ~= nil, "weld Part0 == Right Arm (R6 grip)")
+            assert(handWeld.Part1 == muzzle, "weld Part1 == the weapon anchor")
+            print("OK")
+        """))
+
     def test_reequip_waits_for_late_arriving_right_hand(self):
         # P1 (round 3): on respawn CharacterAdded fires BEFORE the R15 RightHand
-        # is parented. reequipLastWeapon must resolve the hand with a bounded
-        # WaitForChild so the just-spawned Character (RightHand ABSENT at call
-        # time, arriving shortly after) still gets the weapon re-equipped.
-        # FAILS against the pre-fix one-shot FindFirstChild (resolves nil ->
-        # no weld, no _EquippedWeapon).
+        # is parented. reequipLastWeapon must POLL (bounded) so the just-spawned
+        # Character (RightHand ABSENT at call time, arriving a few ticks later)
+        # still gets the weapon re-equipped. FAILS against the pre-fix one-shot
+        # FindFirstChild (resolves nil -> no weld, no _EquippedWeapon).
         _assert_ok(textwrap.dedent("""\
             local player = {}  -- opaque per-player key
             local character = mockInst("Character", "Model")
-            -- RightHand is NOT a child yet; it "arrives late" on the first
-            -- WaitForChild (modelling the limb landing a frame after spawn).
+            -- RightHand is NOT a child yet; it "arrives" once the poll has
+            -- yielded 3 times (modelling the limb landing a few frames later).
             local rightHand = mockInst("RightHand", "Part")
             rightHand.CFrame = "handCF"
-            character._pendingChildren = {RightHand = rightHand}
+            character:_arriveChildAtTick(rightHand, 3)
             assert(character:FindFirstChild("RightHand") == nil,
                 "precondition: RightHand absent at reequip-call time")
 
@@ -551,7 +633,8 @@ class TestReequipOnRespawn:
             engine:rememberEquip(player, "prefab_rifle")
             engine:reequipLastWeapon(player, character)
 
-            -- The weapon was equipped despite the late-arriving hand.
+            -- The weapon was equipped once the late hand arrived.
+            assert(_tick >= 3, "poll yielded until the hand arrived, got " .. _tick)
             local welded = character:FindFirstChild("_EquippedWeapon")
             assert(welded ~= nil, "weapon re-equipped after late RightHand arrival")
             local welds = createdWelds()
