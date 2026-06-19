@@ -1357,6 +1357,59 @@ class Pipeline:
             return None
         return resolved
 
+    def _emitted_so_guids(self) -> set[str]:
+        """The guid set of every EMITTED ScriptableObject module.
+
+        Reverse-maps each converted SO asset's ``.asset`` ``source_path`` to its
+        guid via the GuidIndex (the same positive ``so_guids`` gate
+        ``_build_scriptable_object_module_map`` derives in ``write_output``, but
+        available at plan time from ``self.state.scriptable_objects``). Returns an
+        empty set when no SO assets / no GuidIndex.
+        """
+        from converter.scriptable_object_converter import AssetConversionResult
+
+        so_state = getattr(self.state, "scriptable_objects", None)
+        if not isinstance(so_state, AssetConversionResult) or not so_state.assets:
+            return set()
+        guid_index = self.state.guid_index
+        if guid_index is None:
+            return set()
+        path_to_guid: dict[Path, str] = {}
+        for guid, entry in guid_index.guid_to_entry.items():
+            path_to_guid[entry.asset_path] = guid
+            try:
+                path_to_guid[entry.asset_path.resolve()] = guid
+            except (OSError, RuntimeError):
+                pass
+        out: set[str] = set()
+        for asset in so_state.assets:
+            guid = path_to_guid.get(asset.source_path)
+            if guid is None:
+                try:
+                    guid = path_to_guid.get(asset.source_path.resolve())
+                except (OSError, RuntimeError):
+                    guid = None
+            if guid is not None:
+                out.add(guid)
+        return out
+
+    def _resolve_so_assetref_prefab_ids(self) -> set[str]:
+        """L0: prefab ids reachable from the emitted SOs' AssetReference fields.
+
+        Gated on the emitted-SO guid set (``_emitted_so_guids``), narrowed to
+        ``.prefab`` targets by the shared filter inside
+        ``resolve_so_assetref_prefab_ids``. Empty when no emitted SOs / no
+        GuidIndex.
+        """
+        from unity.addressables_resolver import resolve_so_assetref_prefab_ids
+
+        if self.state.guid_index is None:
+            return set()
+        so_guids = self._emitted_so_guids()
+        if not so_guids:
+            return set()
+        return resolve_so_assetref_prefab_ids(so_guids, self.state.guid_index)
+
     def plan_scene_runtime(self) -> None:
         """Phase: build the project-level ``scene_runtime`` artifact.
 
@@ -1422,6 +1475,31 @@ class Pipeline:
                 len(resolved.by_address),
                 len(resolved.by_label),
                 resolved.skipped_non_prefab,
+            )
+
+        # L0 (gap #5 spawn closure): prefabs referenced ONLY from an emitted SO's
+        # AssetReference/object-ref fields (e.g. ThemeData zones[].prefabList /
+        # collectiblePrefab / cloudPrefabs) appear in NO AddressableAssetsData
+        # group, so the address/label-sourced block above never reaches them and
+        # the emit gate never emits their Templates. Resolve those prefab ids and
+        # union them into BOTH (i) the PERSISTED ``addressables`` block under a new
+        # ``so_prefab_ids`` axis — the structure the emit-gate consumers re-walk
+        # (pipeline.py ``_generate_prefab_packages`` / ``select_emitted_prefab_ids``
+        # loops), so the Templates emit — AND (ii) the LOCAL ``addr_ids`` below,
+        # which feeds the resolved-NAME pass. Gated on the emitted-SO guid set
+        # (D-P4-8/D-P4-9). Off-disk + pure; resume-safe.
+        so_prefab_ids = self._resolve_so_assetref_prefab_ids()
+        if so_prefab_ids:
+            block = artifact.get("addressables")
+            if not isinstance(block, dict):
+                block = {"by_address": {}, "by_label": {}}
+                artifact["addressables"] = block
+            block["so_prefab_ids"] = sorted(so_prefab_ids)
+            addr_ids |= so_prefab_ids
+            log.info(
+                "[plan_scene_runtime] L0 SO-AssetReference prefab ids: %d "
+                "(unioned into emit set + so_prefab_ids axis)",
+                len(so_prefab_ids),
             )
 
         # Resolved-name pass (single source of truth): collision-conditionally
@@ -6503,6 +6581,14 @@ script.Disabled = true
                     addressable_prefab_ids.update(
                         pid for pid in ids if isinstance(pid, str)
                     )
+        # L0 (gap #5): ``so_prefab_ids`` is a FLAT list of prefab ids (reachable
+        # from emitted SO AssetReference fields), not a label/address -> [ids]
+        # dict, so read it directly rather than via ``.values()``.
+        _so_ids = addr_block.get("so_prefab_ids")
+        if isinstance(_so_ids, (list, tuple, set)):
+            addressable_prefab_ids.update(
+                pid for pid in _so_ids if isinstance(pid, str)
+            )
 
         result = generate_prefab_packages(
             prefab_library=prefab_library,
@@ -6755,6 +6841,13 @@ script.Disabled = true
                     addressable_prefab_ids.update(
                         pid for pid in ids if isinstance(pid, str)
                     )
+        # L0 (gap #5): the flat ``so_prefab_ids`` axis (see the sibling consumer
+        # in ``_generate_prefab_packages``) — read directly, not via ``.values()``.
+        _so_ids = addr_block.get("so_prefab_ids")
+        if isinstance(_so_ids, (list, tuple, set)):
+            addressable_prefab_ids.update(
+                pid for pid in _so_ids if isinstance(pid, str)
+            )
 
         # Scope the collision domain to the EMITTED set, not the full plan's
         # ``prefabs`` block (which carries every parsed prefab).
@@ -7253,6 +7346,16 @@ script.Disabled = true
         # emit (so the rewritten RbxScript.source is what gets written). Supersedes
         # the list-store seed only for the keyed-dictionary shape.
         self._lower_so_db_consumers(scene_runtime)
+        # Phase 4 / gap #5 L1 (spawn call-site lowering): rewrite the dynamic
+        # Addressables Instantiate/LoadAsset spawn sites the AI left UNCONVERTED
+        # (dead ``= nil`` sentinels / a ``:Clone()`` on a prefab-id string) to
+        # ``self.host.instantiatePrefab(<prefab-id>, …)``. Runs in THIS window
+        # (after the SO map / so-db lowering, before the plan/entrypoints emit)
+        # so the rewritten ``RbxScript.source`` is what gets written. Pairs with
+        # L0 (the SO-AssetReference Template emission unioned into the addressables
+        # block at ``plan_scene_runtime``): L0 guarantees the Template exists, L1
+        # instantiates it. Fail-closed on shape/expr miss; consumable DEFERRED.
+        self._lower_spawn_call_sites()
         # Phase 1 (consumable prototype materialization): RECOMPUTE the
         # consumable-db seed onto scene_runtime in THIS window — same property
         # as the theme seed (after the SO map, before the plan module emits, so
@@ -7665,6 +7768,33 @@ script.Disabled = true
             log.info(
                 "[write_output] scene-runtime generic: SO-DB consumer-lowering "
                 "rewrote %d keyed-dictionary database(s)", lowered,
+            )
+
+    def _lower_spawn_call_sites(self) -> None:
+        """Rewrite the dynamic Addressables spawn call sites in every placed
+        module to ``self.host.instantiatePrefab(<prefab-id>, …)`` (gap #5 L1).
+
+        Origin-comment-anchored, adjacency-bounded shape rewrite (see
+        ``spawn_call_site_lowering``). Pure per-module; mutates each
+        ``RbxScript.source`` in place (the sibling-pass convention). Fail-soft per
+        site (abstain on a shape/expr miss); the consumable site is DEFERRED
+        (detected + counted, never rewritten — D-P4-11). Idempotent.
+        """
+        if self.state.rbx_place is None:
+            return
+        from converter.spawn_call_site_lowering import (
+            lower_spawn_call_sites_in_scripts,
+        )
+
+        scripts = list(getattr(self.state.rbx_place, "scripts", []) or [])
+        if not scripts:
+            return
+        result = lower_spawn_call_sites_in_scripts(scripts)
+        if result.rewritten or result.deferred:
+            log.info(
+                "[write_output] scene-runtime generic: spawn call-site lowering "
+                "rewrote %d site(s), DEFERRED %d (fail-closed, see followups)",
+                result.rewritten, result.deferred,
             )
 
     def _build_consumable_db_seeds(self, scene_runtime: dict[str, object]) -> None:
