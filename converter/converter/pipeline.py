@@ -210,26 +210,15 @@ def build_equip_scales_bridge(
     scripts: "list[TranspiledScript]",
     equip_prefabs: Mapping[str, str],
 ) -> dict[str, float]:
-    """Build the D17/Bug-2 ``{prefab_id: uniform_scale}`` map for the runtime weld.
+    """Build the D17/Bug-2 ``{prefab_id: uniform_scale}`` map for the runtime weld,
+    reusing the field->prefab_id resolution in ``equip_prefabs`` (no second path).
 
-    Keyed by PREFAB_ID (not field name) because the runtime equip path
-    (``equipWeaponOnCharacter`` / the respawn ``reequipLastWeapon``) holds the
-    resolved prefab_id, not the C# field name. Reuses the field->prefab_id
-    resolution already computed in ``equip_prefabs`` (the single source of truth +
-    its collision fail-close), so this adds NO second resolution path: for each
-    equip carrier it looks up the carrier's field in ``equip_prefabs`` and records
-    the carrier's ``scale`` under that prefab_id.
-
-    Collision fail-close is computed over EVERY CAPTURED scale (an explicit ``1.0``
-    included), so a carrier that explicitly captured ``1.0`` for a prefab that
-    another carrier captured at ``0.2`` is a genuine contract conflict -> RuntimeError
-    (mirrors the field->prefab_id collision fail-close). The carrier's ``scale`` is
-    ``None`` when NOTHING was captured (no localScale / non-uniform / non-positive) —
-    that is NOT a captured ``1.0`` and is skipped without entering the collision check.
-
-    Only NON-1.0 captured scales are EMITTED — 1.0 is the runtime no-op default, so an
-    absent entry means "no scaling" (keeps the Plan minimal for the common game with
-    no captured localScale)."""
+    Keyed by prefab_id (the runtime equip path holds that, not the C# field name).
+    The carrier ``scale`` is ``None`` when nothing was captured (no localScale /
+    non-uniform / non-positive) and is skipped; a captured value (incl an explicit
+    ``1.0``) enters the per-prefab_id collision check, so two carriers capturing
+    DIFFERENT scales for one prefab_id fail closed (RuntimeError). Only non-1.0
+    captures are emitted (1.0 is the runtime no-op)."""
     captured: dict[str, float] = {}  # prefab_id -> captured scale (incl explicit 1.0)
     for ts in scripts:
         eb = ts.equip_binding

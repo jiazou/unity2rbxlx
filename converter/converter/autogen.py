@@ -1339,40 +1339,23 @@ end)
 -- (closes the connect/parent race; the client WaitForChild cannot resolve, so
 -- cannot FireServer, until the listener is live).
 equipWeaponRemote.Parent = RS
--- 6. Re-equip on respawn: a NEW Character has no welded weapon, so re-run the
---    last successful equip (remembered per-Player in step 5).
---    SELF-HEALING MOUNT (generic across R6/R15): CharacterAdded fires while the
---    avatar is still streaming, and a hand limb present now can be REPLACED by the
---    HumanoidDescription/appearance load a moment later. Welding to a limb that is
---    then replaced destroys the WeldConstraint (Part0 = the old limb) -> the
---    un-anchored weapon detaches, free-falls, and is destroyed at
---    workspace.FallenPartsDestroyHeight. Rather than GUESS a stable instant (an
---    appearance signal can fire BEFORE the final limb lands, so a one-shot weld
---    races the rig build), we re-equip whenever a hand limb ARRIVES under the
---    Character, for a bounded window: the durable mount converges onto the FINAL
---    limb regardless of the replacement timing. equipWeaponOnCharacter removes the
---    prior _EquippedWeapon FIRST, so repeated re-equips are idempotent (never a
---    duplicate weapon); on the watcher path the hand already exists, so the equip
---    resolves immediately (no 5s poll, no concurrent-clone yield race). The manual
---    (gameplay) equip path is unaffected -- it fires on an already-stable Character.
+-- 6. Re-equip on respawn (self-healing). A hand limb present at CharacterAdded can
+--    be REPLACED by the appearance/rig load a moment later, destroying the mount
+--    weld (Part0 = old limb) so the weapon detaches. Instead of guessing a stable
+--    instant, re-equip whenever a hand limb ARRIVES under the Character (bounded
+--    window) so the mount converges onto the final limb. equipWeaponOnCharacter
+--    removes the prior _EquippedWeapon first, so repeated re-equips are idempotent.
 local REEQUIP_HAND_LIMBS = {RightHand = true, ["Right Arm"] = true}
 local REEQUIP_HEAL_WINDOW = 10  -- seconds to watch for a post-spawn limb swap
 local function reequipOnRespawn(p, char)
-    -- Connect the limb-swap watcher FIRST so a hand arriving between CharacterAdded
-    -- and now is not missed; then the initial equip covers a hand already present.
-    -- DescendantAdded (NOT ChildAdded) matches this runtime's other limb-arrival
-    -- watchers (the late-HRP resync) and is a strict superset: a hand parented at
-    -- any depth still heals. reequipLastWeapon re-checks character liveness, so a
-    -- late fire on a despawned character is a safe no-op.
-    local conn
-    conn = char.DescendantAdded:Connect(function(child)
+    -- DescendantAdded (matching the runtime's late-HRP watcher; depth-robust).
+    -- Connect before the initial equip so a hand arriving in between is not missed.
+    local conn = char.DescendantAdded:Connect(function(child)
         if REEQUIP_HAND_LIMBS[child.Name] then
             task.spawn(function() engine:reequipLastWeapon(p, char) end)
         end
     end)
-    task.delay(REEQUIP_HEAL_WINDOW, function()
-        if conn then conn:Disconnect() end
-    end)
+    task.delay(REEQUIP_HEAL_WINDOW, function() conn:Disconnect() end)
     task.spawn(function() engine:reequipLastWeapon(p, char) end)
 end
 Players.PlayerAdded:Connect(function(p)

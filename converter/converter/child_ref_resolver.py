@@ -1084,8 +1084,7 @@ def _resolve_equip_obligation(
     if not setparent_hits:
         return None  # no SetParent onto the rig slot -> abstain
 
-    candidates: list[tuple[str, str]] = []
-    scale_by_candidate: dict[tuple[str, str], float | None] = {}
+    candidates: list[tuple[str, str, float | None]] = []
     for method, hits in setparent_hits.items():
         body_open, body_close = hits[0][1], hits[0][2]
         # (A) Directly-chained Instantiate(prefab)[.transform].SetParent(field) —
@@ -1133,12 +1132,11 @@ def _resolve_equip_obligation(
             parsed = _parse_uniform_scale_rhs(sm.group(2))
             if parsed is not None:
                 scale = parsed
-        candidates.append((method, prefab))
-        scale_by_candidate[(method, prefab)] = scale
+        candidates.append((method, prefab, scale))
 
     # >1 distinct qualifying (method, prefab) -> ambiguous obligation -> ABSTAIN
     # (the single carrier holds one obligation; bias to the recognizer's abstain).
-    distinct = set(candidates)
+    distinct = {(m, p) for m, p, _ in candidates}
     if len(distinct) != 1:
         return None
     method_name = candidates[0][0]
@@ -1149,8 +1147,7 @@ def _resolve_equip_obligation(
     # rewrite site, so ABSTAIN rather than bind one arbitrary obligation.
     if _count_cs_methods_named(source, method_name) > 1:
         return None
-    method, prefab = candidates[0]
-    return (method, prefab, scale_by_candidate[(method, prefab)])
+    return candidates[0]
 
 
 def _count_cs_methods_named(source: str, name: str) -> int:
