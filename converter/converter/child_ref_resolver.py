@@ -155,7 +155,7 @@ _CS_CAM_GETCHILD_RE = re.compile(
 # group 2 is the ``<slot>`` argument text. The resolver (a) compares the slot
 # against the recognized rig ``field`` AND (b) binds the receiver back to the
 # Instantiate result symbol — proving the PARENTED object IS the instantiated one
-# (round-2 P1-2). The receiver class is captured greedily as a dotted/`this.` chain.
+# The receiver class is captured greedily as a dotted/`this.` chain.
 _CS_SETPARENT_RE = re.compile(
     r"\b((?:this\.)?[A-Za-z_][\w.]*?)\.SetParent\s*\(\s*([A-Za-z_][\w.]*)\s*\)"
 )
@@ -991,12 +991,12 @@ def _resolve_equip_obligation(source: str, field: str) -> tuple[str, str] | None
       2. a ``<receiver>.SetParent(<slot>)`` whose ``<slot>`` is EXACTLY the
          recognized rig ``field`` (bare or ``this.``-qualified) AND whose
          ``<receiver>`` base symbol IS that same ``<sym>`` — i.e. the PARENTED
-         object is provably the INSTANTIATED one (round-2 P1-2), AND
+         object is provably the INSTANTIATED one, AND
       3. both in the SAME enclosing method ``M``.
 
     ABSTAIN (None) on: no qualifying Instantiate; a SetParent whose slot is not
     ``field``; a SetParent whose receiver is NOT the Instantiate result (parents a
-    DIFFERENT object — round-2 P1-2); the two in DIFFERENT methods; ``>1`` distinct
+    DIFFERENT object); the two in DIFFERENT methods; ``>1`` distinct
     qualifying method (ambiguous — §Edge f); an unresolvable prefab arg (D11).
     Pure; code-position-aware; keyed entirely on the C# ``field`` already proven to
     be the MainCamera-child slot."""
@@ -1047,7 +1047,7 @@ def _resolve_equip_obligation(source: str, field: str) -> tuple[str, str] | None
         method_prefabs = chain_prefabs | bind_prefabs
         if len(method_prefabs) != 1:
             # zero -> the parented object isn't a proven Instantiate result (the
-            # over-broad false-positive P1-2 fixes); >1 -> ambiguous. Abstain.
+            # over-broad false-positive this strictness avoids); >1 -> ambiguous. Abstain.
             continue
         candidates.append((method, next(iter(method_prefabs))))
 

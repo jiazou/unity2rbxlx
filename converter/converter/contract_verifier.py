@@ -2440,13 +2440,13 @@ def _equip_request_discharged(
           block —
       (2) an alias bound to ``self._services.<remote>`` fires
           ``:FireServer("<prefab>")`` (so a shadowing rebind to a foreign remote +
-          foreign fire OUTSIDE the block does NOT discharge — round-2 alias-shadow),
+          foreign fire OUTSIDE the block does NOT discharge — alias-shadow guard),
           AND
       (3) NO surviving ``instantiatePrefab(<prefab>)`` camera-mount equip call
           remains in the method body (the request REPLACED it, not added alongside).
     Delegates to the producer's shared ``equip_request_discharged_in_span`` so
-    producer + checker apply the EXACT same predicate. ``remote`` is LOAD-BEARING
-    (round-2 P1-1): the request must fire on an alias bound to the carrier's OWN
+    producer + checker apply the EXACT same predicate. ``remote`` is LOAD-BEARING:
+    the request must fire on an alias bound to the carrier's OWN
     ``self._services.<remote>`` — a ``FireServer("<prefab>")`` on a DIFFERENT
     remote/alias does NOT discharge."""
     if not prefab or not method or not remote:

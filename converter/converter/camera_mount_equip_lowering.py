@@ -518,7 +518,7 @@ def _equip_request_present(source: str, prefab: str, method: str) -> bool:
 # self._services.<remote>`` the request fires through. Group 1 = the bound alias
 # local; the binding MUST resolve ``self._services.<remote>`` (the carrier's own
 # remote), so a request fired on an alias bound to a DIFFERENT service does NOT
-# count (round-2 P1-1: a remote-agnostic ``FireServer("<prefab>")`` false-passed).
+# count (a remote-agnostic ``FireServer("<prefab>")`` would otherwise false-pass).
 def _alias_binding_re(remote: str) -> re.Pattern[str]:
     r = re.escape(remote)
     return re.compile(
@@ -571,7 +571,7 @@ def equip_request_discharged_in_span(
     ``_rig``-style span helper). True IFF, all at code positions:
       (1) the own-emit marker ``-- _EQUIP_REQUEST_<prefab>`` is present (within the
           method body), AND — WITHIN that marker's CONTIGUOUS emitted block
-          ``[marker, guard-if's end]`` (round-2 P1: NOT scattered across the body,
+          ``[marker, guard-if's end]`` (NOT scattered across the body,
           so a shadowing rebind to a foreign remote + foreign fire OUTSIDE the block
           cannot satisfy these) —
       (2) an alias is bound to the carrier's OWN remote — ``local <alias> =
@@ -580,8 +580,8 @@ def equip_request_discharged_in_span(
           ``remote`` so a mismatched-remote carrier is checked against ITS remote),
           AND
       (3) that SAME ``<alias>`` fires the request ``<alias>:FireServer("<prefab>")``
-          (so firing the prefab on a DIFFERENT remote/alias does NOT discharge —
-          round-2 P1-1), AND
+          (so firing the prefab on a DIFFERENT remote/alias does NOT discharge),
+          AND
       (4) NO surviving ``instantiatePrefab(<prefab>)`` equip call anywhere in the
           method body (the request REPLACED it, not added alongside)."""
     if not remote:
