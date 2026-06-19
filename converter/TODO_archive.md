@@ -13,6 +13,53 @@ Open work moves to `TODO.md`. Completed work and execution logs stay here.
 
 ---
 
+## 2026-06-19 — items completed and moved from TODO.md (condensed; full prose in git history)
+
+- [x] **P0 (generic) — F10 door never opens (animation driver-domain → server fallback, pattern #9).**
+  FIXED 2026-06-16 (`fix/door-animator-source-narrowing`, PR #195 / `a10b60f`): dynamic-getter
+  Animator drivers resolved via C# source narrowing — scan the scope for the param-write to the
+  clip's `observed_attribute`, inherit that writer's domain (→ client for `Door`). Anim script
+  emitted as a single `LocalScript` in `StarterPlayerScripts`. Implements §3 row 9 of
+  `docs/design/generic-converter-architecture.md`.
+- [x] **P1 (e2e fixture) — F15 mine + F10 door behavior fixtures contact-miss.** FIXED 2026-06-17
+  (PR #207): replaced single-teleport with translation-only swept `PivotTo` entries in
+  `tests/fixtures/upload_snapshots/SimpleFPS.behavior.json`. F15 mine GREEN e2e (Touched →
+  `Humanoid:TakeDamage` 100→90); F10 door harness fixed (panel-tween gated on the binding-race fix below).
+- [x] **P1 (generic) — F10 door Anim_Door LocalScript startup-scan races runtime prefab placement.**
+  FIXED 2026-06-17 (`drive/door-binding-race-20260617T174816`, PR #208 / `59a5646`): the
+  `animation_converter` Anim_* emitter binds runtime-placed prefab targets via a
+  `workspace.DescendantAdded` late-arrival listener + eager scan, gated on runtime
+  `not _ownerIsContainer`, across all four trigger shapes (bool/int param, loop-autoplay,
+  play-once). Also fixed the HostilePlane flying-loop (same boot-scan/early-return bug).
+  Live-verified (door opens in Studio). This was the last blocker turning F10 GREEN.
+- [x] **P1 — Generic-mode SimpleFPS canary failures (2026-06-11).** DONE: **T** ✅ #193 (turret
+  child-index lowering), **R** ✅ #191 (generic `weaponSlot` rebind), **D** ✅ #195 (door
+  dynamic-Animator narrowing), **H** ✅ (HudControl `domain:client`/`LocalScript`). Residual turret
+  projectile-physics + damage (#8 stages 3–4) is tracked under the F16 turret P0 in `TODO.md`.
+- [x] **P1 — Shared-flag name sanitization.** FIXED 2026-06-02 (`fix/shared-flag-name-sanitization`,
+  PR #165): canonical ASCII sanitizer at the runtime `"has" .. name` concat (emitted Luau
+  `gsub("[^%w_]+","_")` from one constant in `core/flag_names.py`) at every writer + the Machine
+  dynamic reader; `itemName`/`ItemType` kept raw; scan made ASCII-explicit.
+  See `docs/design/shared-flag-name-sanitization-brief.md`.
+- [x] **P2 — Topology prepass reads pre-coherence `script_type`.** CLOSED 2026-06-02
+  (`fix/topology-script-type-authority-guard`): premise imprecise — legacy corrects `script_type`
+  before routing reads it; `infer_module_domains` derives `domains` from source/evidence, not type.
+  Shipped a defensive WARNING on the LocalScript/server-domain conflict + a regression test pinning
+  legacy cohere-before-classify ordering. Full type↔domain reconciliation in generic mode deferred.
+- [x] **P1 — Upstream classifier misroutes Roblox-dead Unity-rendering modules to server-only.**
+  FIXED 2026-06-01 (`fix/roblox-dead-module-routing`): a generic behavior-based `roblox_dead_modules`
+  detector (mapping-coverage prior + post-coherence output-inertness + hard veto; NO class names)
+  replaces the hardcoded heuristic; dead modules route out of `ServerStorage` to `ReplicatedStorage`
+  (both topology + legacy paths) + a closure-safe prune of fully-dead require-closures.
+  See `docs/design/roblox-dead-module-routing-brief.md`.
+- [x] **P1 — Transpiler false-positive `require()` injection poisons storage classification.**
+  FIXED 2026-06-01 (`fix/dead-require-from-runtime-lookup-generics`): exclude the type args of GLOBAL
+  scene-lookup generics (`FindObjectOfType<T>` / `FindObjectsOfType<T>`) from `referenced_types`
+  (`_GLOBAL_LOOKUP_GENERIC_METHODS` in `script_analyzer.py`) — they locate an existing instance, so
+  no dependency edge / no require. COMPONENT-lookup generics (`GetComponent<T>` etc.) kept as real edges.
+
+---
+
 
 ## P0 — Blocking Gameplay
 

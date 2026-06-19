@@ -4,15 +4,130 @@ Active work items only. Completed work + PR execution logs live in `TODO_archive
 
 Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice to have.
 
+Citation rule: reference code by grep-target (`file.py` + symbol/string), never by line
+number — line refs rot (the 2026-06-11 review found every CLAUDE.md/TODO.md line ref stale).
+
 ---
+
+## Architecture & platform currency (2026-06-11 review)
+
+From a full repo audit + external fact-check of platform claims against Roblox Creator Docs
+(2024-2026 changes). Verified CORRECT and needing no action: coordinate/quaternion math, stud
+scale (0.28 m), 2048-stud part cap, FBX-7500 diagnosis, task-library usage, two-tier publish
+cache. The items below are where code or docs are stale or wrong.
+
+- [ ] **P1 — Architecture docs describe a retired pipeline.** ARCHITECTURE.md/CLAUDE.md list 10
+  phases; `pipeline.py:PHASES` has 12 (`plan_scene_runtime`, `materialize_and_classify` and the
+  whole scene-runtime-topology / contract-verifier / `contract_pipeline.py` subsystem are
+  undocumented). The "Asset Resolution (Critical)" section is obsolete twice: textures upload as
+  `Image` assetType (`cloud_api.upload_image` — no Decal→Image resolution needed) and mesh
+  resolution is headless via the official Open Cloud Luau Execution API (`execute_luau` =
+  `luau-execution-session-tasks`) — not "Studio-required". Also fix: runtime-module list
+  (animator retired; `scene_runtime.luau`/`scene_camera_input.luau` undocumented), AI backend
+  (Claude CLI preferred + Anthropic API fallback), `--api-key` not `--api-key-file` (incl. a
+  stale error msg in `u2r.py`), 6 undocumented u2r subcommands, stale test counts, and convert
+  all hardcoded `file:line` citations to grep-targets.
+
+- [ ] **P1 — Mesh face cap is stale (10k) and the quality floor ignores it.** Roblox's limit has
+  been **20,000** triangles since ~2021 (creator-docs mesh specifications); `config.py
+  MESH_ROBLOX_MAX_FACES = 10_000` over-decimates large meshes ~2×, AND `mesh_processor.py`
+  applies `MESH_QUALITY_FLOOR` with no cap clamp (50k faces × floor 0.6 → 30k > cap → upload
+  fails). Fix both: constant → 20_000, clamp after the floor. Open Cloud may also silently
+  decimate server-side (DevForum 2026-04) — enforce locally, don't rely on the server.
+
+- [ ] **P1 — Workspace gravity comment is false; physics diverges 5.6×.** `rbxlx_writer.py`
+  writes `Gravity = 196.2` commented "(9.81 m/s²)" — at the converter's own 0.28 m/stud scale
+  that is 54.9 m/s² (196.2 = 20×9.81 is the pre-2019 5 cm/stud convention). Unity-tuned
+  ballistics/falls/jumps land ~5.6× heavy. DECIDE: (a) fidelity `9.81 × STUDS_PER_METER ≈ 35.0`,
+  (b) keep 196.2 for Roblox-native avatar feel, or (c) config knob. Fix the comment regardless;
+  playtest (a) before committing — it changes feel globally.
+
+- [ ] **P1 — Contract verifier ships shadow-mode against a fail-closed contract.**
+  `scene-runtime-contract.md` promises fail-closed; `contract_verifier.py` "never fails the
+  build" (only `FAIL_CLOSED_CHECKS` members can trip), and the status lives only in
+  `.harness/followups.md`. Flip to enforced (PR6/PR8 territory per the recut plan) — also
+  gate (b) of legacy retirement below; until it lands, note shadow status in KNOWN_ISSUES.
+
+- [ ] **P1 — Output boundary doesn't sanitize foreign strings.** (a) `rbxlx_writer.py`
+  `_add_string`/`_add_float` pass control chars (U+0000–001F) and inf/nan into XML — one NaN
+  transform poisons the whole `.rbxlx`; (b) `luau_place_builder._luau_str` +
+  `place_publisher` collision-fixup splice untrusted names/JSON into long-bracket Luau
+  literals — `]]`-shaped content in an asset name breaks (or injects into) the builder script
+  executed via `execute_luau`. Escape-encode at both boundaries.
+
+- [ ] **P1 — Transpile gate: silent pass when luau-analyze is missing; cheap semantic upgrade
+  available.** `utils/luau_analyze.py` returns `[]` when the binary is absent — "syntax-gated"
+  is silently false (likely incl. CI ubuntu jobs). Fail loud / stamp the report. Then: the
+  KNOWN_ISSUES "validator catches syntax, not Roblox API semantics" gap is not a research
+  project — `luau-lsp analyze --definitions:@roblox=globalTypes.d.luau`
+  (JohnnyMorganz/luau-lsp) ships maintained Roblox API types; wire into the existing
+  lint+reprompt loop.
+
+- [ ] **P2 — AI truncation guard.** `code_transpiler` never checks
+  `response.stop_reason == "max_tokens"`; truncated-but-syntactically-valid Luau ships
+  incomplete logic. (Promoted from KNOWN_ISSUES.)
+
+- [ ] **P2 — `conversion_context.json` save is not atomic.** `ConversionContext.save` is a
+  single `write_text`; a crash/Ctrl+C mid-write corrupts the only cross-CLI state file (no
+  KeyboardInterrupt handling either — KNOWN_ISSUES). Write-tmp-then-rename.
+
+- [ ] **P2 — CI gate gaps.** (a) `nightly-summary` echoes `cold-e2e` result but never gates on
+  it — a nightly cold-e2e failure reports green (`test.yml`). (b) smoke/cold-e2e convert a
+  hardcoded local clone (`UNITY_SIMPLEFPS_DIR`), not the pinned submodule — the gate can drift
+  from repo state; one self-hosted Mac = bus factor 1. (c) Consider: required gate on the
+  cached AI shape + advisory fresh-AI run, so pre-merge red isn't a function of model variance.
+
+- [ ] **P2 — Attribute sanitizer: raise cap, guard RBX prefix.** Real SetAttribute rules:
+  alphanumeric + `. - / _`, max **100** chars, reserved `RBX` name prefix. Our `[A-Za-z0-9_]`
+  charset is safe-but-lossy, the 64 cap can go to 100, and nothing guards `RBX*` (throws at
+  runtime). `core/flag_names.py` + serialized-field attribute emission.
+
+- [ ] **P2 — ".rbxlx → HTTP 400" is folklore; fix the comments.** Official place-publishing
+  docs accept both `application/xml` (.rbxlx) and `application/octet-stream` (.rbxl), and
+  `cloud_api.publish_place_file` already sets Content-Type by extension. Verify one real
+  `.rbxlx` publish, then rewrite the three "Open Cloud rejects XML with 400" comments
+  (`convert_interactive.py` upload, `u2r.py`) — the on-error fallback that deletes the `.rbxl`
+  and publishes the `.rbxlx` is probably fine; the comments steer changes wrong.
+
+- [ ] **P2 — Document Open Cloud quotas.** 100 audio uploads/month (10 if not ID-verified),
+  video 20/day, 20 MB/call, 120 req/min. A sound-heavy game can exhaust the monthly audio
+  quota in one conversion. Add to UNSUPPORTED.md + surface in the upload report.
+
+- [ ] **P2 — Unit/easing sweep for component conversion.** ParticleSystem `startSpeed` is
+  emitted raw m/s (force-over-lifetime and light range ARE scaled) → particles ~3.6× slow;
+  audit all unit-bearing props in `component_converter.py` once. Animation easing is
+  hardcoded Quad/InOut at all four TweenInfo emit sites in `animation_converter.py` — Unity
+  AnimationCurve easing is parsed but dropped.
+
+## Legacy retirement (strategic direction, 2026-06-11)
+
+- [ ] **P1 — Retire legacy mode + the coherence-pack layer; generic is the path forward.**
+  Direction set 2026-06-11: stop *investing new architecture* in legacy. The eventual end state
+  relocates semantic-fidelity jobs to the deterministic lowering layer / host-runtime services
+  (the Turret/HudControl pattern — KNOWN_ISSUES § "Scene-runtime generic mode") and deletes
+  `script_coherence_packs.py`, `--scaffolding=fps` + `converter/scaffolding/` +
+  `_fps_artifacts_*` in `pipeline.py`, the `detect_fps_game` heuristic, and the legacy
+  `scene_runtime_mode` branch. Gates before any deletion:
+  - (a) generic parity on the e2e fixture set — player-bind Phase 2 (`self.host.player`
+    authority, then `REQUIRE_PLAYER_BIND` 0→1 in `test.yml`);
+  - (b) contract verifier flipped fail-closed (Architecture section above);
+  - (c) deterministic-lowering homes for the known pack-covered gaps verified on a generic
+    conversion.
+  **NOTE (hybrid, 2026-06-19):** this is a north-star, NOT a license to drop the live pack
+  bugs. The pack layer is still in active use and being fixed tactically (door binding-race
+  #208 landed in `animation_converter`; camera-mount / turret-bullet-damage / checkmark-toggle
+  sessions are touching packs/lowering now). The specific pack-hardening items below
+  (door-pack widening, genre-genericness P1.a/b/c, weapon-mount packs) **remain tracked** until
+  their semantics have a verified deterministic-lowering home — closing them IS gate (c), not a
+  precondition waived by this decision. `docs/refactor_plan.md` (2026-06-11): pack-split lane
+  (PR-E0/E/F) dropped — packs are deleted under retirement, not split.
 
 ## Pipeline / runtime gaps
 
-> **Top two gameplay gaps to solve next (2026-06-15):** (1) the **door** (#9 animation
-> driver-domain, P0 below) and (2) the **turret projectile physics** (#8, P0 below). Both
-> block their e2e fixtures (F10, F16). The door is a client/server domain-split bug; the
-> turret is a generic-flow coverage gap (the legacy projectile primitive was never ported).
-> Neither is started in code.
+> **Top remaining gameplay gap (updated 2026-06-19):** the **turret projectile physics +
+> damage** (#8, P0 below) — blocks the F16 fixture; a generic-flow coverage gap (the legacy
+> projectile primitive was never ported). The door (#9, F10) is DONE — animation driver-domain
+> narrowing (#195) + the Anim_Door runtime-placement binding race (#208); both archived.
 
 - [ ] **P0 (generic) — F16 turret never damages: bullet drops to ground (#8 projectile physics) + damage hits wrong health surface. Analyzed 2026-06-15 (Claude + Codex; static + rbxlx, live Studio owed).**
   The turret kill-chain has FOUR stages; two fail, for unrelated reasons. **None is a client/server
@@ -50,132 +165,6 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
      `Player.curHealth` and the fixture checks that.
   **Order:** stage 3 is the first blocker but stage 4 is independent — fixing the projectile alone won't
   turn F16 green. Schema cross-refs: §3 row 8 (projectile), §8 T-bullet row (corrected 2026-06-15).
-
-- [x] **P0 (generic) — F10 door never opens: animation driver-domain unresolved → server fallback (pattern #9). Empirically reproduced 2026-06-14.**
-  FIXED 2026-06-16 (`fix/door-animator-source-narrowing`, PR #195 / `a10b60f`): dynamic-getter
-  Animator drivers are resolved via C# source narrowing (scan the scope for the param-write to the
-  clip's `observed_attribute`, inherit that writer's domain). NOTE: the F10 *e2e fixture* still
-  contact-misses (the player teleport doesn't walk into the trigger) — that harness-only half is
-  tracked in the F15/F10-fixture P1 below, NOT here.
-  Implements the **CANDIDATE** in `docs/design/generic-converter-architecture.md` §3 row 9
-  ("dynamic-component-ref → driver-domain"). Status was analysis-only (PR #188, 2026-06-11);
-  this entry adds the live repro + the precise fix site + nuances.
-
-  **Mechanism.** `animation_routing.resolve_driver` (Phase 1, merged `71b3355`/`0ffe3e2`/`989a2a4`)
-  resolves an animation's driver ONLY via the *serialized* Animator reference graph
-  (`target_component_type == "Animator"`). `Door.cs:14` accesses its Animator *dynamically* —
-  `transform.parent.Find("door").GetComponent<Animator>()` — then `doorAnim.SetBool("open", value)`
-  (line 37). No serialized field ⇒ 0 candidates ⇒ the `animation_drivers` entry
-  `…Door.prefab:door:open` lands `routing_status:"unresolved"`, `domain:"server"` (fallback).
-  So `Anim_Door_door_open` is emitted as a server `Script` in ServerScriptService and listens for
-  `open` on the SERVER door. But the Door *component* is `domain:"client"` (rule 7 single-player
-  default, all signals zero — `module_domain.py:1714`), so it writes `open` on the CLIENT door
-  instance. Client→server attribute writes don't replicate ⇒ the server animation never observes
-  `open` ⇒ the door never tweens (Anim_Door_door_open tweens +14.28 studs Y on `open`→true).
-
-  **Live proof** (Studio play, `output/e2e/2026-06-05…/conversion`, Beach.Door):
-  (1) hooked the server `TriggerZone.Touched` → fires 40× on a real walk (so the server DOES
-  see the contact — disproves the "server can't see client CFrame" hypothesis);
-  (2) a client walk/sweep sets the CLIENT door `open=true`, but the SERVER door `open` stays
-  `false` even with server-side `hasKey=true`; (3) the `Anim_Door_*` scripts live in
-  ServerScriptService, none on the client.
-
-  **Fix (pattern #9).** When serialized-ref resolution yields 0 candidates, run a C#/Luau
-  param-write narrowing pass: scan the scope's component sources for a write to the clip's
-  `observed_attribute` (`Animator.SetBool/SetTrigger/SetInteger` matching the param, or the
-  transpiled `SetAttribute("open", …)`); pick that component as the driver; inherit its domain
-  (→ client here). Then route the Anim script into the writer's domain.
-  - **Nuance 1 (placement):** the door anim is ONE scene-level script doing a `workspace`
-    search over all `door` parts. As a client driver, emit it as a single `LocalScript` in
-    `StarterPlayerScripts` (LocalScripts run there and the workspace search still works). Do NOT
-    prefab-clone a `LocalScript` into a workspace Model — LocalScripts don't execute in Workspace.
-  - **Nuance 2 (scope):** §3 row 9 warns "other animation drivers fail for different reasons"
-    — gate on real param-write evidence and ABSTAIN (keep server fallback) when ambiguous;
-    the Phase-3 cross-domain verifier backstops.
-
-  **Out of scope here (e2e harness, NOT converter):** the `SimpleFPS.behavior.json` fixtures are
-  also wrong. F10 `door_opens_with_key` teleports to `door_mesh.Position+2` ≈ y29.4, just ABOVE
-  the TriggerZone cube (center y18.5, top y29.2) → no contact; it needs a real walk into the
-  trigger (camera-aligned W-drive — `Player:Move` is camera-`_yaw`-relative, not character-facing).
-  F10 won't pass until pattern #9 lands AND the fixture walks in. See the next item for F15.
-
-- [x] **P1 (e2e fixture) — F15 mine + F10 door behavior fixtures contact-miss. FIXED 2026-06-17 (PR #207; e2e-confirmed on a fresh generic post-#195 conversion).**
-  Harness-only (`tests/fixtures/upload_snapshots/SimpleFPS.behavior.json`), no converter change. Both
-  setups single-teleported the player to a point that doesn't overlap the trigger; replaced with
-  translation-only swept `PivotTo` entries.
-  **F15 mine — GREEN end-to-end.** Swept `PivotTo` through the mine at `c.Y+0.5` → `Touched` fires
-  (85× on the sweep) → `Explode → Humanoid:TakeDamage` → 100→90. Confirmed on the fresh generic
-  conversion (note: the Explode is slightly delayed; the fixture's 3.0s settle covers it).
-  **F10 door — harness FIXED + e2e-confirmed RED for a real converter reason** (see the new converter
-  bug below). The old setup aimed at the `door` PANEL (runtime-placed high above ground), teleporting
-  the player into the air. New setup sweeps the HRP from outside INTO the Door's `TriggerZone`
-  (~21-stud CanCollide=false cube at ground level under `Door/base`) and STOPS (passing through fires
-  `TouchEnded→ToggleDoor(false)` and re-closes it, zeroing the end-state motion). Live-verified:
-  entering with hasKey flips and HOLDS `open=true`; `hasKey` is a CHARACTER attr (cardkey pickup sets
-  it, Door reads it via `playerFromTouch` — char-only confirmed). The strict `dPos>1` assert correctly
-  stays RED because the panel never tweens — the residual converter bug below, NOT a harness flaw.
-
-- [ ] **P1 (generic) — F10 door still doesn't visually open: Anim_Door LocalScript binds via a one-time startup scan that RACES runtime prefab placement. Found 2026-06-17 (e2e, post-#195).**
-  #195 correctly routed `Anim_Door_door_open/close` to client `LocalScript`s in StarterPlayerScripts
-  (domain fix). But the script (`Anim_Door_*.luau`, emitted by `animation_converter`) finds and
-  connects its door panels with a SINGLE `workspace:FindFirstChild("door", true)` + one-pass
-  `workspace:GetDescendants()` multi-target scan **at player-spawn**. In generic scene-runtime mode the
-  Door prefab instances are placed at RUNTIME (scene-runtime `_constructPrefabClone`), AFTER the
-  LocalScript's startup scan runs — so it never connects to the runtime-placed `Beach.Door.door`
-  panel. **Live proof (fresh generic conv, run `2026-06-17T09-17-02`):** a manual `open` flip on the
-  panel produces NO tween (real script not connected); a connection added AFTER placement tweens it
-  fine (+14.28 Y); direct `TweenService` moves and HOLDS the panel (engine/anchoring are not the
-  issue). Fix direction: make the Anim script's binding placement-order-robust — connect on
-  `DescendantAdded` for late-arriving `door` panels (or re-scan), OR co-place/parent the Anim driver
-  with the prefab clone so it binds when the panel is constructed. Door-scoped; gate on the generic
-  runtime-placement path. This is what turns the (now-correct) F10 fixture GREEN.
-
-- [x] **P1 — Generic-mode SimpleFPS canary failures (dual-voice investigation 2026-06-11; NOT Step-1b regressions).** See `docs/design/scene-runtime-pr5-8-recut-plan.md` §"The canary failures" — the PR5 canary gate (SimpleFPS plays under generic). Slices: **T** turret child-index lowering, **T-bullet** nil-parent→workspace default, **R** generic `weaponSlot` rebind, **D** door dynamic-Animator-driver narrowing, **H** HudControl client-domain rule.
-  STATUS (verified 2026-06-17): **T** ✅ Phase-1 canary merged #193; **R** ✅ merged #191 (`drive/rifle-dropped-ref`); **D** ✅ merged #195; **H** ✅ done (HudControl classifies `domain:client`/`LocalScript` — `simplefps_minimal.json`). The remaining turret **projectile-physics + damage** half (#8 stages 3–4) is ACTIVELY OWNED by `drive/turret-bullet-damage-real` (tip `58651d7` "bind damage Touched to the colliding body") — tracked under the F16 turret P0 above, not here. Nothing in this entry is outstanding-and-unowned.
-
-- [x] **P1 — Shared-flag name sanitization is unowned (pre-existing; surfaced by Phase 2b reframe, 2026-06-01).** FIXED 2026-06-02 (`fix/shared-flag-name-sanitization`, PR #165): canonical ASCII sanitizer applied at the runtime `"has" .. name` concat (emitted Luau `gsub("[^%w_]+","_")` from one constant in `core/flag_names.py`) at every writer + the Machine dynamic reader; `itemName`/`ItemType` kept RAW (gameplay payloads); scan made ASCII-explicit. See `docs/design/shared-flag-name-sanitization-brief.md`.
-  The generator builds the shared-flag attribute name as `"has" .. itemName`
-  with NO sanitization (`code_transpiler` `_GENERIC_RUNTIME_PROMPT`,
-  `script_coherence_packs`, and `scene_converter._apply_gameplay_attributes`
-  derives `itemName`/`ItemType` from the raw prefab name). But the
-  `PlayerSetSharedFlag` funnel listener rejects `^[%w_]+$` violations
-  (`autogen.py`), AND Roblox `SetAttribute` itself rejects names with
-  spaces/hyphens. So an `itemName` like `"Red Key"` produces `hasRed Key`,
-  which (a) errors on the client `SetAttribute`, (b) is dropped by the
-  funnel, (c) is read as nil by the server. Fix: a CANONICAL sanitizer
-  applied at the source so writer + reader + funnel + Roblox all agree on a
-  `[%w_]` name; then the `shared_flag_channels` scan's `\w+` charset is
-  correct by construction. Until then `shared_flag_channels` deliberately
-  scans `\w+` (matches the runtime allowlist) — non-conforming flags are
-  recorded nowhere because the bridge can't deliver them regardless.
-  Touches `code_transpiler` / `scene_converter` / packs — its own slice,
-  NOT topology work.
-
-- [x] **P2 — Topology prepass reads pre-coherence `script_type` (pre-existing; surfaced 2026-06-01).**
-  CLOSED 2026-06-02 (`fix/topology-script-type-authority-guard`): the stated
-  premise was IMPRECISE (verified empirically + Claude/Codex review). Findings:
-  (1) the prepass runs INSIDE `_classify_storage`, which is AFTER
-  `_subphase_cohere_scripts` in `MATERIALIZE_AND_CLASSIFY_ORDER` — so in LEGACY
-  mode `script_type` is already corrected before routing reads it; (2)
-  `infer_module_domains` derives `domains` from SOURCE/evidence, NOT
-  `script_type`, so the `domains` map (the main topology output storage
-  consumes) is never polluted by a pre-coherence type; (3) the only genuine
-  pre-coherence read is `compute_shared_flag_channels(transpiled_scripts=…)`,
-  which already FAILS OPEN and deliberately doesn't suppress on `script_type`;
-  (4) `lifecycle_roles` uses the immutable `intrinsic_script_type`. So NO
-  current consumer needs an authoritative post-coherence domain it doesn't
-  already have. The one residual is a LATENT generic-mode gap (Codex): generic
-  skips the client/server type-fix by contract, and
-  `_decide_script_container_from_topology` routes `LocalScript` by type before
-  domain — a stale/uncorrected `LocalScript` with server-domain source would
-  misroute to StarterPlayerScripts. Not demonstrated on a real project
-  (generic forces runtime-bearing→ModuleScript; `_classify_script_type` is
-  source-based; resume rehydrates a consistent type+source pair). Shipped a
-  light guard: a defensive WARNING on the LocalScript/server-domain conflict
-  (no routing change, no contract violation) + a regression test pinning the
-  legacy cohere-before-classify ordering. A full type↔domain reconciliation in
-  generic mode (crossing the generic contract boundary) is deferred as
-  unjustified for a latent, unprovable edge.
 
 - [ ] **P1 — Door pack widening (PR #121 `371ab76`) has 1 fixture covering 1 of 3 emit shapes.** Claude review, 2026-05-21.
   `_detect_door_module_player_lookup` + `_fix_door_module_player_lookup` were
@@ -306,64 +295,11 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
     shared module instead of inlining the BindableEvent vs
     RemoteEvent fork.
 
-
 - [ ] **P2 — Persistent prefab/asset cache.** Prefab library is in-memory
   only; rebuilt from disk every conversion. Needs a cache-schema design
   pass before code — see
   [`docs/FUTURE_IMPROVEMENTS.md`](docs/FUTURE_IMPROVEMENTS.md)
   § "Persistent prefab/asset cache".
-
-- [x] **P1 — Upstream classifier misroutes Roblox-dead Unity-rendering
-  modules to server-only.** Phase 2a slice 7 audit, 2026-05-30. FIXED
-  2026-06-01 (`fix/roblox-dead-module-routing`). **Corrected root cause
-  (audit framing was imprecise, like sibling #9):** the misroute is NOT
-  `infer_module_domains` stamping these server — zero-signal modules hit
-  Rule 7 → `client` under `networking="none"`. It is the **caller-domain
-  storage routing** (`storage_classifier._decide_script_container_*`)
-  pulling a self-requiring cluster of Roblox-dead rendering modules into
-  `ServerStorage` because their callers default to server. Also found: the
-  existing `code_transpiler._is_visual_only_script` already classified
-  "visual-only" but via a **hardcoded game class-name list** (the only
-  reason `WaterBase`/`Displace` were caught) and never propagated the
-  verdict to routing. **Fix (hybrid C + D3 definition):** a generic,
-  behavior-based `roblox_dead_modules` detector (input mapping-coverage
-  prior + decisive post-coherence output-inertness + hard veto; NO class
-  names) replaces the hardcoded heuristic; dead modules are routed out of
-  `ServerStorage` to `ReplicatedStorage` (BOTH topology + legacy paths) and
-  a closure-safe prune pass drops fully-dead require-closures (never a
-  module with a live requirer; closure computed from emitted Luau). See
-  `docs/design/roblox-dead-module-routing-brief.md` (LOCKED DECISIONS) +
-  `docs/design/scene-runtime-architecture-ir.md` § "Roblox-dead module
-  handling" + `.claude/handoffs/task-8-roblox-dead-modules.md`.
-
-- [x] **P1 — Transpiler false-positive `require()` injection poisons
-  storage classification.** Phase 2a slice 7 audit, 2026-05-30. FIXED
-  2026-06-01 (`fix/dead-require-from-runtime-lookup-generics`).
-  **Corrected root cause (the audit's framing was incomplete):** the
-  `Plane→GameManager` false edge is NOT a phantom — `Plane.cs` references
-  `GameManager` via `FindObjectOfType<GameManager>()` (a RUNTIME scene
-  lookup → `self.host.findObjectOfType("GameManager")`). The reference
-  extractor's generic-type-arg regex (`script_analyzer.py`
-  `<\s*([A-Z]\w+)`) captured that runtime-lookup type arg as a
-  `referenced_type` → `dependency_map["Plane"]=[GameManager]`. That single
-  fault poisoned BOTH consumers: the legacy require-injector AND the
-  GENERIC-mode topology `caller_graph` (built directly from
-  `dependency_map`; the prescribed injection-site guard would NOT have
-  fixed generic mode, where `inject_require_calls` doesn't even run).
-  **Fix (at the source, helps both modes):** exclude the type args of
-  GLOBAL scene-lookup generics (`FindObjectOfType<T>` /
-  `FindObjectsOfType<T>`) from `referenced_types` — they locate an
-  already-existing instance, creating no dependency edge and no module
-  require. Genuine deps are still captured via the new/field/param/base
-  patterns. See `_GLOBAL_LOOKUP_GENERIC_METHODS` in `script_analyzer.py`.
-  **Scoped narrowly (Codex review):** COMPONENT-lookup generics
-  (`GetComponent<T>` / `AddComponent<T>` / `TryGetComponent<T>` / …) are
-  NOT excluded — they're real peer edges the caller_graph / reachability
-  consumers (`resolve_caller_graph`, `derive_reachability_requirements`,
-  `_compute_network_behaviour_reachable`) need; dropping them would orphan
-  a component referenced only that way. (Whether a component-lookup edge
-  should ALSO drive a `require()` is a separate, pre-existing concern at
-  the injection site.)
 
 ## Materials & meshes
 
@@ -426,10 +362,12 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
   raw upload of these heavily-rigged multi-skin character FBX is rejected
   by Roblox Open Cloud with "Failed to parse the uploaded file".
   Fix: extend `_read_node` / `_write_node` to handle 7500's 64-bit
-  EndOffset / NumProperties / PropertyListLen header fields. Note: even
-  with 7500 read support, complex skinned-character FBX still cannot go
-  through the Open Cloud mesh endpoint (see next item) — this fix recovers
-  handedness + bbox for *static* 7500 meshes.
+  EndOffset / NumProperties / PropertyListLen header fields (+ the 25-byte NULL
+  sentinel; assimp PR #1354 is the reference). Keep the 32-bit path — Blender still
+  exports 7400. Note: even with 7500 read support, complex skinned-character FBX still
+  cannot go through the Open Cloud mesh endpoint (see next item) — this fix recovers
+  handedness + bbox for *static* 7500 meshes. Alternative worth a spike: Open Cloud now
+  accepts `.gltf/.glb` for Model uploads (Oct 2025), which may bypass FBX patching entirely.
 
 - [ ] **P2 — Skinned/animation-only FBX uploaded as meshes and rejected.**
   Two sub-cases found in the trash-dash run (2026-05-18):
@@ -443,7 +381,10 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
   by the Open Cloud mesh endpoint at all — consistent with the existing
   `docs/UNSUPPORTED.md` skeletal-mesh limitation.
   Fix: detect zero-vertex `Geometry` and skinned FBX pre-upload; skip them
-  and surface to `UNCONVERTED.md` instead of issuing a doomed upload.
+  and surface to `UNCONVERTED.md` instead of issuing a doomed upload. Note:
+  EditableMesh gained programmatic skinning APIs (Studio beta, 2025-06) — a
+  possible future skinned-mesh path; the UNSUPPORTED.md stance stands for now.
+
 ## Infrastructure
 
 - [ ] **P1 — Converter doesn't wire ScreenGui enable/disable into the state
@@ -549,15 +490,9 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
   `ROBLOX_API_KEY`, `ROBLOX_UNIVERSE_ID`, `ROBLOX_PLACE_ID`, and
   `ROBLOX_CREATOR_ID`; `ai-convert-matrix` needs `ANTHROPIC_API_KEY`.
   Wire them when CI billing allows.
-## Type-strictness debt (forward-only gate landed; cleanup separate)
+## Type-strictness debt
 
-The no-Any gate prevents new smuggling. Existing-offender cleanup has
-landed in dedicated PRs (#10 gate, storage_plan, ported-module signatures
-PR #34, PipelineState PR #36, trivial 3-fix + ConversionContext final 4).
-
-No tracked remaining items. The `scene_converter.py` `mesh_hierarchies`
-field that previously lived here is already typed
-`dict[str, list[MeshHierarchyEntry]]` (see `scene_converter.py:177`).
+Forward-only no-Any gate landed; no tracked remaining cleanup items.
 
 ---
 
