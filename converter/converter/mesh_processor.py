@@ -165,7 +165,8 @@ def decimate_mesh(
             "clamping to floor",
             ratio, MESH_QUALITY_FLOOR, path.name,
         )
-        target_faces = max(target_faces, int(original_faces * MESH_QUALITY_FLOOR))
+        target_faces = min(max(target_faces, int(original_faces * MESH_QUALITY_FLOOR)),
+                           MESH_ROBLOX_MAX_FACES)
 
     try:
         # Primary: quadric decimation (requires scipy/quadric extension).

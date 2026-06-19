@@ -31,7 +31,7 @@ from config import (
     OUTPUT_DIR,
     RBXLX_OUTPUT_FILENAME,
 )
-from core.conversion_context import ConversionContext
+from core.conversion_context import ConversionContext, MeshHierarchyEntry
 from core.unity_types import (
     AssetManifest,
     GuidIndex,
@@ -460,6 +460,37 @@ def _roblox_call_net_errors(semantic_report: "object") -> list[str]:
             f"{issue.snippet}]"
         )
     return out
+
+
+def _quarantine_bad_embedded_meshes(
+    mesh_hierarchies: dict[str, list[MeshHierarchyEntry]],
+    mesh_native_sizes: dict[str, list[float]],
+    uploaded_assets: dict[str, str],
+    upload_errors: list[str],
+) -> list[str]:
+    """Drop synthetic embedded-mesh keys that resolved to != 1 sub-mesh.
+
+    The synthesised FBX has exactly one Geometry node by construction; >1 (or 0)
+    means the template-cleanup leaked extra Geometries and ``sub_meshes[0]`` would
+    bind to non-deterministic geometry. Rather than ship the wrong mesh, evict the
+    key from every table the MeshId binding reads so the node falls through to the
+    crash-free no-MeshId / face-decal fallback. Mutates the four args in place;
+    returns the list of quarantined keys.
+    """
+    from core.asset_keys import is_embedded_mesh_key
+    bad = [k for k, subs in mesh_hierarchies.items()
+           if is_embedded_mesh_key(k) and len(subs) != 1]
+    for k in bad:
+        mesh_hierarchies.pop(k, None)
+        mesh_native_sizes.pop(k, None)
+        # _resolve_mesh_id (scene_converter) reads uploaded_assets via
+        # _embedded_key_candidates slash variants, so pop every slash direction.
+        prefix, _, file_id = k.partition("#")
+        for variant in (prefix, prefix.replace("\\", "/"), prefix.replace("/", "\\")):
+            uploaded_assets.pop(f"{variant}#{file_id}", None)
+        if k not in upload_errors:
+            upload_errors.append(k)
+    return bad
 
 
 @dataclass
@@ -2849,6 +2880,21 @@ return table.concat(allData, "\\n")'''
             merged_hierarchies = {**existing_hierarchies, **mesh_hierarchies}
             self.ctx.mesh_native_sizes = merged_sizes
             self.ctx.mesh_hierarchies = merged_hierarchies
+            # Quarantine embedded-mesh keys that resolved to the wrong sub-mesh
+            # count (!= 1). Runs on the MERGED ctx dicts so a bad key pre-seeded
+            # from a prior force-rerun is evicted even if this run didn't re-parse
+            # it. self.ctx.* IS the merged dict (assigned just above), so popping
+            # from ctx pops from the merged result.
+            quarantined = _quarantine_bad_embedded_meshes(
+                self.ctx.mesh_hierarchies,
+                self.ctx.mesh_native_sizes,
+                self.ctx.uploaded_assets,
+                self.ctx.asset_upload_errors,
+            )
+            if quarantined:
+                log.warning(
+                    "[resolve_assets] Quarantined %d embedded-mesh key(s) with the "
+                    "wrong sub-mesh count: %s", len(quarantined), quarantined)
             log.info(
                 "[resolve_assets] Resolved %d new meshes (total %d, %d sub-meshes)",
                 len(mesh_native_sizes), len(merged_sizes),
