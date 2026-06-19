@@ -40,13 +40,191 @@ from core.unity_types import (
 )
 from core.roblox_types import RbxPart, RbxPlace, RbxScript, ScriptType
 from converter.animation_converter import AnimationConversionResult
-from converter.code_transpiler import TranspilationResult
+from converter.code_transpiler import TranspilationResult, TranspiledScript
 from converter.material_mapper import MaterialMapping
 from converter.scriptable_object_converter import AssetConversionResult
 from converter.sprite_extractor import SpriteExtractionResult
 from unity.yaml_parser import ref_guid
 
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 (camera-mount -> player-mount equip, D13) — the field-name -> prefab_id
+# bridge. Phase 1's lowered request fires the C# prefab FIELD NAME
+# (``equipWeaponRemote:FireServer("riflePrefab")``); the server clone path
+# ``clonePrefabTemplate(prefab_id, ...)`` needs a ``prefab_id`` key into
+# ``Plan.prefabs``. The mapping field-name -> prefab_id lives ONLY in the
+# per-component ``SceneRuntimeReference`` rows (``{from, field, target_kind,
+# target_ref}``) the planner already seeds into ``scene_runtime``. This helper
+# joins the equip-emitting scripts (keyed by ``equip_binding``) with those rows
+# to build the flat ``{field_name: prefab_id}`` map (D13b), failing CLOSED on a
+# same-field-name-different-prefab collision across equip scripts (the gate that
+# makes the flat map safe — the codex "AVOID (B): silent misbinding" objection).
+# ---------------------------------------------------------------------------
+
+
+def _instance_id_to_script_id(
+    scene_runtime: Mapping[str, object],
+) -> dict[str, str]:
+    """Build ``{instance_id: script_id}`` from every ``instances`` list under the
+    ``scenes`` and ``prefabs`` blocks of ``scene_runtime``. The reference rows are
+    keyed by ``from`` = instance_id; the equip join needs the OWNING script_id of
+    each row, which lives on the instance."""
+    out: dict[str, str] = {}
+    for block_key in ("scenes", "prefabs"):
+        block = scene_runtime.get(block_key)
+        if not isinstance(block, dict):
+            continue
+        for sub in block.values():
+            if not isinstance(sub, dict):
+                continue
+            instances = sub.get("instances")
+            if not isinstance(instances, list):
+                continue
+            for inst in instances:
+                if not isinstance(inst, dict):
+                    continue
+                iid = inst.get("instance_id")
+                sid = inst.get("script_id")
+                if isinstance(iid, str) and isinstance(sid, str) and sid:
+                    out[iid] = sid
+    return out
+
+
+def _iter_prefab_reference_rows(
+    scene_runtime: Mapping[str, object],
+) -> "list[dict[str, object]]":
+    """Collect every ``target_kind == "prefab"`` reference row across the
+    ``scenes`` and ``prefabs`` blocks. Each row carries ``from`` (instance_id),
+    ``field``, and ``target_ref`` (the prefab_id)."""
+    rows: list[dict[str, object]] = []
+    for block_key in ("scenes", "prefabs"):
+        block = scene_runtime.get(block_key)
+        if not isinstance(block, dict):
+            continue
+        for sub in block.values():
+            if not isinstance(sub, dict):
+                continue
+            references = sub.get("references")
+            if not isinstance(references, list):
+                continue
+            for row in references:
+                if isinstance(row, dict) and row.get("target_kind") == "prefab":
+                    rows.append(cast("dict[str, object]", row))
+    return rows
+
+
+def build_equip_prefabs_bridge(
+    scripts: "list[TranspiledScript]",
+    scene_runtime: Mapping[str, object],
+    guid_index: object | None,
+) -> dict[str, str]:
+    """Build the D13b ``{field_name: prefab_id}`` equip bridge.
+
+    For each script carrying an equip obligation (``equip_binding`` non-None with
+    a ``prefab`` field name), resolve that field to a ``prefab_id`` via the prefab
+    reference rows owned by an instance of THAT script (joined on the script's
+    canonical ``script_id``). Build the flat field-name -> prefab_id map.
+
+    FAIL CLOSED (``RuntimeError``) on a same-field-name-different-prefab collision
+    across equip scripts — the build-time gate that converts the flat map's silent
+    misbinding into a loud stop (D13b). Within a single equip obligation, the
+    field resolves to exactly one prefab_id by construction (one field on one
+    script's instances); a single field that resolves to two prefab_ids across
+    DISTINCT equip scripts is the collision case.
+
+    Returns an empty dict when no script carries an equip obligation (the common
+    non-equip game) or when the reference rows do not resolve the field (the
+    handler then abstains at runtime, D11)."""
+    inst_to_script = _instance_id_to_script_id(scene_runtime)
+    prefab_rows = _iter_prefab_reference_rows(scene_runtime)
+
+    equip_prefabs: dict[str, str] = {}
+    # Per-field provenance so a collision message names the offending scripts.
+    field_provenance: dict[str, tuple[str, str]] = {}  # field -> (prefab_id, script_id)
+
+    for ts in scripts:
+        eb = ts.equip_binding
+        if not eb:
+            continue
+        field_name = str(eb.get("prefab") or "")
+        if not field_name:
+            continue
+        script_id = _script_id_for_source_path(ts.source_path, guid_index)
+        if not script_id:
+            # Cannot key the script to its reference rows -> the field stays
+            # unresolved (runtime abstain). A missing script_id is not a
+            # collision, so no fail-close.
+            continue
+        # Resolve the field's prefab_id from THIS script's prefab reference rows.
+        # Collect ALL target_refs across EVERY matching row (across all authored
+        # instances of this script class) — a single instance taking the first
+        # row would silently misbind when two instances of the SAME script class
+        # share the field name but reference DIFFERENT prefabs (same-script
+        # multi-instance collision). The resolved set must be exactly one.
+        resolved_set: set[str] = set()
+        for row in prefab_rows:
+            if row.get("field") != field_name:
+                continue
+            frm = row.get("from")
+            if not isinstance(frm, str):
+                continue
+            if inst_to_script.get(frm) != script_id:
+                continue
+            target_ref = row.get("target_ref")
+            if isinstance(target_ref, str) and target_ref:
+                resolved_set.add(target_ref)
+        if not resolved_set:
+            continue
+        if len(resolved_set) > 1:
+            refs = ", ".join(repr(r) for r in sorted(resolved_set))
+            raise RuntimeError(
+                "[contract] camera-mount equip bridge: field name "
+                f"{field_name!r} on script {script_id!r} maps to multiple "
+                f"different prefabs across that script's instances ({refs}) — "
+                "refusing to ship a flat field->prefab_id map that would "
+                "silently misbind one of them (D13b build-time collision "
+                "fail-close). File D13a (scriptId-scoped resolution) to support "
+                "this game."
+            )
+        resolved = next(iter(resolved_set))
+        prior = field_provenance.get(field_name)
+        if prior is not None and prior[0] != resolved:
+            raise RuntimeError(
+                "[contract] camera-mount equip bridge: field name "
+                f"{field_name!r} maps to two different prefabs across equip "
+                f"scripts ({prior[0]!r} from script {prior[1]!r} vs "
+                f"{resolved!r} from script {script_id!r}) — refusing to ship a "
+                "flat field->prefab_id map that would silently misbind one of "
+                "them (D13b build-time collision fail-close). File D13a "
+                "(scriptId-scoped resolution) to support this game."
+            )
+        equip_prefabs[field_name] = resolved
+        field_provenance.setdefault(field_name, (resolved, script_id))
+
+    return equip_prefabs
+
+
+def _script_id_for_source_path(
+    source_path: str,
+    guid_index: object | None,
+) -> str:
+    """Resolve a transpiled script's ``.cs`` ``source_path`` to its canonical
+    ``script_id`` (the .cs GUID), the key the planner uses for reference-row
+    instances. Uses the guid_index reverse lookup (``guid_for_path``); returns
+    ``""`` when unresolvable (caller leaves the field unresolved -> runtime
+    abstain, never a fail-close)."""
+    if not source_path:
+        return ""
+    guid_for_path = getattr(guid_index, "guid_for_path", None)
+    if not callable(guid_for_path):
+        return ""
+    try:
+        guid = guid_for_path(Path(source_path))
+    except Exception:
+        return ""
+    return guid if isinstance(guid, str) and guid else ""
 
 
 # ---------------------------------------------------------------------------
@@ -2488,6 +2666,21 @@ class Pipeline:
             # sorted list of strings so a resume round-trip is stable.
             self.ctx.scene_runtime["runtime_bearing_paths"] = sorted(
                 str(p) for p in contract_result.runtime_bearing_paths
+            )
+            # Phase 2 (D13): build the field-name -> prefab_id equip bridge now
+            # that BOTH inputs exist — the equip-emitting scripts' ``equip_binding``
+            # (produced by the camera-mount equip lowering inside
+            # ``transpile_with_contract``) AND the per-component prefab reference
+            # rows ``plan_scene_runtime`` seeded into ``ctx.scene_runtime``. This
+            # MUST run here (post-transpile), NOT in ``plan_scene_runtime`` which
+            # runs before the equip facts exist. The map reaches the emitted
+            # SceneRuntimePlan via the ``equip_prefabs`` entry in
+            # ``_PLAN_KEYS_FOR_HOST`` (else the live handler reads nil). Fails
+            # CLOSED on a same-field-name-different-prefab collision (D13b gate).
+            self.ctx.scene_runtime["equip_prefabs"] = build_equip_prefabs_bridge(
+                contract_result.transpilation.scripts,
+                self.ctx.scene_runtime,
+                self.state.guid_index,
             )
         else:
             # Legacy path -- must stay byte-identical. Do NOT thread
