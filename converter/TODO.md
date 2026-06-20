@@ -28,25 +28,14 @@ cache. The items below are where code or docs are stale or wrong.
   stale error msg in `u2r.py`), 6 undocumented u2r subcommands, stale test counts, and convert
   all hardcoded `file:line` citations to grep-targets.
 
-- [ ] **P1 — Workspace gravity comment is false; physics diverges 5.6×.** `rbxlx_writer.py`
-  writes `Gravity = 196.2` commented "(9.81 m/s²)" — at the converter's own 0.28 m/stud scale
-  that is 54.9 m/s² (196.2 = 20×9.81 is the pre-2019 5 cm/stud convention). Unity-tuned
-  ballistics/falls/jumps land ~5.6× heavy. DECIDE: (a) fidelity `9.81 × STUDS_PER_METER ≈ 35.0`,
-  (b) keep 196.2 for Roblox-native avatar feel, or (c) config knob. Fix the comment regardless;
-  playtest (a) before committing — it changes feel globally.
-
-- [ ] **P1 — Contract verifier ships shadow-mode against a fail-closed contract.**
-  `scene-runtime-contract.md` promises fail-closed; `contract_verifier.py` "never fails the
-  build" (only `FAIL_CLOSED_CHECKS` members can trip), and the status lives only in
-  `.harness/followups.md`. Flip to enforced (PR6/PR8 territory per the recut plan) — also
-  gate (b) of legacy retirement below; until it lands, note shadow status in KNOWN_ISSUES.
-
-- [ ] **P1 — Output boundary doesn't sanitize foreign strings.** (a) `rbxlx_writer.py`
-  `_add_string`/`_add_float` pass control chars (U+0000–001F) and inf/nan into XML — one NaN
-  transform poisons the whole `.rbxlx`; (b) `luau_place_builder._luau_str` +
-  `place_publisher` collision-fixup splice untrusted names/JSON into long-bracket Luau
-  literals — `]]`-shaped content in an asset name breaks (or injects into) the builder script
-  executed via `execute_luau`. Escape-encode at both boundaries.
+- [ ] **P1 — Workspace gravity comment is false (the comment only — physics divergence handled).**
+  PARTIAL: the 5.6× physics divergence is now corrected at runtime via `project_gravity.py` +
+  `scene_runtime.luau` clone-site hook (PR #194, in tree) — dynamic assemblies use scale-faithful
+  gravity from the Unity project's real `DynamicsManager.asset`. REMAINING: `rbxlx_writer.py` still
+  writes the static `Gravity = 196.2` with the wrong comment "(9.81 m/s²)" (at 0.28 m/stud that's
+  54.9 m/s²; 196.2 = 20×9.81 is the pre-2019 5 cm/stud convention). Fix the comment; decide whether
+  the static workspace Gravity value should also change (a) `9.81 × STUDS_PER_METER ≈ 35.0`,
+  (b) keep 196.2 for Roblox-native avatar feel, or (c) config knob — playtest (a) before committing.
 
 - [ ] **P1 — Transpile gate: silent pass when luau-analyze is missing; cheap semantic upgrade
   available.** `utils/luau_analyze.py` returns `[]` when the binary is absent — "syntax-gated"
@@ -212,15 +201,9 @@ cache. The items below are where code or docs are stale or wrong.
   flagged six findings the PR explicitly defers — non-FPS Unity projects may
   regress on any of these until follow-up lands.
 
-  - **P1.a — `localscript_api_shim` type-aware accessor classification.**
-    `_classify_api()` (`script_coherence_packs.py:_classify_api`) currently
-    treats any bare-identifier return (`return gotKey`) as boolean
-    backing-state and emits a hardcoded `c:GetAttribute(...) == true or false`
-    shim. Non-boolean APIs (ammo counts, cooldowns, enum/state IDs, inventory
-    quantities) silently become "always false". Fix: classify by inferring the
-    backing var's declared literal type (`= 0` → number, `= ""` → string, etc.)
-    and emit type-appropriate `GetAttribute` reads. Add mixed-type test
-    coverage in `tests/test_script_coherence_packs.py::TestLocalScriptApiShim`.
+  - **P1.a — `localscript_api_shim` type-aware accessor classification. — DONE (`95b4fc5`,
+    moved to archive).** `_classify_api` now gates the boolean shim on `_is_boolean_state_var`;
+    non-boolean accessors fall through to `return nil`. Kept here only as a pointer — P1.b/P1.c below remain open.
   - **P1.b — `localscript_api_shim` server-side consumer fails.** The shim's
     `_resolveCharacter(character)` (`script_coherence_packs.py:_build_shim_source`)
     falls back to `Players.LocalPlayer.Character`, which is nil on server
@@ -342,10 +325,12 @@ cache. The items below are where code or docs are stale or wrong.
   (2026-05-18): `Cat.fbx` / `CatBase.fbx` / `Racoon.fbx` are all 7500;
   raw upload of these heavily-rigged multi-skin character FBX is rejected
   by Roblox Open Cloud with "Failed to parse the uploaded file".
-  Fix: extend `_read_node` / `_write_node` to handle 7500's 64-bit
-  EndOffset / NumProperties / PropertyListLen header fields (+ the 25-byte NULL
-  sentinel; assimp PR #1354 is the reference). Keep the 32-bit path — Blender still
-  exports 7400. Note: even with 7500 read support, complex skinned-character FBX still
+  NEARLY DONE: `_read_node` / `_write_node` ALREADY handle the 7500 64-bit
+  EndOffset / NumProperties / PropertyListLen header fields + 25-byte NULL sentinel (the
+  `ver >= 7500` `<QQQ>`/24-byte branches are implemented in tree). The ONLY thing still
+  rejecting 7500 is the early `raise NotImplementedError` gate at the top of `read_fbx` —
+  remove it so the existing 64-bit path runs (then test against a real 7500 file). Keep the
+  32-bit path — Blender still exports 7400. Note: even with 7500 read support, complex skinned-character FBX still
   cannot go through the Open Cloud mesh endpoint (see next item) — this fix recovers
   handedness + bbox for *static* 7500 meshes. Alternative worth a spike: Open Cloud now
   accepts `.gltf/.glb` for Model uploads (Oct 2025), which may bypass FBX patching entirely.

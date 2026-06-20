@@ -13,6 +13,24 @@ Open work moves to `TODO.md`. Completed work and execution logs stay here.
 
 ---
 
+## 2026-06-20 — TODO reconcile: items already fixed but never struck (verified against tree)
+
+- [x] **P1 — Output boundary doesn't sanitize foreign strings.** FIXED — merged ntornow#215
+  (`1c5723c` rbxlx XML control-char strip + NaN/inf finitize; `669054c` total Luau-literal
+  escaping for the place builder, incl. `]]`-injection in long-bracket literals). Both halves
+  (rbxlx_writer `_add_string`/`_add_float` + `luau_place_builder._luau_str`/place_publisher
+  fixup) covered. Was open in TODO only because this branch lagged upstream/main; merged in
+  2026-06-20.
+- [x] **P1 — Contract verifier ships shadow-mode against a fail-closed contract.** FIXED
+  (`17a7575`, in tree): all 5 checks now in `FAIL_CLOSED_CHECKS`; `pipeline.py` promotes
+  violations to `ctx.errors` (flips `conversion_report.success=False`). `U2R_CONTRACT_VERIFIER_FAIL_OPEN`
+  is the release escape hatch. Never struck from the active TODO.
+- [x] **P1.a (genre-genericness) — `localscript_api_shim` type-aware accessor classification.**
+  FIXED (`95b4fc5`): `_classify_api` now gates the boolean-shim on `_is_boolean_state_var`
+  (every assignment a boolean literal); non-boolean accessors fall through to `return nil`
+  instead of the hardcoded `== true or false`. Regression test `TestLocalScriptApiShimInstanceReturn`.
+  (Sibling P1.b server-side consumer + P1.c template-clone over-broad detector remain OPEN.)
+
 ## 2026-06-20 — mesh-fidelity fixes (merged ntornow#212, /drive run mesh-fidelity-20260619T232452)
 
 - [x] **P1 — Mesh face cap stale (10k) + quality floor ignored it.** FIXED #212: `config.py
