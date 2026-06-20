@@ -112,6 +112,11 @@ cache. The items below are where code or docs are stale or wrong.
 > narrowing (#195) + the Anim_Door runtime-placement binding race (#208); both archived.
 
 - [ ] **P0 (generic) — F16 turret never damages: bullet drops to ground (#8 projectile physics) + damage hits wrong health surface. Analyzed 2026-06-15 (Claude + Codex; static + rbxlx, live Studio owed).**
+  **IN PROGRESS (2026-06-20): actively owned by a concurrent session — do NOT double-claim.**
+  NOTE: PRs #193 / #197 / #198 (merged 2026-06-15/16) already touched stages 3–4 (host-impulse
+  launch + Humanoid-damage API + bind-Touched-to-colliding-body); the concurrent session owns
+  re-verifying whether F16 is now green and closing whatever remains. The analysis below predates
+  those merges — treat it as background, not the current state.
   The turret kill-chain has FOUR stages; two fail, for unrelated reasons. **None is a client/server
   problem** — Turret + TurretBullet + Player are all Rule-7 `domain:client` in single-player, so every
   interaction is local (contrast the door #9, which IS a domain split).
