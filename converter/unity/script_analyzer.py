@@ -238,13 +238,18 @@ _RE_METHOD_HEAD = re.compile(
 # A bare C# field identifier — the container candidate ``C``.
 _RE_BARE_IDENT = re.compile(r"^[A-Za-z_]\w*$")
 
-# An instantiate/reparent INTO a container field ``C`` (``C`` is the LAST arg of
-# ``Instantiate``, the receiver of ``InstantiateAsync``, or the arg of
-# ``SetParent``). We capture the container token and validate it is a bare field
-# identifier (not ``transform``/``this``/a member chain). Built per-scan because
-# the canonical-clear gate needs the matched spawn's position.
+# An instantiate/reparent INTO a container field ``C`` (``C`` is the SECOND
+# (parent) arg of ``Instantiate``, the receiver of ``InstantiateAsync``, or the
+# arg of ``SetParent``). For ``Instantiate`` we capture the 2nd argument so that
+# ``Instantiate(prefab, C)``, ``Instantiate(prefab, C, false)`` and
+# ``Instantiate(prefab, C, true)`` (worldPositionStays) all capture ``C``. The
+# 4-arg ``Instantiate(prefab, pos, rot, parent)`` form captures ``pos`` (a
+# Vector3 position expression), which fails the bare-field/cleared-container
+# resolution and correctly ABSTAINS. We capture the token and validate it is a
+# bare field identifier (not ``transform``/``this``/a member chain). Built
+# per-scan because the canonical-clear gate needs the matched spawn's position.
 _RE_SPAWN_INTO = re.compile(
-    r"\bInstantiate\s*\(\s*[^;]*?,\s*([A-Za-z_][\w.]*)\s*\)"   # Instantiate(prefab, C)
+    r"\bInstantiate\s*\(\s*[^;]*?,\s*([A-Za-z_][\w.]*)\s*[,)]"  # Instantiate(prefab, C[, ...])
     r"|([A-Za-z_][\w.]*)\s*\.\s*InstantiateAsync\s*\("          # C.InstantiateAsync(...)
     r"|\.\s*SetParent\s*\(\s*([A-Za-z_][\w.]*)",                # x.SetParent(C ...)
 )

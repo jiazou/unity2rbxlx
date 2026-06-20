@@ -108,6 +108,51 @@ def test_two_containers_each_canonical_union():
     )
 
 
+def test_instantiate_worldpositionstays_false_emits():
+    """``Instantiate(prefab, container, false)`` — the 3-arg
+    worldPositionStays overload — captures the 2nd (parent) arg, NOT the
+    trailing ``false``, so the cleared container is detected."""
+    src = _wrap("Ctrl", """
+    public Transform container;
+    public GameObject prefab;
+    void Refresh() {
+        foreach (Transform c in container) Destroy(c.gameObject);
+        Instantiate(prefab, container, false);
+    }
+""")
+    assert detect_cleared_containers(src, "Ctrl") == frozenset({"container"})
+
+
+def test_instantiate_worldpositionstays_true_emits():
+    """``Instantiate(prefab, container, true)`` — captures the 2nd (parent)
+    arg, NOT the trailing ``true``."""
+    src = _wrap("Ctrl", """
+    public Transform container;
+    public GameObject prefab;
+    void Refresh() {
+        foreach (Transform c in container) Destroy(c.gameObject);
+        Instantiate(prefab, container, true);
+    }
+""")
+    assert detect_cleared_containers(src, "Ctrl") == frozenset({"container"})
+
+
+def test_instantiate_position_rotation_parent_form_abstains():
+    """The 4-arg ``Instantiate(prefab, pos, rot, container)`` overload captures
+    the 2nd arg (``pos``, a Vector3 position expression) which is NOT a cleared
+    container field, so the detector correctly ABSTAINS — even though
+    ``container`` is genuinely cleared, the spawn does not resolve to it."""
+    src = _wrap("Ctrl", """
+    public Transform container;
+    public GameObject prefab;
+    void Refresh() {
+        foreach (Transform c in container) Destroy(c.gameObject);
+        Instantiate(prefab, pos, rot, container);
+    }
+""")
+    assert detect_cleared_containers(src, "Ctrl") == frozenset()
+
+
 # ---------------------------------------------------------------------------
 # Abstain cases — each returns the empty set.
 # ---------------------------------------------------------------------------
