@@ -2345,8 +2345,40 @@ function SceneRuntime:applyImpulse(part, force)
 	-- is the AI's Vector3 argument passed straight through — a malformed force errors exactly as
 	-- today's raw ``part:ApplyImpulse(force)`` would (never worse), and is NOT silently swallowed
 	-- (a no-op would mask an AI codegen bug).
-	if (type(part) ~= "table" and type(part) ~= "userdata") or not _isBasePart(part) then
+	if type(part) ~= "table" and type(part) ~= "userdata" then
 		return
+	end
+	-- Resolve the launch BODY. A force-launched MonoBehaviour passes ``self.gameObject``; for a
+	-- wrapped-Model prefab (outer Model + inner ``*_Mesh`` body) that is the MODEL, not a BasePart.
+	-- The old ``not _isBasePart -> return`` SILENTLY dropped the launch on every such body (the
+	-- regression). Resolve the Model to its dynamic body BasePart: the ``_UnityMass``-stamped
+	-- descendant FIRST -- the converter stamps ``_UnityMass`` ONLY on the dynamic Rigidbody body, so
+	-- it outranks ``PrimaryPart`` (which may be a cosmetic part) -- then ``PrimaryPart``, then the
+	-- first descendant BasePart. Abstain only when NO BasePart resolves (a body-less GameObject has
+	-- nothing to launch). Once resolved, the existing assembly/mass logic below finds the stamp.
+	if not _isBasePart(part) then
+		if type(part.GetDescendants) ~= "function" then
+			return
+		end
+		local body
+		for _, d in ipairs(part:GetDescendants()) do
+			if _isBasePart(d) and d:GetAttribute("_UnityMass") ~= nil then
+				body = d
+				break
+			end
+		end
+		if body == nil then
+			local pp = part:IsA("Model") and part.PrimaryPart
+			if pp and _isBasePart(pp) then
+				body = pp
+			else
+				body = part:FindFirstChildWhichIsA("BasePart", true)
+			end
+		end
+		if body == nil then
+			return
+		end
+		part = body
 	end
 	local target, mUnity = part, part:GetAttribute("_UnityMass")
 	if mUnity == nil and part.AssemblyRootPart then

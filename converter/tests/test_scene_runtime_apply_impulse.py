@@ -106,6 +106,55 @@ class TestApplyImpulse:
         assert rc == 0, f"luau failed: {err}\n{out}"
         assert "SAFE_OK" in out, out
 
+    def test_model_arg_resolves_unity_mass_body_not_early_return(self):
+        # REGRESSION GUARD (live-confirmed): a force-launched MonoBehaviour passes
+        # ``self.gameObject`` = the wrapped MODEL (e.g. TurretBullet wrapping anchored Sparks +
+        # dynamic ``*_Mesh``). applyImpulse must resolve the ``_UnityMass``-stamped inner body and
+        # launch IT — NOT early-return on the Model (the bug silently dropped the launch). The
+        # ``_UnityMass`` body must OUTRANK a first cosmetic/anchored BasePart.
+        rc, out, err = _run_scenario(_MOCK + """
+        local sparks = mockPart({})                  -- cosmetic, NO _UnityMass, appears FIRST
+        local mesh = mockPart({ _UnityMass = 1.0 })  -- the dynamic body
+        local model = {}
+        function model:IsA(c) return c == "Model" end
+        function model:GetDescendants() return { sparks, mesh } end
+        model.PrimaryPart = nil
+        SceneRuntime:applyImpulse(model, 60)
+        print(string.format("MODEL_mesh=%.2f sparks=%.2f", mesh.AssemblyLinearVelocity, sparks.AssemblyLinearVelocity))
+        """)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        # the _UnityMass mesh launches at 214.26; the first (cosmetic) BasePart stays untouched
+        assert "MODEL_mesh=214.26 sparks=0.00" in out, out
+
+    def test_model_no_unity_mass_falls_back_to_primarypart(self):
+        # Priority tier 2: a Model with NO _UnityMass-stamped descendant launches its PrimaryPart
+        # (best-effort), not abstain.
+        rc, out, err = _run_scenario(_MOCK + """
+        local prim = mockPart({ _UnityMass = 1.0 })  -- stamped here so the launch math is checkable
+        local model = {}
+        function model:IsA(c) return c == "Model" end
+        function model:GetDescendants() return { } end   -- no stamped descendant found in the walk
+        model.PrimaryPart = prim
+        SceneRuntime:applyImpulse(model, 60)
+        print(string.format("PRIM_v=%.2f", prim.AssemblyLinearVelocity))
+        """)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "PRIM_v=214.26" in out, out
+
+    def test_model_with_no_basepart_abstains(self):
+        # Abstain only when NO BasePart resolves (a body-less GameObject) — a safe no-op, no error.
+        rc, out, err = _run_scenario(_MOCK + """
+        local model = {}
+        function model:IsA(c) return c == "Model" end
+        function model:GetDescendants() return { } end
+        model.PrimaryPart = nil
+        function model:FindFirstChildWhichIsA(c, r) return nil end
+        SceneRuntime:applyImpulse(model, 60)
+        print("ABSTAIN_OK")
+        """)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "ABSTAIN_OK" in out, out
+
     def test_host_wrapper_dotted_and_colon_dispatch(self):
         # The self.host.applyImpulse wrapper routes both dotted and colon call forms to the engine.
         rc, out, err = _run_scenario(_MOCK + """
