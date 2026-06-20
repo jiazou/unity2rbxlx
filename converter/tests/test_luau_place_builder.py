@@ -383,3 +383,20 @@ class TestEmitScreenGuiEnabled:
         from core.roblox_types import RbxScreenGui
         out = self._emit(RbxScreenGui(name="UI"))
         assert "g.Enabled=true" in out
+
+    def test_enabled_emitted_before_attributes(self):
+        """`g.Enabled` is emitted BEFORE any `SetAttribute(...)`. (AC#4)
+
+        Pins the ordering contract: a future reorder that emits attributes
+        ahead of `g.Enabled` must fail RED. Builds a ScreenGui WITH an
+        attribute so both emissions are present in the output.
+        """
+        from core.roblox_types import RbxScreenGui
+        gui = RbxScreenGui(name="UI", enabled=False)
+        gui.attributes["_SceneRuntimeId"] = "Scene:1"
+        out = self._emit(gui)
+        assert "g.Enabled=false" in out
+        assert "SetAttribute" in out
+        assert "_SceneRuntimeId" in out
+        assert out.index("g.Enabled") < out.index("SetAttribute")
+        assert out.index("g.Enabled") < out.index("_SceneRuntimeId")

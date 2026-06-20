@@ -690,7 +690,8 @@ class TestCanvasEnabled:
                      has_canvas_comp: bool = True) -> SceneNode:
         comps: list[ComponentData] = []
         if has_canvas_comp:
-            props: dict = {} if m_enabled is None else {"m_Enabled": m_enabled}
+            props: dict[str, object] = (
+                {} if m_enabled is None else {"m_Enabled": m_enabled})
             comps.append(ComponentData("Canvas", "canvasComp", props))
         return SceneNode(
             name="Canvas", file_id="canvasFid", active=active, layer=0,
@@ -747,36 +748,27 @@ class TestCanvasEnabled:
         disabled, via the real scene_parser + find_canvas_nodes +
         convert_canvas. (AC#6)
 
-        Falls back to synthetic nodes if the scene isn't present in this env.
+        Real-corpus only: skips (does NOT silently substitute synthetic data)
+        when the scene is absent, so the suite honestly reports whether the
+        real-corpus check ran. The synthetic AND-semantics matrix is covered
+        by the other tests in this class.
         """
+        import pytest
         from pathlib import Path
         from converter.ui_translator import convert_canvas, find_canvas_nodes
 
         scene = Path("/Users/jiazou/workspace/trash-dash/Assets/Scenes/Main.unity")
-        if scene.exists():
-            from unity.scene_parser import parse_scene
-            parsed = parse_scene(scene)
-            canvases = find_canvas_nodes(parsed.roots)
-            guis = convert_canvas(canvases, scene_namespace=self.NS)
-            by_name = {g.name: g.enabled for g in guis}
-            # The active boot canvas ships enabled; the rest ship disabled.
-            assert by_name.get("Loadout") is True, by_name
-            for n in ("Game", "GameOver", "Leaderboard"):
-                assert by_name.get(n) is False, by_name
-        else:  # synthetic fallback mirroring trash-dash authored active states
-            nodes = [
-                self._canvas_node(True, 1),   # Loadout-like (active)
-            ]
-            nodes[0].name = "Loadout"
-            for nm in ("Game", "GameOver", "Leaderboard"):
-                n = self._canvas_node(False, 1)
-                n.name = nm
-                nodes.append(n)
-            guis = convert_canvas(nodes, scene_namespace=self.NS)
-            by_name = {g.name: g.enabled for g in guis}
-            assert by_name["Loadout"] is True
-            for nm in ("Game", "GameOver", "Leaderboard"):
-                assert by_name[nm] is False
+        if not scene.exists():
+            pytest.skip("trash-dash Main.unity not present in this env")
+        from unity.scene_parser import parse_scene
+        parsed = parse_scene(scene)
+        canvases = find_canvas_nodes(parsed.roots)
+        guis = convert_canvas(canvases, scene_namespace=self.NS)
+        by_name = {g.name: g.enabled for g in guis}
+        # The active boot canvas ships enabled; the rest ship disabled.
+        assert by_name.get("Loadout") is True, by_name
+        for n in ("Game", "GameOver", "Leaderboard"):
+            assert by_name.get(n) is False, by_name
 
 
 class TestToggleIsOnAttrConvention:
