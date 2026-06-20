@@ -40,6 +40,61 @@ class ToggleBinding(TypedDict):
     initial_on: bool   # from m_IsOn
     attr_name: str     # the isOn attribute NAME the writer uses (= _TOGGLE_ISON_ATTR)
 
+
+class ClickBinding(TypedDict):
+    """One Unity Button ``onClick`` -> target-component method invocation row.
+
+    Mirrors ``ToggleBinding``: a deterministic build-time fact (keyed on the
+    Unity ``m_OnClick`` persistent-call target component fileID + method name,
+    NOT AI output) consumed by the runtime (``scene_runtime.luau``) to wire the
+    Button's ``Activated`` signal to the converted component-instance method.
+
+    Component-precise: ``target_component_id`` is the engine registry key for
+    the EXACT target component instance (``"<scene>:<component_fileID>"`` --
+    identical to the planner's per-instance ``instance_id``), so dispatch hits
+    that component (preserving Unity semantics) rather than fanning out across
+    every component on the GameObject. ``target_sri`` is the owning
+    GameObject's SRI, used only for the provably-unambiguous GO-level fallback.
+    Strictly typed -- str/int only, NO ``Any``.
+    """
+
+    button_sri: str           # "<scene>:<button_go_fileID>" -- the Button GameObject's SRI
+    target_sri: str           # "<scene>:<target_go_fileID>" -- owning GameObject's SRI
+    target_component_id: str  # "<scene>:<target_component_fileID>" -- engine registry key
+    method: str               # the onClick method name (m_MethodName)
+    call_index: int           # ordinal of this call within the Button's m_Calls list
+
+
+class UnsupportedClickBinding(TypedDict):
+    """One Button ``onClick`` call this version cannot honor, recorded LOUD.
+
+    Surfaced in the conversion report (operator-inspectable) so a menu-critical
+    dead button is visible at convert time. NEVER shipped to the host plan (the
+    converter emits no no-op binding for it). ``reason`` is one of:
+    ``"domain_server"`` / ``"domain_excluded"`` / ``"unresolved_target"`` /
+    ``"static_argument"``.
+    """
+
+    button_sri: str           # the Button GameObject's SRI (or "" if unstamped)
+    target_file_id: str       # the raw Unity target component fileID
+    method: str               # the onClick method name
+    reason: str               # why it could not be honored (see above)
+    call_index: int           # ordinal of this call within the Button's m_Calls list
+
+
+# Unity ``PersistentListenerMode`` (the ``m_Mode`` on each ``m_OnClick`` call):
+#   0 EventDefined -- use the UnityEvent's own argument (a Button onClick is a
+#                     no-argument UnityEvent, so this behaves like Void).
+#   1 Void         -- call a no-argument method (the dispatchable case).
+#   2 Object / 3 Int / 4 Float / 5 String / 6 Bool -- the call passes a STATIC
+#                     argument captured in the scene. v1 dispatches no-arg
+#                     methods only, so any ``m_Mode >= 2`` is recorded as
+#                     ``static_argument`` (a named follow-on), not emitted.
+# (The design doc's "static-argument == m_Mode==1" was a slip: real Trash-Dash
+# StartButton->StartGame is ``m_Mode==1`` and MUST emit; mode-6 SetActive(bool)
+# is the genuine static-arg case. Keyed on the real serialized values.)
+_PERSISTENT_MODE_STATIC_ARG_MIN = 2
+
 # Unity UI component type -> Roblox class name mapping.
 _UI_CLASS_MAP: dict[str, str] = {
     "Canvas": "ScreenGui",
@@ -178,6 +233,38 @@ def build_component_owner_index(roots: list[SceneNode]) -> dict[str, str]:
     return index
 
 
+def build_component_domain_index(
+    roots: list[SceneNode], module_domains: dict[str, str],
+) -> dict[str, str]:
+    """Map each MonoBehaviour component's fileID to its module domain, scene-wide.
+
+    Walks every node recursively; for each component carrying an ``m_Script``
+    GUID present in ``module_domains`` (the classified
+    ``scene_runtime["modules"][<guid>]["domain"]`` map), records
+    ``comp.file_id -> domain`` (``client`` / ``server`` / ``helper`` /
+    ``excluded``). Components whose script GUID is absent (built-in components,
+    unresolved scripts) are omitted -- the onClick domain gate then treats them
+    as unresolvable.
+
+    Pure: builds and returns a fresh ``dict[str, str]``; no input mutation. No
+    name matching -- keyed solely on the deterministic ``m_Script`` GUID.
+    """
+    index: dict[str, str] = {}
+    stack: list[SceneNode] = list(roots)
+    while stack:
+        node = stack.pop()
+        for comp in node.components:
+            script_ref = comp.properties.get("m_Script")
+            if not isinstance(script_ref, dict):
+                continue
+            guid = ref_guid(script_ref) or ""
+            domain = module_domains.get(guid)
+            if domain:
+                index[comp.file_id] = domain
+        stack.extend(node.children)
+    return index
+
+
 def _canvas_enabled(canvas_node: SceneNode) -> bool:
     """ScreenGui.Enabled approximates the Unity render gate (activeInHierarchy AND Canvas.enabled).
 
@@ -213,6 +300,9 @@ def convert_canvas(
     suppress_static_children_ids: frozenset[str] | None = None,
     component_owner_index: dict[str, str] | None = None,
     toggle_bindings: list[ToggleBinding] | None = None,
+    component_domain_index: dict[str, str] | None = None,
+    click_bindings: list[ClickBinding] | None = None,
+    unsupported_click_bindings: list[UnsupportedClickBinding] | None = None,
 ) -> list[RbxScreenGui]:
     """Convert a list of Unity Canvas root nodes to Roblox ScreenGui objects.
 
@@ -254,6 +344,19 @@ def convert_canvas(
             stashes the populated result onto ``ctx.scene_runtime`` -- so the
             rows surface without riding the (unchanged) return value and without
             any transport attribute leaking onto a produced instance.
+        component_domain_index: Scene-wide
+            ``component fileID -> domain`` map (``client`` / ``server`` /
+            ``helper`` / ``excluded``), built in ``convert_scene`` from the
+            classified ``scene_runtime["modules"]``. Drives the onClick
+            domain gate. ``None`` for legacy / synthetic callers.
+        click_bindings: By-ref ``ClickBinding`` accumulator (mirrors
+            ``toggle_bindings``). For each dispatchable onClick call (no static
+            arg, resolvable client/helper target) ``_emit_click_bindings``
+            appends a row. ``None`` for legacy callers.
+        unsupported_click_bindings: By-ref accumulator for onClick calls this
+            version cannot honor (server/excluded/unresolved target or static
+            arg). Surfaced LOUD in the conversion report; never shipped to the
+            host plan. ``None`` for legacy callers.
 
     Returns:
         List of RbxScreenGui objects.
@@ -287,6 +390,9 @@ def convert_canvas(
                 ),
                 component_owner_index=component_owner_index,
                 toggle_bindings=toggle_bindings,
+                component_domain_index=component_domain_index,
+                click_bindings=click_bindings,
+                unsupported_click_bindings=unsupported_click_bindings,
             )
             if element is not None:
                 screen_gui.elements.append(element)
@@ -391,6 +497,9 @@ def _convert_ui_element(
     suppress_static_children_ids: frozenset[str] = frozenset(),
     component_owner_index: dict[str, str] | None = None,
     toggle_bindings: list[ToggleBinding] | None = None,
+    component_domain_index: dict[str, str] | None = None,
+    click_bindings: list[ClickBinding] | None = None,
+    unsupported_click_bindings: list[UnsupportedClickBinding] | None = None,
 ) -> RbxUIElement | None:
     """Recursively convert a SceneNode (under a Canvas) to an RbxUIElement.
 
@@ -476,16 +585,21 @@ def _convert_ui_element(
             persistent_calls = on_click.get("m_PersistentCalls", {})
             calls = persistent_calls.get("m_Calls", [])
             if isinstance(calls, list):
-                for call in calls:
+                for call_index, call in enumerate(calls):
                     if isinstance(call, dict):
                         method = call.get("m_MethodName", "")
                         call_state = int(call.get("m_CallState", 0))
                         if method and call_state >= 2:  # RuntimeOnly or EditorAndRuntime
                             target_ref = call.get("m_Target", {})
                             target_id = target_ref.get("fileID", "") if isinstance(target_ref, dict) else ""
+                            mode = _coerce_int(call.get("m_Mode", 1))
                             on_click_handlers.append({
-                                "method": method,
+                                "method": str(method),
                                 "target_file_id": str(target_id),
+                                # Ordinal within m_Calls (preserve dispatch order)
+                                # and the PersistentListenerMode for the static-arg gate.
+                                "call_index": str(call_index),
+                                "mode": str(mode if mode is not None else 1),
                             })
                             log.info("  [%s] Button onClick: %s (target %s)", node.name, method, target_id)
 
@@ -507,10 +621,18 @@ def _convert_ui_element(
     # before any per-class property overlay so the attribute survives
     # downstream rewrites that read but don't replace the attributes dict.
     _stamp_scene_runtime_id(element, node.file_id, scene_namespace)
-    # Store onClick method names as attributes for script wiring
-    if on_click_handlers:
-        methods = ",".join(h["method"] for h in on_click_handlers)
-        element.attributes["_OnClick"] = methods
+    # onClick wiring is carried by the ``ClickBinding`` round-trip (see
+    # ``_emit_click_bindings`` below), NOT a stub LocalScript reading an
+    # ``_OnClick`` attribute. No transport attribute is written onto the
+    # element -- the rows go straight to the by-ref accumulator.
+    _emit_click_bindings(
+        element, node, on_click_handlers,
+        component_owner_index=component_owner_index,
+        component_domain_index=component_domain_index,
+        scene_namespace=scene_namespace,
+        click_bindings=click_bindings,
+        unsupported_click_bindings=unsupported_click_bindings,
+    )
 
     # Extract type-specific properties.
     if element_class in ("TextLabel", "TextButton"):
@@ -577,11 +699,106 @@ def _convert_ui_element(
             suppress_static_children_ids=suppress_static_children_ids,
             component_owner_index=component_owner_index,
             toggle_bindings=toggle_bindings,
+            component_domain_index=component_domain_index,
+            click_bindings=click_bindings,
+            unsupported_click_bindings=unsupported_click_bindings,
         )
         if child_element is not None:
             element.children.append(child_element)
 
     return element
+
+
+def _emit_click_bindings(
+    element: RbxUIElement,
+    node: SceneNode,
+    on_click_handlers: list[dict[str, str]],
+    *,
+    component_owner_index: dict[str, str] | None,
+    component_domain_index: dict[str, str] | None,
+    scene_namespace: str,
+    click_bindings: list[ClickBinding] | None,
+    unsupported_click_bindings: list[UnsupportedClickBinding] | None,
+) -> None:
+    """Emit one ``ClickBinding`` per dispatchable onClick call; record the rest.
+
+    For each parsed onClick call (already gated on ``m_CallState >= 2``):
+      * A static-argument call (``m_Mode >= 2``) is recorded as unsupported.
+      * An unresolvable target (``target_file_id`` of ``0`` / not in the owner
+        index, or a Button element that wasn't SRI-stamped) is recorded as
+        unsupported.
+      * A target whose component domain is ``server`` / ``excluded`` (or any
+        non-client/helper value) is recorded as unsupported -- it isn't
+        reachable from the client VM where ``Activated`` fires.
+      * Only a target resolving to ``client`` / ``helper`` domain emits a
+        ``ClickBinding`` row, component-precise (the engine registry key).
+
+    Fail LOUD, never silent: every non-emitted call lands in
+    ``unsupported_click_bindings`` (surfaced in the conversion report). NO
+    transport attribute is written onto ``element``. Legacy / synthetic callers
+    that pass ``None`` accumulators get no rows (back-compat).
+    """
+    if not on_click_handlers:
+        return
+    if click_bindings is None or unsupported_click_bindings is None:
+        return
+    if not scene_namespace:
+        return
+
+    button_sri = element.attributes.get("_SceneRuntimeId")
+    button_sri = button_sri if isinstance(button_sri, str) else ""
+    owner_index = component_owner_index or {}
+    domain_index = component_domain_index or {}
+
+    for handler in on_click_handlers:
+        method = handler.get("method", "")
+        target_file_id = handler.get("target_file_id", "")
+        call_index = _coerce_int(handler.get("call_index", "0")) or 0
+        mode = _coerce_int(handler.get("mode", "1"))
+        mode = mode if mode is not None else 1
+        if not method:
+            continue
+
+        def _record_unsupported(reason: str) -> None:
+            unsupported_click_bindings.append(UnsupportedClickBinding(
+                button_sri=button_sri,
+                target_file_id=target_file_id,
+                method=method,
+                reason=reason,
+                call_index=call_index,
+            ))
+
+        # Static-argument calls (Object/Int/Float/String/Bool) are not
+        # dispatched in v1 -> named follow-on.
+        if mode >= _PERSISTENT_MODE_STATIC_ARG_MIN:
+            _record_unsupported("static_argument")
+            continue
+
+        # Resolve target component fileID -> owning GameObject fileID.
+        target_go_fid = owner_index.get(target_file_id) if target_file_id else None
+        if not target_go_fid or not button_sri:
+            _record_unsupported("unresolved_target")
+            continue
+
+        # Domain gate: only client/helper targets are reachable in the client VM.
+        domain = domain_index.get(target_file_id, "")
+        if domain not in ("client", "helper"):
+            reason = (
+                "domain_server" if domain == "server"
+                else "domain_excluded" if domain == "excluded"
+                else "unresolved_target" if domain == ""
+                else f"domain_{domain}"
+            )
+            _record_unsupported(reason)
+            continue
+
+        click_bindings.append(ClickBinding(
+            button_sri=button_sri,
+            target_sri=f"{scene_namespace}:{target_go_fid}",
+            target_component_id=f"{scene_namespace}:{target_file_id}",
+            method=method,
+            call_index=call_index,
+        ))
 
 
 # ---------------------------------------------------------------------------

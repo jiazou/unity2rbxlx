@@ -5278,6 +5278,33 @@ script.Disabled = true
             check = str(row.get("check", ""))
             contract_by_check[check] = contract_by_check.get(check, 0) + 1
 
+        # Summarize the unsupported onClick bindings stashed on scene_runtime by
+        # convert_scene (operator-only; never shipped to the host plan).
+        from converter.report_generator import (
+            UnsupportedOnClickIssue, UnsupportedOnClickSummary,
+        )
+        unsupported_clicks = cast(
+            "list[dict[str, object]]",
+            self.ctx.scene_runtime.get("unsupported_onclick_bindings", []),
+        )
+        click_reason_counts: dict[str, int] = {}
+        click_issues: list[UnsupportedOnClickIssue] = []
+        for row in unsupported_clicks:
+            reason = str(row.get("reason", ""))
+            click_reason_counts[reason] = click_reason_counts.get(reason, 0) + 1
+            click_issues.append(UnsupportedOnClickIssue(
+                button_sri=str(row.get("button_sri", "")),
+                target_file_id=str(row.get("target_file_id", "")),
+                method=str(row.get("method", "")),
+                reason=reason,
+                call_index=int(cast(int, row.get("call_index", 0) or 0)),
+            ))
+        unsupported_onclick_summary = UnsupportedOnClickSummary(
+            total=len(click_issues),
+            counts_by_reason=click_reason_counts,
+            issues=click_issues,
+        )
+
         return ConversionReport(
             unity_project_path=str(self.unity_project_path),
             output_dir=str(self.output_dir),
@@ -5307,6 +5334,7 @@ script.Disabled = true
             semantic_warnings=semantic_summary,
             contract_check_violations=len(contract_rows),
             contract_violations_by_check=contract_by_check,
+            unsupported_onclick_bindings=unsupported_onclick_summary,
         )
 
     # Marker substrings that identify converter-emitted scripts.

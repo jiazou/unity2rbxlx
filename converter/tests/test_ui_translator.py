@@ -1132,3 +1132,254 @@ class TestInactiveUiSubtreeEmission:
         # inactive subtree was recursed into rather than dropped at the root.
         assert f"{self.NS}:1834564028" in sris
         assert f"{self.NS}:375939466" in sris
+
+
+class TestClickBindingEmit:
+    """``_emit_click_bindings`` (via ``_convert_ui_element``) emits one
+    ``ClickBinding`` per dispatchable onClick call, and records the rest in the
+    unsupported accumulator. Component-precise (registry key), domain-gated,
+    fail-loud. NO transport attribute on the produced element.
+    """
+
+    NS = "Assets/Scenes/main.unity"
+
+    def _button_node(
+        self, *, button_fid: str, target_fid: str, method: str,
+        mode: int = 1, call_state: int = 2, name: str = "TheButton",
+        extra_calls: list | None = None,
+    ) -> SceneNode:
+        calls = [{
+            "m_MethodName": method,
+            "m_CallState": call_state,
+            "m_Mode": mode,
+            "m_Target": {"fileID": target_fid},
+        }]
+        if extra_calls:
+            calls.extend(extra_calls)
+        return SceneNode(
+            name=name, file_id=button_fid, active=True, layer=0, tag="Untagged",
+            components=[ComponentData(
+                component_type="MonoBehaviour", file_id=f"{button_fid}comp",
+                properties={"m_OnClick": {"m_PersistentCalls": {"m_Calls": calls}}},
+            )],
+            children=[], parent_file_id=None,
+        )
+
+    def _convert(self, node, *, owner_index, domain_index, clicks, unsupported):
+        from converter.ui_translator import _convert_ui_element
+        return _convert_ui_element(
+            node, scene_namespace=self.NS,
+            component_owner_index=owner_index,
+            component_domain_index=domain_index,
+            click_bindings=clicks,
+            unsupported_click_bindings=unsupported,
+        )
+
+    def test_client_target_emits_component_precise_row(self):
+        """A client-domain, void-method (mode 1) onClick emits ONE
+        component-precise ClickBinding with the owning-GO SRI + registry key."""
+        owner = {"869760749": "869760744"}        # target comp -> owning GO
+        domain = {"869760749": "client"}
+        clicks: list = []
+        unsupported: list = []
+        node = self._button_node(
+            button_fid="500", target_fid="869760749", method="StartGame", mode=1,
+        )
+        element = self._convert(
+            node, owner_index=owner, domain_index=domain,
+            clicks=clicks, unsupported=unsupported,
+        )
+        assert unsupported == []
+        assert len(clicks) == 1
+        row = clicks[0]
+        assert row["button_sri"] == f"{self.NS}:500"
+        assert row["target_sri"] == f"{self.NS}:869760744"
+        assert row["target_component_id"] == f"{self.NS}:869760749"
+        assert row["method"] == "StartGame"
+        assert row["call_index"] == 0
+        # No transport attribute on the produced element.
+        assert "_OnClick" not in (element.attributes or {})
+
+    def test_helper_domain_also_emits(self):
+        owner = {"42": "40"}
+        domain = {"42": "helper"}
+        clicks: list = []
+        unsupported: list = []
+        self._convert(
+            self._button_node(button_fid="9", target_fid="42", method="Do"),
+            owner_index=owner, domain_index=domain,
+            clicks=clicks, unsupported=unsupported,
+        )
+        assert len(clicks) == 1 and unsupported == []
+
+    def test_server_target_recorded_unsupported_no_row(self):
+        """Fail-loud: a server-domain target is recorded in the unsupported
+        accumulator and NO binding row is emitted."""
+        owner = {"77": "70"}
+        domain = {"77": "server"}
+        clicks: list = []
+        unsupported: list = []
+        self._convert(
+            self._button_node(button_fid="9", target_fid="77", method="ServerOnly"),
+            owner_index=owner, domain_index=domain,
+            clicks=clicks, unsupported=unsupported,
+        )
+        assert clicks == []
+        assert len(unsupported) == 1
+        assert unsupported[0]["reason"] == "domain_server"
+        assert unsupported[0]["method"] == "ServerOnly"
+
+    def test_excluded_target_recorded_unsupported(self):
+        owner = {"77": "70"}
+        domain = {"77": "excluded"}
+        clicks: list = []
+        unsupported: list = []
+        self._convert(
+            self._button_node(button_fid="9", target_fid="77", method="X"),
+            owner_index=owner, domain_index=domain,
+            clicks=clicks, unsupported=unsupported,
+        )
+        assert clicks == []
+        assert unsupported[0]["reason"] == "domain_excluded"
+
+    def test_static_argument_mode_recorded_unsupported(self):
+        """A static-argument call (m_Mode >= 2; here Bool=6) is unsupported."""
+        owner = {"77": "70"}
+        domain = {"77": "client"}
+        clicks: list = []
+        unsupported: list = []
+        self._convert(
+            self._button_node(
+                button_fid="9", target_fid="77", method="SetActive", mode=6,
+            ),
+            owner_index=owner, domain_index=domain,
+            clicks=clicks, unsupported=unsupported,
+        )
+        assert clicks == []
+        assert unsupported[0]["reason"] == "static_argument"
+
+    def test_unresolved_target_recorded_unsupported(self):
+        """A target fileID absent from the owner index is unsupported."""
+        owner: dict = {}                       # nothing resolves
+        domain = {"77": "client"}
+        clicks: list = []
+        unsupported: list = []
+        self._convert(
+            self._button_node(button_fid="9", target_fid="77", method="X"),
+            owner_index=owner, domain_index=domain,
+            clicks=clicks, unsupported=unsupported,
+        )
+        assert clicks == []
+        assert unsupported[0]["reason"] == "unresolved_target"
+
+    def test_multi_call_preserves_order_and_call_index(self):
+        """Two onClick calls -> two rows, call_index 0 and 1 in order."""
+        owner = {"10": "100", "20": "200"}
+        domain = {"10": "client", "20": "client"}
+        clicks: list = []
+        unsupported: list = []
+        node = self._button_node(
+            button_fid="9", target_fid="10", method="First", mode=1,
+            extra_calls=[{
+                "m_MethodName": "Second", "m_CallState": 2, "m_Mode": 1,
+                "m_Target": {"fileID": "20"},
+            }],
+        )
+        self._convert(
+            node, owner_index=owner, domain_index=domain,
+            clicks=clicks, unsupported=unsupported,
+        )
+        assert [r["method"] for r in clicks] == ["First", "Second"]
+        assert [r["call_index"] for r in clicks] == [0, 1]
+
+    def test_real_main_unity_startbutton_emits_loadout_client(self):
+        """Acceptance (i): the REAL trash-dash Main.unity StartButton emits a
+        ClickBinding -> the LoadoutState-owning GameObject, method StartGame,
+        with the target domain ``client``.
+
+        Real-corpus only: skips (does NOT substitute synthetic data) when the
+        scene is absent. Drives the converter's own scene_parser +
+        build_component_owner_index + build_component_domain_index, exactly the
+        production resolution path. The LoadoutState script (guid
+        d44710303ccf2f24ea73d3e94c1923ba) classifies ``client`` in the real
+        conversion; we supply that domain for its GUID and assert the binding
+        carries the real owner-resolved SRI + registry key.
+        """
+        import pytest
+        from pathlib import Path
+        from converter.ui_translator import (
+            find_canvas_nodes, convert_canvas, build_component_owner_index,
+            build_component_domain_index,
+        )
+
+        scene = Path("/Users/jiazou/workspace/trash-dash/Assets/Scenes/Main.unity")
+        if not scene.exists():
+            pytest.skip("trash-dash Main.unity not present in this env")
+        from unity.scene_parser import parse_scene
+        parsed = parse_scene(scene)
+
+        owner = build_component_owner_index(parsed.roots)
+        # LoadoutState's real script GUID -> client domain (its real classified
+        # domain). build_component_domain_index keys components by m_Script GUID.
+        loadout_guid = "d44710303ccf2f24ea73d3e94c1923ba"
+        domain_index = build_component_domain_index(
+            parsed.roots, {loadout_guid: "client"},
+        )
+
+        canvases = find_canvas_nodes(parsed.roots)
+        clicks: list = []
+        unsupported: list = []
+        convert_canvas(
+            canvases, scene_namespace=self.NS,
+            component_owner_index=owner,
+            component_domain_index=domain_index,
+            click_bindings=clicks,
+            unsupported_click_bindings=unsupported,
+        )
+
+        # The StartButton -> StartGame call (target comp 869760749, owned by
+        # GO 869760744 = the Loadout GameObject) must emit a client ClickBinding.
+        start_rows = [
+            r for r in clicks
+            if r["method"] == "StartGame"
+            and r["target_component_id"] == f"{self.NS}:869760749"
+        ]
+        assert len(start_rows) == 1, (clicks, unsupported)
+        row = start_rows[0]
+        assert row["target_sri"] == f"{self.NS}:869760744"   # the Loadout GO
+        # The target domain gated it through as a real client binding.
+        assert domain_index.get("869760749") == "client"
+
+    def test_real_main_unity_static_arg_buttons_unsupported(self):
+        """Real-corpus: the mode-6 (Bool static-arg) SetActive onClicks land in
+        the unsupported accumulator, never as ClickBinding rows."""
+        import pytest
+        from pathlib import Path
+        from converter.ui_translator import (
+            find_canvas_nodes, convert_canvas, build_component_owner_index,
+            build_component_domain_index,
+        )
+
+        scene = Path("/Users/jiazou/workspace/trash-dash/Assets/Scenes/Main.unity")
+        if not scene.exists():
+            pytest.skip("trash-dash Main.unity not present in this env")
+        from unity.scene_parser import parse_scene
+        parsed = parse_scene(scene)
+        owner = build_component_owner_index(parsed.roots)
+        # Domain-classify nothing -> every target is unresolved/unsupported, but
+        # the static-arg gate fires BEFORE the domain gate, so mode-6 SetActive
+        # calls are recorded as ``static_argument`` regardless.
+        domain_index = build_component_domain_index(parsed.roots, {})
+        canvases = find_canvas_nodes(parsed.roots)
+        clicks: list = []
+        unsupported: list = []
+        convert_canvas(
+            canvases, scene_namespace=self.NS,
+            component_owner_index=owner,
+            component_domain_index=domain_index,
+            click_bindings=clicks,
+            unsupported_click_bindings=unsupported,
+        )
+        static_arg = [u for u in unsupported if u["reason"] == "static_argument"]
+        # The About/BackButton SetActive(bool) onClicks are mode 6 -> static-arg.
+        assert any(u["method"] == "SetActive" for u in static_arg), unsupported

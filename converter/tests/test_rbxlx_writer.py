@@ -152,7 +152,16 @@ class TestRbxlxWriter:
         content = output.read_text()
         assert "ScreenGui" in content
 
-    def test_button_onclick_event_wiring(self, tmp_path):
+    def test_button_onclick_stub_removed(self, tmp_path):
+        """The legacy print-stub ``UIEventWiring`` LocalScript is GONE.
+
+        Migrated from ``test_button_onclick_event_wiring`` (which pinned the
+        stub output). Button onClick is now carried by the ``ClickBinding``
+        round-trip (build-time emit -> ``scene_runtime["ui_click_bindings"]``
+        -> the host runtime's ``_installClickWatch``), so the writer must emit
+        NO ``UIEventWiring`` script and NO ``_OnClick`` attribute -- exactly one
+        real ``Activated`` handler per button comes from the runtime, not here.
+        """
         from roblox.rbxlx_writer import write_rbxlx
         btn = RbxUIElement(
             class_name="TextButton",
@@ -160,7 +169,6 @@ class TestRbxlxWriter:
             text="Start",
             size=(0, 200, 0, 50),
             on_click_handlers=[{"method": "StartGame", "target_file_id": "123"}],
-            attributes={"_OnClick": "StartGame"},
         )
         gui = RbxScreenGui(
             name="MenuUI",
@@ -170,9 +178,17 @@ class TestRbxlxWriter:
         output = tmp_path / "test.rbxlx"
         write_rbxlx(place, output)
         content = output.read_text()
-        assert "UIEventWiring" in content
-        assert "StartGame" in content
-        assert "Activated:Connect" in content
+        # The button still serializes (it's a TextButton element)...
+        assert "StartBtn" in content
+        # ...but the stub wiring script and the dead attribute are gone.
+        assert "UIEventWiring" not in content
+        assert "_OnClick" not in content
+        assert "Activated:Connect" not in content
+
+    def test_generate_ui_event_script_function_removed(self):
+        """The stub generator function itself is deleted (not just unused)."""
+        import roblox.rbxlx_writer as w
+        assert not hasattr(w, "_generate_ui_event_script")
 
     def test_cframe_serialization(self, tmp_path):
         from roblox.rbxlx_writer import write_rbxlx

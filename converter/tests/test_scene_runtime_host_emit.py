@@ -324,6 +324,46 @@ class TestEntrypointGenerators:
         assert "Assets/Scenes/main.unity:264237063" in src
         assert "Assets/Scenes/main.unity:250410364" in src
 
+    def test_plan_module_embeds_ui_click_bindings(self):
+        """``ui_click_bindings`` must survive the ``_PLAN_KEYS_FOR_HOST``
+        allowlist filter and land in the embedded plan ModuleScript; without
+        it the runtime never wires any button onClick."""
+        rows = [
+            {
+                "button_sri": "Assets/Scenes/main.unity:500",
+                "target_sri": "Assets/Scenes/main.unity:869760744",
+                "target_component_id": "Assets/Scenes/main.unity:869760749",
+                "method": "StartGame",
+                "call_index": 0,
+            },
+        ]
+        script = generate_scene_runtime_plan_module({
+            "modules": {}, "scenes": {}, "prefabs": {},
+            "ui_click_bindings": rows,
+        })
+        src = script.source
+        assert "ui_click_bindings" in src, (
+            "embedded plan must carry ui_click_bindings; if missing the "
+            "_PLAN_KEYS_FOR_HOST allowlist dropped it"
+        )
+        assert "Assets/Scenes/main.unity:869760749" in src
+        assert "StartGame" in src
+
+    def test_plan_module_elides_unsupported_onclick_bindings(self):
+        """The operator-only ``unsupported_onclick_bindings`` diagnostic is
+        DELIBERATELY absent from ``_PLAN_KEYS_FOR_HOST`` -- it surfaces in the
+        conversion report, never in the embedded host plan."""
+        script = generate_scene_runtime_plan_module({
+            "modules": {}, "scenes": {}, "prefabs": {},
+            "unsupported_onclick_bindings": [
+                {"button_sri": "x", "target_file_id": "1", "method": "M",
+                 "reason": "domain_server", "call_index": 0},
+            ],
+        })
+        assert "unsupported_onclick_bindings" not in script.source
+        # The reason/method strings must not leak into the host plan either.
+        assert "domain_server" not in script.source
+
     def test_install_ui_descendant_watch_is_client_only(self):
         """The standing late-clone watch service ``installUiDescendantWatch``
         is present on the CLIENT entrypoint's services table and OMITTED from

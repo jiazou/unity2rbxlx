@@ -600,6 +600,17 @@ function SceneRuntime.new(services, plan)
 	self._unboundToggleIndex = nil
 	self._toggleWatchConn = nil
 
+	-- Button ``onClick`` -> target-component method bindings (client-only).
+	-- Mirrors the toggle watch. Built lazily at watch install.
+	--   ``_boundClickRows[row] = button instance`` -- PER-ROW exactly-once
+	--     marker keyed on the LIVE button Instance, so a ResetOnSpawn re-clone
+	--     (same SRI, NEW instance) re-connects without double-binding.
+	--   ``_unboundClickIndex[button_sri] = LIST of rows`` -- O(1) dispatch per
+	--     ``DescendantAdded`` fire (a button may carry >=2 onClick rows).
+	self._boundClickRows = setmetatable({}, {__mode = "v"})
+	self._unboundClickIndex = nil
+	self._clickWatchConn = nil
+
 	return self
 end
 
@@ -4065,6 +4076,154 @@ function SceneRuntime:_installToggleGraphicWatch()
 	self:_applyToggleGraphicBindings()
 end
 
+-- ---------------------------------------------------------------------
+-- Button onClick -> target component-instance method (client-only)
+-- ---------------------------------------------------------------------
+-- Mirrors the Toggle watch above. Each ``ui_click_bindings`` row wires the
+-- button's ``Activated`` signal to the EXACT target component instance (by its
+-- build-time registry key ``target_component_id``). Resolution of the TARGET is
+-- LATE (at CLICK time, not bind time) so a target component not yet built when
+-- the button binds still dispatches once it registers. Dispatch is
+-- component-precise; the GO-level fan-out is used ONLY when provably unambiguous
+-- (exactly one component on the target GO defines the method). Any other precise
+-- miss warns LOUD and dispatches NOTHING -- never a guess to a wrong component.
+
+function SceneRuntime:_dispatchClick(row)
+	-- Resolve + invoke the target method at CLICK time. Precise first.
+	local method = row.method
+	local comp = self._componentByInstanceId[row.target_component_id]
+	if comp ~= nil then
+		-- The build-time-named EXACT target component resolved. Component-
+		-- precise contract: dispatch ONLY to it. If it does NOT define the
+		-- method, the binding is broken (a mismatched / stale id) -> fail LOUD
+		-- and dispatch NOTHING. We must NOT fall through to a sibling component
+		-- on the same GameObject -- that would be a wrong-component guess that
+		-- silently masks the broken binding (Codex r4).
+		local meta = self._meta[comp]
+		local class = meta and meta.classTable
+		if class and type(class[method]) == "function" then
+			-- ``_callMethod`` invokes ``fn(comp)`` -> the method receives the
+			-- component instance as ``self``. A Button onClick is a no-arg
+			-- UnityEvent, so no extra args are forwarded.
+			self:_callMethod(comp, method)
+		else
+			self._warn(string.format(
+				"[onclick] precise target %s does not define method %s;"
+				.. " dispatched nothing",
+				tostring(row.target_component_id), tostring(method)))
+		end
+		return
+	end
+
+	-- The precise target id did NOT resolve in the registry (an uncertain /
+	-- broken id->registry mapping). Bounded GO-level fallback: dispatch ONLY
+	-- when exactly one component on the target GameObject defines the method
+	-- (provably unambiguous == identical result to precise); any other case
+	-- fails LOUD and dispatches nothing -- never a wrong-component guess.
+	local bucket = self._componentsByGameObject[row.target_sri]
+	if bucket == nil then
+		self._warn(string.format(
+			"[onclick] target %s for method %s has no registered components;"
+			.. " dispatched nothing",
+			tostring(row.target_component_id), tostring(method)))
+		return
+	end
+	local defining = nil
+	local count = 0
+	for _, c in ipairs(bucket) do
+		local m = self._meta[c]
+		local class = m and m.classTable
+		if class and type(class[method]) == "function" then
+			count = count + 1
+			defining = c
+		end
+	end
+	if count == 1 then
+		self:_callMethod(defining, method)
+	else
+		self._warn(string.format(
+			"[onclick] method %s on target %s is ambiguous (%d defining"
+			.. " components) or unresolved; dispatched nothing",
+			tostring(method), tostring(row.target_sri), count))
+	end
+end
+
+function SceneRuntime:_bindOneClick(row, hint)
+	-- Connect ONE row's button.Activated, idempotently. SRI service, never a
+	-- raw walk. ``hint`` is an already-resolved button (the DescendantAdded
+	-- ``desc``) to skip one linear scan.
+	local button = (hint and hint:GetAttribute("_SceneRuntimeId") == row.button_sri and hint)
+		or self._services.workspaceFind(row.button_sri)
+	if button == nil then return end
+	if self._boundClickRows[row] == button then return end  -- this ROW already bound to THIS live instance
+	-- A destroyed clone (respawn) auto-disconnects its signals, so the old
+	-- connection need not be tracked for teardown; re-bind records the new one.
+	local engine = self
+	local ok = pcall(function()
+		button.Activated:Connect(function()
+			engine:_dispatchClick(row)
+		end)
+	end)
+	if not ok then
+		self._warn(string.format(
+			"[onclick] could not connect Activated on button %s",
+			tostring(row.button_sri)))
+		return
+	end
+	self._boundClickRows[row] = button                      -- per-row exactly-once marker
+end
+
+function SceneRuntime:_buildUnboundClickIndex()
+	-- ``button_sri -> LIST of rows`` so a ``DescendantAdded`` for a button
+	-- looks up every onClick row on it in O(1). A list because a button may
+	-- carry multiple onClick calls.
+	local index = {}
+	for _, row in ipairs(self._plan.ui_click_bindings or {}) do
+		local sri = row.button_sri
+		if type(sri) == "string" and sri ~= "" then
+			local list = index[sri]
+			if not list then list = {}; index[sri] = list end
+			table.insert(list, row)
+		end
+	end
+	self._unboundClickIndex = index
+end
+
+function SceneRuntime:_applyClickBindings()
+	-- One-time scan over all rows (used ONLY at watch install). Rows whose
+	-- button clones haven't landed no-op and are bound later by the watch.
+	for _, row in ipairs(self._plan.ui_click_bindings or {}) do
+		self:_bindOneClick(row, nil)
+	end
+end
+
+function SceneRuntime:_installClickWatch()
+	-- The SOLE binder for onClick. Client-only: gated on the client-only
+	-- ``installUiDescendantWatch`` service, so the server NEVER binds. Connect-
+	-- then-scan once (mirrors the toggle watch): install the standing watch
+	-- FIRST so a button landing during the install scan still fires.
+	local install = self._services.installUiDescendantWatch
+	if type(install) ~= "function" then return end          -- server / no UI watch -> never bind
+	local rows = self._plan.ui_click_bindings
+	if type(rows) ~= "table" or #rows == 0 then return end   -- nothing to bind
+	self:_buildUnboundClickIndex()
+	local engine = self
+	self._clickWatchConn = install(function(desc)
+		local sri = desc:GetAttribute("_SceneRuntimeId")
+		if sri == nil then return end                        -- non-matching descendant short-circuit
+		local matched = engine._unboundClickIndex[sri]
+		if matched == nil then return end                    -- O(1) miss -> no rescan
+		for _, row in ipairs(matched) do
+			engine:_bindOneClick(row, desc)                  -- reuse desc as the resolved button
+		end
+	end)
+	-- Fail-closed: a present service may still decline (no PlayerGui yet ->
+	-- nil). No standing watch -> never scan/bind.
+	if self._clickWatchConn == nil then return end
+	-- Now bind every button already present (connect-then-scan race close).
+	self:_applyClickBindings()
+end
+
 -- Static-event channel identity: pre-set module-table fields before Awake
 -- ---------------------------------------------------------------------
 
@@ -4424,6 +4583,11 @@ function SceneRuntime:start(domainFilter)
 	-- no pre-Awake hook needed (``start()`` never yields, so a present clone
 	-- binds before the first rendered frame).
 	self:_installToggleGraphicWatch()
+
+	-- Install the standing client-only Button onClick watch (same client gate
+	-- + connect-then-scan-once contract as the toggle watch). Late TARGET
+	-- resolution at click time tolerates a target not yet registered at bind.
+	self:_installClickWatch()
 
 	-- Build the host-owned per-player embodiment authority (paradigm C).
 	-- Client-only + keyed on the upstream has_character_controller MODULE

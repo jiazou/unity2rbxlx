@@ -1637,7 +1637,8 @@ def convert_scene(
     # the static-emit path is byte-identical to pre-PR3c.
     from converter.ui_translator import (
         find_canvas_nodes, convert_canvas, build_component_owner_index,
-        ToggleBinding,
+        build_component_domain_index, ToggleBinding, ClickBinding,
+        UnsupportedClickBinding,
     )
     canvas_nodes = find_canvas_nodes(parsed_scene.roots)
     if canvas_nodes:
@@ -1651,6 +1652,23 @@ def convert_scene(
         # reference (e.g. a Unity ``Toggle.graphic``) can be resolved to its
         # owning GameObject.
         component_owner_index = build_component_owner_index(parsed_scene.roots)
+        # Scene-wide component fileID -> module domain map (client/server/
+        # helper/excluded), built from the classified ``scene_runtime.modules``
+        # so the Button onClick gate can decide whether a target is reachable
+        # in the client VM where ``Activated`` fires. Empty when the scene_runtime
+        # is absent / unclassified (legacy / synthetic) -> no ClickBinding emit.
+        module_domains: dict[str, str] = {}
+        if scene_runtime is not None:
+            modules_obj = scene_runtime.get("modules")
+            if isinstance(modules_obj, dict):
+                for guid, mod in modules_obj.items():
+                    if isinstance(mod, dict):
+                        dom = mod.get("domain")
+                        if isinstance(dom, str) and dom:
+                            module_domains[str(guid)] = dom
+        component_domain_index = build_component_domain_index(
+            parsed_scene.roots, module_domains,
+        )
         # By-ref accumulator for Toggle ``isOn`` -> checkmark-graphic bindings.
         # ``convert_canvas`` appends a ``ToggleBinding`` per Toggle with a
         # resolvable ``graphic``; the populated list is stashed onto
@@ -1658,6 +1676,13 @@ def convert_scene(
         # (``_PLAN_KEYS_FOR_HOST``) carries it to the runtime. The rows surface
         # without a transport attribute on any produced instance.
         toggle_bindings: list[ToggleBinding] = []
+        # By-ref accumulators for Button onClick wiring (mirrors the toggle
+        # round-trip). ``click_bindings`` -> ``scene_runtime["ui_click_bindings"]``
+        # (host-bound); ``unsupported_click_bindings`` ->
+        # ``scene_runtime["unsupported_onclick_bindings"]`` (operator-only,
+        # surfaced in the conversion report, NEVER shipped to the host).
+        click_bindings: list[ClickBinding] = []
+        unsupported_click_bindings: list[UnsupportedClickBinding] = []
         place.screen_guis = convert_canvas(
             canvas_nodes,
             scene_namespace=_ctx().scene_runtime_namespace,
@@ -1665,6 +1690,9 @@ def convert_scene(
             suppress_static_children_ids=ui_suppress_ids,
             component_owner_index=component_owner_index,
             toggle_bindings=toggle_bindings,
+            component_domain_index=component_domain_index,
+            click_bindings=click_bindings,
+            unsupported_click_bindings=unsupported_click_bindings,
         )
         if scene_runtime is not None and toggle_bindings:
             # Append to (not overwrite) so multi-scene conversions that share
@@ -1674,6 +1702,26 @@ def convert_scene(
                 existing.extend(toggle_bindings)
             else:
                 scene_runtime["ui_toggle_bindings"] = list(toggle_bindings)
+        if scene_runtime is not None and click_bindings:
+            existing_clicks = scene_runtime.get("ui_click_bindings")
+            if isinstance(existing_clicks, list):
+                existing_clicks.extend(click_bindings)
+            else:
+                scene_runtime["ui_click_bindings"] = list(click_bindings)
+        if scene_runtime is not None and unsupported_click_bindings:
+            existing_unsupported = scene_runtime.get("unsupported_onclick_bindings")
+            if isinstance(existing_unsupported, list):
+                existing_unsupported.extend(unsupported_click_bindings)
+            else:
+                scene_runtime["unsupported_onclick_bindings"] = list(
+                    unsupported_click_bindings
+                )
+            for row in unsupported_click_bindings:
+                log.warning(
+                    "[onclick] unsupported binding: button %s -> %s (reason=%s); "
+                    "no Activated handler emitted",
+                    row["button_sri"] or "?", row["method"], row["reason"],
+                )
         log.info("Converted %d Canvas nodes to ScreenGuis", len(place.screen_guis))
 
     # Detect terrain components and convert them to terrain ground parts.
