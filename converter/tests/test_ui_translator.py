@@ -801,6 +801,97 @@ class TestCanvasEnabled:
         for n in ("Game", "GameOver", "Leaderboard"):
             assert by_name.get(n) is False, by_name
 
+    def test_trash_dash_scene_enabled_serialized_full_chain(self, tmp_path):
+        """Full chain: real trash-dash Main.unity -> parse -> find_canvas_nodes
+        -> convert_canvas -> RbxPlace -> BOTH serializers, asserting each named
+        ScreenGui lands the correct `Enabled` value in the ACTUAL serialized
+        output. Completes AC#6's designed serialized-XML form (the parse-only
+        sibling above stops at the in-memory RbxScreenGui list).
+
+        Real-corpus only: skips (does NOT silently substitute synthetic data)
+        when the scene is absent, mirroring the AC#6 sibling.
+        """
+        import re
+        import xml.etree.ElementTree as ET
+        from pathlib import Path
+
+        import pytest
+
+        from converter.ui_translator import convert_canvas, find_canvas_nodes
+        from core.roblox_types import RbxPlace
+        from roblox.luau_place_builder import generate_place_luau
+        from roblox.rbxlx_writer import write_rbxlx
+
+        scene = Path("/Users/jiazou/workspace/trash-dash/Assets/Scenes/Main.unity")
+        if not scene.exists():
+            pytest.skip("trash-dash Main.unity not present in this env")
+
+        from unity.scene_parser import parse_scene
+        parsed = parse_scene(scene)
+        canvases = find_canvas_nodes(parsed.roots)
+        guis = convert_canvas(canvases, scene_namespace=self.NS)
+        place = RbxPlace(screen_guis=guis)
+
+        # The four canvases of interest and their expected Enabled value.
+        expected = {
+            "Loadout": True,
+            "Game": False,
+            "GameOver": False,
+            "Leaderboard": False,
+        }
+
+        # --- rbxlx serialization: locate each ScreenGui Item by its Name
+        #     string property, then read its own Enabled bool (no global
+        #     substring -- that can't tell the canvases apart). ---
+        out = tmp_path / "place.rbxlx"
+        write_rbxlx(place, out)
+        root = ET.parse(out).getroot()
+
+        def _prop_text(props: ET.Element, tag: str, name: str) -> str | None:
+            for el in props.findall(tag):
+                if el.get("name") == name:
+                    return el.text
+            return None
+
+        enabled_by_name: dict[str, str | None] = {}
+        for item in root.iter("Item"):
+            if item.get("class") != "ScreenGui":
+                continue
+            props = item.find("Properties")
+            assert props is not None
+            sg_name = _prop_text(props, "string", "Name")
+            if sg_name in expected:
+                enabled_by_name[sg_name] = _prop_text(props, "bool", "Enabled")
+
+        for name, want in expected.items():
+            assert enabled_by_name.get(name) == ("true" if want else "false"), (
+                f"rbxlx ScreenGui {name!r} Enabled={enabled_by_name.get(name)!r}"
+            )
+
+        # --- luau serialization: each ScreenGui emits a `g.Name="<name>"`
+        #     immediately followed (within its own `do` block) by a
+        #     `g.Enabled=true/false`. Match each block and check the value. ---
+        luau = generate_place_luau(place)
+        block_re = re.compile(
+            r"g\.Name=\"(?P<name>[^\"]+)\".*?g\.Enabled=(?P<enabled>true|false)",
+            re.DOTALL,
+        )
+        luau_enabled: dict[str, str] = {}
+        for m in block_re.finditer(luau):
+            nm = m.group("name")
+            if nm in expected and nm not in luau_enabled:
+                luau_enabled[nm] = m.group("enabled")
+
+        for name, want in expected.items():
+            assert luau_enabled.get(name) == ("true" if want else "false"), (
+                f"luau ScreenGui {name!r} Enabled={luau_enabled.get(name)!r}"
+            )
+
+        # Robust cross-check: among the four canvases, exactly one is enabled.
+        canvas_enabled = [luau_enabled[n] for n in expected]
+        assert canvas_enabled.count("true") == 1, canvas_enabled
+        assert canvas_enabled.count("false") == 3, canvas_enabled
+
 
 class TestToggleIsOnAttrConvention:
     """Pin ``_TOGGLE_ISON_ATTR`` to the converter's Toggle-``isOn`` LOWERING
