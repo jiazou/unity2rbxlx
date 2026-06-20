@@ -2377,7 +2377,7 @@ function SceneRuntime:_resolveScreenGui(go, goId)
 	-- Return the ScreenGui Instance owned by the toggled GO, or nil.
 	-- 1. ``go`` may ALREADY be the ScreenGui (client-resolved gameobject
 	--    ref, the common path) -- accept it directly when it IsA ScreenGui.
-	if type(go) == "table" and type(go.IsA) == "function" then
+	if (type(go) == "table" or type(go) == "userdata") and type(go.IsA) == "function" then
 		local okGui, isGui = pcall(function() return go:IsA("ScreenGui") end)
 		if okGui and isGui then return go end
 	end
@@ -2387,7 +2387,7 @@ function SceneRuntime:_resolveScreenGui(go, goId)
 	--    workspaceFind scans PlayerGui; SERVER workspaceFind scans
 	--    workspace only -> nil (no-op).
 	local found = self._services.workspaceFind and self._services.workspaceFind(goId) or nil
-	if found ~= nil and type(found) == "table" and type(found.IsA) == "function" then
+	if found ~= nil and (type(found) == "table" or type(found) == "userdata") and type(found.IsA) == "function" then
 		local okGui, isGui = pcall(function() return found:IsA("ScreenGui") end)
 		if okGui and isGui then return found end
 	end
@@ -2409,7 +2409,11 @@ function SceneRuntime:setActive(go, bool)
 	local goInst
 	if type(go) == "string" then
 		goId = go
-	elseif type(go) == "table" then
+	elseif type(go) == "table" or type(go) == "userdata" then
+		-- Real Roblox Instances are ``"userdata"`` not ``"table"`` (the test
+		-- harness substitutes a table). Accept both so a real ScreenGui
+		-- Instance arg reaches getInstanceId + the toggle block below,
+		-- instead of falling to ``else return`` and no-opping the toggle.
 		goInst = go
 		if self._services.getInstanceId then
 			goId = self._services.getInstanceId(go)

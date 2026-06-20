@@ -4447,6 +4447,91 @@ class TestScreenGuiToggle:
         assert rc == 0, f"luau failed: {err}\n{out}"
         assert "OK" in out
 
+    # -- Regression: REAL userdata Instance shape --------------------------
+    # The table-mock tests above pass even when the runtime guards reject
+    # userdata, because a Lua table reports ``type() == "table"``. Real
+    # Roblox Instances report ``type() == "userdata"``. These two tests use
+    # ``newproxy(true)`` (the same idiom as test_destroy_accepts_userdata_
+    # instance) to build a value whose ``type()`` is genuinely "userdata",
+    # so they BITE the three ``type==table``-only guards that silently
+    # no-op the toggle in production (dispatch arm + _resolveScreenGui
+    # branches 1 & 2). They FAIL against the pre-fix runtime and pass after.
+    #
+    # A userdata proxy cannot carry fields directly, so the metatable
+    # provides ``IsA``/``_sceneRuntimeId`` via __index and captures the
+    # ``.Enabled`` write into a side table via __newindex. ``getInstanceId``
+    # (harness) reads ``inst._sceneRuntimeId`` -> served by __index.
+    _USERDATA_SCREENGUI = textwrap.dedent("""\
+        -- Build a userdata-typed ScreenGui (type() == "userdata"). The
+        -- captured ``Enabled`` lives in ``state`` since userdata fields
+        -- cannot be set directly; reads/writes route through the metatable.
+        local function makeUserdataScreenGui(sri)
+            local state = { Enabled = true }
+            local ud = newproxy(true)
+            local mt = getmetatable(ud)
+            mt.__index = function(_, key)
+                if key == "IsA" then
+                    return function(_, class) return class == "ScreenGui" end
+                elseif key == "_sceneRuntimeId" then
+                    return sri
+                elseif key == "Enabled" then
+                    return state.Enabled
+                end
+                return nil
+            end
+            mt.__newindex = function(_, key, value)
+                if key == "Enabled" then
+                    state.Enabled = value
+                else
+                    error("unexpected userdata write: " .. tostring(key))
+                end
+            end
+            return ud, state
+        end
+    """)
+
+    def test_userdata_instance_setactive_toggles_enabled(self):
+        # Test A: setActive(<userdata ScreenGui>, false) must set the
+        # captured Enabled to false. Exercises the dispatch userdata arm
+        # (getInstanceId reaches the goId) AND _resolveScreenGui branch 1
+        # userdata arm. MUST fail pre-fix (userdata rejected -> no-op).
+        scenario = self._USERDATA_SCREENGUI + textwrap.dedent("""\
+            local plan = { modules = {}, scenes = {}, prefabs = {},
+                           domain_overrides = {} }
+            local gui, state = makeUserdataScreenGui("canvasSRI")
+            assert(type(gui) == "userdata", "test bug: gui must be userdata; got " .. type(gui))
+            local services = servicesFor(plan, {}, {canvasSRI = gui})
+            local engine = SceneRuntime.new(services, plan)
+            engine:setActive(gui, false)
+            assert(state.Enabled == false, "userdata setActive(gui,false) must set Enabled=false; got " .. tostring(state.Enabled))
+            engine:setActive(gui, true)
+            assert(state.Enabled == true, "userdata setActive(gui,true) must set Enabled=true; got " .. tostring(state.Enabled))
+            print("OK")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "OK" in out
+
+    def test_userdata_instance_string_id_resolves_via_workspacefind(self):
+        # Test B: string-id form where workspaceFind(goId) returns a
+        # <userdata ScreenGui>. Exercises _resolveScreenGui branch 2
+        # userdata arm. MUST fail pre-fix (the workspaceFind result is
+        # userdata -> rejected -> no-op).
+        scenario = self._USERDATA_SCREENGUI + textwrap.dedent("""\
+            local plan = { modules = {}, scenes = {}, prefabs = {},
+                           domain_overrides = {} }
+            local gui, state = makeUserdataScreenGui("canvasSRI")
+            assert(type(gui) == "userdata", "test bug: gui must be userdata; got " .. type(gui))
+            local services = servicesFor(plan, {}, {canvasSRI = gui})
+            local engine = SceneRuntime.new(services, plan)
+            engine:setActive("canvasSRI", false)
+            assert(state.Enabled == false, "string-id setActive must resolve userdata via workspaceFind and set Enabled=false; got " .. tostring(state.Enabled))
+            print("OK")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "OK" in out
+
     def test_ac5_server_no_playergui_is_noop(self):
         # AC#5: server-shaped services table whose workspaceFind returns
         # nil for the GUI SRI (server scans workspace only, no PlayerGui)
