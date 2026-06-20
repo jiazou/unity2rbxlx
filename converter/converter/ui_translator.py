@@ -179,13 +179,22 @@ def build_component_owner_index(roots: list[SceneNode]) -> dict[str, str]:
 
 
 def _canvas_enabled(canvas_node: SceneNode) -> bool:
-    """ScreenGui.Enabled = Unity render gate = activeInHierarchy AND Canvas.enabled.
+    """ScreenGui.Enabled approximates the Unity render gate (activeInHierarchy AND Canvas.enabled).
 
-    Unity renders a Canvas only when BOTH the GameObject is active AND the Canvas
-    component is enabled. We approximate activeInHierarchy with
-    ``canvas_node.active`` (the parsed ``m_IsActive``) AND the Canvas component's
-    ``m_Enabled``. Each missing input defaults to True so absence never spuriously
-    disables a canvas.
+    Unity renders a Canvas only when BOTH the GameObject is active in the hierarchy
+    AND the Canvas component is enabled. We approximate this with the Canvas
+    GameObject's OWN active-self (``canvas_node.active`` / the parsed ``m_IsActive``)
+    AND the Canvas component's ``m_Enabled``. Each missing input defaults to True so
+    absence never spuriously disables a canvas.
+
+    LIMITATION (active-self, not true activeInHierarchy): we use the Canvas node's own
+    ``m_IsActive``, NOT the full ancestor chain, so a Canvas authored active-self=True
+    under an INACTIVE ANCESTOR ships ``Enabled=true`` even though Unity would hide it.
+    This is intentional for now: ancestor active-state is not available at this call
+    site (``convert_canvas`` receives only the flat canvas-node list), it matches the
+    converter's existing element-level ``visible=node.active`` (active-self) model, and
+    it is a strict improvement over the prior all-``Enabled=true`` behavior. Threading
+    true activeInHierarchy through the caller is tracked as a follow-on.
     """
     active = bool(canvas_node.active)
     canvas_m_enabled = True
