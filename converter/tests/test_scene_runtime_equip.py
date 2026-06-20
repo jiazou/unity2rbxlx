@@ -648,26 +648,26 @@ class TestReequipOnRespawn:
             print("OK")
         """))
 
-    def test_reequip_no_op_on_despawned_character(self):
-        # Liveness guard: a heal-window task that fires AFTER the character left the
-        # DataModel (Parent == nil) must no-op — no weld, no orphan weapon — even
-        # though the hand is present, so a stale watcher fire is harmless.
+    def test_reequip_does_not_bail_on_transiently_unparented_character(self):
+        # REGRESSION GUARD (Bug-1 live): on respawn the new Character is parented to
+        # workspace a beat AFTER CharacterAdded fires, so its Parent is transiently
+        # nil when reequipLastWeapon runs. reequipLastWeapon must NOT gate on
+        # character.Parent (a parent guard no-op'd the whole respawn re-equip live) —
+        # it must still resolve the present hand and weld, so the weapon rides along
+        # once the character finishes parenting.
         _assert_ok(textwrap.dedent("""\
             local player = {}
             local character = mockInst("Character", "Model")
-            -- Despawned: NOT parented to the DataModel.
-            character.Parent = nil
+            character.Parent = nil  -- still spawning: not yet parented to workspace
             local rightHand = mockInst("RightHand", "Part")
-            addChild(character, rightHand)  -- hand present, but char is orphaned
+            addChild(character, rightHand)  -- hand already present at CharacterAdded
             local engine = SceneRuntime.new(
                 equipServices(function() return mockInst("g", "Part") end),
                 {equip_prefabs = {riflePrefab = "p"}})
             engine:rememberEquip(player, "p")
-            local before = #createdWelds()
             engine:reequipLastWeapon(player, character)
-            assert(#createdWelds() == before, "no weld on a despawned character")
-            assert(character:FindFirstChild("_EquippedWeapon") == nil,
-                "no orphan weapon parented on a despawned character")
+            assert(character:FindFirstChild("_EquippedWeapon") ~= nil,
+                "weapon equipped despite the transiently-nil Parent (no parent gate)")
             print("OK")
         """))
 
