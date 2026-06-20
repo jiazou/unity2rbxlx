@@ -12,3 +12,12 @@
   (AI-independent) + add a server-side weld-to-RightHand equip handler + a client→server equip signal
   (the existing unconsumed `PlayerSetSharedFlag:FireServer` seam). Full design + open questions:
   see the run's DESIGN-camera-mount-to-player-mount.md. Own /drive run (premises→design→build→live-verify).
+
+## /drive run output-boundary-sanitize-20260620T082237 — architectural follow-ups (2026-06-20T02:26:55Z)
+
+- `converter/roblox/rbxlx_writer.py:1437` — `_write_attributes(lighting_props, pp_attrs)` is
+  CALLED but the function is never DEFINED or imported in the module → a latent `NameError`
+  reachable when post-processing attributes (`pp_attrs`) are truthy. Pre-existing, unrelated
+  to the output-boundary escaping work (out of this run's blast radius). Flagged independently
+  by the phase-design and finalize audits. Fix in a separate change (define/import the writer,
+  or remove the dead call) with a test that exercises the truthy-`pp_attrs` path.

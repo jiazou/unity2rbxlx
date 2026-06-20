@@ -1214,3 +1214,10 @@ The Gate-A open question deferred proving Roblox accepts a >10k–≤20k-face me
 decimate_mesh has NO production caller AND the converter env lacks a decimation backend, so a live conversion
 would not exercise the clamp at all. Defer the real-upload acceptance check until decimate_mesh is wired into
 the upload path; bug-2 quarantine is covered by the call-site + helper tests.
+
+## /drive run output-boundary-sanitize-20260620T082237 (2026-06-20T02:28:30Z)
+## From Phase 1 detailed design (output-boundary-sanitize)
+- `rbxlx_writer.py:1382` calls `_write_attributes(lighting_props, pp_attrs)` but
+  `_write_attributes` is UNDEFINED in the module and not imported — latent
+  NameError reachable only when `pp.attributes` is truthy. Unrelated to escaping;
+  pre-existing. Fix separately.
