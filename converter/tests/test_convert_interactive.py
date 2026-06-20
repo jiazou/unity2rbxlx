@@ -1032,7 +1032,12 @@ class TestValidate:
         assert payload["success"] is False
         assert any("No .lua/.luau files" in e for e in payload["errors"])
 
-    def test_dry_run_does_not_write_files(self, tmp_path):
+    def test_dry_run_does_not_write_files(self, tmp_path, monkeypatch):
+        # Pin the analyzer present + clean so the test is deterministic on any
+        # env (validate now fails closed when luau-analyze is absent, e.g. CI).
+        import utils.luau_analyze as la
+        monkeypatch.setattr(la, "luau_analyze_path", lambda: "/usr/bin/luau-analyze")
+        monkeypatch.setattr(la, "syntax_errors_for_file", lambda p, timeout=10.0: [])
         runner = CliRunner()
         out_dir = tmp_path / "out"
         scripts_dir = out_dir / "scripts"
@@ -1074,6 +1079,12 @@ class TestTranspileValidateWorkflow:
     ):
         import convert_interactive
         from converter.code_transpiler import TranspilationResult, TranspiledScript
+
+        # Pin the analyzer present + clean so validate runs deterministically on
+        # any env (it now fails closed when luau-analyze is absent, e.g. CI).
+        import utils.luau_analyze as la
+        monkeypatch.setattr(la, "luau_analyze_path", lambda: "/usr/bin/luau-analyze")
+        monkeypatch.setattr(la, "syntax_errors_for_file", lambda p, timeout=10.0: [])
 
         unity = tmp_path / "FakeProject"
         (unity / "Assets").mkdir(parents=True)
@@ -1337,3 +1348,37 @@ class TestFrontDoorSceneRuntimeStamp:
         assert read_scene_runtime_stamp(out) == "legacy"
         with pytest.raises(SceneRuntimeModeMismatch):
             check_scene_runtime_mode_match(out, "generic")
+
+
+class TestValidateGateFailsLoudWithoutAnalyzer:
+    """The validate phase must not silently pass when luau-analyze is absent:
+    syntax_errors_for_file returns [] for every file, so the old code emitted
+    success=True / 0 fixes — reading as 'all scripts validated clean' when in
+    fact nothing was checked. The gate now fails closed and stamps the result."""
+
+    def _make_scripts(self, tmp_path):
+        out = tmp_path / "out"
+        scripts = out / "scripts"
+        scripts.mkdir(parents=True)
+        (scripts / "Foo.luau").write_text("return {}")
+        return out
+
+    def test_absent_analyzer_fails_closed(self, tmp_path, monkeypatch):
+        import utils.luau_analyze as la
+        monkeypatch.setattr(la, "luau_analyze_path", lambda: None)
+        out = self._make_scripts(tmp_path)
+        _code, payload = _invoke_json(CliRunner(), ["validate", str(out)])
+        assert payload["success"] is False
+        assert payload["analyzer_available"] is False
+        assert payload["files_scanned"] == 1
+        assert any("not installed" in e for e in payload["errors"])
+
+    def test_present_analyzer_reports_available(self, tmp_path, monkeypatch):
+        import utils.luau_analyze as la
+        monkeypatch.setattr(la, "luau_analyze_path", lambda: "/usr/bin/luau-analyze")
+        monkeypatch.setattr(la, "syntax_errors_for_file", lambda p, timeout=10.0: [])
+        out = self._make_scripts(tmp_path)
+        _code, payload = _invoke_json(CliRunner(), ["validate", str(out)])
+        assert payload["success"] is True
+        assert payload["analyzer_available"] is True
+        assert payload["files_scanned"] == 1
