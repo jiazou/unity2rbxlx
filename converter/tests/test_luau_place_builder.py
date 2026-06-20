@@ -354,3 +354,32 @@ class TestHeadlessTerrainEmit:
         place.headless_terrain_scripts.append("t:FillBlock(...)")
         # The contract: scripts list does not contain a TerrainGenerator entry
         assert not any(s.name == "TerrainGenerator" for s in place.scripts)
+
+
+class TestEmitScreenGuiEnabled:
+    """`_emit_screen_gui` emits `g.Enabled` matching the model. (AC#4, AC#5)"""
+
+    @staticmethod
+    def _emit(gui) -> str:
+        from roblox.luau_place_builder import _LuauBuilder, _emit_screen_gui
+        b = _LuauBuilder()
+        _emit_screen_gui(b, gui)
+        return b.build()
+
+    def test_enabled_true(self):
+        from core.roblox_types import RbxScreenGui
+        out = self._emit(RbxScreenGui(name="UI", enabled=True))
+        assert "g.Enabled=true" in out
+        assert "g.Enabled=false" not in out
+
+    def test_enabled_false(self):
+        from core.roblox_types import RbxScreenGui
+        out = self._emit(RbxScreenGui(name="UI", enabled=False))
+        assert "g.Enabled=false" in out
+        assert "g.Enabled=true" not in out
+
+    def test_enabled_default_true(self):
+        """No `enabled=` -> default True -> g.Enabled=true. (AC#5)"""
+        from core.roblox_types import RbxScreenGui
+        out = self._emit(RbxScreenGui(name="UI"))
+        assert "g.Enabled=true" in out

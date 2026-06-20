@@ -178,6 +178,24 @@ def build_component_owner_index(roots: list[SceneNode]) -> dict[str, str]:
     return index
 
 
+def _canvas_enabled(canvas_node: SceneNode) -> bool:
+    """ScreenGui.Enabled = Unity render gate = activeInHierarchy AND Canvas.enabled.
+
+    Unity renders a Canvas only when BOTH the GameObject is active AND the Canvas
+    component is enabled. We approximate activeInHierarchy with
+    ``canvas_node.active`` (the parsed ``m_IsActive``) AND the Canvas component's
+    ``m_Enabled``. Each missing input defaults to True so absence never spuriously
+    disables a canvas.
+    """
+    active = bool(canvas_node.active)
+    canvas_m_enabled = True
+    for comp in canvas_node.components:
+        if comp.component_type == "Canvas":
+            canvas_m_enabled = int(comp.properties.get("m_Enabled", 1)) != 0
+            break
+    return active and canvas_m_enabled
+
+
 def convert_canvas(
     canvas_nodes: list[SceneNode],
     scene_namespace: str = "",
@@ -237,7 +255,10 @@ def convert_canvas(
     )
 
     for canvas_node in canvas_nodes:
-        screen_gui = RbxScreenGui(name=canvas_node.name)
+        screen_gui = RbxScreenGui(
+            name=canvas_node.name,
+            enabled=_canvas_enabled(canvas_node),
+        )
 
         # Extract CanvasScaler settings and store as attributes.
         _apply_canvas_scaler(screen_gui, canvas_node)

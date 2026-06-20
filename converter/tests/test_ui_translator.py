@@ -675,6 +675,110 @@ class TestToggleGraphicBinding:
         assert bindings[0]["graphic_sri"] == f"{self.NS}:250410364"
 
 
+class TestCanvasEnabled:
+    """`_canvas_enabled` AND-semantics + `convert_canvas` Enabled wiring.
+
+    Unity renders a Canvas only when BOTH the GameObject is active AND the
+    Canvas component is enabled (`m_Enabled`). The ScreenGui.Enabled contract
+    mirrors that AND. (AC#1, AC#2, AC#6)
+    """
+
+    NS = "TestScene"
+
+    @staticmethod
+    def _canvas_node(active: bool, m_enabled: int | None,
+                     has_canvas_comp: bool = True) -> SceneNode:
+        comps: list[ComponentData] = []
+        if has_canvas_comp:
+            props: dict = {} if m_enabled is None else {"m_Enabled": m_enabled}
+            comps.append(ComponentData("Canvas", "canvasComp", props))
+        return SceneNode(
+            name="Canvas", file_id="canvasFid", active=active, layer=0,
+            tag="Untagged", components=comps, children=[], parent_file_id=None,
+        )
+
+    def test_active_and_enabled_true(self):
+        """active=True, m_Enabled=1 -> True. (AC#2)"""
+        from converter.ui_translator import _canvas_enabled
+        assert _canvas_enabled(self._canvas_node(True, 1)) is True
+
+    def test_inactive_false(self):
+        """active=False short-circuits to False regardless of m_Enabled. (AC#2)"""
+        from converter.ui_translator import _canvas_enabled
+        assert _canvas_enabled(self._canvas_node(False, 1)) is False
+
+    def test_active_but_canvas_disabled_false(self):
+        """active=True, m_Enabled=0 -> False (the AND). (AC#2)"""
+        from converter.ui_translator import _canvas_enabled
+        assert _canvas_enabled(self._canvas_node(True, 0)) is False
+
+    def test_missing_m_enabled_defaults_true(self):
+        """Canvas component present but no m_Enabled key -> defaults True. (AC#2)"""
+        from converter.ui_translator import _canvas_enabled
+        assert _canvas_enabled(self._canvas_node(True, None)) is True
+
+    def test_no_canvas_component_active_only(self):
+        """No Canvas component -> gates on active alone, never spurious False. (AC#2)"""
+        from converter.ui_translator import _canvas_enabled
+        assert _canvas_enabled(
+            self._canvas_node(True, None, has_canvas_comp=False)) is True
+        assert _canvas_enabled(
+            self._canvas_node(False, None, has_canvas_comp=False)) is False
+
+    def test_default_synthetic_node_true(self):
+        """A synthetic node (active default True, no Canvas) -> True. (AC#1)"""
+        from converter.ui_translator import _canvas_enabled
+        node = SceneNode(name="Canvas", file_id="f", active=True, layer=0,
+                         tag="Untagged")
+        assert _canvas_enabled(node) is True
+
+    def test_convert_canvas_sets_enabled(self):
+        """`convert_canvas` threads `_canvas_enabled` onto the ScreenGui. (AC#2)"""
+        from converter.ui_translator import convert_canvas
+        enabled = convert_canvas([self._canvas_node(True, 1)],
+                                 scene_namespace=self.NS)
+        disabled = convert_canvas([self._canvas_node(False, 1)],
+                                  scene_namespace=self.NS)
+        assert enabled[0].enabled is True
+        assert disabled[0].enabled is False
+
+    def test_trash_dash_scene_active_states(self):
+        """E2E: real trash-dash Main.unity -> Loadout enabled, the rest
+        disabled, via the real scene_parser + find_canvas_nodes +
+        convert_canvas. (AC#6)
+
+        Falls back to synthetic nodes if the scene isn't present in this env.
+        """
+        from pathlib import Path
+        from converter.ui_translator import convert_canvas, find_canvas_nodes
+
+        scene = Path("/Users/jiazou/workspace/trash-dash/Assets/Scenes/Main.unity")
+        if scene.exists():
+            from unity.scene_parser import parse_scene
+            parsed = parse_scene(scene)
+            canvases = find_canvas_nodes(parsed.roots)
+            guis = convert_canvas(canvases, scene_namespace=self.NS)
+            by_name = {g.name: g.enabled for g in guis}
+            # The active boot canvas ships enabled; the rest ship disabled.
+            assert by_name.get("Loadout") is True, by_name
+            for n in ("Game", "GameOver", "Leaderboard"):
+                assert by_name.get(n) is False, by_name
+        else:  # synthetic fallback mirroring trash-dash authored active states
+            nodes = [
+                self._canvas_node(True, 1),   # Loadout-like (active)
+            ]
+            nodes[0].name = "Loadout"
+            for nm in ("Game", "GameOver", "Leaderboard"):
+                n = self._canvas_node(False, 1)
+                n.name = nm
+                nodes.append(n)
+            guis = convert_canvas(nodes, scene_namespace=self.NS)
+            by_name = {g.name: g.enabled for g in guis}
+            assert by_name["Loadout"] is True
+            for nm in ("Game", "GameOver", "Leaderboard"):
+                assert by_name[nm] is False
+
+
 class TestToggleIsOnAttrConvention:
     """Pin ``_TOGGLE_ISON_ATTR`` to the converter's Toggle-``isOn`` LOWERING
     CONVENTION, checked against EVERY converted-writer shape in the contract
