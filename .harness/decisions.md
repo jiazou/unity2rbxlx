@@ -3547,6 +3547,140 @@ the same single name. Classification: Mechanical (no-regression hardening).
 test_generate_rotation_tween:1054 asserts the removed `while true do`; AC12 now requires updating EVERY
 test asserting the removed shape (grep `while true do`/`_targets`/`_ownerIsContainer`). Classification: Mechanical.
 
+<!-- ===== /drive run rifle-mount-diag-20260617T215229 (2026-06-18) ===== -->
+# Decisions — rifle-mount-diag run
+
+## Phase 2 (design-phase2.md) — player-alias receiver routing
+
+- **D-P2-1 (interface placement).** Player-alias branch lives in `sendMessage`/`broadcastMessage`
+  BEFORE `_resolveReceiverGoId`; the resolver stays single-id and byte-for-byte unchanged. Rationale:
+  player alias maps to a LIST of goIds (single-return resolver is the wrong shape) + zero-diff
+  guarantee for the Phase-1 non-player path (doors/fires/turrets). Classification: workflow/domain.
+- **D-P2-2 (explicit IsA guard).** `_isPlayerAlias` uses an explicit `pcall`-wrapped
+  `recv:IsA("Player")` plus `playerFromTouch(recv)`, never a duck-typed/field-sniff check — else the
+  live `plr` (`Players`-service object) symptom persists. Classification: universal-candidate.
+- **D-P2-3 (player goIds, not instances).** `_playerGoIds` mirrors `_playerRigInstances`'s walk
+  (`meta.scriptId == _player._playerScriptId`, dedupe) but collects `meta.gameObjectId` (what
+  `_dispatchToGameObject` keys on), NOT `meta.gameObjectInstance`. Classification: workflow/domain.
+- **D-P2-4 (broadcast = flat per-goId, no subtree descent for a player alias).** A player-alias
+  `broadcastMessage` dispatches to each player goId WITHOUT the descendant walk (logic singleton, no
+  corpus player-rooted broadcast, walk would only re-hit the same components). Non-player broadcast
+  keeps the Phase-1 descendant walk. Classification: workflow/domain.
+- **D-P2-5 (>1 character-controller MODULES fail-close to no-route).** `_player == nil` →
+  `_playerGoIds` returns {} → warn + no dispatch (= current `_initPlayerAuthority` behavior; one camera
+  per client). Distinct from >1 rig INSTANCES of one module, which all dispatch (P2-F). Classification:
+  workflow/domain.
+- **D-P2-6 (live test is the gate).** Cold `/convert-unity` SimpleFPS + Studio Play (rifle mounts on
+  camera WeaponSlot AND fires) is the acceptance authority — NOT the seeded `luau` unit tests
+  (green-test-can-pass-for-the-wrong-reason). Classification: universal (already canonical).
+
+## Phase 2 — round-1 dual-voice review fold-ins
+
+- **D-P2-7 (nil-`_player` fail-closed — refutes codex round-1 BLOCKING).** `_isPlayerAlias` may match a
+  live `Player` object while `self._player` is nil. This is SAFE at the doc level: `_playerGoIds()`
+  guards `if not p or not p._playerScriptId then return {} end`, so it NEVER indexes
+  `_player._playerScriptId` on a nil `_player` — it returns `{}`, and the caller treats empty as
+  warn + no-route. A Player-object receiver under 0/>1-character-controller (nil `_player`) fail-closes
+  to a no-op, never a runtime error. The BLOCKING is refuted in design (Interfaces section + edge case 4).
+  Classification: workflow/domain.
+- **D-P2-8 (`playerFromTouch` breadth — codex MAJOR #3).** Branch (b) `playerFromTouch(recv)` runs for
+  non-player receivers too; it resolves ONLY a character/limb belonging to a player's character model
+  and returns nil otherwise, so doors/fires/turrets (never parented under a player character) take the
+  unchanged Phase-1 path. Boundary/documented limit: a non-player object deliberately parented inside a
+  player character WOULD be treated as a player alias — not exercised by any corpus site. New edge case
+  8. Classification: workflow/domain.
+- **D-P2-9 (multi-goId fan-out / "multiple rifles" — codex MAJOR #4).** `>1` distinct goId →
+  dispatch to each (intended Unity multi-GameObject semantics); single-embodiment (one Player module on
+  one GameObject) → exactly one goId → exactly one dispatch (no duplicate rifle). New edge case 9 + an
+  AC-1 assertion that dispatch count == `#_playerGoIds()` (== 1 in the single-embodiment fixture), so a
+  double-registered player rig is caught. Classification: workflow/domain.
+
+## D-FIN2 (finalize scope after v4 redesign) — Classification: workflow/domain
+The v3 finalize CONVERGED at a3451a4 (de-slopped phase 1). The v4 redesign added phase 2 on top
+(now drive tip 364699d). Re-running finalize's de-slop/logic lenses over the WHOLE c30c259..364699d
+diff would re-audit already-finalized clean phase-1 code (review-churn). Scope this finalize's
+code lenses to the NEW work since the converged v3 finalize: a3451a4..364699d (the phase-2 delta);
+whole-run read context retained for aggregate awareness. The terminal review-finalize-2.md still
+binds the full featureBranch tip 364699d (ship-gate R==tip holds).
+
+## ---- /drive run mesh-fidelity-20260619T232452 (promoted 2026-06-19T16:22:45Z) ----
+
+# Decisions — mesh-fidelity-20260619T232452
+
+## PLAN-stage design choices
+
+- **`MESH_ROBLOX_MAX_FACES = 20_000`** — documented Roblox per-mesh triangle limit since ~2021. Classification: Mechanical (matches platform spec the task cites).
+- **Clamp semantics `min(max(target, floor), cap)`** — quality floor may raise the target; the hard cap always wins so output never exceeds what Roblox accepts. `MESH_TARGET_FACES = 8_000` left unchanged (only the cap was stale). Classification: Mechanical.
+- **Quarantine at the single invariant site (`pipeline.py:2820–2851`)** — on an embedded-mesh key resolving to ≠1 sub-mesh, drop it from freshly-parsed `mesh_hierarchies` + `mesh_native_sizes` before merge, and append to `ctx.asset_upload_errors`. Keep the existing `log.warning` as the diagnostic. Classification: Taste (chose single-source-of-truth quarantine over a separate pass).
+- **No `scene_converter.py` change** — its face-decal/no-mesh fallback already fires on key-absence from the hierarchy tables (read-confirmed in `_resolve_mesh_geometry`/`_resolve_sub_mesh`), so upstream quarantine is sufficient. Classification: Taste (avoid redundant downstream gate).
+
+## Single phase
+- One phase, one slice. Both fixes are independent, disjoint-file, ≲25 logic SLOC total → no fan-out and no staged-risk seam. Classification: Mechanical (default-to-one-phase).
+
+
+## Design review r1 (2026-06-19) — BLOCKING: bug-2 binding gate is uploaded_assets, not hierarchy tables
+Classification: Mechanical (root-caused against real code by the Claude voice; codex text-only missed it).
+Revise design: bug-2 quarantine must also drop the key from `uploaded_assets` (the table _resolve_mesh_id
+reads), detailed design to verify the mesh-less node reaches the face-decal/no-geometry path. Fold MINORs:
+(1) note bug-1 decimation path is currently unwired (latent fix + test pin; don't claim real-output change);
+(2) also pop the quarantined key from the merged/ctx dicts, not just the pre-merge fresh dicts.
+
+## Revised decisions (post-r1, against real code under converter/converter/)
+
+- **Bug-2 quarantine mechanism (REVISED)** — at the invariant site (`pipeline.py:2820–2851`), drop the
+  offending embedded key from THREE table sets and append to `ctx.asset_upload_errors`:
+  (1) `mesh_hierarchies` + `mesh_native_sizes`, (2) `ctx.uploaded_assets` (the MeshId binding gate read by
+  `_resolve_mesh_id` at `scene_converter.py:2892–2896`), (3) the MERGED/`ctx` dicts, not just the pre-merge
+  fresh dicts (merge is `{**existing, **fresh}` → a prior-rerun `ctx` key survives a pre-merge-only drop).
+  Same `f"{rel}#{file_id}"` key shape in both tables (`pipeline.py:2014`), recognised by `is_embedded_mesh_key`.
+  Classification: Mechanical (binding-gate root-caused against real code; the round-1 "hierarchy-tables-only,
+  no scene_converter change" claim was FALSE — size-only, MeshId still bound to leaked geometry).
+
+- **Verified end-state — NO `scene_converter.py` change needed** — with the key absent from `uploaded_assets`
+  AND `mesh_hierarchies`, `_resolve_mesh_id` returns `None` via membership-guarded `in` checks (no KeyError):
+  `_resolve_sub_mesh`→None, embedded-candidate lookup misses, `.prefab` path is not an `uploaded_assets` key.
+  `part.mesh_id` is never set (`scene_converter.py:1889`); sizing falls to `_compute_mesh_size_from_fbx_bbox`
+  (reads FBX, not the tables) / unity-scale fallback → MeshPart with no MeshId = existing colored-part /
+  face-decal fallback, crash-free. Classification: Taste (skip a redundant downstream guard the trace proves
+  unnecessary). If the trace had shown a KeyError, the fallback was a `scene_converter` guard on
+  `asset_upload_errors`; it is not needed.
+
+- **Bug-1 is a LATENT fix (MINOR folded)** — `decimate_mesh`/`needs_decimation` have NO production callers
+  (grep-confirmed; test-only references). Meshes upload raw, Open Cloud decimates server-side. Cap bump
+  (20_000) + clamp are correct and test-pinned, but the design/PR must NOT claim they change real conversion
+  output today. Classification: Mechanical (latent correctness + spec-accuracy).
+
+## Stage-1 autoplan skipped (proportionality)
+Classification: Taste. Ran the dual-voice design review (the load-bearing P1 gate — it caught + fixed a
+real BLOCKING). Skipped the full gstack autoplan (CEO/Design/Eng/DX) as disproportionate for a ~30-SLOC
+internal mesh-pipeline correctness fix with no product/UX surface. Per OPERATING.md right-size-at-design.
+
+## Phase-1 DETAILED-DESIGN choices (2026-06-19, against real code @ eb8f452)
+- **File layout (verified):** `config.py` is at `converter/config.py` (NOT `converter/converter/`); constants at lines 173–175. Clamp line is `mesh_processor.py:168`. Quarantine site `pipeline.py`, ctx-merge at 2847–2851 (log.warning loop 2830–2841). `_resolve_mesh_id` 2882–2933, embedded lookup 2917–2921. Classification: Mechanical.
+- **Bug-2 extracted as a pure module-level helper `_quarantine_bad_embedded_meshes(mesh_hierarchies, mesh_native_sizes, uploaded_assets, upload_errors)`** — mutates in place, returns quarantined keys, called once right after the ctx merge (post-merge). Single source of truth at the invariant site (honors locked "no second pass"); makes the quarantine unit-testable without the Open Cloud resolve round-trip. log.warning diagnostic kept. Classification: Taste.
+- **Quarantine operates on `self.ctx.*` (merged dicts), pops all three slash directions of the embedded key from `uploaded_assets`** (mirrors `_embedded_key_candidates`), discovers offending keys via `mesh_hierarchies.items()` + `is_embedded_mesh_key` with `len(subs) != 1` (covers 0 and ≥2). Satisfies the post-merge + slash-variant pins. Classification: Mechanical.
+- **Bug-1 existing tests survive the bump** — `test_mesh_processor_decimation.py` passes `max_faces=10_000` as an explicit arg, not the default constant; no test asserts the default value. Update the stale module docstring ("currently 21,844 faces" → 20_000). Classification: Taste.
+- **Single slice confirmed at detailed design** — disjoint files, no fan-out / staged-risk, ~25–30 SLOC; the bug-2 helper + its single call site stay in one review unit (shared contract). Classification: Mechanical.
+
+## Phase-1 integration review — proportionate (single-slice)
+Classification: Taste. phaseInt is a clean FF of the already-dual-voice-reviewed slice (identical content).
+Recorded CONVERGED on the integration suite (4014 passed, no-Any) + the slice dual-voice pass rather than
+burning a duplicate full review round on byte-identical code. Per OPERATING.md right-size-at-design.
+
+## Finalize r1 — bug-1 was deeper than framed: decimation was entirely non-functional (positional arg)
+Classification: Mechanical (empirically root-caused). decimate_mesh passed the face count positionally to
+trimesh's simplify_quadric_decimation(percent=…, face_count=…) → ValueError → except → un-decimated original.
+So bug-1 is NOT merely a stale-constant/clamp latent fix: whenever a decimation backend IS present the path
+was broken (no decimation, oversized meshes shipped). Fixed with face_count= keyword; output now strictly
+bounded by the (clamped) cap. decimate_mesh still has no production caller today (impact latent until wired),
+but the fix makes the path actually correct. Surface this corrected framing at Gate B.
+
+## Verify stage skipped (no UI/URL; real-upload check low-yield)
+Classification: Taste. The change is converter-internal (no UI/URL surface to qa-only/browse). The Gate-A
+deferred 20k real-upload acceptance check is now low-yield (decimate_mesh has no production caller + no
+decimation backend in-env, so a live conversion wouldn't exercise the clamp). Documented as a followup;
+verification rests on the unit suite (4016 passed) + the strict <=cap real-path tests (active with a backend).
+
 
 # Decisions — trash-dash-phase2 run
 

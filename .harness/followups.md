@@ -1122,6 +1122,99 @@ Start a fresh /drive run on this scope; multi-subsystem → expect multiple phas
 - converter/converter/animation_converter.py:29 — `Any` co-imported with `Literal` (Any pre-existing for parser sigs, not in this diff)
 - converter/converter/animation_converter.py:1305-1311 — "Runtime placement gate" rationale duplicated as Python `#` comment + emitted Luau `--` comments
 
+<!-- ===== /drive run rifle-mount-diag-20260617T215229 (2026-06-18) ===== -->
+# Follow-ups (out of scope for this run)
+
+- **Player-rooted `BroadcastMessage` subtree descent.** Phase-2 decision BC-1/D-P2-4 makes a
+  player-alias `broadcastMessage` a flat per-goId dispatch (no `_goParentId` descendant walk), because
+  no corpus site roots a broadcast at the player and the player embodiment is a logic singleton. If a
+  future game broadcasts to the player subtree (registered child GameObjects under the player rig),
+  add a descent path for the player-alias broadcast branch. Not built now (right-sized, no driver).
+- **Cross-client player-alias routing.** Phase 2 (like Phase 1) resolves within the LOCAL partition /
+  per-client `_player`. A `host:sendMessage` whose player alias names a DIFFERENT client's player would
+  need RemoteEvent funneling (the `PlayerSetSharedFlag` pattern). No corpus site exercises it → out of
+  scope; future relation if a cross-client site appears.
+- **Primitive (number/boolean) `recv` throws in `_isPlayerAlias`/`_resolveReceiverGoId`.** Indexing
+  `recv.IsA` (Slice 2.1) — and the pre-existing `type(recv.FindFirstAncestorWhichIsA)` in
+  `_resolveReceiverGoId` — throws when `recv` is a bare number/boolean (not nil, not a table). Unreachable
+  from real emission (a transpiled `obj.SendMessage(...)` receiver is always a GameObject/Component
+  handle), so no current driver. If a defensive guard is ever wanted, gate both indexings on
+  `type(recv) == "table"`/`"userdata"` first. Found in review-2.1-1; low priority.
+
+## [phase2 codex] flat player-alias broadcast skips descendants (D-P2-4)
+`broadcastMessage` to a player alias dispatches flat per-goId (no subtree descent), unlike the
+non-player path which descends children. Intentional (no corpus BroadcastMessage targets a player).
+IF a future phase attaches descendant broadcast-target components under the player-embodiment
+GameObject, revisit: player-alias broadcast would silently skip them. Low priority; no current site.
+
+## [review-phase2-2] `_playerScriptId`-nil test does not isolate the second guard clause (P2)
+`test_fail_closed_when_player_script_id_nil` verifies the fail-close BEHAVIOR (warn + no
+dispatch + no throw) for `_player` set / `_playerScriptId` nil, but does not tightly guard the
+`not p._playerScriptId` clause specifically: mutating the runtime to drop that clause leaves the
+test green, because the loop's `m.scriptId == nil` comparison matches nothing anyway (real
+`meta.scriptId` is always non-nil). Defense-in-depth, not the line under test. To make it a tight
+guard, seed a `_meta` row with `scriptId = nil` (or assert the clause via a unit on `_playerGoIds`).
+Low priority — the asserted behavior is real and the dedupe/alias guards are surgically proven.
+
+## slop (deferred to finalize)
+scene_runtime.luau:1641-1650 — long intent-comment restating design history (player-alias branch)
+scene_runtime.luau:1662-1666 — long intent-comment (broadcast player branch)
+scene_runtime.luau:1725-1730 — long intent-comment
+test_send_message_dispatch.py:612-640 — long docstring restating design history
+test_send_message_dispatch.py:678-706 — long docstring
+
+## [finalize P2] plain component-table IsA-false branch untested
+A receiver that is a plain table WITH an IsA method returning false (not a Player) should fall through
+pcall→false→playerFromTouch→non-player path. Covered indirectly by the non-player control (no IsA);
+a direct IsA-returns-false case is untested. Low value (no real emission shape); P2.
+
+## [finalize r3 codex — non-blocking taste/refactor, routed not applied]
+- scene_runtime.luau _isPlayerAlias/_playerGoIds doc-comments: codex would trim further; Claude (with design context) marked them KEEP (decoupling + deterministic-key + fail-close are load-bearing). Taste disagreement, not clear slop.
+- scene_runtime.luau "-- Non-player path." minimal section label — could drop; NIT.
+- extract the shared player-alias dispatch/warn block from sendMessage+broadcastMessage into one helper — a REFACTOR (out of de-slop scope; would re-introduce the over-abstraction codex flagged for _playerGoIds). Defer.
+
+## [verify live — NEW BUG] GetRifle transpile drops weaponSlot parenting (rifle mounts at head, not WeaponSlot)
+LIVE (post routing-fix): rifle now picks up + GetRifle runs, but the rifle is parented to the Player
+ROOT at getLookCFrame() (head ~y140), NOT to Workspace.DynamicObjects.Player."Main Camera".WeaponSlot
+(empty, y138). Unity Player.cs:264-272 GetRifle: Instantiate(riflePrefab, weaponSlot.position);
+SetParent(weaponSlot); localScale=0.2; localRotation=identity; localPosition=zero (weaponSlot=cam.GetChild(0)).
+The AI transpiler flattened weaponSlot->getLookCFrame() and SetParent(weaponSlot)->parent=Player root +
+PivotTo(lookCF), losing the FPS hold-slot offset. SEPARATE from this run's SendMessage routing fix; a
+distinct transpile-fidelity defect (non-deterministic AI output dropping a Transform ref + SetParent).
+Acceptance "mounts on the camera WeaponSlot" not met by placement, though routing/mount now works.
+
+## [deferred feature] camera-mount → player-mount (replicated weapon equip)
+See DESIGN-camera-mount-to-player-mount.md + finalize-todo.md. The rifle now picks up + GetRifle runs
+(routing fix), but mounts at head (camera viewmodel intent) not a replicated character mount. Product
+decision: build the Roblox-idiomatic server-replicated character-attached weapon equip as its own run.
+
+## ---- /drive run mesh-fidelity-20260619T232452 (promoted 2026-06-19T16:22:45Z) ----
+
+# Follow-ups — mesh-fidelity-20260619T232452
+
+
+## Phase-1 detailed-design pins (from design review r2 — non-blocking)
+- Bug-2 pop must cover `_embedded_key_candidates` slash variants of the offending key in `uploaded_assets` (cross-OS cached ctx); add that case to the quarantine test.
+- Bug-2: discover offending keys via `mesh_hierarchies.items()` + `is_embedded_mesh_key`, pop those keys from the POST-merge ctx dicts; test the pre-seeded-in-ctx force-rerun case.
+
+## Latent edge (codex, slice-1 review — non-blocking)
+`_quarantine_bad_embedded_meshes` uses `partition("#")` (splits on FIRST '#'). If an embedded prefab/asset
+path itself contained a '#', the slash-variant reconstruction could mis-target. Not an established real
+case (asset paths with '#' aren't known to occur), and `is_embedded_mesh_key` already constrains the shape.
+Revisit only if such paths appear.
+
+## Decimation except-fallback can exceed cap (codex finalize r2 — non-blocking, latent path)
+`decimate_mesh`'s `except Exception` exports the UN-decimated original on ANY backend failure, so output is
+strictly ≤ cap only when decimation succeeds. Acceptable today (no production caller; backend often absent),
+but when decimate_mesh is wired, consider failing loud / quarantining the mesh instead of shipping an
+oversized original on a true decimation failure.
+
+## Real-upload 20k-acceptance verification (deferred from VERIFY — now low-yield)
+The Gate-A open question deferred proving Roblox accepts a >10k–≤20k-face mesh to VERIFY. Finalize revealed
+decimate_mesh has NO production caller AND the converter env lacks a decimation backend, so a live conversion
+would not exercise the clamp at all. Defer the real-upload acceptance check until decimate_mesh is wired into
+the upload path; bug-2 quarantine is covered by the call-site + helper tests.
+
 
 
 ## Phase 1 (consumables) — phase-level live-verify checkpoints
