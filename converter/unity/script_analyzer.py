@@ -476,6 +476,53 @@ def _foreach_body_is_full_destroy(loop_body: str, iter_var: str) -> bool:
     )
 
 
+def _token_is_shadowing_member(token: str, class_body: str) -> bool:
+    """True when ``token`` is declared in THIS class body as anything OTHER than
+    a plain instance field — a PROPERTY, or a ``new``/``static``/``const`` member
+    that HIDES an inherited serialized field of the same name. In those cases the
+    clear-then-spawn used the hiding member (a property accessor or a
+    new/static/const member), NOT the inherited serialized field the resolver
+    would suppress BY NAME — so the detector must ABSTAIN. ``class_body`` is the
+    de-commented span BETWEEN the class braces.
+
+    Conservative: any of the shadowing forms below → abstain. A plain
+    ``public Transform <token>;`` / ``[SerializeField] Transform <token>;``
+    instance-field declaration does NOT match (it has no property syntax and no
+    ``new``/``static``/``const`` modifier), so it still emits. A token NOT
+    declared in this class at all (a legit inherited plain field) also does NOT
+    match → still emits, which is correct.
+
+      (i) PROPERTY — ``<Type> <token> =>`` (expression-bodied) or
+          ``<Type> <token> {`` (accessor block / auto-property). The token is
+          immediately followed (modulo whitespace) by ``=>`` or ``{``.
+     (ii) MODIFIED — a declaration ``<modifiers> <Type> <token>`` whose modifier
+          list (the run of keywords before the type) includes ``new`` /
+          ``static`` / ``const``.
+    """
+    t = re.escape(token)
+    # (i) PROPERTY: ``<Type> <token> =>`` or ``<Type> <token> {``. Require a
+    # preceding type token so a bare reference (``container { ... }`` inside a
+    # method) cannot match — a declaration is ``<Type> <token>`` then ``=>``/``{``.
+    if re.search(
+        rf"\b[A-Za-z_][\w.<>\[\],?\s]*?\b{t}\s*(?:=>|\{{)",
+        class_body,
+    ):
+        return True
+    # (ii) MODIFIED: a ``new``/``static``/``const`` member named ``token``. Match
+    # a modifier list (one or more access/decl keywords, at least one of which is
+    # new/static/const) followed by ``<Type> <token>`` terminated by ``;``/``=``/
+    # ``(`` (field / initialised field / method-like member).
+    _MODS = r"public|private|protected|internal|readonly|new|static|const|virtual|override|sealed|abstract|extern|unsafe|volatile"
+    for dm in re.finditer(
+        rf"((?:\b(?:{_MODS})\b\s+)+)[A-Za-z_][\w.<>\[\],?]*\s+{t}\s*(?:[;={{(]|=>)",
+        class_body,
+    ):
+        mods = dm.group(1)
+        if re.search(r"\b(?:new|static|const)\b", mods):
+            return True
+    return False
+
+
 def detect_cleared_containers(source: str, class_name: str) -> frozenset[str]:
     """Return the set of serialized container FIELD NAMES that ``class_name``
     provably clears-then-populates (the canonical clear-all-then-instantiate
@@ -507,6 +554,13 @@ def detect_cleared_containers(source: str, class_name: str) -> frozenset[str]:
     emitted: set[str] = set()
     for param_list, body in _iter_method_bodies(class_body):
         emitted |= _detect_in_body(param_list, body)
+    # ABSTAIN on any token THIS class declares as a property or a
+    # new/static/const member: such a member HIDES an inherited serialized field
+    # of the same name, so the clear used the hiding member — NOT the field the
+    # resolver suppresses BY NAME. Over-detection destroys authored UI.
+    emitted = {
+        tok for tok in emitted if not _token_is_shadowing_member(tok, class_body)
+    }
     return frozenset(emitted)
 
 

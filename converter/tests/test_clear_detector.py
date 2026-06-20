@@ -400,6 +400,76 @@ def test_lambda_containing_spawn_still_abstains_via_depth_gate():
 
 
 # ---------------------------------------------------------------------------
+# Member-shadow abstention — a token THIS class declares as a property or a
+# new/static/const member HIDES an inherited serialized field of the same name;
+# the clear used the hiding member, not the field the resolver suppresses by
+# name, so the detector must abstain (over-detection destroys authored UI).
+# ---------------------------------------------------------------------------
+
+def test_property_member_shadow_abstains():
+    """A ``public new Transform container => ...;`` expression-bodied PROPERTY
+    HIDES the inherited serialized ``Base.container`` field. The clear+spawn use
+    the property accessor, not the field — abstain so the resolver does not
+    suppress (destroy) the authored UI under ``Base.container``."""
+    src = """
+using UnityEngine;
+
+public class Base : MonoBehaviour {
+    public Transform container;
+}
+
+public class Derived : Base {
+    public GameObject prefab;
+    public ScrollRect scroll;
+    public new Transform container => scroll.content;
+    void Refresh() {
+        foreach (Transform c in container) Destroy(c.gameObject);
+        Instantiate(prefab, container);
+    }
+}
+"""
+    assert detect_cleared_containers(src, "Derived") == frozenset()
+
+
+def test_static_member_shadow_abstains():
+    """A ``public new static Transform container;`` member HIDES the inherited
+    serialized ``Base.container`` instance field — a static member is not the
+    per-instance serialized field the resolver would suppress, so abstain."""
+    src = """
+using UnityEngine;
+
+public class Base : MonoBehaviour {
+    public Transform container;
+}
+
+public class Derived : Base {
+    public GameObject prefab;
+    public new static Transform container;
+    void Refresh() {
+        foreach (Transform c in container) Destroy(c.gameObject);
+        Instantiate(prefab, container);
+    }
+}
+"""
+    assert detect_cleared_containers(src, "Derived") == frozenset()
+
+
+def test_plain_serialized_field_container_still_emits():
+    """Positive regression: a PLAIN instance-field container (no property syntax,
+    no ``new``/``static``/``const`` modifier) with the canonical clear+spawn is
+    NOT a shadowing member, so it STILL emits."""
+    src = _wrap("Ctrl", """
+    public Transform container;
+    public GameObject prefab;
+    void Refresh() {
+        foreach (Transform c in container) Destroy(c.gameObject);
+        Instantiate(prefab, container);
+    }
+""")
+    assert detect_cleared_containers(src, "Ctrl") == frozenset({"container"})
+
+
+# ---------------------------------------------------------------------------
 # Wiring — analyze_script populates ScriptInfo.cleared_container_fields.
 # ---------------------------------------------------------------------------
 
