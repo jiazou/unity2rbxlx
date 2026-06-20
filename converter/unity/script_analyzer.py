@@ -226,12 +226,12 @@ def _find_lazy_singleton_field(decommented: str, class_name: str) -> str:
 
 # A C# method declaration head: ``<ret-type> <Name>(<params>)`` immediately
 # preceding a ``{`` body. Matched at class-body brace-depth 1 only (see
-# ``_iter_method_bodies``). The return type / name / param list are not
-# captured — we only need the body span that follows.
+# ``_iter_method_bodies``). The parameter list is captured (group 1) so the
+# clear-detector can see parameter names that SHADOW a serialized field.
 _RE_METHOD_HEAD = re.compile(
     r"[A-Za-z_][\w.<>\[\],\s]*?"   # return type (possibly generic/qualified)
     r"\b[A-Za-z_]\w*\s*"          # method name
-    r"\([^;{}]*\)\s*"             # parameter list (no ; { } inside)
+    r"\(([^;{}]*)\)\s*"           # parameter list (no ; { } inside) — captured
     r"\{",                         # opening brace of the body
 )
 
@@ -281,13 +281,15 @@ def _class_body_for(decommented: str, class_name: str) -> str | None:
     return decommented[span[0] + 1 : span[1]]
 
 
-def _iter_method_bodies(class_body: str) -> list[str]:
-    """Return the brace-delimited bodies (INCLUDING braces) of every top-level
-    method declared directly in ``class_body`` (brace-depth 1). Nested types or
+def _iter_method_bodies(class_body: str) -> list[tuple[str, str]]:
+    """Return ``(param_list, body)`` pairs for every top-level method declared
+    directly in ``class_body`` (brace-depth 1). ``param_list`` is the raw text
+    between the method head's parentheses (for parameter-shadow detection);
+    ``body`` is the brace-delimited body (INCLUDING braces). Nested types or
     accessor blocks are skipped by only matching method heads that sit at the
     class's own depth. ``class_body`` is the source BETWEEN the class braces,
     de-commented."""
-    bodies: list[str] = []
+    methods: list[tuple[str, str]] = []
     pos = 0
     n = len(class_body)
     while pos < n:
@@ -306,9 +308,9 @@ def _iter_method_bodies(class_body: str) -> list[str]:
         span = _matching_brace_span(class_body, brace_idx)
         if span is None:
             break
-        bodies.append(class_body[span[0] : span[1] + 1])
+        methods.append((m.group(1), class_body[span[0] : span[1] + 1]))
         pos = span[1] + 1
-    return bodies
+    return methods
 
 
 def _depth_at(body: str, idx: int) -> int:
@@ -324,10 +326,51 @@ def _depth_at(body: str, idx: int) -> int:
     return depth
 
 
-def _detect_in_body(body: str) -> frozenset[str]:
+def _token_is_local_or_param(token: str, param_list: str, body: str) -> bool:
+    """True when ``token`` is declared as a method-LOCAL variable or a method
+    PARAMETER — in which case it CANNOT be the class-level serialized field
+    (declared only at class scope) and the detector must ABSTAIN. A serialized
+    field is declared at CLASS level, never inside a method; so a token that
+    resolves to a local/param here shadows the field and the clear-then-spawn
+    cleared a DIFFERENT transform than the field the resolver would suppress.
+
+    Conservative: any match → abstain.
+      (i) LOCAL — a declaration position in the body: ``var <tok>`` or
+          ``<Type> <tok>`` immediately preceding a ``=`` or ``;`` (a typed
+          declaration / assignment-init / foreach binding).
+     (ii) PARAMETER — ``<tok>`` appears as a parameter name in ``param_list``
+          (the identifier immediately before a ``,`` / end-of-list, i.e. the
+          last identifier of each comma-separated parameter)."""
+    t = re.escape(token)
+    # (i) LOCAL declaration: ``var <tok> =`` or ``<Type> <tok> =`` or
+    # ``<Type> <tok>;`` — a type or ``var`` immediately preceding the token in a
+    # ``=``/``;``-terminated declaration. Also a ``foreach (Type <tok> in ...)``
+    # binding. The leading ``\b[A-Za-z_][\w.<>\[\],]*`` is the declared type (or
+    # ``var``); the token is followed by ``=`` / ``;`` / ``in``.
+    if re.search(
+        rf"\b(?:var|[A-Za-z_][\w.<>\[\],]*)\s+{t}\s*(?:=|;|\bin\b)",
+        body,
+    ):
+        return True
+    # (ii) PARAMETER: the last identifier of any comma-separated parameter.
+    for raw_param in param_list.split(","):
+        param = raw_param.strip()
+        if not param:
+            continue
+        # Strip trailing default-value (``= ...``) and take the declared name
+        # (the last bare identifier of the ``<modifiers> <Type> <name>`` form).
+        name_part = param.split("=", 1)[0].strip()
+        names = re.findall(r"[A-Za-z_]\w*", name_part)
+        if names and names[-1] == token:
+            return True
+    return False
+
+
+def _detect_in_body(param_list: str, body: str) -> frozenset[str]:
     """Return the container field names this ONE method body provably clears-
-    then-populates. ``body`` includes its surrounding braces, de-commented.
-    Empty on any ambiguity."""
+    then-populates. ``body`` includes its surrounding braces, de-commented;
+    ``param_list`` is the method's raw parameter-list text (for shadow
+    detection). Empty on any ambiguity."""
     # Collect every spawn-into-C site: (container_token, match_start).
     spawns: list[tuple[str, int]] = []
     for sm in _RE_SPAWN_INTO.finditer(body):
@@ -343,6 +386,12 @@ def _detect_in_body(body: str) -> frozenset[str]:
     }
     for container in candidates:
         if container in ("transform", "this"):
+            continue
+        # ABSTAIN if the token is a method-local variable or a parameter — it
+        # shadows (cannot BE) the class-level serialized field, so the clear hit
+        # a different transform than the resolver would suppress. Over-detection
+        # destroys authored UI; under-detection is a safe double-stamp.
+        if _token_is_local_or_param(container, param_list, body):
             continue
         clear = _re_foreach_clear(container).search(body)
         destroy_children = re.search(
@@ -456,8 +505,8 @@ def detect_cleared_containers(source: str, class_name: str) -> frozenset[str]:
     if class_body is None:
         return frozenset()
     emitted: set[str] = set()
-    for body in _iter_method_bodies(class_body):
-        emitted |= _detect_in_body(body)
+    for param_list, body in _iter_method_bodies(class_body):
+        emitted |= _detect_in_body(param_list, body)
     return frozenset(emitted)
 
 

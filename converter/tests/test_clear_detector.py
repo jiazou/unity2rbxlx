@@ -157,6 +157,39 @@ def test_instantiate_position_rotation_parent_form_abstains():
 # Abstain cases — each returns the empty set.
 # ---------------------------------------------------------------------------
 
+def test_local_var_shadow_container_abstains():
+    """A method-LOCAL ``var container = ...`` that SHADOWS a serialized field
+    of the same name: the canonical clear+spawn target the LOCAL, not the
+    field, so the resolver would suppress the WRONG (real) field's UI subtree.
+    A serialized field is declared at CLASS level, never in a method — so a
+    container token declared as a local CANNOT be proven to be the field →
+    ABSTAIN."""
+    src = _wrap("Ctrl", """
+    public Transform container;
+    public GameObject itemPrefab;
+    void Rebuild() {
+        var container = someOtherTransform;
+        foreach (Transform c in container) Destroy(c.gameObject);
+        Instantiate(itemPrefab, container);
+    }
+""")
+    assert detect_cleared_containers(src, "Ctrl") == frozenset()
+
+
+def test_parameter_container_abstains():
+    """The container token is a method PARAMETER, not the serialized field, so
+    the cleared transform is whatever the caller passed — abstain."""
+    src = _wrap("Ctrl", """
+    public Transform container;
+    public GameObject prefab;
+    void Fill(Transform container) {
+        foreach (Transform c in container) Destroy(c.gameObject);
+        Instantiate(prefab, container);
+    }
+""")
+    assert detect_cleared_containers(src, "Ctrl") == frozenset()
+
+
 def test_guarded_clear_abstains():
     """The clear is wrapped in an ``if`` (guard asymmetry) → abstain."""
     src = _wrap("Ctrl", """
