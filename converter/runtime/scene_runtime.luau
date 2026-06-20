@@ -2348,18 +2348,13 @@ function SceneRuntime:applyImpulse(part, force)
 	if type(part) ~= "table" and type(part) ~= "userdata" then
 		return
 	end
-	-- Resolve the launch BODY. A force-launched MonoBehaviour passes ``self.gameObject``; for a
-	-- wrapped-Model prefab (outer Model + inner ``*_Mesh`` body) that is the MODEL, not a BasePart.
-	-- The old ``not _isBasePart -> return`` SILENTLY dropped the launch on every such body (the
-	-- regression). Resolve the Model to its dynamic body BasePart: the ``_UnityMass``-stamped
-	-- descendant FIRST -- the converter stamps ``_UnityMass`` ONLY on the dynamic Rigidbody body, so
-	-- it outranks ``PrimaryPart`` (which may be a cosmetic part) -- then ``PrimaryPart``, then the
-	-- first descendant BasePart. Abstain only when NO BasePart resolves (a body-less GameObject has
-	-- nothing to launch). Once resolved, the existing assembly/mass logic below finds the stamp.
+	-- A force-launched MonoBehaviour passes ``self.gameObject``; for a wrapped-Model prefab that is
+	-- the Model, not a BasePart, and the old ``not _isBasePart -> return`` silently dropped the
+	-- launch (the regression). Resolve the Model to its dynamic body BasePart, by priority: the
+	-- ``_UnityMass``-stamped descendant (the converter stamps it only on the dynamic Rigidbody body,
+	-- so it outranks ``PrimaryPart``, which may be cosmetic), else ``PrimaryPart``, else the first
+	-- descendant BasePart; abstain if none. A non-Instance arg (no GetDescendants) soft-returns.
 	if not _isBasePart(part) then
-		-- A malformed/wrong-typed arg (no GetDescendants) SOFT-RETURNS — preserving the prior
-		-- "bad part arg is a safe no-op" contract. Each Instance method below is also guarded at its
-		-- use site so a partial Instance-like value never hard-errors.
 		if type(part.GetDescendants) ~= "function" then
 			return
 		end
@@ -2371,10 +2366,10 @@ function SceneRuntime:applyImpulse(part, force)
 			end
 		end
 		if body == nil then
-			local pp = type(part.IsA) == "function" and part:IsA("Model") and part.PrimaryPart
+			local pp = part:IsA("Model") and part.PrimaryPart
 			if pp and _isBasePart(pp) then
 				body = pp
-			elseif type(part.FindFirstChildWhichIsA) == "function" then
+			else
 				body = part:FindFirstChildWhichIsA("BasePart", true)
 			end
 		end

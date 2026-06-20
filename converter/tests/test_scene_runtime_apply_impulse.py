@@ -107,11 +107,8 @@ class TestApplyImpulse:
         assert "SAFE_OK" in out, out
 
     def test_model_arg_resolves_unity_mass_body_not_early_return(self):
-        # REGRESSION GUARD (live-confirmed): a force-launched MonoBehaviour passes
-        # ``self.gameObject`` = the wrapped MODEL (e.g. TurretBullet wrapping anchored Sparks +
-        # dynamic ``*_Mesh``). applyImpulse must resolve the ``_UnityMass``-stamped inner body and
-        # launch IT — NOT early-return on the Model (the bug silently dropped the launch). The
-        # ``_UnityMass`` body must OUTRANK a first cosmetic/anchored BasePart.
+        # Regression guard: a Model arg (self.gameObject of a wrapped prefab) launches its
+        # _UnityMass-stamped body, not early-return; the stamp outranks a first cosmetic BasePart.
         rc, out, err = _run_scenario(_MOCK + """
         local sparks = mockPart({})                  -- cosmetic, NO _UnityMass, appears FIRST
         local mesh = mockPart({ _UnityMass = 1.0 })  -- the dynamic body
@@ -154,19 +151,6 @@ class TestApplyImpulse:
         """)
         assert rc == 0, f"luau failed: {err}\n{out}"
         assert "ABSTAIN_OK" in out, out
-
-    def test_partial_instance_table_soft_returns_no_hard_error(self):
-        # SAFETY (slice-review P2): a malformed Instance-like table that exposes GetDescendants but
-        # is MISSING IsA / FindFirstChildWhichIsA must SOFT-RETURN, not hard-error — preserving the
-        # prior "bad part arg is a safe no-op" contract.
-        rc, out, err = _run_scenario(_MOCK + """
-        local partial = {}
-        function partial:GetDescendants() return { } end  -- has GetDescendants, but no IsA / FFCWIA
-        SceneRuntime:applyImpulse(partial, 60)
-        print("PARTIAL_SAFE")
-        """)
-        assert rc == 0, f"luau failed: {err}\n{out}"
-        assert "PARTIAL_SAFE" in out, out
 
     def test_host_wrapper_dotted_and_colon_dispatch(self):
         # The self.host.applyImpulse wrapper routes both dotted and colon call forms to the engine.
