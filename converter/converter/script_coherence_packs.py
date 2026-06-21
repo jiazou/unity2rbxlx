@@ -5210,9 +5210,6 @@ _SLIDER_GUESS_FILL_SIGS = (
     'FindFirstChild("Bar")',
     'FindFirstChild("Foreground")',
 )
-# Idempotency / rewritten marker — the canonical body contains this; the
-# guessed-fill body never does, so detect/apply gate on its ABSENCE.
-_SLIDER_REWRITTEN_SIG = 'slider:GetAttribute("SliderFillElement")'
 
 # The path-aware, fail-loud, anchor/direction-aware replacement body. Generic:
 # reads ``SliderFillElement``/``SliderDirection`` off the slider Frame; no
@@ -5308,9 +5305,9 @@ def _free_function_setter_start(src: str, from_index: int = 0) -> int:
     flag LOUDLY rather than silently mangled.
 
     Returns the EARLIEST matching start so a file with several free-function
-    setters is walked left-to-right (each span rewritten independently — the
-    whole-file rewritten marker is NOT a bail-out gate, so a second still-guessed
-    setter is never silently skipped just because an earlier one was rewritten).
+    setters is walked left-to-right (each span rewritten independently — a
+    second still-guessed setter is never silently skipped just because an
+    earlier one was rewritten).
     """
     best = -1
     for anchor in (
@@ -5343,8 +5340,7 @@ def _detect_slider_fill_resize(scripts: list["RbxScript"]) -> bool:
     The presence of a guessed-fill token IS the per-setter signal: the canonical
     rewritten body contains none of them, so a remaining guessed-fill token means
     an un-rewritten guessed setter is still in the file — even if a SECOND setter
-    in the same file was already rewritten (whole-file ``_SLIDER_REWRITTEN_SIG``
-    presence is therefore NOT used as a gate here)."""
+    in the same file was already rewritten."""
     for s in scripts:
         src = s.source or ""
         if _has_slider_setter(src) and _has_guessed_fill(src):
@@ -5367,9 +5363,7 @@ def _guard_slider_fill_coverage(scripts: list["RbxScript"]) -> None:
     token that survives the rewrite means an un-rewritten guessed setter remains,
     so we warn even when a SECOND setter in the same file WAS rewritten (the
     canonical body contains no guessed-fill token, so its presence is unambiguous
-    evidence of a still-guessed setter). Gating on whole-file
-    ``_SLIDER_REWRITTEN_SIG`` presence is exactly the silent-skip this guard
-    must not have."""
+    evidence of a still-guessed setter)."""
     for s in scripts:
         src = s.source or ""
         if not _has_slider_setter(src):
@@ -5395,8 +5389,7 @@ def _fix_slider_fill_resize(scripts: list["RbxScript"]) -> int:
     for s in scripts:
         src = s.source or ""
         # Walk EVERY free-function setSliderValue span left-to-right and rewrite
-        # each one whose body still guesses the fill name. Per-span — NOT gated
-        # on whole-file ``_SLIDER_REWRITTEN_SIG`` presence — so a second
+        # each one whose body still guesses the fill name. Per-span, so a second
         # still-guessed free-function setter is rewritten even when an earlier
         # one in the same file was already rewritten (idempotency comes from the
         # per-body guessed-fill gate: a rewritten body has no guessed-fill token,

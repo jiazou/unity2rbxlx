@@ -1838,3 +1838,71 @@ class TestSliderFillElement:
         fill = self._node("Cur/Health", file_id="cur", parent_file_id="health")
         node_index = {"health": slider, "cur": fill}
         assert _relative_fill_path(slider, "cur", node_index) is None
+
+    # --- Acceptance: REAL convert_scene threads node_index=all_nodes (FIX 1). ---
+    def test_convert_scene_threads_node_index_to_slider(self, tmp_path):
+        """Drive a parsed scene through the REAL top-level ``convert_scene`` entry
+        (NOT a hand-threaded ``convert_canvas`` call) and assert the converted
+        slider Frame carries ``SliderFillElement == "Back/CurHealth"``.
+
+        This is the ONLY test that exercises the
+        ``node_index=parsed_scene.all_nodes`` threading at ``scene_converter.py``:
+        every other slider test passes ``node_index`` in by hand, so a regression
+        on that threading line (e.g. dropping the kwarg or passing ``None``) would
+        slip past them. Verified RED when the threading is broken.
+        """
+        from pathlib import Path
+        from converter.scene_converter import convert_scene
+        from core.unity_types import ParsedScene
+
+        # Build the SimpleFPS-shaped slider subtree UNDER a Canvas root so
+        # ``find_canvas_nodes`` picks it up and ``convert_scene`` converts it.
+        health, node_index, _ = self._simplefps_tree()
+        health.parent_file_id = "canvas"
+        canvas = self._node(
+            "Canvas", file_id="canvas", parent_file_id=None,
+            components=[
+                ComponentData(
+                    component_type="Canvas", file_id="canvascomp",
+                    properties={"m_Enabled": 1},
+                ),
+            ],
+            children=[health],
+        )
+        # ``all_nodes`` is the scene-wide fileID->SceneNode map convert_scene
+        # threads as ``node_index``. Populate it with EVERY node (canvas + the
+        # slider subtree) exactly as the real parser would.
+        all_nodes = {canvas.file_id: canvas}
+        all_nodes.update(node_index)
+
+        project_root = tmp_path / "proj"
+        (project_root / "Assets" / "Scenes").mkdir(parents=True)
+        parsed = ParsedScene(
+            scene_path=Path(project_root) / "Assets" / "Scenes" / "Main.unity",
+            roots=[canvas],
+            all_nodes=all_nodes,
+        )
+        place = convert_scene(
+            parsed_scene=parsed,
+            unity_project_root=project_root,
+            scene_runtime=None,
+            scene_runtime_mode="generic",
+        )
+
+        # Walk the converted ScreenGui tree for the Health (slider) Frame.
+        def _find(elements, name):
+            for el in elements:
+                if el.name == name:
+                    return el
+                hit = _find(el.children, name)
+                if hit is not None:
+                    return hit
+            return None
+
+        health_frame = None
+        for gui in place.screen_guis:
+            health_frame = _find(gui.elements, "Health")
+            if health_frame is not None:
+                break
+        assert health_frame is not None, "Health slider Frame not converted"
+        assert health_frame.attributes["SliderFillElement"] == "Back/CurHealth"

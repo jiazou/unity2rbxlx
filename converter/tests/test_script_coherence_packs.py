@@ -4217,9 +4217,9 @@ class TestSliderFillPathResize:
         guard LOUDLY warns about the remaining method-form guessed setter
         (per-setter determination, not whole-file rewritten-marker gating).
 
-        Pins codex P1: whole-script ``_SLIDER_REWRITTEN_SIG in src`` gating made
-        detect/apply/guard all skip a 2nd guessed setter once any setter in the
-        file was rewritten (§3 edge-5 / criterion 8 'never silently skipped')."""
+        Pins codex P1: whole-script rewritten-marker gating made detect/apply/
+        guard all skip a 2nd guessed setter once any setter in the file was
+        rewritten (§3 edge-5 / criterion 8 'never silently skipped')."""
         import logging
         src = (
             "local Hud = {}\n\n"
