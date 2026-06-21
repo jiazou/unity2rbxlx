@@ -41,6 +41,36 @@ from converter.child_index_lowering import (
     source_has_child_index,
 )
 
+# The guessed-fill slider rewrite primitives (regexes, the ``_resolveSliderFill``
+# helper + its injection gate, the inline RESOLUTION rewrite, and the
+# setSliderValue/guessed-fill detectors) live in ``slider_fill_common`` so the
+# GENERIC contract-pipeline lowering (``slider_fill_lowering``) reuses the SAME
+# string-level implementation -- ONE source of truth for legacy + generic. Aliased
+# to the original private names so the legacy pack body below is unchanged.
+from converter.slider_fill_common import (
+    _ANY_GUESS_FILL_RE,
+    _SLIDER_FILL_HELPER,  # noqa: F401  (re-export)
+    _SLIDER_FILL_HELPER_DEF,  # noqa: F401  (re-export)
+    _SLIDER_FILL_HELPER_TOKEN,
+    _SLIDER_GUESS_FILL_SIGS,
+    _INLINE_GUESS_FILL_RE,  # noqa: F401  (re-export)
+    _FILL_RECEIVER_RE,  # noqa: F401  (re-export)
+)
+from converter.slider_fill_common import (
+    free_function_setter_start as _free_function_setter_start,
+)
+from converter.slider_fill_common import has_guessed_fill as _has_guessed_fill
+from converter.slider_fill_common import (
+    has_inline_guessed_fill as _has_inline_guessed_fill,
+)
+from converter.slider_fill_common import has_slider_setter as _has_slider_setter
+from converter.slider_fill_common import (
+    inject_slider_fill_helper as _inject_slider_fill_helper,  # noqa: F401
+)
+from converter.slider_fill_common import (
+    rewrite_inline_guessed_fill as _rewrite_inline_guessed_fill,
+)
+
 if TYPE_CHECKING:
     from core.roblox_types import RbxScript
 
@@ -5195,4 +5225,214 @@ def _fix_fps_camera_yaw_from_player_pivot(scripts: list["RbxScript"]) -> int:
                 "  Restored FPS camera yaw in '%s' (%d site(s): %s)",
                 s.name, len(edits), ", ".join(obj for _, obj in edits),
             )
+    return fixes
+
+
+# ---------------------------------------------------------------------------
+# slider_fill_path_resize — rewrite the HUD's guessed-fill ``setSliderValue``
+# to resolve the converter-emitted ``SliderFillElement`` relative path, fail
+# loud (no guessed-name fallback), and resize the fill anchor/direction-aware.
+# ---------------------------------------------------------------------------
+
+# The path-aware, fail-loud, anchor/direction-aware replacement body. Generic:
+# reads ``SliderFillElement``/``SliderDirection`` off the slider Frame; no
+# hardcoded child names. Treats the incoming value as a [0,1] fraction (clamp),
+# matching the original guessed body and the AI call site (``cur / max``).
+_CANONICAL_SLIDER_SETTER = '''local function setSliderValue(slider, percentage)
+\tif not slider then return end
+\tslider:SetAttribute("value", percentage)
+
+\t-- Resolve the fill by the converter-emitted relative descendant path.
+\t-- FAIL LOUD: no guessed-name fallback (that fallback IS the original bug).
+\tlocal path = slider:GetAttribute("SliderFillElement")
+\tif type(path) ~= "string" or path == "" then
+\t\twarn("[setSliderValue] slider '" .. slider.Name .. "' has no SliderFillElement attribute; fill not resized")
+\t\treturn
+\tend
+\t-- Walk the slash-separated path. FAIL LOUD on a malformed path: split on
+\t-- "/" keeping EMPTY segments (a leading/trailing/double slash means an
+\t-- un-encodable intermediate name leaked through) and bail rather than let
+\t-- gmatch("[^/]+") silently skip the empty segment and mis-resolve.
+\tlocal fill = slider
+\tlocal cursor = 1
+\twhile cursor <= #path + 1 do
+\t\tlocal nextSlash = string.find(path, "/", cursor, true)
+\t\tlocal segment
+\t\tif nextSlash then
+\t\t\tsegment = string.sub(path, cursor, nextSlash - 1)
+\t\t\tcursor = nextSlash + 1
+\t\telse
+\t\t\tsegment = string.sub(path, cursor)
+\t\t\tcursor = #path + 2
+\t\tend
+\t\tif segment == "" then
+\t\t\twarn("[setSliderValue] slider '" .. slider.Name .. "' fill path '" .. path .. "' has an empty segment; fill not resized")
+\t\t\treturn
+\t\tend
+\t\tfill = fill and fill:FindFirstChild(segment)
+\t\tif not fill then
+\t\t\twarn("[setSliderValue] slider '" .. slider.Name .. "' fill path '" .. path .. "' did not resolve (segment '" .. segment .. "')")
+\t\t\treturn
+\t\tend
+\tend
+\tif not (fill and fill:IsA("GuiObject")) then
+\t\twarn("[setSliderValue] slider '" .. slider.Name .. "' fill path '" .. path .. "' did not resolve to a GuiObject")
+\t\treturn
+\tend
+
+\t-- Treat the incoming value as a normalized [0,1] fraction and clamp. We do
+\t-- NOT re-normalize by Min/Max: a conditional (t-min)/(max-min) gated on
+\t-- t>1||t<0 mis-renders sliders whose raw domain overlaps [0,1].
+\tlocal t = math.clamp(percentage, 0, 1)
+
+\t-- Anchor/direction-aware Size authoring. The converted fill has Size=(0,0,0,0)
+\t-- and NO AnchorPoint, so author a COMPLETE UDim2 (full cross-axis, scaled
+\t-- main axis) rather than mutating one axis of a zero Size.
+\tlocal dir = slider:GetAttribute("SliderDirection") or 0  -- 0 LTR,1 RTL,2 BTT,3 TTB
+\tif dir == 2 or dir == 3 then
+\t\tfill.Size = UDim2.new(1, 0, t, 0)           -- vertical: scale height
+\t\tif dir == 3 then                             -- TopToBottom: drain from top
+\t\t\tfill.AnchorPoint = Vector2.new(0, 0)
+\t\t\tfill.Position = UDim2.new(0, 0, 0, 0)
+\t\telse                                         -- BottomToTop: drain from bottom
+\t\t\tfill.AnchorPoint = Vector2.new(0, 1)
+\t\t\tfill.Position = UDim2.new(0, 0, 1, 0)
+\t\tend
+\telse
+\t\tfill.Size = UDim2.new(t, 0, 1, 0)           -- horizontal: scale width
+\t\tif dir == 1 then                             -- RightToLeft: drain from right
+\t\t\tfill.AnchorPoint = Vector2.new(1, 0)
+\t\t\tfill.Position = UDim2.new(1, 0, 0, 0)
+\t\telse                                         -- LeftToRight: drain from left
+\t\t\tfill.AnchorPoint = Vector2.new(0, 0)
+\t\t\tfill.Position = UDim2.new(0, 0, 0, 0)
+\t\tend
+\tend
+end'''
+
+
+# The guessed-fill slider rewrite primitives moved to ``slider_fill_common`` and
+# imported at the top of this module (aliased to their original private names):
+# ``_SLIDER_FILL_HELPER``/``_SLIDER_FILL_HELPER_TOKEN``/``_SLIDER_FILL_HELPER_DEF``,
+# ``_INLINE_GUESS_FILL_RE``/``_FILL_RECEIVER_RE``/``_ANY_GUESS_FILL_RE``,
+# ``_SLIDER_GUESS_FILL_SIGS``, and the detectors/rewriters
+# ``_has_guessed_fill``/``_free_function_setter_start``/``_has_slider_setter``/
+# ``_has_inline_guessed_fill``/``_inject_slider_fill_helper``/
+# ``_rewrite_inline_guessed_fill``. The GENERIC contract-pipeline lowering
+# (``slider_fill_lowering``) reuses the SAME string-level implementation.
+
+
+def _detect_slider_fill_resize(scripts: list["RbxScript"]) -> bool:
+    """Fire when any script still contains a guessed-fill ``setSliderValue``
+    (free-function OR method form) OR an inlined guessed-fill resolution
+    assignment that has not yet been rewritten.
+
+    The presence of a guessed-fill token IS the per-setter signal: the canonical
+    rewritten body / injected helper contains none of them, so a remaining
+    guessed-fill token means an un-rewritten guessed shape is still in the file —
+    even if a SECOND setter in the same file was already rewritten."""
+    for s in scripts:
+        src = s.source or ""
+        if _has_slider_setter(src) and _has_guessed_fill(src):
+            return True
+        if _has_inline_guessed_fill(src):
+            return True
+    return False
+
+
+def _guard_slider_fill_coverage(scripts: list["RbxScript"]) -> None:
+    """LOUD non-fire detector. The deterministic upstream signal is a guessed-fill
+    resolution — either a ``setSliderValue`` body OR an inlined
+    ``<x> = <frame>:FindFirstChild("Fill")`` assignment. If after the pack any
+    guessed-fill resolution remains un-rewritten (the AI reshaped the shape
+    enough that the span/identity gate abstained), ``log.warning`` so the
+    silent-abstain is observable rather than shipping a frozen bar.
+
+    Two surfaces are flagged:
+      * a ``setSliderValue`` (free-function AND method form) that still guesses;
+      * an inlined guessed-fill resolution assignment outside any setter body
+        (the broadened generic-shape surface).
+
+    The "covered" determination is per-resolution, not whole-file: any guessed-
+    fill token that survives the rewrite is unambiguous evidence of a still-
+    guessed shape (the canonical body / injected helper contains none), so we
+    warn even when a SIBLING resolution in the same file WAS rewritten."""
+    for s in scripts:
+        src = s.source or ""
+        if _has_slider_setter(src) and _has_guessed_fill(src):
+            log.warning(
+                "[slider_fill_path_resize] '%s' has a guessed-fill "
+                "setSliderValue the pack did not rewrite (shape drifted); "
+                "slider bar will stay frozen. Inspect the emitted "
+                "setSliderValue.", s.name,
+            )
+        elif _has_inline_guessed_fill(src):
+            log.warning(
+                "[slider_fill_path_resize] '%s' has an inlined guessed-fill "
+                "resolution (<x> = <frame>:FindFirstChild(\"Fill\")) the pack "
+                "did not rewrite (shape drifted); slider bar will stay frozen. "
+                "Inspect the emitted fill resolution.", s.name,
+            )
+
+
+@patch_pack(
+    name="slider_fill_path_resize",
+    description="Rewrite the HUD's guessed-fill setSliderValue (legacy) AND the "
+    "inlined guessed-fill resolution (generic) to resolve the converter-emitted "
+    "SliderFillElement relative path, fail loud, and resize the fill "
+    "anchor/direction-aware.",
+    detect=_detect_slider_fill_resize,
+)
+def _fix_slider_fill_resize(scripts: list["RbxScript"]) -> int:
+    fixes = 0
+    for s in scripts:
+        src = s.source or ""
+        # Walk EVERY free-function setSliderValue span left-to-right and rewrite
+        # each one whose body still guesses the fill name. Per-span, so a second
+        # still-guessed free-function setter is rewritten even when an earlier
+        # one in the same file was already rewritten (idempotency comes from the
+        # per-body guessed-fill gate: a rewritten body has no guessed-fill token,
+        # so re-running makes 0 edits).
+        search_from = 0
+        while True:
+            start = _free_function_setter_start(src, search_from)
+            if start == -1:
+                break
+            # Function span: from the definition start to its first column-0
+            # ``\nend`` (the function close; inline guards keep their ``end``
+            # mid-line). Same span technique as ``door_player_flag_location``.
+            close = src.find("\nend", start)
+            if close == -1:
+                break
+            end_idx = close + len("\nend")
+            body = src[start:end_idx]
+            # Identity gate on the GUESSED-FILL shape: only rewrite a body that
+            # actually guesses the fill name; abstain on any other
+            # setSliderValue shape (already-rewritten or unrelated) so a future
+            # reshape is flagged by the coverage guard, not silently mangled.
+            if not _has_guessed_fill(body):
+                search_from = end_idx
+                continue
+            src = src[:start] + _CANONICAL_SLIDER_SETTER + src[end_idx:]
+            search_from = start + len(_CANONICAL_SLIDER_SETTER)
+            fixes += 1
+            log.info(
+                "  Rewrote setSliderValue in '%s' to path-aware fail-loud "
+                "resize", s.name,
+            )
+        # SECOND shape: the inlined guessed-fill resolution (faithful OOP HUD
+        # with NO setSliderValue). Localized RHS rewrite + one-shot helper
+        # injection. Runs on the post-legacy-rewrite source so the canonical
+        # setter body (which holds a variable ``segment``, not a guessed
+        # literal) is never matched.
+        src, inline_count = _rewrite_inline_guessed_fill(src)
+        if inline_count:
+            fixes += inline_count
+            log.info(
+                "  Rewrote %d inlined guessed-fill resolution(s) in '%s' to "
+                "_resolveSliderFill(frame)", inline_count, s.name,
+            )
+        s.source = src
+    # Coverage guard runs on the post-rewrite scripts.
+    _guard_slider_fill_coverage(scripts)
     return fixes

@@ -1567,6 +1567,352 @@ class TestClickBindingProductionDomainWiring:
         assert not place.unsupported_onclick_bindings
 
 
+class TestSliderFillElement:
+    """Slider fill-path producer (slice 1.1) — criteria 1-4.
+
+    Validates the MonoBehaviour-serialized Slider dispatch (D-1), the
+    ``SliderFillElement`` relative-path emission, the abstain paths, and the
+    pure ``_relative_fill_path`` helper.
+    """
+
+    @staticmethod
+    def _node(
+        name: str, file_id: str,
+        parent_file_id: str | None = None,
+        components: list[ComponentData] | None = None,
+        children: list[SceneNode] | None = None,
+    ) -> SceneNode:
+        return SceneNode(
+            name=name,
+            file_id=file_id,
+            active=True,
+            layer=0,
+            tag="Untagged",
+            components=components or [],
+            children=children or [],
+            parent_file_id=parent_file_id,
+        )
+
+    def _simplefps_tree(self):
+        """Build a SimpleFPS-shaped tree:
+
+            Health (slider GO, MonoBehaviour w/ m_FillRect -> RectTransform 'rt')
+              Back
+                CurHealth   (the fill GO; owns RectTransform 'rt')
+
+        Returns (health_node, node_index, component_owner_index).
+        """
+        from converter.ui_translator import build_component_owner_index
+
+        # CurHealth GO owns the RectTransform component 'rt' (the m_FillRect target).
+        cur_health = self._node(
+            "CurHealth", file_id="cur", parent_file_id="back",
+            components=[
+                ComponentData(component_type="RectTransform", file_id="rt", properties={}),
+            ],
+        )
+        back = self._node(
+            "Back", file_id="back", parent_file_id="health",
+            children=[cur_health],
+        )
+        health = self._node(
+            "Health", file_id="health", parent_file_id=None,
+            components=[
+                ComponentData(
+                    component_type="MonoBehaviour", file_id="slidercomp",
+                    properties={
+                        "m_FillRect": {"fileID": "rt"},
+                        "m_Direction": 0,
+                        "m_MinValue": 0,
+                        "m_MaxValue": 1,
+                        "m_Value": 1,
+                    },
+                ),
+            ],
+            children=[back],
+        )
+        node_index = {n.file_id: n for n in (health, back, cur_health)}
+        component_owner_index = build_component_owner_index([health])
+        return health, node_index, component_owner_index
+
+    # --- Criterion 1: writer fires on the MonoBehaviour-serialized Slider. ---
+    def test_writer_fires_on_monobehaviour_slider(self):
+        from converter.ui_translator import _apply_slider_properties
+        from core.roblox_types import RbxUIElement
+
+        health, node_index, owner_index = self._simplefps_tree()
+        element = RbxUIElement(class_name="Frame", name="Health")
+        _apply_slider_properties(
+            element, health.components[0].properties,
+            node=health,
+            component_owner_index=owner_index,
+            node_index=node_index,
+        )
+        assert element.attributes["SliderFillElement"] == "Back/CurHealth"
+
+    def test_dispatch_fires_via_convert_ui_element(self):
+        """End-to-end through the dispatch: a MonoBehaviour Slider (no literal
+        ``component_type=='Slider'``) gets the attribute via ``_convert_ui_element``."""
+        from converter.ui_translator import _convert_ui_element, build_component_owner_index
+
+        health, node_index, _ = self._simplefps_tree()
+        owner_index = build_component_owner_index([health])
+        element = _convert_ui_element(
+            health, scene_namespace="",
+            component_owner_index=owner_index,
+            node_index=node_index,
+        )
+        assert element is not None
+        assert element.attributes["SliderFillElement"] == "Back/CurHealth"
+
+    def test_dispatch_does_not_misfire_on_non_slider_monobehaviour(self):
+        """Mis-fire guard (codex P2): a non-Slider MonoBehaviour WITHOUT
+        ``m_FillRect`` must NOT be treated as a slider — no ``SliderFillElement``,
+        ``MinValue``, ``MaxValue``, or ``SliderDirection`` attributes. The
+        dispatch keys solely on ``m_FillRect`` presence, so an arbitrary
+        MonoBehaviour script (no fill ref) abstains cleanly."""
+        from converter.ui_translator import _convert_ui_element, build_component_owner_index
+
+        other = self._node(
+            "SomeWidget", file_id="widget", parent_file_id=None,
+            components=[
+                ComponentData(
+                    component_type="MonoBehaviour", file_id="othercomp",
+                    # No m_FillRect; even carries Min/Max-shaped fields that a
+                    # naive dispatch might mistake for a slider.
+                    properties={"m_MinValue": 5, "m_MaxValue": 10, "m_Value": 7},
+                ),
+            ],
+        )
+        node_index = {"widget": other}
+        owner_index = build_component_owner_index([other])
+        element = _convert_ui_element(
+            other, scene_namespace="",
+            component_owner_index=owner_index,
+            node_index=node_index,
+        )
+        assert element is not None
+        assert "SliderFillElement" not in element.attributes
+        assert "MinValue" not in element.attributes
+        assert "MaxValue" not in element.attributes
+        assert "SliderDirection" not in element.attributes
+
+    # --- Criterion 2: Min/Max/Value/Direction still emitted (no regression). ---
+    def test_writer_still_emits_minmax_value_direction(self):
+        from converter.ui_translator import _apply_slider_properties
+        from core.roblox_types import RbxUIElement
+
+        health, node_index, owner_index = self._simplefps_tree()
+        element = RbxUIElement(class_name="Frame", name="Health")
+        _apply_slider_properties(
+            element, health.components[0].properties,
+            node=health,
+            component_owner_index=owner_index,
+            node_index=node_index,
+        )
+        assert element.attributes["MinValue"] == 0.0
+        assert element.attributes["MaxValue"] == 1.0
+        assert element.attributes["Value"] == 1.0
+        assert element.attributes["SliderDirection"] == 0
+
+    # --- Criterion 3: writer abstains correctly. ---
+    def test_abstain_on_zero_fillrect(self):
+        from converter.ui_translator import _apply_slider_properties
+        from core.roblox_types import RbxUIElement
+
+        health, node_index, owner_index = self._simplefps_tree()
+        props = dict(health.components[0].properties)
+        props["m_FillRect"] = {"fileID": "0"}
+        element = RbxUIElement(class_name="Frame", name="Health")
+        _apply_slider_properties(
+            element, props, node=health,
+            component_owner_index=owner_index, node_index=node_index,
+        )
+        assert "SliderFillElement" not in element.attributes
+        # Min/Max still emitted.
+        assert element.attributes["MinValue"] == 0.0
+
+    def test_abstain_on_non_descendant_fill(self):
+        from converter.ui_translator import _apply_slider_properties, build_component_owner_index
+        from core.roblox_types import RbxUIElement
+
+        # Fill GO is a sibling root, NOT a descendant of the slider.
+        outside = self._node(
+            "Outside", file_id="out", parent_file_id=None,
+            components=[
+                ComponentData(component_type="RectTransform", file_id="rt", properties={}),
+            ],
+        )
+        health = self._node(
+            "Health", file_id="health", parent_file_id=None,
+            components=[
+                ComponentData(
+                    component_type="MonoBehaviour", file_id="slidercomp",
+                    properties={"m_FillRect": {"fileID": "rt"}, "m_MinValue": 0, "m_MaxValue": 1},
+                ),
+            ],
+        )
+        node_index = {n.file_id: n for n in (health, outside)}
+        owner_index = build_component_owner_index([health, outside])
+        element = RbxUIElement(class_name="Frame", name="Health")
+        _apply_slider_properties(
+            element, health.components[0].properties,
+            node=health, component_owner_index=owner_index, node_index=node_index,
+        )
+        assert "SliderFillElement" not in element.attributes
+        assert element.attributes["MinValue"] == 0.0
+
+    def test_abstain_on_legacy_caller(self):
+        """No indices threaded (legacy/synthetic) -> no SliderFillElement, but
+        Min/Max still emitted."""
+        from converter.ui_translator import _apply_slider_properties
+        from core.roblox_types import RbxUIElement
+
+        element = RbxUIElement(class_name="Frame", name="Health")
+        _apply_slider_properties(
+            element,
+            {"m_FillRect": {"fileID": "rt"}, "m_MinValue": 0, "m_MaxValue": 1},
+        )
+        assert "SliderFillElement" not in element.attributes
+        assert element.attributes["MinValue"] == 0.0
+
+    # --- Criterion 4: _relative_fill_path is grandchild-correct. ---
+    def test_relative_fill_path_direct_child(self):
+        from converter.ui_translator import _relative_fill_path
+
+        slider = self._node("Health", file_id="health")
+        fill = self._node("CurHealth", file_id="cur", parent_file_id="health")
+        node_index = {"health": slider, "cur": fill}
+        assert _relative_fill_path(slider, "cur", node_index) == "CurHealth"
+
+    def test_relative_fill_path_grandchild(self):
+        from converter.ui_translator import _relative_fill_path
+
+        slider = self._node("Health", file_id="health")
+        back = self._node("Back", file_id="back", parent_file_id="health")
+        fill = self._node("CurHealth", file_id="cur", parent_file_id="back")
+        node_index = {"health": slider, "back": back, "cur": fill}
+        assert _relative_fill_path(slider, "cur", node_index) == "Back/CurHealth"
+
+    def test_relative_fill_path_non_descendant_returns_none(self):
+        from converter.ui_translator import _relative_fill_path
+
+        slider = self._node("Health", file_id="health")
+        # Fill chains up to a different root, never hitting the slider.
+        other = self._node("Other", file_id="other", parent_file_id=None)
+        fill = self._node("CurHealth", file_id="cur", parent_file_id="other")
+        node_index = {"health": slider, "other": other, "cur": fill}
+        assert _relative_fill_path(slider, "cur", node_index) is None
+
+    def test_relative_fill_path_cycle_returns_none(self):
+        from converter.ui_translator import _relative_fill_path
+
+        slider = self._node("Health", file_id="health")
+        # a -> b -> a cycle that never reaches the slider; bounded loop -> None.
+        a = self._node("A", file_id="a", parent_file_id="b")
+        b = self._node("B", file_id="b", parent_file_id="a")
+        node_index = {"health": slider, "a": a, "b": b}
+        assert _relative_fill_path(slider, "a", node_index) is None
+
+    def test_relative_fill_path_fill_is_slider_returns_none(self):
+        from converter.ui_translator import _relative_fill_path
+
+        slider = self._node("Health", file_id="health")
+        node_index = {"health": slider}
+        # The fill GO IS the slider -> no descendant segments -> None.
+        assert _relative_fill_path(slider, "health", node_index) is None
+
+    # --- FIX 4 (pins FIX 1): un-encodable segment names -> abstain (None). ---
+    def test_relative_fill_path_empty_intermediate_name_returns_none(self):
+        from converter.ui_translator import _relative_fill_path
+
+        # An intermediate GameObject with an EMPTY name can't round-trip the
+        # "/"-joined encoding (the reader would skip the empty segment and
+        # mis-resolve), so the writer must abstain rather than emit "/CurHealth".
+        slider = self._node("Health", file_id="health")
+        back = self._node("", file_id="back", parent_file_id="health")
+        fill = self._node("CurHealth", file_id="cur", parent_file_id="back")
+        node_index = {"health": slider, "back": back, "cur": fill}
+        assert _relative_fill_path(slider, "cur", node_index) is None
+
+    def test_relative_fill_path_slash_in_name_returns_none(self):
+        from converter.ui_translator import _relative_fill_path
+
+        # A segment name containing "/" would split into fake segments; abstain.
+        slider = self._node("Health", file_id="health")
+        fill = self._node("Cur/Health", file_id="cur", parent_file_id="health")
+        node_index = {"health": slider, "cur": fill}
+        assert _relative_fill_path(slider, "cur", node_index) is None
+
+    # --- Acceptance: REAL convert_scene threads node_index=all_nodes (FIX 1). ---
+    def test_convert_scene_threads_node_index_to_slider(self, tmp_path):
+        """Drive a parsed scene through the REAL top-level ``convert_scene`` entry
+        (NOT a hand-threaded ``convert_canvas`` call) and assert the converted
+        slider Frame carries ``SliderFillElement == "Back/CurHealth"``.
+
+        This is the ONLY test that exercises the
+        ``node_index=parsed_scene.all_nodes`` threading at ``scene_converter.py``:
+        every other slider test passes ``node_index`` in by hand, so a regression
+        on that threading line (e.g. dropping the kwarg or passing ``None``) would
+        slip past them. Verified RED when the threading is broken.
+        """
+        from pathlib import Path
+        from converter.scene_converter import convert_scene
+        from core.unity_types import ParsedScene
+
+        # Build the SimpleFPS-shaped slider subtree UNDER a Canvas root so
+        # ``find_canvas_nodes`` picks it up and ``convert_scene`` converts it.
+        health, node_index, _ = self._simplefps_tree()
+        health.parent_file_id = "canvas"
+        canvas = self._node(
+            "Canvas", file_id="canvas", parent_file_id=None,
+            components=[
+                ComponentData(
+                    component_type="Canvas", file_id="canvascomp",
+                    properties={"m_Enabled": 1},
+                ),
+            ],
+            children=[health],
+        )
+        # ``all_nodes`` is the scene-wide fileID->SceneNode map convert_scene
+        # threads as ``node_index``. Populate it with EVERY node (canvas + the
+        # slider subtree) exactly as the real parser would.
+        all_nodes = {canvas.file_id: canvas}
+        all_nodes.update(node_index)
+
+        project_root = tmp_path / "proj"
+        (project_root / "Assets" / "Scenes").mkdir(parents=True)
+        parsed = ParsedScene(
+            scene_path=Path(project_root) / "Assets" / "Scenes" / "Main.unity",
+            roots=[canvas],
+            all_nodes=all_nodes,
+        )
+        place = convert_scene(
+            parsed_scene=parsed,
+            unity_project_root=project_root,
+            scene_runtime=None,
+            scene_runtime_mode="generic",
+        )
+
+        # Walk the converted ScreenGui tree for the Health (slider) Frame.
+        def _find(elements, name):
+            for el in elements:
+                if el.name == name:
+                    return el
+                hit = _find(el.children, name)
+                if hit is not None:
+                    return hit
+            return None
+
+        health_frame = None
+        for gui in place.screen_guis:
+            health_frame = _find(gui.elements, "Health")
+            if health_frame is not None:
+                break
+        assert health_frame is not None, "Health slider Frame not converted"
+        assert health_frame.attributes["SliderFillElement"] == "Back/CurHealth"
+
+
 class TestBackgroundTransparencyFromGraphic:
     """``_convert_ui_element`` sets ``background_transparency`` from a node's
     fill-painting Image/RawImage graphic (``1.0 - m_Color.a``), and 1.0 (fully
