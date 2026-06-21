@@ -4300,4 +4300,76 @@ P2-HARDEN: setActive dispatch now accepts a userdata Instance arg (`elseif type(
   both the legacy pack (RbxScript.source) and the generic lowering (TranspiledScript.luau_source)
   reuse one implementation cleanly — avoid a shallow porting bug. Classification: Mechanical.
 - Residuals (flagged, out of scope for the LTR health-bar symptom): RTL/BottomToTop direction-aware
-  resize (would need the host route); generic method-form coverage (fail-loud guard makes drift observable).
+  resize (would need the host route); generic method-form coverage (fail-loud guard makes drift observable).## /drive run gap4-boot-ordering-20260621T101429 (2026-06-21T06:37:24Z)
+
+# Decisions — gap4-boot-ordering
+
+## Phase 1 (detailed design — design-phase1.md)
+
+- **D1 — Pass-2 lifecycle order = scene batches THEN placement batches.**
+  Classification: Mechanical. Preserve today's relative scene-then-placement batch order; do
+  not re-sort. Minimal reorder that restores the contract; any re-sort is out-of-scope.
+
+- **D2 — Split placement seed-all (F2') from construct-all (F3') into two passes over
+  `placementOrder`.** Classification: Mechanical. Needed for correct `activeInHierarchy` when a
+  placement parents under a later-sorted placement; without it a child placement's construct
+  could read an unseeded parent `_goParentId`/`_goActiveSelf` entry.
+
+- **D3 — EXISTENCE-not-READINESS is the deliberate bounded scope.** Classification:
+  User-Challenge. Acceptance (i) probes a non-nil placement OBJECT at the scene comp's OnEnable,
+  NOT a placement-Awake-set field value. Full Awake-interleave (Option B) is OUT OF SCOPE, gated
+  on evidence a real conversion needs it (none today — the 85 refs need only object identity +
+  `.gameObject`). State the claim as "refs EXIST before lifecycle", not "Unity lifecycle restored".
+
+- **D4 — Update the existing `test_scene_runtime_stripped_refs.py` `fieldDuringWire == nil`
+  assertion IN PLACE to the new OnEnable-non-nil contract.** Classification: Taste. The old
+  assertion encodes the pre-fix contract (drain after lifecycle) and is now factually wrong;
+  leaving it would be a contradictory/green-for-wrong-reason guard. Retain the no-drain RED test
+  as acceptance-(i) RED proof (a); add a "drain stays late" RED variant for proof (b).
+
+## Phase 1 — Slice 1.1 implementer notes (impl decisions)
+
+- **I1 — Renamed the old `TestStrippedRefBindsAfterPlacementDrain` class to
+  `TestStrippedRefExistsBeforeSceneLifecycle` and re-authored its scenario to probe at the scene
+  comp's `OnEnable` (and `Awake`), asserting non-nil object + non-nil `.gameObject`.**
+  Classification: Taste. The old class name and `WIRE_NIL_OK`/`fieldDuringWire == nil` assertion
+  encoded the pre-fix "nil before drain" contract; D4 mandates inverting it. The acceptance-(i)
+  GREEN test FAILS against pre-reorder code (stash-verified: `ONENABLE_NIL`) → real regression guard.
+
+- **I2 — RED proof (a) vs (b) split per review MINOR #1.** Classification: Mechanical. Proof (a)
+  (`drain_mode="absent"`) shadows the drain to a no-op for the whole run → proves the DRAIN is
+  load-bearing. Proof (b) (`drain_mode="stays_late"`) suppresses the early drain DURING `start()`
+  and invokes the real drain only AFTER `start()` returns → the pre-reorder order (drain present
+  but late) → ref nil at the OnEnable probe → proves the EARLY POSITION is load-bearing. Distinct
+  models, not duplicative.
+
+- **I3 — Two-pass placement split realized as `placementBuildOrder` accumulator.** Classification:
+  Mechanical. PASS 1a resolves each `placement_clone` exactly once (the resolver consumes
+  `boundClones`) + seeds all parent maps, capturing `{placement_clone, prefab, prefab_id,
+  p_placement_id}`; PASS 1b iterates that captured list to `_constructPrefabClone` (never
+  re-resolving) and collects each `componentList`. Honors codex MINOR #1 (cache clone across passes).
+
+- **I4 — `converter/.cache` (LLM cache, created by running luau-gated tests) left UNTRACKED and NOT
+  committed.** Classification: Mechanical. Generated artifact; not part of the slice diff.
+
+## /drive run ui-bare-container-transparency (2026-06-21)
+
+# Decisions — ui-bare-container-transparency
+
+- **D1 — Key off presence of an Image/RawImage graphic** (reuse existing ImageLabel-promotion
+  signal: `_UI_CLASS_MAP`→ImageLabel, or MonoBehaviour with `m_Sprite`/`_is_ui_image_mb`).
+  Classification: Mechanical/structural. The deterministic upstream source the task names;
+  avoids regex/fingerprint on generated output.
+- **D2 — Post-pass guard at the build site** (`if not has_image_graphic: background_transparency
+  = 1.0`), not a `core/roblox_types.py` default change. Classification: Mechanical. The default
+  can't know per-element graphic presence; the build site can; keeps non-UI consumers undisturbed.
+- **D3 — Leave Button/ScrollingFrame/TextBox/widget edge classes to existing handlers; no
+  Button-background-image special case.** Classification: Taste (scope). Symptom is bare
+  containers; Button image fill is a separate non-blocking concern → followup if e2e surfaces it.
+
+- **HARDEN scope-widening (Mechanical, root-cause of a flagged P1).** The alpha-crash P1
+  (`float(col.get("a",1.0))` on non-numeric `m_Color.a`) also lived in the pre-existing
+  `_apply_image_properties` (ui_translator.py, runs before the post-pass for Image elements), so
+  the regression test stayed RED until BOTH sites were fixed. A `_coerce_alpha` helper (mirrors
+  the file's `_coerce_int`) is now applied at both sites — same file, in the phase's surface,
+  completing design edge-10's malformed-m_Color defensive commitment. Surface at Gate B.
