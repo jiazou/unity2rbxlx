@@ -4,6 +4,10 @@ from converter.ui_translator import _extract_rect_transform, _apply_text_propert
 from core.roblox_types import RbxUIElement
 from core.unity_types import ComponentData, SceneNode
 
+# UnityEngine.UI.Image script GUID (prefix-matched by ``_is_ui_image_mb``); used
+# by the background-transparency tests to forge a real Image MonoBehaviour shape.
+IMAGE_GUID_GLOBAL = "fe87c0e1cc204ed48ad3e3b5e8b2e000"
+
 
 class TestRectTransform:
     """Tests for Unity RectTransform to Roblox UDim2 conversion."""
@@ -1560,3 +1564,280 @@ class TestClickBindingProductionDomainWiring:
         assert isinstance(rows, list) and len(rows) == 1, scene_runtime
         assert rows[0]["method"] == "StartGame"
         assert not place.unsupported_onclick_bindings
+
+
+class TestBackgroundTransparencyFromGraphic:
+    """``_convert_ui_element`` sets ``background_transparency`` authoritatively
+    from a node's fill-painting Image/RawImage Graphic (``1.0 - m_Color.a``), and
+    1.0 (fully transparent) when the node owns no graphic.
+
+    Keyed on the SAME image-promotion signal the element-class logic uses
+    (``_UI_CLASS_MAP``->ImageLabel, or a MonoBehaviour with ``m_Sprite`` /
+    ``_is_ui_image_mb``) — never a bare ``m_Texture`` heuristic, never a name match.
+    Image graphics are their own component (Unity widgets serialize as
+    MonoBehaviour + m_Script, the Image is a separate Graphic component).
+    """
+
+    NS = "Assets/Scenes/Main.unity"
+
+    @staticmethod
+    def _node(
+        name: str, file_id: str, *,
+        components: list[ComponentData] | None = None,
+    ) -> SceneNode:
+        return SceneNode(
+            name=name,
+            file_id=file_id,
+            active=True,
+            layer=0,
+            tag="Untagged",
+            components=components or [],
+            children=[],
+            parent_file_id=None,
+        )
+
+    def _convert(self, node: SceneNode) -> RbxUIElement:
+        from converter.ui_translator import _convert_ui_element
+        element = _convert_ui_element(node, scene_namespace=self.NS)
+        assert element is not None
+        return element
+
+    # --- AC1: bare container (no graphic) -> 1.0 -----------------------------
+    def test_bare_container_is_transparent(self):
+        """AC1 — a RectTransform-only container (no Image/RawImage graphic)
+        renders nothing in Unity, so it must be fully transparent (1.0)."""
+        node = self._node(
+            "CharZone", "10",
+            components=[ComponentData(
+                component_type="RectTransform", file_id="rt",
+                properties={"m_SizeDelta": {"x": 100, "y": 100}},
+            )],
+        )
+        assert self._convert(node).background_transparency == 1.0
+
+    def test_bare_container_no_components_is_transparent(self):
+        """AC1 — a node with no components at all (Frame default) -> 1.0."""
+        assert self._convert(self._node("WholeUI", "11")).background_transparency == 1.0
+
+    # --- AC2/AC3: literal ImageLabel alpha -> 1.0 - alpha --------------------
+    def test_imagelabel_opaque(self):
+        """AC2 — literal Image component, m_Color.a == 1.0 -> 0.0 (opaque)."""
+        node = self._node(
+            "Panel", "20",
+            components=[ComponentData(
+                component_type="Image", file_id="C",
+                properties={"m_Color": {"r": 1, "g": 1, "b": 1, "a": 1.0}},
+            )],
+        )
+        assert self._convert(node).background_transparency == 0.0
+
+    def test_imagelabel_half_alpha(self):
+        """AC3 — literal Image, m_Color.a == 0.5 -> 0.5."""
+        node = self._node(
+            "Panel", "21",
+            components=[ComponentData(
+                component_type="Image", file_id="C",
+                properties={"m_Color": {"r": 1, "g": 1, "b": 1, "a": 0.5}},
+            )],
+        )
+        assert self._convert(node).background_transparency == 0.5
+
+    # --- AC4: Button-with-Image (the load-bearing regression guard) ----------
+    def test_button_with_image_uses_image_own_alpha(self):
+        """AC4 — a Button (MonoBehaviour + m_OnClick) on the SAME node as an
+        Image MB (m_Color.a == 0.784): element becomes TextButton (text handler
+        forces 1.0), but the post-pass finds the IMAGE MB and overrides to
+        1.0 - 0.784 == 0.216. The value MUST come from the Image MB's OWN
+        m_Color — NOT the merged ui_properties (the Button MB carries no
+        m_Color, so a merge would leave the Image's alpha intact, but a Button
+        carrying its own m_Color must not shadow the graphic's)."""
+        button_mb = ComponentData(
+            component_type="MonoBehaviour", file_id="btnComp",
+            properties={
+                # A Button serializes m_OnClick; give it its OWN m_Color to prove
+                # the post-pass reads the Image MB's color, not a merged/other one.
+                "m_OnClick": {"m_PersistentCalls": {"m_Calls": []}},
+                "m_Color": {"r": 1, "g": 1, "b": 1, "a": 1.0},
+            },
+        )
+        image_mb = ComponentData(
+            component_type="MonoBehaviour", file_id="imgComp",
+            properties={
+                "m_Sprite": {"fileID": 0},
+                "m_Color": {"r": 0.0, "g": 0.784, "b": 0.784, "a": 0.784},
+            },
+        )
+        node = self._node("MenuButton", "30", components=[button_mb, image_mb])
+        element = self._convert(node)
+        assert element.class_name == "TextButton"
+        assert abs(element.background_transparency - (1.0 - 0.784)) < 1e-9
+        assert element.background_transparency != 1.0
+
+    # --- AC5: TextBox (InputField) with Image -> 1.0 - alpha -----------------
+    def test_textbox_with_image_partial_alpha(self):
+        """AC5 — an InputField (TextBox) node owning an Image with partial
+        alpha: text handler forces 1.0, post-pass -> 1.0 - alpha."""
+        node = self._node(
+            "NameInput", "40",
+            components=[
+                ComponentData(
+                    component_type="InputField", file_id="ifComp",
+                    properties={"m_Text": ""},
+                ),
+                ComponentData(
+                    component_type="MonoBehaviour", file_id="imgComp",
+                    properties={
+                        "m_Sprite": {"fileID": 0},
+                        "m_Color": {"r": 1, "g": 1, "b": 1, "a": 0.25},
+                    },
+                ),
+            ],
+        )
+        element = self._convert(node)
+        assert element.class_name == "TextBox"
+        assert abs(element.background_transparency - 0.75) < 1e-9
+
+    # --- AC6: ScrollRect (ScrollingFrame) with Image -> 1.0 - alpha ----------
+    def test_scrollrect_with_image_partial_alpha(self):
+        """AC6 — a ScrollRect (ScrollingFrame) owning an Image with partial
+        alpha -> 1.0 - alpha (NOT the 0.0 opaque default it was stuck at)."""
+        node = self._node(
+            "ListView", "50",
+            components=[
+                ComponentData(
+                    component_type="ScrollRect", file_id="srComp",
+                    properties={"m_Horizontal": 0, "m_Vertical": 1},
+                ),
+                ComponentData(
+                    component_type="MonoBehaviour", file_id="imgComp",
+                    properties={
+                        "m_Sprite": {"fileID": 0},
+                        "m_Color": {"r": 1, "g": 1, "b": 1, "a": 0.6},
+                    },
+                ),
+            ],
+        )
+        element = self._convert(node)
+        assert element.class_name == "ScrollingFrame"
+        assert abs(element.background_transparency - 0.4) < 1e-9
+
+    # --- AC7: literal RawImage detected; bare-MB RawImage NOT detected -------
+    def test_literal_rawimage_component_type_detected(self):
+        """AC7 — a literal ``RawImage`` component_type (so
+        ``_UI_CLASS_MAP["RawImage"]=="ImageLabel"``) with m_Color.a -> 1.0-a."""
+        node = self._node(
+            "RawPanel", "60",
+            components=[ComponentData(
+                component_type="RawImage", file_id="C",
+                properties={"m_Color": {"r": 1, "g": 1, "b": 1, "a": 0.3}},
+            )],
+        )
+        element = self._convert(node)
+        assert element.class_name == "ImageLabel"
+        assert abs(element.background_transparency - 0.7) < 1e-9
+
+    def test_bare_monobehaviour_rawimage_only_texture_not_detected(self):
+        """AC7 — a RawImage left as a bare MonoBehaviour (only m_Texture, no
+        m_Sprite, not the Image GUID) is NOT a detected graphic -> 1.0
+        (transparent, the SAFE direction; not promoted, renders no texture)."""
+        node = self._node(
+            "RawBare", "61",
+            components=[ComponentData(
+                component_type="MonoBehaviour", file_id="C",
+                properties={
+                    "m_Texture": {"fileID": 0, "guid": "abc123"},
+                    "m_Color": {"r": 1, "g": 1, "b": 1, "a": 1.0},
+                },
+            )],
+        )
+        assert self._convert(node).background_transparency == 1.0
+
+    # --- AC8: pure TextLabel -> 1.0 -----------------------------------------
+    def test_pure_textlabel_is_transparent(self):
+        """AC8 — a pure Text node: its m_Color is the TEXT color, NOT a fill
+        alpha. No Image/RawImage graphic -> 1.0 (transparent)."""
+        node = self._node(
+            "Title", "70",
+            components=[ComponentData(
+                component_type="Text", file_id="C",
+                properties={
+                    "m_Text": "Hello",
+                    "m_Color": {"r": 1, "g": 0, "b": 0, "a": 1.0},
+                },
+            )],
+        )
+        element = self._convert(node)
+        assert element.class_name == "TextLabel"
+        assert element.background_transparency == 1.0
+
+    def test_text_monobehaviour_is_transparent(self):
+        """AC8 — a TMP/Text MonoBehaviour (m_Text, m_Color, no m_Sprite, not
+        the Image GUID) -> TextLabel and 1.0 (the text color is not a fill)."""
+        node = self._node(
+            "Score", "71",
+            components=[ComponentData(
+                component_type="MonoBehaviour", file_id="C",
+                properties={
+                    "m_text": "0",
+                    "m_Color": {"r": 1, "g": 1, "b": 1, "a": 1.0},
+                },
+            )],
+        )
+        element = self._convert(node)
+        assert element.class_name == "TextLabel"
+        assert element.background_transparency == 1.0
+
+    # --- Edge: Image MB missing m_Color -> opaque (Unity default) -----------
+    def test_image_missing_color_is_opaque(self):
+        """E9 — an Image MB with NO m_Color: default alpha 1.0 -> 0.0 (opaque),
+        matching Unity's default opaque-white Image."""
+        node = self._node(
+            "Plain", "80",
+            components=[ComponentData(
+                component_type="MonoBehaviour", file_id="C",
+                properties={"m_Sprite": {"fileID": 0}},
+            )],
+        )
+        assert self._convert(node).background_transparency == 0.0
+
+    def test_image_color_not_a_dict_is_opaque(self):
+        """E10 — a malformed m_Color (not a dict) is guarded -> alpha 1.0 ->
+        0.0 opaque, no crash."""
+        node = self._node(
+            "Malformed", "81",
+            components=[ComponentData(
+                component_type="MonoBehaviour", file_id="C",
+                properties={"m_Sprite": {"fileID": 0}, "m_Color": "not-a-dict"},
+            )],
+        )
+        assert self._convert(node).background_transparency == 0.0
+
+    def test_is_ui_image_mb_guid_detected(self):
+        """An Image subclass MonoBehaviour with NO m_Sprite but the Image
+        script GUID is detected via ``_is_ui_image_mb`` -> 1.0 - alpha."""
+        node = self._node(
+            "Subclass", "90",
+            components=[ComponentData(
+                component_type="MonoBehaviour", file_id="C",
+                properties={
+                    "m_Script": {"fileID": 11500000, "guid": IMAGE_GUID_GLOBAL},
+                    "m_Color": {"r": 1, "g": 1, "b": 1, "a": 0.2},
+                },
+            )],
+        )
+        assert abs(self._convert(node).background_transparency - 0.8) < 1e-9
+
+    # --- AC9: text_color / background_color (RGB) / image unchanged ----------
+    def test_other_properties_unchanged_for_image(self):
+        """AC9 — only background_transparency changes; the RGB tint
+        (background_color) from the Image's m_Color is still applied."""
+        node = self._node(
+            "Tinted", "100",
+            components=[ComponentData(
+                component_type="Image", file_id="C",
+                properties={"m_Color": {"r": 0.0, "g": 0.784, "b": 0.784, "a": 0.5}},
+            )],
+        )
+        element = self._convert(node)
+        assert element.background_transparency == 0.5
+        assert element.background_color == (0.0, 0.784, 0.784)
