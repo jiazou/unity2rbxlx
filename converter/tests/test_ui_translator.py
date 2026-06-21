@@ -1132,3 +1132,431 @@ class TestInactiveUiSubtreeEmission:
         # inactive subtree was recursed into rather than dropped at the root.
         assert f"{self.NS}:1834564028" in sris
         assert f"{self.NS}:375939466" in sris
+
+
+class TestClickBindingEmit:
+    """``_emit_click_bindings`` (via ``_convert_ui_element``) emits one
+    CANDIDATE ``ClickBinding`` per dispatchable onClick call, and records the
+    static-arg / unresolvable rest in the unsupported accumulator.
+    Component-precise (registry key), fail-loud. The DOMAIN gate is DEFERRED to
+    a post-classification reclassification step (design AMENDMENT r3) -- stage 1
+    is domain-AGNOSTIC, so a server/excluded target still emits a candidate here
+    and is moved to unsupported later (see ``TestClickBindingDomainReclassify``).
+    NO transport attribute on the produced element.
+    """
+
+    NS = "Assets/Scenes/main.unity"
+
+    def _button_node(
+        self, *, button_fid: str, target_fid: str, method: str,
+        mode: int = 1, call_state: int = 2, name: str = "TheButton",
+        extra_calls: list | None = None,
+    ) -> SceneNode:
+        calls = [{
+            "m_MethodName": method,
+            "m_CallState": call_state,
+            "m_Mode": mode,
+            "m_Target": {"fileID": target_fid},
+        }]
+        if extra_calls:
+            calls.extend(extra_calls)
+        return SceneNode(
+            name=name, file_id=button_fid, active=True, layer=0, tag="Untagged",
+            components=[ComponentData(
+                component_type="MonoBehaviour", file_id=f"{button_fid}comp",
+                properties={"m_OnClick": {"m_PersistentCalls": {"m_Calls": calls}}},
+            )],
+            children=[], parent_file_id=None,
+        )
+
+    def _convert(self, node, *, owner_index, clicks, unsupported):
+        from converter.ui_translator import _convert_ui_element
+        return _convert_ui_element(
+            node, scene_namespace=self.NS,
+            component_owner_index=owner_index,
+            click_bindings=clicks,
+            unsupported_click_bindings=unsupported,
+        )
+
+    def test_client_target_emits_component_precise_row(self):
+        """A void-method (mode 1), owner-resolvable onClick emits ONE
+        component-precise CANDIDATE ClickBinding with the owning-GO SRI +
+        registry key. Domain-agnostic at this stage."""
+        owner = {"869760749": "869760744"}        # target comp -> owning GO
+        clicks: list = []
+        unsupported: list = []
+        node = self._button_node(
+            button_fid="500", target_fid="869760749", method="StartGame", mode=1,
+        )
+        element = self._convert(
+            node, owner_index=owner,
+            clicks=clicks, unsupported=unsupported,
+        )
+        assert unsupported == []
+        assert len(clicks) == 1
+        row = clicks[0]
+        assert row["button_sri"] == f"{self.NS}:500"
+        assert row["target_sri"] == f"{self.NS}:869760744"
+        assert row["target_component_id"] == f"{self.NS}:869760749"
+        assert row["method"] == "StartGame"
+        assert row["call_index"] == 0
+        # No transport attribute on the produced element.
+        assert "_OnClick" not in (element.attributes or {})
+
+    def test_server_target_still_emits_candidate_at_stage1(self):
+        """Domain is deferred: a target that will classify ``server`` STILL
+        emits a candidate at stage 1 (no domain consulted here). It is moved to
+        unsupported only by the post-classification reclassifier."""
+        owner = {"77": "70"}
+        clicks: list = []
+        unsupported: list = []
+        self._convert(
+            self._button_node(button_fid="9", target_fid="77", method="ServerOnly"),
+            owner_index=owner,
+            clicks=clicks, unsupported=unsupported,
+        )
+        assert len(clicks) == 1
+        assert clicks[0]["method"] == "ServerOnly"
+        assert unsupported == []
+
+    def test_static_argument_mode_recorded_unsupported(self):
+        """A static-argument call (m_Mode >= 2; here Bool=6) is unsupported --
+        the static-arg gate is at stage 1 (independent of domain)."""
+        owner = {"77": "70"}
+        clicks: list = []
+        unsupported: list = []
+        self._convert(
+            self._button_node(
+                button_fid="9", target_fid="77", method="SetActive", mode=6,
+            ),
+            owner_index=owner,
+            clicks=clicks, unsupported=unsupported,
+        )
+        assert clicks == []
+        assert unsupported[0]["reason"] == "static_argument"
+
+    def test_unresolved_target_recorded_unsupported(self):
+        """A target fileID absent from the owner index is unsupported -- the
+        owner-resolution gate is at stage 1 (independent of domain)."""
+        owner: dict = {}                       # nothing resolves
+        clicks: list = []
+        unsupported: list = []
+        self._convert(
+            self._button_node(button_fid="9", target_fid="77", method="X"),
+            owner_index=owner,
+            clicks=clicks, unsupported=unsupported,
+        )
+        assert clicks == []
+        assert unsupported[0]["reason"] == "unresolved_target"
+
+    def test_editor_and_runtime_call_state_emits(self):
+        """FIX 1: Unity UnityEventCallState is Off=0, EditorAndRuntime=1,
+        RuntimeOnly=2. BOTH EditorAndRuntime(1) and RuntimeOnly(2) invoke at
+        runtime, so an EditorAndRuntime(1) client-domain button MUST emit a
+        ClickBinding. RED against the pre-fix ``call_state >= 2`` gate, which
+        silently dropped EditorAndRuntime listeners (they shipped dead and never
+        reached the unsupported report).
+        """
+        owner = {"869760749": "869760744"}
+        clicks: list = []
+        unsupported: list = []
+        node = self._button_node(
+            button_fid="500", target_fid="869760749", method="StartGame",
+            mode=1, call_state=1,   # EditorAndRuntime
+        )
+        self._convert(
+            node, owner_index=owner,
+            clicks=clicks, unsupported=unsupported,
+        )
+        assert len(clicks) == 1, (clicks, unsupported)
+        assert clicks[0]["method"] == "StartGame"
+        assert unsupported == []
+
+    def test_off_call_state_neither_emits_nor_unsupported(self):
+        """FIX 1: an Off(0) listener is deliberately disabled in Unity -- it
+        does NOT invoke at runtime, so it correctly emits NO ClickBinding AND is
+        NOT recorded as unsupported (a disabled listener is not a binding this
+        version 'cannot honor', it's one the author turned off)."""
+        owner = {"77": "70"}
+        clicks: list = []
+        unsupported: list = []
+        node = self._button_node(
+            button_fid="9", target_fid="77", method="Disabled",
+            mode=1, call_state=0,   # Off
+        )
+        self._convert(
+            node, owner_index=owner,
+            clicks=clicks, unsupported=unsupported,
+        )
+        assert clicks == []
+        assert unsupported == []
+
+    def test_multi_call_preserves_order_and_call_index(self):
+        """Two onClick calls -> two rows, call_index 0 and 1 in order."""
+        owner = {"10": "100", "20": "200"}
+        clicks: list = []
+        unsupported: list = []
+        node = self._button_node(
+            button_fid="9", target_fid="10", method="First", mode=1,
+            extra_calls=[{
+                "m_MethodName": "Second", "m_CallState": 2, "m_Mode": 1,
+                "m_Target": {"fileID": "20"},
+            }],
+        )
+        self._convert(
+            node, owner_index=owner,
+            clicks=clicks, unsupported=unsupported,
+        )
+        assert [r["method"] for r in clicks] == ["First", "Second"]
+        assert [r["call_index"] for r in clicks] == [0, 1]
+
+    def test_real_main_unity_startbutton_emits_loadout_candidate(self):
+        """Acceptance (i, stage 1): the REAL trash-dash Main.unity StartButton
+        emits a CANDIDATE ClickBinding -> the LoadoutState-owning GameObject,
+        method StartGame, with the real owner-resolved SRI + registry key. The
+        domain is NOT consulted at this stage (deferred to reclassification);
+        the candidate emits regardless of domain.
+
+        Real-corpus only: skips (does NOT substitute synthetic data) when the
+        scene is absent. Drives the converter's own scene_parser +
+        build_component_owner_index, exactly the production resolution path.
+        """
+        import pytest
+        from pathlib import Path
+        from converter.ui_translator import (
+            find_canvas_nodes, convert_canvas, build_component_owner_index,
+        )
+
+        scene = Path("/Users/jiazou/workspace/trash-dash/Assets/Scenes/Main.unity")
+        if not scene.exists():
+            pytest.skip("trash-dash Main.unity not present in this env")
+        from unity.scene_parser import parse_scene
+        parsed = parse_scene(scene)
+
+        owner = build_component_owner_index(parsed.roots)
+        canvases = find_canvas_nodes(parsed.roots)
+        clicks: list = []
+        unsupported: list = []
+        convert_canvas(
+            canvases, scene_namespace=self.NS,
+            component_owner_index=owner,
+            click_bindings=clicks,
+            unsupported_click_bindings=unsupported,
+        )
+
+        # The StartButton -> StartGame call (target comp 869760749, owned by
+        # GO 869760744 = the Loadout GameObject) must emit a candidate binding.
+        start_rows = [
+            r for r in clicks
+            if r["method"] == "StartGame"
+            and r["target_component_id"] == f"{self.NS}:869760749"
+        ]
+        assert len(start_rows) == 1, (clicks, unsupported)
+        row = start_rows[0]
+        assert row["target_sri"] == f"{self.NS}:869760744"   # the Loadout GO
+
+    def test_real_main_unity_static_arg_buttons_unsupported(self):
+        """Real-corpus: the mode-6 (Bool static-arg) SetActive onClicks land in
+        the unsupported accumulator at stage 1, never as ClickBinding rows."""
+        import pytest
+        from pathlib import Path
+        from converter.ui_translator import (
+            find_canvas_nodes, convert_canvas, build_component_owner_index,
+        )
+
+        scene = Path("/Users/jiazou/workspace/trash-dash/Assets/Scenes/Main.unity")
+        if not scene.exists():
+            pytest.skip("trash-dash Main.unity not present in this env")
+        from unity.scene_parser import parse_scene
+        parsed = parse_scene(scene)
+        owner = build_component_owner_index(parsed.roots)
+        canvases = find_canvas_nodes(parsed.roots)
+        clicks: list = []
+        unsupported: list = []
+        convert_canvas(
+            canvases, scene_namespace=self.NS,
+            component_owner_index=owner,
+            click_bindings=clicks,
+            unsupported_click_bindings=unsupported,
+        )
+        static_arg = [u for u in unsupported if u["reason"] == "static_argument"]
+        # The About/BackButton SetActive(bool) onClicks are mode 6 -> static-arg.
+        assert any(u["method"] == "SetActive" for u in static_arg), unsupported
+
+
+class TestClickBindingProductionDomainWiring:
+    """AMENDMENT r3 (deferred two-stage domain gate): the domain feeding the
+    onClick gate is applied in a POST-classification reclassification step
+    (``Pipeline._reclassify_click_bindings_by_domain``), NOT at ``convert_scene``
+    time -- because the real pipeline stamps
+    ``scene_runtime["modules"][*]["domain"]`` only AFTER ``convert_scene`` runs.
+
+    These tests reproduce the REAL pipeline ORDERING, never a seeded-modules-at-
+    convert_scene tautology: stage 1 (``convert_scene`` with NO domains in the
+    modules map) emits a domain-agnostic CANDIDATE; stage 2 (the reclassifier,
+    fed the classified modules map) re-gates it. A client target stays in
+    ``ui_click_bindings``; a server target moves to
+    ``rbx_place.unsupported_onclick_bindings``. (Fully end-to-end through the
+    storage classifier is impractical in a unit test -- it needs the whole
+    transpile/classify pipeline -- so we feed the modules map in its classified
+    shape and assert the reclassifier, NOT a seeded-at-convert value, gates.)
+    """
+
+    def _stage1_emit(self, *, project_root, target_guid):
+        """Stage 1: run ``convert_scene`` with an UNCLASSIFIED modules map (NO
+        domains). Returns ``(place, parsed, scene_runtime)``. The candidate
+        ClickBinding must emit regardless of domain (domain deferred)."""
+        from converter.scene_converter import convert_scene
+        parsed = self._scene(project_root=project_root, target_guid=target_guid)
+        # Modules present (so the stage-2 gate is open) but domain UNSET at
+        # convert_scene time -- exactly the real pipeline ordering (the domain is
+        # stamped later by _classify_storage).
+        scene_runtime: dict = {"modules": {target_guid: {}}}
+        place = convert_scene(
+            parsed_scene=parsed,
+            unity_project_root=project_root,
+            scene_runtime=scene_runtime,
+            scene_runtime_mode="generic",
+        )
+        return place, parsed, scene_runtime
+
+    def _reclassify(self, *, project_root, place, parsed, scene_runtime):
+        """Stage 2: drive the REAL ``Pipeline._reclassify_click_bindings_by_domain``
+        against the now-classified modules map (domains stamped)."""
+        from converter.pipeline import Pipeline
+        pipe = Pipeline(unity_project_path=project_root, output_dir=project_root / "out")
+        pipe.state.rbx_place = place
+        pipe.state.parsed_scene = parsed
+        pipe.ctx.scene_runtime = scene_runtime
+        pipe.ctx.scene_runtime_mode = "generic"
+        pipe._reclassify_click_bindings_by_domain()
+
+    def test_candidate_emits_at_stage1_without_domain(self, tmp_path):
+        """Stage 1 (real ordering): ``convert_scene`` emits a candidate
+        ClickBinding even though the modules map carries NO domain yet. RED
+        against the pre-r3 code, which domain-gated at convert_scene and so
+        emitted ZERO bindings (every client target fell to unresolved_target)."""
+        project_root = tmp_path / "proj"
+        (project_root / "Assets" / "Scenes").mkdir(parents=True)
+        target_guid = "abc123def456abc123def456abc12345"
+        place, parsed, scene_runtime = self._stage1_emit(
+            project_root=project_root, target_guid=target_guid,
+        )
+        rows = scene_runtime.get("ui_click_bindings")
+        assert isinstance(rows, list) and len(rows) == 1, scene_runtime
+        ns = "Assets/Scenes/Main.unity"
+        assert rows[0]["method"] == "StartGame"
+        assert rows[0]["target_component_id"] == f"{ns}:710"
+        # No domain consulted -> nothing in the unsupported report yet.
+        assert not place.unsupported_onclick_bindings
+
+    def test_client_target_survives_reclassification(self, tmp_path):
+        """Acceptance (real ordering): convert_scene with NO seeded domains, THEN
+        the reclassifier fed the REAL classified modules (client). The StartGame
+        binding STAYS in ``ui_click_bindings`` and is NOT moved to unsupported.
+        RED against the current pre-r3 code (dropped at convert_scene)."""
+        project_root = tmp_path / "proj"
+        (project_root / "Assets" / "Scenes").mkdir(parents=True)
+        target_guid = "abc123def456abc123def456abc12345"
+        place, parsed, scene_runtime = self._stage1_emit(
+            project_root=project_root, target_guid=target_guid,
+        )
+        # The classifier stamps the module ``client`` (mutates the modules map
+        # in place, exactly as _classify_storage does).
+        scene_runtime["modules"][target_guid]["domain"] = "client"
+        self._reclassify(
+            project_root=project_root, place=place,
+            parsed=parsed, scene_runtime=scene_runtime,
+        )
+        rows = scene_runtime.get("ui_click_bindings")
+        assert isinstance(rows, list) and len(rows) == 1, scene_runtime
+        ns = "Assets/Scenes/Main.unity"
+        assert rows[0]["method"] == "StartGame"
+        assert rows[0]["target_component_id"] == f"{ns}:710"
+        assert not place.unsupported_onclick_bindings
+
+    def test_server_target_moved_to_unsupported_at_stage2(self, tmp_path):
+        """The mirror: convert_scene emits a candidate; the reclassifier fed a
+        ``server``-classified module MOVES it out of ``ui_click_bindings`` to
+        ``rbx_place.unsupported_onclick_bindings`` (reason ``domain_server``)."""
+        project_root = tmp_path / "proj"
+        (project_root / "Assets" / "Scenes").mkdir(parents=True)
+        target_guid = "fff000fff000fff000fff000fff00012"
+        place, parsed, scene_runtime = self._stage1_emit(
+            project_root=project_root, target_guid=target_guid,
+        )
+        # Candidate present after stage 1.
+        assert scene_runtime.get("ui_click_bindings")
+        scene_runtime["modules"][target_guid]["domain"] = "server"
+        self._reclassify(
+            project_root=project_root, place=place,
+            parsed=parsed, scene_runtime=scene_runtime,
+        )
+        assert not scene_runtime.get("ui_click_bindings"), scene_runtime
+        unsupported = place.unsupported_onclick_bindings
+        assert len(unsupported) == 1
+        assert unsupported[0]["reason"] == "domain_server"
+        assert unsupported[0]["method"] == "StartGame"
+        assert unsupported[0]["target_file_id"] == "710"
+
+    def _scene(self, *, project_root, target_guid):
+        from pathlib import Path
+        # GameObject owning the target component (m_Script = target_guid).
+        target_go = SceneNode(
+            name="LoadoutState", file_id="700", active=True, layer=0, tag="Untagged",
+            components=[ComponentData(
+                component_type="MonoBehaviour", file_id="710",
+                properties={"m_Script": {"guid": target_guid, "fileID": "11500000"}},
+            )],
+            children=[], parent_file_id=None,
+        )
+        # Button GameObject whose onClick targets component 710 / method StartGame.
+        button_go = SceneNode(
+            name="StartButton", file_id="800", active=True, layer=0, tag="Untagged",
+            components=[ComponentData(
+                component_type="MonoBehaviour", file_id="810",
+                properties={"m_OnClick": {"m_PersistentCalls": {"m_Calls": [{
+                    "m_MethodName": "StartGame", "m_CallState": 2, "m_Mode": 1,
+                    "m_Target": {"fileID": "710"},
+                }]}}},
+            )],
+            children=[], parent_file_id="900",
+        )
+        canvas = SceneNode(
+            name="Canvas", file_id="900", active=True, layer=0, tag="Untagged",
+            components=[ComponentData(
+                component_type="Canvas", file_id="910", properties={"m_Enabled": 1},
+            )],
+            children=[button_go], parent_file_id=None,
+        )
+        from core.unity_types import ParsedScene
+        return ParsedScene(
+            scene_path=Path(project_root) / "Assets" / "Scenes" / "Main.unity",
+            roots=[canvas, target_go],
+        )
+
+    def test_stage1_emits_candidate_even_for_server_module(self, tmp_path):
+        """Even with the modules map already carrying ``server``, stage 1
+        (``convert_scene``) emits the candidate -- proving the domain is NOT
+        consulted at convert_scene time. The move-to-unsupported happens only in
+        stage 2 (``test_server_target_moved_to_unsupported_at_stage2``)."""
+        from converter.scene_converter import convert_scene
+
+        project_root = tmp_path / "proj"
+        (project_root / "Assets" / "Scenes").mkdir(parents=True)
+        target_guid = "fff000fff000fff000fff000fff00012"
+        parsed = self._scene(project_root=project_root, target_guid=target_guid)
+        scene_runtime: dict = {
+            "modules": {target_guid: {"domain": "server"}},
+        }
+        place = convert_scene(
+            parsed_scene=parsed,
+            unity_project_root=project_root,
+            scene_runtime=scene_runtime,
+            scene_runtime_mode="generic",
+        )
+        # convert_scene emits the candidate regardless of domain (deferred gate).
+        rows = scene_runtime.get("ui_click_bindings")
+        assert isinstance(rows, list) and len(rows) == 1, scene_runtime
+        assert rows[0]["method"] == "StartGame"
+        assert not place.unsupported_onclick_bindings

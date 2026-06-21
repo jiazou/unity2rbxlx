@@ -104,6 +104,31 @@ class SemanticWarningsSummary:
 
 
 @dataclass
+class UnsupportedOnClickIssue:
+    """One Button ``onClick`` call the converter could not wire, surfaced for
+    operator inspection. Mirrors ``ui_translator.UnsupportedClickBinding``."""
+    button_sri: str = ""
+    target_file_id: str = ""
+    method: str = ""
+    reason: str = ""
+    call_index: int = 0
+
+
+@dataclass
+class UnsupportedOnClickSummary:
+    """Aggregate of Button onClick calls this conversion could not honor.
+
+    Persists under ``unsupported_onclick_bindings`` in conversion_report.json so
+    a menu-critical dead button is visible at convert time (a SERVER/EXCLUDED
+    target, an unresolvable target, or a static-argument call). The matching
+    ``ClickBinding`` rows that WERE emitted ride the host plan, not the report.
+    """
+    total: int = 0
+    counts_by_reason: dict[str, int] = field(default_factory=dict)
+    issues: list[UnsupportedOnClickIssue] = field(default_factory=list)
+
+
+@dataclass
 class ConversionReport:
     """Top-level conversion report written to disk after a completed run."""
     generated_at: str = field(
@@ -127,6 +152,11 @@ class ConversionReport:
     # Phase 3 contract-verifier summary (shadow mode); total + per-check.
     contract_check_violations: int = 0
     contract_violations_by_check: dict[str, int] = field(default_factory=dict)
+    # Button onClick calls this version could not wire (server/excluded/
+    # unresolved target or static-argument); surfaced for operator inspection.
+    unsupported_onclick_bindings: UnsupportedOnClickSummary = field(
+        default_factory=UnsupportedOnClickSummary,
+    )
 
 
 def generate_report(

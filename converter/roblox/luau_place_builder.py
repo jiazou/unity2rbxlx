@@ -1293,8 +1293,9 @@ def _emit_ui_element(b: _LuauBuilder, elem: RbxUIElement, parent_var: str) -> No
             b.line(f"lay.CellSize=UDim2.new(0,{cs[0]},0,{cs[1]})")
             b.line(f"lay.CellPadding=UDim2.new(0,{elem.layout_padding},0,{elem.layout_padding})")
         b.line(f"lay.Parent={var}")
-    # Emit attributes (e.g. PR2 ``_SceneRuntimeId``, ``_OnClick`` button
-    # wiring) so the headless builder matches rbxlx_writer's UI surface.
+    # Emit attributes (e.g. PR2 ``_SceneRuntimeId``, widget config) so the
+    # headless builder matches rbxlx_writer's UI surface. (Button onClick is
+    # carried by the ``ui_click_bindings`` plan round-trip, not an attribute.)
     _emit_attributes(b, elem.attributes or {}, var)
     for child in elem.children:
         _emit_ui_element(b, child, var)

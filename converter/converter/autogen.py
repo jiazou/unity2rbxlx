@@ -665,6 +665,15 @@ _PLAN_KEYS_FOR_HOST: tuple[str, ...] = (
     # to the Toggle's ``isOn`` attribute; without it here the field is elided and
     # the runtime never binds.
     "ui_toggle_bindings",
+    # Button ``onClick`` -> target-component method bindings (list of
+    # ``ClickBinding`` rows), stashed onto ``scene_runtime`` by ``convert_scene``.
+    # The client runtime wires each row's button ``Activated`` to the precise
+    # target component instance method (``_installClickWatch``); without it here
+    # the field is elided and every converted button dispatches nothing.
+    # NOTE: the operator-only ``unsupported_onclick_bindings`` diagnostic is
+    # DELIBERATELY absent from this allowlist -- it surfaces in the conversion
+    # report, never in the embedded host plan.
+    "ui_click_bindings",
     # Unit-3 theme registration: per-DB seed records the entrypoint shim replays
     # at boot. LOAD-BEARING — without the allowlist entry the recomputed key is
     # elided from the emitted plan and the shim sees ``{}`` (dead registry).
