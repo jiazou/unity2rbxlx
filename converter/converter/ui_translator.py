@@ -177,6 +177,19 @@ def _coerce_int(raw: object) -> int | None:
         return None
 
 
+def _coerce_alpha(raw: object) -> float:
+    """Best-effort float coercion for a serialized ``m_Color.a``; 1.0 (opaque) on failure.
+
+    Mirrors ``_coerce_int``: the value crosses the parser boundary untyped and may be
+    present-but-non-numeric (``None``, ``"bad"``), so a present-but-bad alpha defaults
+    to opaque just like an absent one.
+    """
+    try:
+        return float(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 1.0
+
+
 def _map_tmp_bitfield(raw: object, table: dict[int, str]) -> str | None:
     """Resolve a TMP alignment bitfield int to a Roblox token.
 
@@ -719,7 +732,7 @@ def _convert_ui_element(
     graphic = _find_image_graphic(node)
     if graphic is not None:
         col = graphic.properties.get("m_Color", {})
-        alpha = float(col.get("a", 1.0)) if isinstance(col, dict) else 1.0
+        alpha = _coerce_alpha(col.get("a", 1.0)) if isinstance(col, dict) else 1.0
         element.background_transparency = 1.0 - alpha
     else:
         element.background_transparency = 1.0
@@ -1042,7 +1055,7 @@ def _apply_image_properties(element: RbxUIElement, props: dict[str, Any]) -> Non
             float(color.get("g", 1)),
             float(color.get("b", 1)),
         )
-        alpha = float(color.get("a", 1.0))
+        alpha = _coerce_alpha(color.get("a", 1.0))
         element.background_transparency = 1.0 - alpha
 
 

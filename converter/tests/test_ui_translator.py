@@ -1812,6 +1812,30 @@ class TestBackgroundTransparencyFromGraphic:
         )
         assert self._convert(node).background_transparency == 0.0
 
+    def test_image_color_a_none_is_opaque(self):
+        """E10 — an Image MB whose m_Color.a is present-but-None: the alpha read
+        coerces to the opaque default 1.0 -> 0.0, no crash."""
+        node = self._node(
+            "ANone", "82",
+            components=[ComponentData(
+                component_type="MonoBehaviour", file_id="C",
+                properties={"m_Sprite": {"fileID": 0}, "m_Color": {"a": None}},
+            )],
+        )
+        assert self._convert(node).background_transparency == 0.0
+
+    def test_image_color_a_nonnumeric_string_is_opaque(self):
+        """E10 — an Image MB whose m_Color.a is a non-numeric string: the alpha
+        read coerces to the opaque default 1.0 -> 0.0, no crash."""
+        node = self._node(
+            "ABad", "83",
+            components=[ComponentData(
+                component_type="MonoBehaviour", file_id="C",
+                properties={"m_Sprite": {"fileID": 0}, "m_Color": {"a": "bad"}},
+            )],
+        )
+        assert self._convert(node).background_transparency == 0.0
+
     def test_is_ui_image_mb_guid_detected(self):
         """An Image subclass MonoBehaviour with NO m_Sprite but the Image
         script GUID is detected via ``_is_ui_image_mb`` -> 1.0 - alpha."""
@@ -1830,14 +1854,93 @@ class TestBackgroundTransparencyFromGraphic:
     # --- AC9: text_color / background_color (RGB) / image unchanged ----------
     def test_other_properties_unchanged_for_image(self):
         """AC9 — only background_transparency changes; the RGB tint
-        (background_color) from the Image's m_Color is still applied."""
+        (background_color) AND the resolved sprite (element.image) from the
+        Image's m_Color/m_Sprite are still applied (post-pass disturbs neither)."""
         node = self._node(
             "Tinted", "100",
             components=[ComponentData(
                 component_type="Image", file_id="C",
-                properties={"m_Color": {"r": 0.0, "g": 0.784, "b": 0.784, "a": 0.5}},
+                properties={
+                    "m_Sprite": {"fileID": 21300000, "guid": "abc123def456"},
+                    "m_Color": {"r": 0.0, "g": 0.784, "b": 0.784, "a": 0.5},
+                },
             )],
         )
         element = self._convert(node)
         assert element.background_transparency == 0.5
         assert element.background_color == (0.0, 0.784, 0.784)
+        assert element.image == "guid://abc123def456"
+
+    def test_text_color_unchanged_for_text_node(self):
+        """AC9 — for a text node the post-pass forces background_transparency to
+        1.0 (no fill graphic) but does NOT disturb text_color, which is still the
+        Unity Text m_Color."""
+        node = self._node(
+            "Caption", "101",
+            components=[ComponentData(
+                component_type="Text", file_id="C",
+                properties={
+                    "m_Text": "Hi",
+                    "m_Color": {"r": 1.0, "g": 0.0, "b": 0.5, "a": 1.0},
+                },
+            )],
+        )
+        element = self._convert(node)
+        assert element.class_name == "TextLabel"
+        assert element.background_transparency == 1.0
+        assert element.text_color == (1.0, 0.0, 0.5)
+
+    # --- E11: two Image MBs -> FIRST in component order ----------------------
+    def test_two_image_mbs_uses_first_in_component_order(self):
+        """E11 — a node with TWO Image MonoBehaviours: ``_find_image_graphic``
+        returns the FIRST in component order (Unity renders one Graphic per
+        GameObject), so the transparency comes from the first MB's m_Color,
+        deterministically — NOT the second."""
+        first = ComponentData(
+            component_type="MonoBehaviour", file_id="img1",
+            properties={
+                "m_Sprite": {"fileID": 0},
+                "m_Color": {"r": 1, "g": 1, "b": 1, "a": 0.25},
+            },
+        )
+        second = ComponentData(
+            component_type="MonoBehaviour", file_id="img2",
+            properties={
+                "m_Sprite": {"fileID": 0},
+                "m_Color": {"r": 1, "g": 1, "b": 1, "a": 0.9},
+            },
+        )
+        node = self._node("DoubleImage", "110", components=[first, second])
+        # 1.0 - 0.25 == 0.75 (first), NOT 1.0 - 0.9 == 0.1 (second).
+        assert abs(self._convert(node).background_transparency - 0.75) < 1e-9
+
+    # --- E12: suppressed-children host STILL gets transparency set ----------
+    def test_suppressed_children_host_still_gets_transparency(self):
+        """E12 — a node whose id is in ``suppress_static_children_ids`` still
+        gets its transparency set, because the authoritative post-pass runs
+        BEFORE the early ``return element``. Guards the ordering contract: if
+        the post-pass were moved below the early-return, a suppressed-children
+        host would silently regress to the opaque default."""
+        from converter.ui_translator import _convert_ui_element
+        # A BARE container (no graphic): the post-pass forces 1.0, but the
+        # RbxUIElement default is the OPAQUE 0.0 and no per-class handler runs
+        # for a graphic-less Frame — so this value is observable ONLY if the
+        # post-pass ran. (A literal Image would be green-for-the-wrong-reason:
+        # ``_apply_image_properties`` sets 1.0-alpha independently of ordering.)
+        node = self._node(
+            "SuppressedHost", "120",
+            components=[ComponentData(
+                component_type="RectTransform", file_id="rt",
+                properties={"m_SizeDelta": {"x": 100, "y": 100}},
+            )],
+        )
+        sr_id = f"{self.NS}:120"
+        element = _convert_ui_element(
+            node, scene_namespace=self.NS,
+            suppress_static_children_ids=frozenset({sr_id}),
+        )
+        assert element is not None
+        # No graphic -> 1.0 (transparent), set despite the suppress early-return.
+        # Without the post-pass (or with it moved below the return) this stays
+        # at the 0.0 opaque default.
+        assert element.background_transparency == 1.0
