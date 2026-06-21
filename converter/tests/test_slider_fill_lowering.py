@@ -140,6 +140,85 @@ def test_coverage_warning_on_undrewritten_guess(caplog) -> None:
     assert any("slider_fill" in r.message for r in caplog.records)
 
 
+# A generic HUD that CALLS some ``obj:setSliderValue(v)`` (NOT a definition) AND
+# has an inlined guessed-fill resolution. The setter CALL must NOT gate the inline
+# rewrite off -- only a setter DEFINITION does that.
+_CALL_PLUS_INLINE_HUD = textwrap.dedent("""\
+    local HudControl = {}
+    HudControl.__index = HudControl
+
+    function HudControl:Awake()
+        local healthFrame = self.gameObject:FindFirstChild("Health")
+        local healthFill  = healthFrame:FindFirstChild("Fill")
+
+        local otherBar = self.gameObject:FindFirstChild("OtherBar")
+        otherBar:setSliderValue(0.5)
+    end
+
+    return HudControl
+""")
+
+
+def test_setter_call_does_not_disable_inline_rewrite() -> None:
+    """P1 regression: ``has_slider_setter`` must detect a setter DEFINITION only.
+    A bare CALL ``obj:setSliderValue(v)`` must NOT gate the inline rewrite off, so
+    a script that merely CALLS a setter AND has an inline guessed-fill resolution
+    STILL gets rewritten (not silently skipped -> frozen bar).
+
+    Pre-fix (``has_slider_setter`` used the ``":setSliderValue"`` substring) this
+    returned True for the call site -> the inline rewrite no-opped -> ``changed==0``
+    and the guessed literal survived."""
+    s = _S(_CALL_PLUS_INLINE_HUD)
+    changed = lower_slider_fill([s])
+
+    assert changed == 1
+    # The inline guessed-fill resolution was rewritten despite the setter CALL.
+    assert 'FindFirstChild("Fill")' not in s.luau_source
+    assert "local healthFill = _resolveSliderFill(healthFrame)" in s.luau_source
+    # The unrelated setter CALL is left verbatim.
+    assert "otherBar:setSliderValue(0.5)" in s.luau_source
+
+
+# A generic setter-form shape: a ``setSliderValue`` DEFINITION whose body guesses
+# the fill name. The generic inline pass does NOT own setter bodies (those are the
+# legacy span rewrite's), so it abstains -- and the coverage guard must warn LOUDLY
+# rather than leave the frozen bar silent.
+_SETTER_FORM_GUESS_HUD = textwrap.dedent("""\
+    local HudControl = {}
+    HudControl.__index = HudControl
+
+    function setSliderValue(slider, value)
+        local fill = slider:FindFirstChild("Fill")
+        if fill then
+            fill.Size = UDim2.new(value, 0, 1, 0)
+        end
+    end
+
+    return HudControl
+""")
+
+
+def test_setter_form_guess_warns_in_generic_pass(caplog) -> None:
+    """P2 regression: a setter-form ``setSliderValue`` with a guessed fill that the
+    generic inline pass does not own must be flagged LOUDLY by the coverage guard,
+    not silently frozen.
+
+    Pre-fix the coverage guard used ``has_inline_guessed_fill`` (False when a
+    setter definition is present) -> no warning. Post-fix it uses
+    ``has_any_guessed_fill`` -> the surviving guessed literal is warned about."""
+    s = _S(_SETTER_FORM_GUESS_HUD)
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        changed = lower_slider_fill([s])
+
+    # The inline pass abstains on the setter body (owned by the legacy rewrite).
+    assert changed == 0
+    assert 'FindFirstChild("Fill")' in s.luau_source  # un-rewritten
+    # ... but the freeze is LOUD, not silent.
+    assert any("slider_fill" in r.message for r in caplog.records)
+
+
 # ---------------------------------------------------------------------------
 # Pipeline wiring: the REAL generic transpile_with_contract invokes the pass.
 # ---------------------------------------------------------------------------

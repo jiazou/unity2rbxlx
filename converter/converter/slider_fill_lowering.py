@@ -42,7 +42,7 @@ from typing import Protocol
 
 from converter.rifle_rig_retarget_lowering import _luau_syntax_ok
 from converter.slider_fill_common import (
-    has_inline_guessed_fill,
+    has_any_guessed_fill,
     rewrite_inline_guessed_fill,
 )
 
@@ -68,10 +68,12 @@ def lower_slider_fill(scripts: list[_HasLuauSourceAndName]) -> int:
     no edits. A rewrite that produces unparseable Luau is reverted (the original
     ``luau_source`` is restored) so a bad edit never ships.
 
-    Fail-loud coverage: any script that STILL has an inlined guessed-fill
-    resolution after the rewrite (the AI reshaped the resolution enough that the
-    structural gate abstained) is ``log.warning``-flagged so the silent abstain is
-    observable rather than shipping a frozen bar."""
+    Fail-loud coverage: any script that STILL has ANY guessed-fill resolution
+    after the rewrite -- inline OR setter-form -- is ``log.warning``-flagged so the
+    silent abstain is observable rather than shipping a frozen bar. The coverage
+    predicate is ``has_any_guessed_fill`` (not ``has_inline_guessed_fill``) so a
+    setter-form ``setSliderValue`` shape the generic inline pass does not own is
+    flagged loudly, not silently frozen."""
     changed = 0
     for s in scripts:
         original = s.luau_source or ""
@@ -89,14 +91,16 @@ def lower_slider_fill(scripts: list[_HasLuauSourceAndName]) -> int:
                     "Luau; reverted (bar stays frozen). Inspect the emitted fill "
                     "resolution.", s.output_filename,
                 )
-        # Fail-loud coverage on the FINAL committed source: a surviving inlined
-        # guessed-fill resolution means the structural gate abstained (shape
-        # drifted) -- warn so the freeze is observable, not silent.
-        if has_inline_guessed_fill(s.luau_source or ""):
+        # Fail-loud coverage on the FINAL committed source: ANY surviving guessed-
+        # fill resolution -- inline OR setter-form -- means the inline pass did not
+        # rewrite it (shape drifted, or a setter-form shape the generic inline pass
+        # does not own). Warn so the freeze is observable, not silent.
+        if has_any_guessed_fill(s.luau_source or ""):
             log.warning(
-                "[slider_fill] '%s' has an inlined guessed-fill resolution "
-                "(<x> = <frame>:FindFirstChild(\"Fill\")) the lowering did not "
-                "rewrite (shape drifted); slider bar will stay frozen. Inspect "
-                "the emitted fill resolution.", s.output_filename,
+                "[slider_fill] '%s' has a guessed-fill resolution "
+                "(<frame>:FindFirstChild(\"Fill\")) the lowering did not "
+                "rewrite (shape drifted or setter-form not owned by the inline "
+                "pass); slider bar will stay frozen. Inspect the emitted fill "
+                "resolution.", s.output_filename,
             )
     return changed

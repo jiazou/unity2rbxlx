@@ -109,6 +109,18 @@ _FILL_RECEIVER_RE = re.compile(
 # coverage signal so an un-rewritten inlined shape is flagged, not abstained.
 _ANY_GUESS_FILL_RE = re.compile(r':FindFirstChild\(\s*"(?:Fill|Bar|Foreground)"\s*\)')
 
+# A ``setSliderValue`` DEFINITION (never a call site). Three forms:
+#   * free function:   ``function setSliderValue(``
+#   * method/dotted:   ``function HudControl:setSliderValue(`` / ``function M.setSliderValue(``
+#   * local function:  ``local function setSliderValue(``
+# Anchored on the ``function`` keyword so a bare CALL ``obj:setSliderValue(v)``
+# (which is NOT preceded by ``function``) is never matched. ``[%w_.]*`` here is
+# expressed in Python ``re`` as ``[\w.]*``; the receiver separator is ``:`` or
+# ``.`` (method or table-field definition), optional for the free-function form.
+_SLIDER_SETTER_DEF_RE = re.compile(
+    r"(?:local\s+)?function\s+[\w.]*[:.]?setSliderValue\s*\("
+)
+
 
 def has_guessed_fill(src: str) -> bool:
     """True if ``src`` contains any guessed-fill anchor token (legacy
@@ -145,12 +157,30 @@ def free_function_setter_start(src: str, from_index: int = 0) -> int:
 
 
 def has_slider_setter(src: str) -> bool:
-    """True if ``src`` defines a ``setSliderValue`` in ANY form -- free-function
-    (``[local ]function setSliderValue``) OR method (``:setSliderValue``).
+    """True if ``src`` DEFINES a ``setSliderValue`` in any form -- free-function
+    (``[local ]function setSliderValue``), method (``function T:setSliderValue``),
+    or table-field (``function M.setSliderValue``).
 
-    The broadened helper-name anchor shared by the detector and the coverage
-    guard so a method-form HUD is never silently skipped by both."""
-    return free_function_setter_start(src) != -1 or ":setSliderValue" in src
+    Anchored on the ``function`` keyword: a bare CALL ``obj:setSliderValue(v)`` is
+    NOT a definition and must NOT gate the inline rewrite off. Only a DEFINITION is
+    owned by the legacy span rewrite / coverage guard; a call leaves the inline
+    guessed-fill resolution unhandled, so it must keep flowing through the inline
+    path."""
+    return _SLIDER_SETTER_DEF_RE.search(src) is not None
+
+
+def has_any_guessed_fill(src: str) -> bool:
+    """True if ``src`` contains ANY guessed-fill resolution literal
+    (``:FindFirstChild("Fill"|"Bar"|"Foreground")``) REGARDLESS of whether a
+    ``setSliderValue`` setter is present.
+
+    Unlike ``has_inline_guessed_fill`` (which is intentionally False when a setter
+    DEFINITION is present, since the setter body is owned by the legacy span
+    rewrite), this is the broadened coverage predicate: it flags a surviving
+    guessed-fill literal that the inline pass did not rewrite -- including a
+    setter-form shape the generic inline pass does not own -- so the freeze is
+    loud, not silent."""
+    return bool(_ANY_GUESS_FILL_RE.search(src))
 
 
 def has_inline_guessed_fill(src: str) -> bool:
