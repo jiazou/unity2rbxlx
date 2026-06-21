@@ -942,14 +942,17 @@ class TestSlice7FallbackGates:
             p.state = MagicMock()
             # The producer derives ``transpile_ran`` via
             # ``self._topology_data_available()`` (transpile ran this
-            # invocation OR a persisted dep_map was rehydrated). Bind the REAL
-            # method so this pin tracks the actual derivation. MagicMock() is a
-            # non-None transpilation_result marker; None + empty dep_map is the
-            # no-data resume signal.
+            # invocation OR the persisted dependency-analysis sentinel was
+            # rehydrated this run). Bind the REAL method so this pin tracks the
+            # actual derivation. MagicMock() is a non-None transpilation_result
+            # marker; None + no rehydrated sentinel is the no-data resume signal.
             p.state.transpilation_result = (
                 MagicMock() if has_transpile_result else None
             )
             p.state.dependency_map = {}
+            # No persisted-analysis sentinel rehydrated this run (else MagicMock
+            # auto-creates a truthy attr and the gate goes True regardless).
+            p.state.dependency_analysis_available = False
             p._topology_data_available = (
                 lambda: Pipeline._topology_data_available(p)
             )

@@ -212,8 +212,10 @@ class TestDependencyMapPersistTranspileSkip:
 
         transpile_ctx = ConversionContext(unity_project_path=str(unity_project))
         # The production write site mirrors state.dependency_map onto
-        # ctx.dependency_map; replicate that exact copy here.
+        # ctx.dependency_map AND sets the persisted sentinel True (transpile ran
+        # this conversion); replicate that exact pair here.
         transpile_ctx.dependency_map = {k: list(v) for k, v in dep_map.items()}
+        transpile_ctx.dependency_analysis_persisted = True
         ctx_path = tmp_path / "conversion_context.json"
         transpile_ctx.save(ctx_path)
 
@@ -253,15 +255,18 @@ class TestDependencyMapPersistTranspileSkip:
     def test_skip_assemble_fails_closed_without_persisted_dependency_map(
         self, tmp_path: Path,
     ):
-        """``transpile_ran``-absent guard: with the persisted dep_map empty
-        (old context, or a regression that re-empties the field), the topology
-        reachability path must NOT fire — Player falls back to the legacy
-        (server-only) verdict, NOT the topology RS hoist. Proves the fix is
-        gated on the dep_map being present, not unconditionally on."""
+        """Absent-SENTINEL guard: an OLD context that never persisted a
+        dependency analysis (``dependency_analysis_persisted`` defaults False,
+        ``dependency_map`` empty) must NOT fire the topology path — Player falls
+        back to the legacy (server-only) verdict, NOT the topology RS hoist.
+        Proves the fix is gated on the persisted sentinel, not unconditionally
+        on. (Contrast ``test_skip_assemble_computed_empty_*`` which has the SAME
+        empty map but a True sentinel and DOES route via topology.)"""
         unity_project = _write_cs_project(tmp_path)
 
         empty_ctx = ConversionContext(unity_project_path=str(unity_project))
-        # dependency_map left at its default {} (the old-context / re-emptied case)
+        # dependency_map AND dependency_analysis_persisted left at their defaults
+        # ({} / False) — the old-context case that never ran the analysis.
         ctx_path = tmp_path / "conversion_context.json"
         empty_ctx.save(ctx_path)
         reloaded = ConversionContext.load(ctx_path)
@@ -283,6 +288,129 @@ class TestDependencyMapPersistTranspileSkip:
         assert plan["Player"] == SERVER_STORAGE, (
             f"topology path fired without a persisted dep_map (not fail-closed): "
             f"Player -> {plan['Player']}"
+        )
+
+    def test_skip_assemble_computed_empty_graph_routes_via_topology(
+        self, tmp_path: Path,
+    ):
+        """Closure-completeness: a transpile that legitimately produced an
+        EMPTY dependency_map (zero cross-script edges) but a True
+        ``dependency_analysis_persisted`` sentinel must STILL drive the topology
+        path on the transpile-skip assemble — NOT collapse to legacy. This is the
+        case the prior ``bool(dependency_map)`` gate conflated with an old
+        context (both have an empty map). The sentinel disambiguates them.
+
+        Discriminator: the same orphan ModuleScript routes to ReplicatedStorage
+        in BOTH the topology and legacy orphan branches (so the *container* can't
+        tell them apart), but the decision ``reason`` is prefixed ``"topology:"``
+        only when the topology tree was consulted. We assert the two empty cases
+        produce DIFFERENT decision reasons:
+          - sentinel True  -> ``transpile_ran=True``  -> topology orphan reason
+          - sentinel False -> ``transpile_ran=False`` -> legacy  orphan reason
+        """
+        unity_project = tmp_path / "unity"
+        (unity_project / "Assets").mkdir(parents=True)
+
+        # One runtime-bearing ModuleScript with NO require edges -> the dep_map
+        # the real analyzer would build is EMPTY (zero cross-script references).
+        solo_scene_runtime: dict[str, object] = {
+            "modules": {
+                "g-solo": {
+                    "stem": "Solo", "class_name": "Solo",
+                    "runtime_bearing": True, "character_attached": False,
+                    "is_loader": False,
+                },
+            },
+            "scenes": {}, "prefabs": {}, "domain_overrides": {},
+        }
+
+        def _build(out_subdir: str, ctx: ConversionContext) -> Pipeline:
+            output = tmp_path / out_subdir
+            output.mkdir(parents=True, exist_ok=True)
+            pipeline = Pipeline(str(unity_project), str(output))
+            place = RbxPlace()
+            solo = RbxScript(
+                name="Solo", source="return {}", script_type="ModuleScript",
+            )
+            solo.parent_path = SERVER_STORAGE
+            place.scripts = [solo]
+            pipeline.state.rbx_place = place
+            pipeline.ctx = ctx
+            pipeline.ctx.scene_runtime = solo_scene_runtime
+            pipeline.ctx.scene_runtime_mode = "generic"
+            pipeline.state.transpilation_result = None
+            pipeline.state.dependency_map = {}
+            return pipeline
+
+        def _reason_for(pipeline: Pipeline, name: str) -> str:
+            assert pipeline.ctx.storage_plan is not None
+            for d in pipeline.ctx.storage_plan.decisions:
+                if d["script"] == name:
+                    return d["reason"] or ""
+            raise AssertionError(f"no decision recorded for {name}")
+
+        # --- Case A: computed-empty (sentinel True, empty map) ---
+        ctx_true = ConversionContext(unity_project_path=str(unity_project))
+        # Empty map BUT the analysis ran & was persisted this conversion.
+        assert ctx_true.dependency_map == {}
+        ctx_true.dependency_analysis_persisted = True
+        path_true = tmp_path / "ctx_true.json"
+        ctx_true.save(path_true)
+        reloaded_true = ConversionContext.load(path_true)
+        assert reloaded_true.dependency_analysis_persisted is True
+        assert reloaded_true.dependency_map == {}
+
+        pl_true = _build("skip_computed_empty", reloaded_true)
+        pl_true._classify_storage()
+        reason_true = _reason_for(pl_true, "Solo")
+
+        # --- Case B: old context (sentinel False/absent, empty map) ---
+        ctx_false = ConversionContext(unity_project_path=str(unity_project))
+        assert ctx_false.dependency_analysis_persisted is False
+        assert ctx_false.dependency_map == {}
+        path_false = tmp_path / "ctx_false.json"
+        ctx_false.save(path_false)
+        reloaded_false = ConversionContext.load(path_false)
+        assert reloaded_false.dependency_analysis_persisted is False
+
+        pl_false = _build("skip_old_context", reloaded_false)
+        pl_false._classify_storage()
+        reason_false = _reason_for(pl_false, "Solo")
+
+        # The two empty cases route DIFFERENTLY: the computed-empty case is
+        # serviced by the topology tree (sentinel path), the old-context case
+        # falls back to legacy. The reason text proves which path ran.
+        assert reason_true.startswith("topology:"), (
+            f"computed-empty (sentinel True) did NOT use the topology path: "
+            f"{reason_true!r}"
+        )
+        assert not reason_false.startswith("topology:"), (
+            f"old-context (sentinel False) wrongly used the topology path: "
+            f"{reason_false!r}"
+        )
+        assert reason_true != reason_false, (
+            "computed-empty and old-context must route via different paths; "
+            f"both produced {reason_true!r}"
+        )
+
+    def test_old_context_missing_sentinel_field_defaults_false(
+        self, tmp_path: Path,
+    ):
+        """An OLD conversion_context.json predating the sentinel (no
+        ``dependency_analysis_persisted`` key at all) must load with the field
+        defaulting to False -> topology gate stays closed (fail-closed)."""
+        unity_project = tmp_path / "unity"
+        (unity_project / "Assets").mkdir(parents=True)
+        ctx_path = tmp_path / "old_conversion_context.json"
+        # Hand-write a pre-sentinel context: the field is simply absent.
+        ctx_path.write_text(
+            '{"unity_project_path": "' + str(unity_project).replace("\\", "/")
+            + '", "dependency_map": {}}',
+            encoding="utf-8",
+        )
+        loaded = ConversionContext.load(ctx_path)
+        assert loaded.dependency_analysis_persisted is False, (
+            "missing sentinel field must default to False (legacy fail-closed)"
         )
 
     def test_negative_control_shared_class_name_identity_stable(
@@ -360,6 +488,7 @@ class TestDependencyMapPersistTranspileSkip:
         # COLLIDING name (Shared), then round-trip through save/load.
         ctx = ConversionContext(unity_project_path=str(unity_project))
         ctx.dependency_map = {"Hud": ["Real", "Shared"]}
+        ctx.dependency_analysis_persisted = True
         ctx_path = tmp_path / "conversion_context.json"
         ctx.save(ctx_path)
         pipeline.ctx = ConversionContext.load(ctx_path)

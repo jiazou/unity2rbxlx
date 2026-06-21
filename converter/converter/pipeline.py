@@ -744,6 +744,14 @@ class PipelineState:
     rbx_place: RbxPlace | None = None
     prefab_library: PrefabLibrary | None = None
     dependency_map: dict[str, list[str]] = field(default_factory=dict)
+    # TRANSIENT sentinel: True when the persisted dependency analysis was
+    # rehydrated onto ``dependency_map`` this run (transpile-skipped assemble),
+    # set in ``_classify_storage`` from ``ctx.dependency_analysis_persisted``.
+    # Lets ``_topology_data_available`` open the topology gate for a COMPUTED-
+    # but-EMPTY graph without conflating it with an old context that never
+    # persisted one (both have an empty ``dependency_map``). Never persisted —
+    # the ctx field is the durable source of truth.
+    dependency_analysis_available: bool = False
     scriptable_objects: AssetConversionResult | None = None
     sprite_result: SpriteExtractionResult | None = None
     # Output of converter/semantic_validators.run_semantic_validators
@@ -2780,6 +2788,14 @@ class Pipeline:
         self.ctx.dependency_map = {
             k: list(v) for k, v in self.state.dependency_map.items()
         }
+        # Record that the dependency analysis ran and was persisted THIS
+        # conversion, UNCONDITIONALLY — even when the map is empty (a project
+        # with zero cross-script edges). This disambiguates "fresh empty graph"
+        # from "old context that never persisted a graph" downstream
+        # (``_classify_storage`` rehydration + ``_topology_data_available``), so
+        # an empty-but-computed graph still drives the topology path instead of
+        # collapsing to legacy. See ``ConversionContext.dependency_analysis_persisted``.
+        self.ctx.dependency_analysis_persisted = True
 
         if self.ctx.scene_runtime_mode == "generic":
             # Generic path: route through the contract pipeline so
@@ -5916,20 +5932,27 @@ script.Disabled = true
         # (``transpilation_result is None``) and the transient state started
         # empty, but the graph was persisted onto the context the prior
         # transpile run wrote. Restoring it here — BEFORE the topology prepass
-        # — lets the caller graph + reachability gate (``topology_data_available``
+        # — lets the caller graph + reachability gate (``_topology_data_available``
         # below) reconstruct the SAME storage plan a fresh transpile produces,
         # instead of collapsing to the empty-graph legacy path that misroutes
-        # client-reachable ModuleScripts into ServerStorage. Guard on "empty"
-        # so a run that genuinely transpiled (populated ``state.dependency_map``,
-        # possibly emptied of edges) is never clobbered by a stale ctx copy.
+        # client-reachable ModuleScripts into ServerStorage.
+        #
+        # Gate on the persisted SENTINEL (``dependency_analysis_persisted``), NOT
+        # ``bool(ctx.dependency_map)``: a transpile that legitimately produced
+        # ZERO cross-script edges persists an EMPTY map but a True sentinel, and
+        # must still drive the topology path (closure-completeness on the fresh
+        # empty graph). An OLD context that never persisted a graph has the same
+        # empty map but a False/absent sentinel → stays on legacy (fail-closed).
+        # Set the transient ``dependency_analysis_available`` flag so
+        # ``_topology_data_available`` can see the rehydrated-empty case.
         if (
             self.state.transpilation_result is None
-            and not self.state.dependency_map
-            and self.ctx.dependency_map
+            and self.ctx.dependency_analysis_persisted
         ):
             self.state.dependency_map = {
                 k: list(v) for k, v in self.ctx.dependency_map.items()
             }
+            self.state.dependency_analysis_available = True
 
         from converter.storage_classifier import classify_storage
         import json as _json
@@ -6287,8 +6310,16 @@ script.Disabled = true
         ``dependency_map`` (caller graph + reachability). It is available when
         EITHER transpile ran this invocation (``transpilation_result is not
         None``) OR it ran a prior invocation and its dep_map was persisted onto
-        the context and rehydrated onto ``state.dependency_map`` (the
-        transpile-skipped assemble path; see ``_classify_storage``).
+        the context and rehydrated this run (the transpile-skipped assemble
+        path; see ``_classify_storage``).
+
+        Keys on the persisted SENTINEL (rehydrated into the transient
+        ``state.dependency_analysis_available``), NOT ``bool(dependency_map)``:
+        a transpile that legitimately produced ZERO cross-script edges persists
+        an EMPTY map but a True sentinel, and must still run the topology path.
+        ``bool(dependency_map)`` would conflate that fresh empty graph with an
+        old context that never persisted one (both empty) and wrongly fail it
+        closed to legacy — the closure-completeness bug this sentinel fixes.
 
         This replaces the bare ``transpilation_result is not None`` proxy at
         the sites that gate topology-routing QUALITY (domain classification,
@@ -6301,7 +6332,7 @@ script.Disabled = true
         """
         return (
             self.state.transpilation_result is not None
-            or bool(self.state.dependency_map)
+            or self.state.dependency_analysis_available
         )
 
     def _maybe_run_topology_prepass(

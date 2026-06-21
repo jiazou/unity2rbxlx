@@ -1033,10 +1033,10 @@ class TestTopologyInputsTranspileRan:
         ``_topology_data_available()`` (transpile ran this invocation OR a
         persisted dep_map was rehydrated).
 
-        Asserted for both branches (dep_map empty in both, so the result
-        tracks ``transpilation_result``):
+        Asserted for both branches (dep_map empty + no rehydrated sentinel in
+        both, so the result tracks ``transpilation_result``):
           * ``transpilation_result is not None`` -> True
-          * ``transpilation_result is None`` + empty dep_map -> False
+          * ``transpilation_result is None`` + no rehydrated sentinel -> False
         """
         from unittest.mock import MagicMock
         from converter.pipeline import Pipeline
@@ -1051,6 +1051,10 @@ class TestTopologyInputsTranspileRan:
                 MagicMock() if has_transpile_result else None
             )
             p.state.dependency_map = {}
+            # No persisted-analysis sentinel rehydrated this run, so the
+            # gate must track ``transpilation_result`` alone. (MagicMock would
+            # otherwise auto-create a truthy attr and force the gate True.)
+            p.state.dependency_analysis_available = False
             # Bind the REAL gate so the pin tracks the actual derivation.
             p._topology_data_available = (
                 lambda: Pipeline._topology_data_available(p)

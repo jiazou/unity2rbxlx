@@ -182,6 +182,19 @@ class ConversionContext:
     # precedent above.
     dependency_map: dict[str, list[str]] = field(default_factory=dict)
 
+    # Explicit "the cross-script dependency analysis was COMPUTED and persisted
+    # this conversion" sentinel, independent of whether ``dependency_map`` ended
+    # up empty. Needed because an empty ``dependency_map`` is ambiguous: a
+    # transpile that legitimately produced ZERO cross-script edges and an OLD
+    # context that never persisted a graph both have ``dependency_map == {}``.
+    # ``transpile_scripts`` sets this True UNCONDITIONALLY when transpile ran
+    # (even with an empty map), so a later transpile-skipped ``assemble`` can
+    # tell "fresh empty graph" (run the topology path on it) from "absent graph"
+    # (fail closed to legacy). Round-trips via ``asdict``/``cls(**data)``; old
+    # context files lacking this field load with the default ``False`` (legacy
+    # fail-closed). See ``Pipeline._topology_data_available`` / ``_classify_storage``.
+    dependency_analysis_persisted: bool = False
+
     def __post_init__(self) -> None:
         # JSON load via `cls(**data)` populates storage_plan as a dict (the
         # asdict() form). Reconstruct it as a StoragePlan when present so the
