@@ -5274,8 +5274,9 @@ def _has_guessed_fill(src: str) -> bool:
     return any(sig in src for sig in _SLIDER_GUESS_FILL_SIGS)
 
 
-def _free_function_setter_start(src: str) -> int:
-    """Index of a FREE-FUNCTION ``setSliderValue`` definition start, or -1.
+def _free_function_setter_start(src: str, from_index: int = 0) -> int:
+    """Index of the next FREE-FUNCTION ``setSliderValue`` definition start at or
+    after ``from_index``, or -1.
 
     Covers ``local function setSliderValue`` and ``function setSliderValue``.
     The apply rewrites ONLY this form, because the canonical replacement body
@@ -5283,15 +5284,21 @@ def _free_function_setter_start(src: str) -> int:
     (``function T:setSliderValue``) would break the call contract. A
     method-form guessed-fill HUD is therefore left for the coverage guard to
     flag LOUDLY rather than silently mangled.
+
+    Returns the EARLIEST matching start so a file with several free-function
+    setters is walked left-to-right (each span rewritten independently — the
+    whole-file rewritten marker is NOT a bail-out gate, so a second still-guessed
+    setter is never silently skipped just because an earlier one was rewritten).
     """
+    best = -1
     for anchor in (
         "local function setSliderValue",
         "function setSliderValue",
     ):
-        i = src.find(anchor)
-        if i != -1:
-            return i
-    return -1
+        i = src.find(anchor, from_index)
+        if i != -1 and (best == -1 or i < best):
+            best = i
+    return best
 
 
 def _has_slider_setter(src: str) -> bool:
@@ -5308,15 +5315,17 @@ def _has_slider_setter(src: str) -> bool:
 
 
 def _detect_slider_fill_resize(scripts: list["RbxScript"]) -> bool:
-    """Fire when any script defines a guessed-fill ``setSliderValue`` that has
-    not yet been rewritten (free-function OR method form)."""
+    """Fire when any script still contains a guessed-fill ``setSliderValue``
+    (free-function OR method form) that has not yet been rewritten.
+
+    The presence of a guessed-fill token IS the per-setter signal: the canonical
+    rewritten body contains none of them, so a remaining guessed-fill token means
+    an un-rewritten guessed setter is still in the file — even if a SECOND setter
+    in the same file was already rewritten (whole-file ``_SLIDER_REWRITTEN_SIG``
+    presence is therefore NOT used as a gate here)."""
     for s in scripts:
         src = s.source or ""
-        if (
-            _has_slider_setter(src)
-            and _SLIDER_REWRITTEN_SIG not in src
-            and _has_guessed_fill(src)
-        ):
+        if _has_slider_setter(src) and _has_guessed_fill(src):
             return True
     return False
 
@@ -5330,13 +5339,19 @@ def _guard_slider_fill_coverage(scripts: list["RbxScript"]) -> None:
 
     Shares the broadened helper-name anchor (free-function AND method form) so
     a method-form guessed-fill HUD the rewrite missed is LOUDLY flagged, never
-    silently skipped by both."""
+    silently skipped by both.
+
+    The "covered" determination is per-SETTER, not whole-file: a guessed-fill
+    token that survives the rewrite means an un-rewritten guessed setter remains,
+    so we warn even when a SECOND setter in the same file WAS rewritten (the
+    canonical body contains no guessed-fill token, so its presence is unambiguous
+    evidence of a still-guessed setter). Gating on whole-file
+    ``_SLIDER_REWRITTEN_SIG`` presence is exactly the silent-skip this guard
+    must not have."""
     for s in scripts:
         src = s.source or ""
         if not _has_slider_setter(src):
             continue
-        if _SLIDER_REWRITTEN_SIG in src:
-            continue  # covered (rewritten)
         if _has_guessed_fill(src):
             log.warning(
                 "[slider_fill_path_resize] '%s' has a guessed-fill "
@@ -5357,31 +5372,41 @@ def _fix_slider_fill_resize(scripts: list["RbxScript"]) -> int:
     fixes = 0
     for s in scripts:
         src = s.source or ""
-        if _SLIDER_REWRITTEN_SIG in src:
-            continue  # already rewritten — idempotent
-        start = _free_function_setter_start(src)
-        if start == -1:
-            continue
-        # Function span: from the definition start to its first column-0
-        # ``\nend`` (the function close; inline guards keep their ``end``
-        # mid-line). Same span technique as ``door_player_flag_location``.
-        close = src.find("\nend", start)
-        if close == -1:
-            continue
-        end_idx = close + len("\nend")
-        body = src[start:end_idx]
-        # Identity gate on the GUESSED-FILL shape: only rewrite a body that
-        # actually guesses the fill name; abstain on any other setSliderValue
-        # shape so a future reshape is flagged by the coverage guard, not
-        # silently mangled.
-        if not _has_guessed_fill(body):
-            continue
-        s.source = src[:start] + _CANONICAL_SLIDER_SETTER + src[end_idx:]
-        fixes += 1
-        log.info(
-            "  Rewrote setSliderValue in '%s' to path-aware fail-loud resize",
-            s.name,
-        )
+        # Walk EVERY free-function setSliderValue span left-to-right and rewrite
+        # each one whose body still guesses the fill name. Per-span — NOT gated
+        # on whole-file ``_SLIDER_REWRITTEN_SIG`` presence — so a second
+        # still-guessed free-function setter is rewritten even when an earlier
+        # one in the same file was already rewritten (idempotency comes from the
+        # per-body guessed-fill gate: a rewritten body has no guessed-fill token,
+        # so re-running makes 0 edits).
+        search_from = 0
+        while True:
+            start = _free_function_setter_start(src, search_from)
+            if start == -1:
+                break
+            # Function span: from the definition start to its first column-0
+            # ``\nend`` (the function close; inline guards keep their ``end``
+            # mid-line). Same span technique as ``door_player_flag_location``.
+            close = src.find("\nend", start)
+            if close == -1:
+                break
+            end_idx = close + len("\nend")
+            body = src[start:end_idx]
+            # Identity gate on the GUESSED-FILL shape: only rewrite a body that
+            # actually guesses the fill name; abstain on any other
+            # setSliderValue shape (already-rewritten or unrelated) so a future
+            # reshape is flagged by the coverage guard, not silently mangled.
+            if not _has_guessed_fill(body):
+                search_from = end_idx
+                continue
+            src = src[:start] + _CANONICAL_SLIDER_SETTER + src[end_idx:]
+            search_from = start + len(_CANONICAL_SLIDER_SETTER)
+            fixes += 1
+            log.info(
+                "  Rewrote setSliderValue in '%s' to path-aware fail-loud "
+                "resize", s.name,
+            )
+        s.source = src
     # Coverage guard runs on the post-rewrite scripts.
     _guard_slider_fill_coverage(scripts)
     return fixes

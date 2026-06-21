@@ -1660,6 +1660,38 @@ class TestSliderFillElement:
         assert element is not None
         assert element.attributes["SliderFillElement"] == "Back/CurHealth"
 
+    def test_dispatch_does_not_misfire_on_non_slider_monobehaviour(self):
+        """Mis-fire guard (codex P2): a non-Slider MonoBehaviour WITHOUT
+        ``m_FillRect`` must NOT be treated as a slider — no ``SliderFillElement``,
+        ``MinValue``, ``MaxValue``, or ``SliderDirection`` attributes. The
+        dispatch keys solely on ``m_FillRect`` presence, so an arbitrary
+        MonoBehaviour script (no fill ref) abstains cleanly."""
+        from converter.ui_translator import _convert_ui_element, build_component_owner_index
+
+        other = self._node(
+            "SomeWidget", file_id="widget", parent_file_id=None,
+            components=[
+                ComponentData(
+                    component_type="MonoBehaviour", file_id="othercomp",
+                    # No m_FillRect; even carries Min/Max-shaped fields that a
+                    # naive dispatch might mistake for a slider.
+                    properties={"m_MinValue": 5, "m_MaxValue": 10, "m_Value": 7},
+                ),
+            ],
+        )
+        node_index = {"widget": other}
+        owner_index = build_component_owner_index([other])
+        element = _convert_ui_element(
+            other, scene_namespace="",
+            component_owner_index=owner_index,
+            node_index=node_index,
+        )
+        assert element is not None
+        assert "SliderFillElement" not in element.attributes
+        assert "MinValue" not in element.attributes
+        assert "MaxValue" not in element.attributes
+        assert "SliderDirection" not in element.attributes
+
     # --- Criterion 2: Min/Max/Value/Direction still emitted (no regression). ---
     def test_writer_still_emits_minmax_value_direction(self):
         from converter.ui_translator import _apply_slider_properties

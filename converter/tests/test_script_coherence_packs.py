@@ -4205,6 +4205,47 @@ class TestSliderFillPathResize:
             for r in caplog.records
         ), "method-form guessed-fill HUD must be loudly flagged, not silently skipped"
 
+    def test_second_guessed_setter_not_silently_skipped(self, caplog) -> None:
+        """A single file with a REWRITTEN free-function setter AND a still-guessed
+        method-form setter: the rewritten one must NOT cause the method-form one
+        to be silently skipped. The free-function setter is rewritten and the
+        guard LOUDLY warns about the remaining method-form guessed setter
+        (per-setter determination, not whole-file rewritten-marker gating).
+
+        Pins codex P1: whole-script ``_SLIDER_REWRITTEN_SIG in src`` gating made
+        detect/apply/guard all skip a 2nd guessed setter once any setter in the
+        file was rewritten (§3 edge-5 / criterion 8 'never silently skipped')."""
+        import logging
+        src = (
+            "local Hud = {}\n\n"
+            # Free-function guessed setter (will be rewritten by the apply).
+            + self.REAL_GUESSED_SETTER
+            + "\n"
+            # Second, still-guessed setter in METHOD form (apply abstains on it).
+            "function Hud:setSliderValue(slider, percentage)\n"
+            "\tif not slider then return end\n"
+            '\tlocal fill = slider:FindFirstChild("Fill")\n'
+            "\treturn fill\n"
+            "end\n"
+        )
+        s = RbxScript(name="HudControl", source=src, script_type="LocalScript")
+        with caplog.at_level(logging.WARNING):
+            n = run_packs([s])
+        # The free-function setter WAS rewritten.
+        assert n >= 1
+        assert 'slider:GetAttribute("SliderFillElement")' in s.source
+        # The method-form guessed setter survives un-rewritten (still guesses).
+        assert 'slider:FindFirstChild("Fill")' in s.source
+        # ...and is LOUDLY flagged, NOT silently skipped despite the rewritten
+        # sibling in the same file.
+        assert any(
+            "slider_fill_path_resize" in r.message and "did not rewrite" in r.message
+            for r in caplog.records
+        ), (
+            "method-form guessed setter must be flagged even when another setter "
+            "in the same file was already rewritten"
+        )
+
     def test_detector_fires_on_method_form(self) -> None:
         method = (
             "function Hud:setSliderValue(slider, percentage)\n"

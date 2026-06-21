@@ -1063,9 +1063,7 @@ def _apply_scroll_properties(element: RbxUIElement, props: dict[str, Any]) -> No
     element.attributes["_ScrollVertical"] = bool(int(vertical))
 
 
-def _apply_slider_properties(
-    element: RbxUIElement,
-    props: dict[str, Any],
+def _apply_slider_properties(element: RbxUIElement, props: dict[str, Any],
     *,
     node: SceneNode | None = None,
     component_owner_index: dict[str, str] | None = None,

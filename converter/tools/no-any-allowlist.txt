@@ -12,3 +12,4 @@ converter/unity/yaml_parser.py | YAML deserialization boundary; output is dict-o
 converter/unity/prefab_parser.py | Unity YAML dict-of-Any -> PrefabLibrary narrowing point
 converter/unity/binary_scene_parser.py | UnityPy library has no type stubs; Any unavoidable at the seam
 converter/converter/animation_converter.py | Unity .anim/.controller YAML + UnityPy typetree deserialization boundary; dict-of-Any bodies narrowed by callers
+converter/converter/ui_translator.py | receives ComponentData.properties (dict[str,Any] Unity-YAML boundary, core/unity_types.py:29) verbatim as `props`; the Any is the YAML seam, not typed-core debt
