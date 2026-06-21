@@ -1,11 +1,12 @@
 """Tests for ui_translator.py -- Unity Canvas to Roblox ScreenGui conversion."""
 
+import pytest
+
 from converter.ui_translator import _extract_rect_transform, _apply_text_properties
 from core.roblox_types import RbxUIElement
 from core.unity_types import ComponentData, SceneNode
 
-# UnityEngine.UI.Image script GUID (prefix-matched by ``_is_ui_image_mb``); used
-# by the background-transparency tests to forge a real Image MonoBehaviour shape.
+# UnityEngine.UI.Image script GUID (prefix-matched by ``_is_ui_image_mb``).
 IMAGE_GUID_GLOBAL = "fe87c0e1cc204ed48ad3e3b5e8b2e000"
 
 
@@ -1567,15 +1568,9 @@ class TestClickBindingProductionDomainWiring:
 
 
 class TestBackgroundTransparencyFromGraphic:
-    """``_convert_ui_element`` sets ``background_transparency`` authoritatively
-    from a node's fill-painting Image/RawImage Graphic (``1.0 - m_Color.a``), and
-    1.0 (fully transparent) when the node owns no graphic.
-
-    Keyed on the SAME image-promotion signal the element-class logic uses
-    (``_UI_CLASS_MAP``->ImageLabel, or a MonoBehaviour with ``m_Sprite`` /
-    ``_is_ui_image_mb``) — never a bare ``m_Texture`` heuristic, never a name match.
-    Image graphics are their own component (Unity widgets serialize as
-    MonoBehaviour + m_Script, the Image is a separate Graphic component).
+    """``_convert_ui_element`` sets ``background_transparency`` from a node's
+    fill-painting Image/RawImage graphic (``1.0 - m_Color.a``), and 1.0 (fully
+    transparent) when the node owns no graphic.
     """
 
     NS = "Assets/Scenes/Main.unity"
@@ -1644,13 +1639,9 @@ class TestBackgroundTransparencyFromGraphic:
 
     # --- AC4: Button-with-Image (the load-bearing regression guard) ----------
     def test_button_with_image_uses_image_own_alpha(self):
-        """AC4 — a Button (MonoBehaviour + m_OnClick) on the SAME node as an
-        Image MB (m_Color.a == 0.784): element becomes TextButton (text handler
-        forces 1.0), but the post-pass finds the IMAGE MB and overrides to
-        1.0 - 0.784 == 0.216. The value MUST come from the Image MB's OWN
-        m_Color — NOT the merged ui_properties (the Button MB carries no
-        m_Color, so a merge would leave the Image's alpha intact, but a Button
-        carrying its own m_Color must not shadow the graphic's)."""
+        """AC4 — a Button MB + an Image MB (m_Color.a == 0.784) on one node:
+        element is TextButton, and the value comes from the Image MB's OWN
+        m_Color (-> 0.216), not the Button MB's own m_Color."""
         button_mb = ComponentData(
             component_type="MonoBehaviour", file_id="btnComp",
             properties={
@@ -1836,6 +1827,19 @@ class TestBackgroundTransparencyFromGraphic:
         )
         assert self._convert(node).background_transparency == 0.0
 
+    @pytest.mark.parametrize("raw_a", ["inf", float("-inf"), "nan", float("inf")])
+    def test_image_color_a_non_finite_is_opaque(self, raw_a):
+        """E10 — a non-finite m_Color.a (inf/-inf/nan) coerces to the opaque
+        default 1.0 -> 0.0 (finite), never leaking a non-finite transparency."""
+        node = self._node(
+            "ANonFinite", "84",
+            components=[ComponentData(
+                component_type="MonoBehaviour", file_id="C",
+                properties={"m_Sprite": {"fileID": 0}, "m_Color": {"a": raw_a}},
+            )],
+        )
+        assert self._convert(node).background_transparency == 0.0
+
     def test_is_ui_image_mb_guid_detected(self):
         """An Image subclass MonoBehaviour with NO m_Sprite but the Image
         script GUID is detected via ``_is_ui_image_mb`` -> 1.0 - alpha."""
@@ -1922,11 +1926,10 @@ class TestBackgroundTransparencyFromGraphic:
         the post-pass were moved below the early-return, a suppressed-children
         host would silently regress to the opaque default."""
         from converter.ui_translator import _convert_ui_element
-        # A BARE container (no graphic): the post-pass forces 1.0, but the
-        # RbxUIElement default is the OPAQUE 0.0 and no per-class handler runs
-        # for a graphic-less Frame — so this value is observable ONLY if the
-        # post-pass ran. (A literal Image would be green-for-the-wrong-reason:
-        # ``_apply_image_properties`` sets 1.0-alpha independently of ordering.)
+        # A BARE container (no graphic): 1.0 is observable ONLY if the post-pass
+        # ran (the RbxUIElement default is opaque 0.0 and no per-class handler
+        # touches a graphic-less Frame). A literal Image would pass for the wrong
+        # reason — _apply_image_properties sets 1.0-alpha independently of order.
         node = self._node(
             "SuppressedHost", "120",
             components=[ComponentData(
@@ -1940,7 +1943,4 @@ class TestBackgroundTransparencyFromGraphic:
             suppress_static_children_ids=frozenset({sr_id}),
         )
         assert element is not None
-        # No graphic -> 1.0 (transparent), set despite the suppress early-return.
-        # Without the post-pass (or with it moved below the return) this stays
-        # at the 0.0 opaque default.
         assert element.background_transparency == 1.0

@@ -8,6 +8,7 @@ Text/TextMeshPro -> TextLabel, Image -> ImageLabel, Button -> TextButton.
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any, TypedDict
 
 from core.unity_types import ComponentData, SceneNode
@@ -182,12 +183,14 @@ def _coerce_alpha(raw: object) -> float:
 
     Mirrors ``_coerce_int``: the value crosses the parser boundary untyped and may be
     present-but-non-numeric (``None``, ``"bad"``), so a present-but-bad alpha defaults
-    to opaque just like an absent one.
+    to opaque just like an absent one. Non-finite (``inf``/``-inf``/``nan``) → opaque
+    too, so ``1.0 - alpha`` never leaks a non-finite transparency.
     """
     try:
-        return float(raw)  # type: ignore[arg-type]
+        value = float(raw)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return 1.0
+    return value if math.isfinite(value) else 1.0
 
 
 def _map_tmp_bitfield(raw: object, table: dict[int, str]) -> str | None:
@@ -227,25 +230,13 @@ def _is_ui_image_mb(props: dict[str, Any]) -> bool:
 def _find_image_graphic(node: SceneNode) -> ComponentData | None:
     """Return the node's fill-painting Image Graphic component, or None.
 
-    A Unity UI node paints a rectangular background fill iff it owns an Image (or
-    RawImage exposed as a literal class). Detected with EXACTLY the signal the
-    element-class logic already trusts to promote a bare Frame -> ImageLabel (no
-    regex, no AI-output fingerprint, no name matching, no NEW heuristic):
+    Keyed on the same signal that promotes a bare Frame -> ImageLabel:
       - a component whose ``_UI_CLASS_MAP[ct] == "ImageLabel"`` (a literal
         "Image"/"RawImage" component_type), or
       - a MonoBehaviour that is a UI Image (``m_Sprite`` present, or
         ``_is_ui_image_mb`` matches the Image script GUID — covers subclasses).
     Returns the FIRST match in component order (Unity renders one Graphic per
-    GameObject). Pure: reads ``node.components``, returns the matched component
-    (caller reads its OWN ``.properties`` — never the merged ui_properties).
-
-    NOT a bare ``m_Texture in p`` check: that would false-positive on any custom
-    MonoBehaviour with a serialized field named m_Texture, AND a RawImage the
-    parser leaves as a bare MonoBehaviour is never promoted to ImageLabel
-    (promotion keys on m_Sprite/_is_ui_image_mb, never m_Texture), so it renders
-    NO texture — forcing it opaque would yield an opaque EMPTY frame, re-creating
-    the blocking-view bug. Treating such a node as no-fill -> transparent is the
-    correct, safe direction.
+    GameObject). A node with no graphic paints no fill (-> transparent).
     """
     for comp in node.components:
         ct = comp.component_type
@@ -721,14 +712,9 @@ def _convert_ui_element(
     # Detect layout group components.
     _apply_layout_properties(element, node.components)
 
-    # Background transparency (authoritative): a Unity UI node paints a fill ONLY
-    # if it owns an Image/RawImage Graphic; the fill opacity is that graphic's
-    # m_Color.a. A bare RectTransform-only container (no graphic) renders nothing
-    # in Unity, so it must be transparent in Roblox. This is the single source of
-    # truth for background_transparency — it overrides the per-class handlers
-    # (_apply_text_properties forces 1.0; _apply_image_properties sets 1.0-alpha
-    # but ONLY for ImageLabel), which left bare Frames opaque (the bug) and
-    # Button/TextBox/ScrollRect-that-own-an-Image at the wrong value.
+    # Background transparency, authoritative over the per-class handlers: a node
+    # paints a fill only if it owns an Image/RawImage graphic, with opacity from
+    # that graphic's m_Color.a; a graphic-less container is transparent.
     graphic = _find_image_graphic(node)
     if graphic is not None:
         col = graphic.properties.get("m_Color", {})
