@@ -425,6 +425,39 @@ cache. The items below are where code or docs are stale or wrong.
   cover modules; harden the call graph against synthesized require-fallback
   strings; add a module-heavy test project / fixtures. (Claude + Codex cross-model
   analysis, 2026-05-19.)
+  - **UPDATE (2026-06-21) — REAL root cause is an empty `dependency_map`, not the
+    caller-domain heuristic itself.** The escalated "client `require()`s a base class in
+    ServerStorage → `require(nil)` → load failure" symptom DOES reproduce — on **generic
+    SimpleFPS** (not trash-dash), and the live driver is upstream of this item: **PR #222
+    (`cache-prune-count-and-luau-gate`) made `assemble` correctly SKIP re-transpile when
+    the cache is intact, but `self.state.dependency_map` is built ONLY inside
+    `transpile_scripts` (`pipeline.py` ~2762-2768) and is NOT persisted to
+    `conversion_context`.** So on a transpile-skipped `assemble` (the normal phase-by-phase
+    `/convert-unity` + `/e2e-test` flow) `dependency_map` is EMPTY → `resolve_caller_graph`
+    has no edges → modules with real client callers (e.g. `Player`, required by
+    `HudControl`/`HostilePlane` in `ReplicatedStorage`) route to ServerStorage ("required
+    only by server-side callers") → client `require(nil)` → boot cascade. Pre-#222 the
+    cache "always missed", so assemble always re-ran transpile and rebuilt `dependency_map`
+    as a side effect, masking it. Instrumented proof + validated fix (rebuild `dep_map`
+    from `analyze_all_scripts` when empty → `Player → ReplicatedStorage`) are in the memory
+    `player-module-serverstorage-client-require-regression`. Codex's sharper take: prefer
+    **PERSISTING `dependency_map` (and other transpile-derived analysis inputs) to
+    `conversion_context`** over rebuild-on-miss (phase-boundary state transfer; rebuild-only
+    risks cached-vs-uncached classification divergence), and investigate what ELSE is
+    starved on transpile-skip (the topology path stays sparse 2/51 even after the rebuild).
+    - **Why trash-dash didn't show it (caveat for re-investigators):** a `--retranspile`
+      assemble (or `u2r.py convert` single-process) rebuilds `dependency_map`, masking the
+      bug. And trash-dash converts with ~zero client entry-point seeds, so even when a
+      module lands in ServerStorage no client `require` executes it. The symptom needs BOTH
+      (a) a transpile-SKIPPED assemble (empty dep_map) AND (b) a game with real
+      client-reachable modules requiring the misrouted module — SimpleFPS has both.
+    - **Still-real secondary defect:** routing is **not closed under `require`** — a
+      client-domain module (e.g. `TrackManager`) can be placed in ReplicatedStorage while a
+      module it requires (`Coin`) sits in ServerStorage. Latent invariant violation worth a
+      defensive guard + a module-heavy fixture regardless of the dep_map fix.
+    Affects ALL generic conversions on current `upstream/main` (`dependency_map` still not
+    persisted as of 20cf862). Full repro notes:
+    `~/.claude/harness-runs/modulescript-routing-20260621T085815/repro-findings.md`.
 
 - [ ] **P2 — Retire genre-specific scaffolding; make the converter fully
   genre-agnostic.** `--scaffolding=fps` (`u2r.py convert`) injects FPS-genre
